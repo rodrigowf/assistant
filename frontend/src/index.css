@@ -10,9 +10,9 @@
   --text: #b8b9ba;
   --text-muted: #808182;
   --text-bright: #e4e5e6;
-  --accent: #ba7ae0;
-  --accent-hover: #aa6ac9;
-  --accent-subtle: rgba(177, 106, 224, 0.12);
+  --accent: hsl(276, 65%, 70%);
+  --accent-hover: hsl(276, 53%, 55%);
+  --accent-subtle: hsla(276, 53%, 55%, 0.123);
   --user-bg: #262728;
   --error: #d45d5d;
   --success: #5cb87a;
