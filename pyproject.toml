@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: tests that load the sentence-transformer model",
+    "unit: pure unit tests with no external dependencies",
+    "asyncio: async tests for the manager package",
+]
+asyncio_mode = "auto"
+timeout = 30

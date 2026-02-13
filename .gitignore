@@ -1,0 +1,25 @@
+# Vector search index (regenerable from source files)
+index/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Environment
+.env
+
+# Manager local config
+.manager.json
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+
+# Local logs
+logs/
+
+# Claude Code local data
+.claude_config/

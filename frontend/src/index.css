@@ -1,0 +1,104 @@
+/* Theme and base styles */
+
+:root {
+  --bg: #18191a;
+  --bg-surface: #212223;
+  --bg-elevated: #2a2b2c;
+  --bg-hover: #333435;
+  --border: #3a3b3c;
+  --border-subtle: #2a2b2c;
+  --text: #b8b9ba;
+  --text-muted: #808182;
+  --text-bright: #e4e5e6;
+  --accent: #ba7ae0;
+  --accent-hover: #aa6ac9;
+  --accent-subtle: rgba(177, 106, 224, 0.12);
+  --user-bg: #262728;
+  --error: #d45d5d;
+  --success: #5cb87a;
+  --thinking-border: #c9a856;
+  --tool-border: #6a9fcf;
+
+  /* Semantic tool colors - action-based HSL palette (desaturated) */
+  --tool-read: hsl(210, 28%, 55%);       /* Cool blue - observation, inspection */
+  --tool-write: hsl(160, 28%, 48%);      /* Teal-green - creation, modification */
+  --tool-execute: hsl(35, 32%, 50%);     /* Warm brown - terminal, processing */
+  --tool-script: hsl(14, 28%, 52%);      /* Golden amber - script execution */
+  --tool-navigate: hsl(320, 22%, 55%);   /* Dusty rose - active browser control */
+  --tool-capture: hsl(195, 32%, 52%);    /* Sky cyan - screenshots, snapshots */
+  --tool-interact: hsl(30, 38%, 55%);    /* Warm coral - user prompts, dialogs */
+  --tool-todo: hsl(280, 22%, 55%);       /* Soft violet - task tracking, progress */
+  --tool-task: hsl(257, 18%, 52%);       /* Deep indigo - agent delegation */
+  --tool-system: hsl(220, 10%, 52%);     /* Neutral slate - misc, unknown */
+
+  /* Background variants (low opacity) */
+  --tool-read-bg: hsla(210, 40%, 55%, 0.08);
+  --tool-write-bg: hsla(160, 40%, 45%, 0.08);
+  --tool-execute-bg: hsla(35, 45%, 45%, 0.08);
+  --tool-script-bg: hsla(14, 38%, 49%, 0.08);
+  --tool-navigate-bg: hsla(320, 35%, 55%, 0.08);
+  --tool-capture-bg: hsla(195, 50%, 50%, 0.08);
+  --tool-interact-bg: hsla(30, 50%, 55%, 0.08);
+  --tool-todo-bg: hsla(280, 35%, 45%, 0.1);
+  --tool-task-bg: hsla(257, 20%, 35%, 0.08);
+  --tool-system-bg: hsla(220, 15%, 50%, 0.08);
+  --radius: 8px;
+  --radius-lg: 12px;
+  --sidebar-width: 280px;
+  --transition: 150ms ease;
+
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  line-height: 1.5;
+  color: var(--text);
+  background-color: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+input, textarea {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  outline: none;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}

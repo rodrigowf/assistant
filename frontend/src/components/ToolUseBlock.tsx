@@ -1,0 +1,752 @@
+import { useState } from "react";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import {
+  MdCode,
+  MdEdit,
+  MdDescription,
+  MdTerminal,
+  MdSearch,
+  MdLanguage,
+  MdSmartToy,
+  MdChecklist,
+  MdHelpOutline,
+  MdAutoAwesome,
+  MdEditNote,
+  MdBook,
+  MdNavigation,
+  MdTouchApp,
+  MdKeyboard,
+  MdCameraAlt,
+  MdContentCopy,
+  MdBolt,
+  MdList,
+  MdNetworkCheck,
+  MdSpeed,
+  MdBuild,
+  MdError,
+  MdCheckCircle,
+  MdMoreHoriz,
+} from "react-icons/md";
+
+interface Props {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  result?: string;
+  isError?: boolean;
+  complete: boolean;
+}
+
+type ToolInput = Record<string, unknown>;
+
+// ---------------------------------------------------------------------------
+// Tool Categories (semantic, action-based coloring)
+// ---------------------------------------------------------------------------
+
+type ToolCategory = "read" | "write" | "execute" | "script" | "navigate" | "capture" | "interact" | "todo" | "task" | "system";
+
+function getToolCategory(toolName: string): ToolCategory {
+  // Read/inspect tools (passive observation)
+  if (["Read", "Glob", "Grep", "WebFetch", "WebSearch"].includes(toolName)) return "read";
+
+  // Write/modify tools (creation, modification)
+  if (["Write", "Edit", "NotebookEdit"].includes(toolName)) return "write";
+
+  // Todo tracking (task list, progress)
+  if (toolName === "TodoWrite") return "todo";
+
+  // Task delegation (subagents)
+  if (toolName === "Task") return "task";
+
+  // Execute tools (running processes, terminal)
+  if (["Bash", "Skill", "EnterPlanMode", "ExitPlanMode"].includes(toolName)) return "execute";
+
+  // User interaction
+  if (toolName === "AskUserQuestion") return "interact";
+
+  // Browser MCP tools - categorize by action type
+  if (toolName.startsWith("mcp__chrome-devtools__")) {
+    const action = toolName.replace("mcp__chrome-devtools__", "");
+    // Navigation/interaction actions
+    if (["navigate_page", "click", "hover", "drag", "fill", "fill_form", "press_key", "handle_dialog", "new_page", "close_page", "select_page", "resize_page", "wait_for"].includes(action))
+      return "navigate";
+    // Capture/recording actions
+    if (["take_screenshot", "take_snapshot", "performance_start_trace", "performance_stop_trace", "performance_analyze_insight"].includes(action))
+      return "capture";
+    // Script execution (blend of execute + navigate)
+    if (action === "evaluate_script")
+      return "script";
+    // Inspection actions (console, network)
+    if (["list_console_messages", "list_network_requests", "get_console_message", "get_network_request", "list_pages", "emulate"].includes(action))
+      return "read";
+  }
+
+  return "system";
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function formatFilePath(path: unknown): string {
+  if (typeof path !== "string") return String(path);
+  const parts = path.split("/");
+  if (parts.length > 3) {
+    return `.../${parts.slice(-2).join("/")}`;
+  }
+  return path;
+}
+
+function getLanguageFromPath(filePath: string): string {
+  const ext = filePath.split(".").pop()?.toLowerCase() || "";
+  const langMap: Record<string, string> = {
+    ts: "typescript",
+    tsx: "tsx",
+    js: "javascript",
+    jsx: "jsx",
+    py: "python",
+    rs: "rust",
+    go: "go",
+    rb: "ruby",
+    java: "java",
+    c: "c",
+    cpp: "cpp",
+    h: "c",
+    hpp: "cpp",
+    css: "css",
+    scss: "scss",
+    html: "html",
+    json: "json",
+    yaml: "yaml",
+    yml: "yaml",
+    md: "markdown",
+    sh: "bash",
+    bash: "bash",
+    zsh: "bash",
+    sql: "sql",
+    graphql: "graphql",
+    dockerfile: "dockerfile",
+    toml: "toml",
+    xml: "xml",
+  };
+  return langMap[ext] || "text";
+}
+
+// ---------------------------------------------------------------------------
+// Summary formatter (for collapsed view)
+// ---------------------------------------------------------------------------
+
+function formatToolSummary(toolName: string, input: ToolInput): string {
+  switch (toolName) {
+    case "Read":
+      return input.file_path ? `Read ${formatFilePath(input.file_path)}` : "Read";
+    case "Write":
+      return input.file_path ? `Write ${formatFilePath(input.file_path)}` : "Write";
+    case "Edit":
+      return input.file_path ? `Edit ${formatFilePath(input.file_path)}` : "Edit";
+    case "Bash": {
+      // Show description if available, otherwise show truncated command
+      if (input.description) {
+        return String(input.description);
+      }
+      if (input.command) {
+        const cmd = String(input.command);
+        return cmd.slice(0, 60) + (cmd.length > 60 ? "..." : "");
+      }
+      return "Bash";
+    }
+    case "Glob":
+      return input.pattern ? `Glob ${input.pattern}` : "Glob";
+    case "Grep":
+      return input.pattern ? `Grep "${input.pattern}"` : "Grep";
+    case "WebFetch":
+      return input.url ? `Fetch ${input.url}` : "WebFetch";
+    case "WebSearch":
+      return input.query ? `Search "${input.query}"` : "WebSearch";
+    case "Task":
+      return input.description ? `Task: ${input.description}` : "Task";
+    case "TodoWrite":
+      return "Update todos";
+    case "AskUserQuestion":
+      return "Ask user";
+    case "Skill":
+      return input.skill ? `/${input.skill}` : "Skill";
+    case "EnterPlanMode":
+      return "Enter plan mode";
+    case "ExitPlanMode":
+      return "Exit plan mode";
+    case "NotebookEdit":
+      return input.notebook_path ? `Edit notebook ${formatFilePath(input.notebook_path)}` : "Edit notebook";
+  }
+
+  // MCP Chrome DevTools
+  if (toolName.startsWith("mcp__chrome-devtools__")) {
+    const mcpTool = toolName.replace("mcp__chrome-devtools__", "");
+    switch (mcpTool) {
+      case "navigate_page":
+        if (input.type === "reload") return "Reload page";
+        if (input.type === "back") return "Go back";
+        if (input.type === "forward") return "Go forward";
+        return input.url ? `Navigate to ${input.url}` : "Navigate";
+      case "click":
+        return input.dblClick ? "Double click" : "Click";
+      case "fill":
+        return "Fill input";
+      case "fill_form":
+        return "Fill form";
+      case "take_screenshot":
+        return "Screenshot";
+      case "take_snapshot":
+        return "Snapshot";
+      case "evaluate_script":
+        return "Run script";
+      case "emulate":
+        return "Emulate device";
+      case "hover":
+        return "Hover";
+      case "drag":
+        return "Drag";
+      case "press_key":
+        return input.key ? `Press ${input.key}` : "Press key";
+      case "wait_for":
+        return input.text ? `Wait for "${input.text}"` : "Wait";
+      case "list_pages":
+        return "List pages";
+      case "list_console_messages":
+        return "List console";
+      case "list_network_requests":
+        return "List network";
+      case "select_page":
+        return `Select page #${input.pageId}`;
+      case "new_page":
+        return "New page";
+      case "close_page":
+        return "Close page";
+      case "resize_page":
+        return `Resize to ${input.width}×${input.height}`;
+      case "performance_start_trace":
+        return "Start trace";
+      case "performance_stop_trace":
+        return "Stop trace";
+      case "get_console_message":
+        return "Get console message";
+      case "get_network_request":
+        return "Get network request";
+      case "handle_dialog":
+        return input.action === "accept" ? "Accept dialog" : "Dismiss dialog";
+      case "upload_file":
+        return "Upload file";
+      default:
+        return mcpTool.replace(/_/g, " ");
+    }
+  }
+
+  // Generic MCP tool
+  if (toolName.startsWith("mcp__")) {
+    const parts = toolName.split("__");
+    return parts.length >= 3 ? parts[2].replace(/_/g, " ") : toolName;
+  }
+
+  return toolName;
+}
+
+// ---------------------------------------------------------------------------
+// Icon helper
+// ---------------------------------------------------------------------------
+
+function getToolIcon(toolName: string, complete: boolean, isError?: boolean): React.ReactNode {
+  const iconClass = "tool-icon-svg";
+
+  if (!complete) return <MdMoreHoriz className={iconClass} />;
+  if (isError) return <MdError className={iconClass} />;
+
+  switch (toolName) {
+    case "Read":
+      return <MdDescription className={iconClass} />;
+    case "Write":
+      return <MdCode className={iconClass} />;
+    case "Edit":
+      return <MdEdit className={iconClass} />;
+    case "Bash":
+      return <MdTerminal className={iconClass} />;
+    case "Glob":
+    case "Grep":
+      return <MdSearch className={iconClass} />;
+    case "WebFetch":
+      return <MdLanguage className={iconClass} />;
+    case "WebSearch":
+      return <MdSearch className={iconClass} />;
+    case "Task":
+      return <MdSmartToy className={iconClass} />;
+    case "TodoWrite":
+      return <MdChecklist className={iconClass} />;
+    case "AskUserQuestion":
+      return <MdHelpOutline className={iconClass} />;
+    case "Skill":
+      return <MdAutoAwesome className={iconClass} />;
+    case "EnterPlanMode":
+    case "ExitPlanMode":
+      return <MdEditNote className={iconClass} />;
+    case "NotebookEdit":
+      return <MdBook className={iconClass} />;
+  }
+
+  if (toolName.startsWith("mcp__chrome-devtools__")) {
+    const mcpTool = toolName.replace("mcp__chrome-devtools__", "");
+    switch (mcpTool) {
+      case "navigate_page":
+        return <MdNavigation className={iconClass} />;
+      case "click":
+      case "hover":
+      case "drag":
+        return <MdTouchApp className={iconClass} />;
+      case "fill":
+      case "fill_form":
+      case "press_key":
+        return <MdKeyboard className={iconClass} />;
+      case "take_screenshot":
+        return <MdCameraAlt className={iconClass} />;
+      case "take_snapshot":
+        return <MdContentCopy className={iconClass} />;
+      case "evaluate_script":
+        return <MdBolt className={iconClass} />;
+      case "list_console_messages":
+      case "get_console_message":
+        return <MdList className={iconClass} />;
+      case "list_network_requests":
+      case "get_network_request":
+        return <MdNetworkCheck className={iconClass} />;
+      case "performance_start_trace":
+      case "performance_stop_trace":
+        return <MdSpeed className={iconClass} />;
+      default:
+        return <MdBuild className={iconClass} />;
+    }
+  }
+
+  return <MdBuild className={iconClass} />;
+}
+
+// ---------------------------------------------------------------------------
+// Specialized input renderers
+// ---------------------------------------------------------------------------
+
+function WriteInputView({ filePath, content }: { filePath: string; content: string }) {
+  const language = getLanguageFromPath(filePath);
+  return (
+    <div className="tool-write-view">
+      <div className="tool-field">
+        <span className="field-label">File</span>
+        <span className="field-value">{filePath}</span>
+      </div>
+      <div className="tool-code-block">
+        <div className="code-header">
+          <span className="code-lang">{language}</span>
+        </div>
+        <SyntaxHighlighter
+          language={language}
+          style={oneDark}
+          customStyle={{
+            margin: 0,
+            borderRadius: "0 0 var(--radius) var(--radius)",
+            fontSize: "0.8rem",
+            maxHeight: "400px",
+          }}
+        >
+          {content}
+        </SyntaxHighlighter>
+      </div>
+    </div>
+  );
+}
+
+function EditInputView({ filePath, oldString, newString, replaceAll }: {
+  filePath: string;
+  oldString: string;
+  newString: string;
+  replaceAll?: boolean;
+}) {
+  const language = getLanguageFromPath(filePath);
+  return (
+    <div className="tool-edit-view">
+      <div className="tool-field">
+        <span className="field-label">File</span>
+        <span className="field-value">{filePath}</span>
+      </div>
+      {replaceAll && (
+        <div className="tool-field">
+          <span className="field-label">Mode</span>
+          <span className="field-value">Replace all occurrences</span>
+        </div>
+      )}
+      <div className="tool-diff">
+        <div className="diff-section diff-remove">
+          <div className="diff-header">- Remove</div>
+          <SyntaxHighlighter
+            language={language}
+            style={oneDark}
+            customStyle={{
+              margin: 0,
+              fontSize: "0.8rem",
+              background: "rgba(231, 76, 60, 0.1)",
+              maxHeight: "300px",
+            }}
+          >
+            {oldString}
+          </SyntaxHighlighter>
+        </div>
+        <div className="diff-section diff-add">
+          <div className="diff-header">+ Add</div>
+          <SyntaxHighlighter
+            language={language}
+            style={oneDark}
+            customStyle={{
+              margin: 0,
+              fontSize: "0.8rem",
+              background: "rgba(46, 204, 113, 0.1)",
+              maxHeight: "300px",
+            }}
+          >
+            {newString}
+          </SyntaxHighlighter>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BashInputView({ command, description }: { command: string; description?: string }) {
+  return (
+    <div className="tool-bash-view">
+      {description && (
+        <div className="tool-field">
+          <span className="field-label">Description</span>
+          <span className="field-value">{description}</span>
+        </div>
+      )}
+      <div className="tool-code-block">
+        <div className="code-header">
+          <span className="code-lang">bash</span>
+        </div>
+        <SyntaxHighlighter
+          language="bash"
+          style={oneDark}
+          customStyle={{
+            margin: 0,
+            borderRadius: "0 0 var(--radius) var(--radius)",
+            fontSize: "0.8rem",
+          }}
+        >
+          {command}
+        </SyntaxHighlighter>
+      </div>
+    </div>
+  );
+}
+
+function TaskInputView({ description, prompt, subagentType }: {
+  description?: string;
+  prompt: string;
+  subagentType?: string;
+}) {
+  return (
+    <div className="tool-task-view">
+      {description && (
+        <div className="tool-field">
+          <span className="field-label">Task</span>
+          <span className="field-value task-description">{description}</span>
+        </div>
+      )}
+      {subagentType && (
+        <div className="tool-field">
+          <span className="field-label">Agent</span>
+          <span className="field-value agent-type">{subagentType}</span>
+        </div>
+      )}
+      <div className="tool-field multiline">
+        <span className="field-label">Prompt</span>
+        <pre className="field-value task-prompt">{prompt}</pre>
+      </div>
+    </div>
+  );
+}
+
+function GenericInputView({ input }: { input: ToolInput }) {
+  return <pre className="generic-json">{JSON.stringify(input, null, 2)}</pre>;
+}
+
+// ---------------------------------------------------------------------------
+// Input renderer dispatcher
+// ---------------------------------------------------------------------------
+
+function renderToolInput(toolName: string, input: ToolInput) {
+  switch (toolName) {
+    case "Write":
+      if (input.file_path && input.content) {
+        return (
+          <WriteInputView
+            filePath={String(input.file_path)}
+            content={String(input.content)}
+          />
+        );
+      }
+      break;
+    case "Edit":
+      if (input.file_path && input.old_string !== undefined && input.new_string !== undefined) {
+        return (
+          <EditInputView
+            filePath={String(input.file_path)}
+            oldString={String(input.old_string)}
+            newString={String(input.new_string)}
+            replaceAll={Boolean(input.replace_all)}
+          />
+        );
+      }
+      break;
+    case "Bash":
+      if (input.command) {
+        return (
+          <BashInputView
+            command={String(input.command)}
+            description={input.description ? String(input.description) : undefined}
+          />
+        );
+      }
+      break;
+    case "Task":
+      if (input.prompt) {
+        return (
+          <TaskInputView
+            description={input.description ? String(input.description) : undefined}
+            prompt={String(input.prompt)}
+            subagentType={input.subagent_type ? String(input.subagent_type) : undefined}
+          />
+        );
+      }
+      break;
+  }
+
+  // Default: show JSON
+  return <GenericInputView input={input} />;
+}
+
+// ---------------------------------------------------------------------------
+// Specialized blocks for non-collapsible tools
+// ---------------------------------------------------------------------------
+
+function TaskBlock({ toolName, toolInput, result, isError, complete }: Props) {
+  const summary = formatToolSummary(toolName, toolInput);
+  const icon = getToolIcon(toolName, complete, isError);
+  const category = getToolCategory(toolName);
+
+  return (
+    <div className={`tool-block tool-${category} ${isError ? "tool-error" : ""}`}>
+      <div className="tool-header">
+        <span className="tool-icon">{icon}</span>
+        <span className="tool-name">{summary}</span>
+        {complete && (
+          <span className={`tool-status ${isError ? "status-error" : "status-ok"}`}>
+            {isError ? <MdError className="status-icon" /> : <MdCheckCircle className="status-icon" />}
+            {isError ? "error" : "done"}
+          </span>
+        )}
+      </div>
+      <div className="tool-task-content">
+        {renderToolInput(toolName, toolInput)}
+        {result !== undefined && (
+          <details open={result.length < 2000}>
+            <summary className="tool-section-header">
+              Output {result.length > 500 && `(${result.length} chars)`}
+            </summary>
+            <div className={`tool-result ${isError ? "result-error" : ""}`}>
+              <pre>{result}</pre>
+            </div>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Todo item type
+interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+}
+
+// TodoWrite block - always expanded, shows todos as a formatted list
+function TodoWriteBlock({ toolInput, isError, complete }: Props) {
+  const icon = getToolIcon("TodoWrite", complete, isError);
+  const category = getToolCategory("TodoWrite");
+
+  // Parse todos from toolInput
+  const todos: TodoItem[] = Array.isArray(toolInput.todos)
+    ? (toolInput.todos as TodoItem[])
+    : [];
+
+  return (
+    <div className={`tool-block tool-${category} ${isError ? "tool-error" : ""}`}>
+      <div className="tool-header">
+        <span className="tool-icon">{icon}</span>
+        <span className="tool-name">Update todos</span>
+        {complete && (
+          <span className={`tool-status ${isError ? "status-error" : "status-ok"}`}>
+            {isError ? <MdError className="status-icon" /> : <MdCheckCircle className="status-icon" />}
+            {isError ? "error" : "done"}
+          </span>
+        )}
+      </div>
+      <div className="todo-block-content">
+        {todos.length > 0 ? (
+          <ul className="todo-list">
+            {todos.map((todo, idx) => {
+              const statusClass = `todo-item-${todo.status.replace("_", "-")}`;
+              return (
+                <li key={idx} className={`todo-item ${statusClass}`}>
+                  <span className={`todo-indicator todo-indicator-${todo.status.replace("_", "-")}`}>
+                    {todo.status === "completed" && <MdCheckCircle />}
+                  </span>
+                  <span className="todo-text">
+                    {todo.status === "in_progress" && todo.activeForm
+                      ? todo.activeForm
+                      : todo.content}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <span className="no-params">No todos</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Bash block - shows description + command in collapsed header, only output when expanded
+function BashBlock({ toolInput, result, isError, complete }: Props) {
+  const [expanded, setExpanded] = useState(false);
+  const icon = getToolIcon("Bash", complete, isError);
+  const category = getToolCategory("Bash");
+
+  const command = toolInput.command ? String(toolInput.command) : "";
+  const description = toolInput.description ? String(toolInput.description) : null;
+
+  return (
+    <div className={`tool-block tool-${category} ${isError ? "tool-error" : ""}`}>
+      <button
+        className="tool-toggle bash-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="tool-icon">{icon}</span>
+        <div className="bash-header-content">
+          {description && <span className="bash-description">{description}</span>}
+          <div className="bash-command-wrapper">
+            <SyntaxHighlighter
+              language="bash"
+              style={oneDark}
+              customStyle={{
+                margin: 0,
+                padding: "4px 8px",
+                borderRadius: "4px",
+                fontSize: "0.8rem",
+                background: "var(--bg-elevated)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {command}
+            </SyntaxHighlighter>
+          </div>
+        </div>
+        {complete && (
+          <span className={`tool-status ${isError ? "status-error" : "status-ok"}`}>
+            {isError ? <MdError className="status-icon" /> : <MdCheckCircle className="status-icon" />}
+            {isError ? "error" : "done"}
+          </span>
+        )}
+        <span className="toggle-arrow">{expanded ? "▼" : "▶"}</span>
+      </button>
+      {expanded && result !== undefined && (
+        <div className="tool-content">
+          <details open>
+            <summary className="tool-section-header">
+              Output {result.length > 500 && `(${result.length} chars)`}
+            </summary>
+            <div className={`tool-result ${isError ? "result-error" : ""}`}>
+              <pre>{result}</pre>
+            </div>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export function ToolUseBlock({ toolName, toolInput, result, isError, complete }: Props) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Task tool is always expanded (non-collapsible)
+  if (toolName === "Task") {
+    return <TaskBlock {...{ toolName, toolInput, result, isError, complete }} />;
+  }
+
+  // TodoWrite tool shows formatted todo list (always expanded)
+  if (toolName === "TodoWrite") {
+    return <TodoWriteBlock {...{ toolName, toolInput, result, isError, complete }} />;
+  }
+
+  // Bash tool has special header showing description + command
+  if (toolName === "Bash") {
+    return <BashBlock {...{ toolName, toolInput, result, isError, complete }} />;
+  }
+
+  const summary = formatToolSummary(toolName, toolInput);
+  const icon = getToolIcon(toolName, complete, isError);
+  const category = getToolCategory(toolName);
+
+  return (
+    <div className={`tool-block tool-${category} ${isError ? "tool-error" : ""}`}>
+      <button
+        className="tool-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="tool-icon">{icon}</span>
+        <span className="tool-name">{summary}</span>
+        {complete && (
+          <span className={`tool-status ${isError ? "status-error" : "status-ok"}`}>
+            {isError ? <MdError className="status-icon" /> : <MdCheckCircle className="status-icon" />}
+            {isError ? "error" : "done"}
+          </span>
+        )}
+        <span className="toggle-arrow">{expanded ? "▼" : "▶"}</span>
+      </button>
+      {expanded && (
+        <div className="tool-content">
+          <details open>
+            <summary className="tool-section-header">Input</summary>
+            <div className="tool-input">
+              {renderToolInput(toolName, toolInput)}
+            </div>
+          </details>
+          {result !== undefined && (
+            <details open={result.length < 500}>
+              <summary className="tool-section-header">
+                Output {result.length > 500 && `(${result.length} chars)`}
+              </summary>
+              <div className={`tool-result ${isError ? "result-error" : ""}`}>
+                <pre>{result}</pre>
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
