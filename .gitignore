@@ -23,3 +23,9 @@ logs/
 
 # Claude Code local data
 .claude_config/
+
+# Temporary files
+.index-temp/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/

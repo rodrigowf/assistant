@@ -1,0 +1,9 @@
+# Development dependencies (extends requirements.txt)
+-r requirements.txt
+
+# Code quality
+ruff>=0.8.0
+mypy>=1.13.0
+
+# Type stubs
+types-requests>=2.32.0

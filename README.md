@@ -25,24 +25,26 @@ An open-source personal AI assistant built on Claude Code. It can automate workf
 ## Quick Start
 
 ### Prerequisites
+
 - Python 3.12+
 - Node.js 20+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 
-### Setup
+Check if you have everything:
+
+```bash
+scripts/install-prerequisites.sh
+```
+
+### Installation
 
 ```bash
 git clone https://github.com/yourusername/assistant.git
 cd assistant
-
-# Python environment
-python3 -m venv .venv
-.venv/bin/pip install claude-agent-sdk fastapi "uvicorn[standard]" \
-    chromadb sentence-transformers watchfiles pytest pytest-asyncio
-
-# Frontend
-cd frontend && npm install && cd ..
+./install.sh
 ```
+
+That's it. The script sets up the Python environment, installs dependencies, and configures the frontend.
 
 ### Run
 
@@ -55,6 +57,19 @@ cd frontend && npm run dev
 ```
 
 Open **http://localhost:5173** and start chatting.
+
+### Manual Installation
+
+If you prefer to install manually:
+
+```bash
+# Python environment
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Frontend
+cd frontend && npm install
+```
 
 ## Architecture
 
@@ -109,15 +124,18 @@ Both are indexed automatically in the background. Use `/recall` to search explic
 
 ## Configuration
 
-Create `.manager.json`:
+The installer creates `.manager.json` with sensible defaults. You can customize it:
 
 ```json
 {
   "model": "claude-sonnet-4-20250514",
   "permission_mode": "default",
-  "max_budget_usd": 10.0
+  "max_budget_usd": 10.0,
+  "max_turns": 50
 }
 ```
+
+Or use environment variables (see `.env.example`).
 
 ## Philosophy
 
@@ -128,8 +146,15 @@ The assistant can modify itself: fix bugs, add features, improve skills. You're 
 ## Development
 
 ```bash
+# Install with dev dependencies
+./install.sh --dev
+
 # Run tests
 scripts/run.sh -m pytest tests/ -v
+
+# Lint and type check
+.venv/bin/ruff check .
+.venv/bin/mypy api manager
 ```
 
 ## License
