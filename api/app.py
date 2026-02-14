@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure CLAUDE_CONFIG_DIR is always set, even if not launched via run.sh.
+    # Without this, SDK-spawned Claude Code subprocesses write to the project
+    # root instead of .claude_config/.
+    project_root = Path(__file__).resolve().parent.parent
+    os.environ.setdefault("CLAUDE_CONFIG_DIR", str(project_root / ".claude_config"))
+
     config = ManagerConfig.load()
     app.state.config = config
     app.state.store = SessionStore(config.project_dir)

@@ -2,56 +2,51 @@ import { useCallback } from "react";
 import "./App.css";
 import { AuthGate } from "./components/AuthGate";
 import { Sidebar } from "./components/Sidebar";
-import { ChatPanel } from "./components/ChatPanel";
-import { useChat } from "./hooks/useChat";
+import { TabBar } from "./components/TabBar";
+import { ChatPanelContainer } from "./components/ChatPanelContainer";
+import { TabsProvider, useTabsContext } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
 
-export default function App() {
+let tabCounter = 0;
+
+function AppContent() {
   const { sessions, refresh, deleteSession } = useSessions();
-  const chat = useChat({ onSessionChange: refresh });
+  const { openTab, closeTab } = useTabsContext();
 
   const handleNewSession = useCallback(() => {
-    chat.startSession(null);
-  }, [chat]);
-
-  const handleSelectSession = useCallback(
-    (id: string | null) => {
-      if (id) {
-        chat.startSession(id);
-      }
-    },
-    [chat]
-  );
+    const tempId = `new-${++tabCounter}`;
+    openTab(tempId, "New session");
+  }, [openTab]);
 
   const handleDeleteSession = useCallback(
     async (id: string) => {
       await deleteSession(id);
-      if (chat.sessionId === id) {
-        chat.stopSession();
-      }
+      closeTab(id);
     },
-    [deleteSession, chat]
+    [deleteSession, closeTab]
   );
 
   return (
-    <AuthGate>
+    <>
       <Sidebar
         sessions={sessions}
-        activeId={chat.sessionId}
-        onSelect={handleSelectSession}
         onDelete={handleDeleteSession}
         onNew={handleNewSession}
       />
-      <ChatPanel
-        messages={chat.messages}
-        status={chat.status}
-        connectionState={chat.connectionState}
-        cost={chat.cost}
-        turns={chat.turns}
-        error={chat.error}
-        onSend={chat.send}
-        onInterrupt={chat.interrupt}
-      />
+      <main className="main-content">
+        <TabBar />
+        <ChatPanelContainer onSessionChange={refresh} />
+      </main>
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthGate>
+      <TabsProvider>
+        <AppContent />
+      </TabsProvider>
     </AuthGate>
   );
 }

@@ -1,15 +1,31 @@
 import type { SessionInfo } from "../types";
+import { useTabsContext, getTabStatusIcon } from "../context/TabsContext";
 import { SessionItem } from "./SessionItem";
 
 interface Props {
   sessions: SessionInfo[];
-  activeId: string | null;
-  onSelect: (id: string | null) => void;
   onDelete: (id: string) => void;
   onNew: () => void;
 }
 
-export function Sidebar({ sessions, activeId, onSelect, onDelete, onNew }: Props) {
+export function Sidebar({ sessions, onDelete, onNew }: Props) {
+  const { tabs, activeTabId, openTab, switchTab, isTabOpen } = useTabsContext();
+
+  const handleSelect = (id: string) => {
+    if (isTabOpen(id)) {
+      switchTab(id);
+    } else {
+      const session = sessions.find((s) => s.session_id === id);
+      openTab(id, session?.title || "Untitled");
+    }
+  };
+
+  // Build a map of open tab statuses for sidebar indicators
+  const tabStatusMap = new Map<string, string>();
+  for (const tab of tabs) {
+    tabStatusMap.set(tab.sessionId, getTabStatusIcon(tab));
+  }
+
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
@@ -23,8 +39,10 @@ export function Sidebar({ sessions, activeId, onSelect, onDelete, onNew }: Props
           <SessionItem
             key={s.session_id}
             session={s}
-            active={s.session_id === activeId}
-            onClick={() => onSelect(s.session_id)}
+            active={s.session_id === activeTabId}
+            tabOpen={isTabOpen(s.session_id)}
+            tabStatus={tabStatusMap.get(s.session_id)}
+            onClick={() => handleSelect(s.session_id)}
             onDelete={() => onDelete(s.session_id)}
           />
         ))}

@@ -24,6 +24,14 @@ logs/
 # Claude Code local data
 .claude_config/
 
+# Claude Code runtime artifacts (created if CLAUDE_CONFIG_DIR is not set)
+.claude.json
+.claude.json.backup.*
+/debug/
+/projects/
+/todos/
+/plugins/
+
 # Temporary files
 .index-temp/
 *.egg-info/

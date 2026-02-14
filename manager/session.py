@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -222,10 +225,15 @@ class SessionManager:
 
         if isinstance(msg, StreamEvent):
             event = msg.event
+            if not isinstance(event, dict):
+                logger.warning("StreamEvent.event is not a dict: %r", type(event))
+                return
             evt_type = event.get("type", "")
 
             if evt_type == "content_block_delta":
                 delta = event.get("delta", {})
+                if not isinstance(delta, dict):
+                    return
                 delta_type = delta.get("type", "")
 
                 if delta_type == "text_delta":
@@ -243,7 +251,8 @@ class SessionManager:
 
         elif isinstance(msg, SystemMessage):
             if msg.subtype == "compact":
-                trigger = msg.data.get("trigger", "manual")
+                data = msg.data if isinstance(msg.data, dict) else {}
+                trigger = data.get("trigger", "manual")
                 yield CompactComplete(trigger=trigger)
 
         elif isinstance(msg, AssistantMessage):
@@ -276,6 +285,9 @@ class SessionManager:
             # User messages with tool_use_result contain tool output
             if msg.tool_use_result:
                 result = msg.tool_use_result
+                if not isinstance(result, dict):
+                    logger.warning("UserMessage.tool_use_result is not a dict: %r", type(result))
+                    return
                 content = result.get("content", "")
                 if isinstance(content, list):
                     content = json.dumps(content)

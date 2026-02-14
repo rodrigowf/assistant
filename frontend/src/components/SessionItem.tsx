@@ -3,19 +3,29 @@ import type { SessionInfo } from "../types";
 interface Props {
   session: SessionInfo;
   active: boolean;
+  tabOpen: boolean;
+  tabStatus?: string;
   onClick: () => void;
   onDelete: () => void;
 }
 
-export function SessionItem({ session, active, onClick, onDelete }: Props) {
+export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDelete }: Props) {
   const timeAgo = formatRelative(session.last_activity);
 
+  const className = [
+    "session-item",
+    active ? "active" : "",
+    tabOpen && !active ? "tab-open" : "",
+  ].filter(Boolean).join(" ");
+
   return (
-    <div
-      className={`session-item ${active ? "active" : ""}`}
-      onClick={onClick}
-    >
-      <div className="session-title">{session.title || "Untitled"}</div>
+    <div className={className} onClick={onClick}>
+      <div className="session-title">
+        {tabOpen && tabStatus && (
+          <span className={`session-tab-indicator ${tabStatus}`} />
+        )}
+        {session.title || "Untitled"}
+      </div>
       <div className="session-meta">
         <span className="session-time">{timeAgo}</span>
         <span className="session-count">{session.message_count} msgs</span>

@@ -80,3 +80,19 @@ export type ConnectionState =
   | "connected"
   | "disconnected"
   | "error";
+
+// Tab system types
+
+export type TabStatusIcon = "active" | "waiting" | "idle" | "error" | "loading";
+
+export interface TabState {
+  sessionId: string;
+  title: string;
+  status: SessionStatus;
+  connectionState: ConnectionState;
+}
+
+export interface TabsState {
+  tabs: TabState[];
+  activeTabId: string | null;
+}
