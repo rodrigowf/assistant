@@ -41,7 +41,7 @@
   min-width: 80px;
   border: 1px solid transparent;
   border-bottom: none;
-  transition: background var(--transition);
+  transition: background var(--transition), opacity var(--transition);
 }
 
 .tab:hover {
@@ -64,18 +64,24 @@
   background: var(--bg);
 }
 
+/* Status dot — only shown when connected */
+
 .tab-status {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   flex-shrink: 0;
 }
 
-.tab-status.active { background: var(--success); animation: tab-pulse 1.5s ease-in-out infinite; }
-.tab-status.waiting { background: var(--thinking-border); }
-.tab-status.idle { background: var(--tool-border); }
-.tab-status.error { background: var(--error); }
-.tab-status.loading { background: var(--text-muted); animation: tab-pulse 0.8s ease-in-out infinite; }
+.tab-status.active {
+  background: var(--success);
+  animation: tab-pulse 1.5s ease-in-out infinite;
+}
+
+.tab-status.idle {
+  background: var(--success);
+  opacity: 0.4;
+}
 
 @keyframes tab-pulse {
   0%, 100% { opacity: 1; }
@@ -118,26 +124,28 @@
   color: white;
 }
 
-/* Sidebar session tab indicators */
+/* Sidebar session tab indicators — matches tab status dots */
 
 .session-tab-indicator {
   display: inline-block;
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   margin-right: 6px;
   vertical-align: middle;
 }
 
-.session-tab-indicator.active { background: var(--success); }
-.session-tab-indicator.waiting { background: var(--thinking-border); }
-.session-tab-indicator.idle { background: var(--tool-border); }
-.session-tab-indicator.error { background: var(--error); }
-.session-tab-indicator.loading { background: var(--text-muted); }
-
-.session-item.tab-open {
-  border-left: 2px solid var(--accent);
+.session-tab-indicator.active {
+  background: var(--success);
+  animation: tab-pulse 1.5s ease-in-out infinite;
 }
+
+.session-tab-indicator.idle {
+  background: var(--success);
+  opacity: 0.4;
+}
+
+/* No special border for open tabs — the status dot is sufficient */
 
 /* Sidebar */
 
@@ -213,6 +221,10 @@
   background: var(--bg-hover);
 }
 
+.session-item.tab-open {
+  background: hsla(276, 53%, 55%, 0.06);
+}
+
 .session-item.active {
   background: var(--accent-subtle);
 }
@@ -228,10 +240,20 @@
 
 .session-meta {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin-top: 2px;
   font-size: 0.75rem;
   color: var(--text-muted);
+}
+
+/* Subtle type label for orchestrator sessions in the meta line */
+.session-type-label {
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  color: var(--accent);
+  opacity: 0.8;
 }
 
 .session-delete {
@@ -1142,8 +1164,8 @@ pre.field-value {
   width: 28px;
   height: 28px;
   border-radius: var(--radius);
-  background: rgba(155, 89, 182, 0.15);
-  color: #9b59b6;
+  background: var(--accent-subtle);
+  color: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1151,31 +1173,26 @@ pre.field-value {
 }
 
 .new-orchestrator-btn:hover {
-  background: #9b59b6;
+  background: var(--accent);
   color: white;
 }
 
-.orchestrator-badge {
-  display: inline-block;
-  font-size: 0.65rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 1px 5px;
-  border-radius: 3px;
-  background: rgba(155, 89, 182, 0.15);
-  color: #9b59b6;
-  margin-right: 5px;
-  vertical-align: middle;
+/* Orchestrator tab — subtle purple tint */
+
+.tab.orchestrator {
+  background: hsla(276, 53%, 55%, 0.06);
 }
 
-.tab-orchestrator {
-  border-top: 2px solid #9b59b6;
+.tab.orchestrator:hover {
+  background: hsla(276, 53%, 55%, 0.12);
 }
 
-.tab-orch-icon {
-  color: #9b59b6;
-  font-size: 0.75rem;
+.tab.orchestrator.active {
+  background: hsla(276, 53%, 55%, 0.1);
+}
+
+.tab.orchestrator.active::after {
+  background: hsla(276, 53%, 55%, 0.1);
 }
 
 /* Modal */
@@ -1236,10 +1253,10 @@ pre.field-value {
 }
 
 .modal-btn-primary {
-  background: #9b59b6;
+  background: var(--accent);
   color: white;
 }
 
 .modal-btn-primary:hover {
-  background: #8e44ad;
+  background: var(--accent-hover);
 }

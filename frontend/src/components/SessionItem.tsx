@@ -24,12 +24,12 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
         {tabOpen && tabStatus && (
           <span className={`session-tab-indicator ${tabStatus}`} />
         )}
-        {session.is_orchestrator && (
-          <span className="orchestrator-badge">orch</span>
-        )}
         {session.title || "Untitled"}
       </div>
       <div className="session-meta">
+        {session.is_orchestrator && (
+          <span className="session-type-label">orchestrator</span>
+        )}
         <span className="session-time">{timeAgo}</span>
         <span className="session-count">{session.message_count} msgs</span>
       </div>

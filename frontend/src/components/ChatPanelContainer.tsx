@@ -62,7 +62,7 @@ function TabInstance({
     onStatusChange,
     onSessionStarted,
     wsEndpoint,
-    skipHistory: isOrchestrator,
+    skipHistory: isOrchestrator && !resumeId,
     onAgentSessionOpened,
     onAgentSessionClosed,
   });

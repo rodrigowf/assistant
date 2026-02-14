@@ -175,18 +175,15 @@ export function useTabsContext(): TabsContextValue {
 // Utility
 // -------------------------------------------------------------------
 
-export function getTabStatusIcon(tab: TabState): string {
-  if (tab.connectionState === "connecting") return "loading";
-  if (tab.connectionState === "error") return "error";
-  if (tab.connectionState === "disconnected") return "waiting";
+export function getTabStatusIcon(tab: TabState): string | null {
+  // No dot for disconnected/error/connecting — shown via tab opacity
+  if (tab.connectionState !== "connected") return null;
 
   switch (tab.status) {
     case "streaming":
     case "thinking":
     case "tool_use":
       return "active";
-    case "interrupted":
-      return "error";
     default:
       return "idle";
   }

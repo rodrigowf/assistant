@@ -7,9 +7,10 @@ interface Props {
   onDelete: (id: string) => void;
   onNew: () => void;
   onNewOrchestrator: () => void;
+  onSelectOrchestrator: (id: string, title: string) => void;
 }
 
-export function Sidebar({ sessions, onDelete, onNew, onNewOrchestrator }: Props) {
+export function Sidebar({ sessions, onDelete, onNew, onNewOrchestrator, onSelectOrchestrator }: Props) {
   const { tabs, activeTabId, openTab, switchTab, isTabOpen } = useTabsContext();
 
   const handleSelect = (id: string) => {
@@ -17,7 +18,12 @@ export function Sidebar({ sessions, onDelete, onNew, onNewOrchestrator }: Props)
       switchTab(id);
     } else {
       const session = sessions.find((s) => s.session_id === id);
-      openTab(id, session?.title || "Untitled");
+      if (session?.is_orchestrator) {
+        // Route through the orchestrator confirmation flow
+        onSelectOrchestrator(id, session.title || "Untitled");
+      } else {
+        openTab(id, session?.title || "Untitled");
+      }
     }
   };
 

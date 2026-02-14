@@ -5,21 +5,27 @@ export function TabBar() {
 
   if (tabs.length === 0) return null;
 
+  // Sort: orchestrator tab always first
+  const sorted = [...tabs].sort((a, b) => {
+    if (a.isOrchestrator && !b.isOrchestrator) return -1;
+    if (!a.isOrchestrator && b.isOrchestrator) return 1;
+    return 0;
+  });
+
   return (
     <div className="tab-bar">
-      {tabs.map((tab) => {
+      {sorted.map((tab) => {
         const isActive = tab.sessionId === activeTabId;
         const statusIcon = getTabStatusIcon(tab);
 
         return (
           <div
             key={tab.sessionId}
-            className={`tab ${isActive ? "active" : ""} ${tab.isOrchestrator ? "tab-orchestrator" : ""}`}
+            className={`tab ${isActive ? "active" : ""}${tab.isOrchestrator ? " orchestrator" : ""}`}
             onClick={() => switchTab(tab.sessionId)}
           >
-            <span className={`tab-status ${statusIcon}`} />
+            {statusIcon && <span className={`tab-status ${statusIcon}`} />}
             <span className="tab-title">
-              {tab.isOrchestrator && <span className="tab-orch-icon">&#9881; </span>}
               {tab.title || "New session"}
             </span>
             <button
