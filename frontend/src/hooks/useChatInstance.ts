@@ -282,10 +282,18 @@ interface UseChatInstanceOptions {
   onStatusChange?: (status: SessionStatus, connectionState: ConnectionState) => void;
   /** Called when session is established and we have a session ID. */
   onSessionStarted?: (sessionId: string) => void;
+  /** WebSocket endpoint path (default: /api/sessions/chat). */
+  wsEndpoint?: string;
+  /** Skip loading history from REST API (for orchestrator sessions). */
+  skipHistory?: boolean;
+  /** Called when pool notifies that an agent session was opened. */
+  onAgentSessionOpened?: (sessionId: string) => void;
+  /** Called when pool notifies that an agent session was closed. */
+  onAgentSessionClosed?: (sessionId: string) => void;
 }
 
 export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
-  const { resumeId, onSessionChange, onStatusChange, onSessionStarted } = options;
+  const { resumeId, onSessionChange, onStatusChange, onSessionStarted, wsEndpoint, skipHistory, onAgentSessionOpened, onAgentSessionClosed } = options;
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [wsActive, setWsActive] = useState(false);
   const pendingStartRef = useRef<{ resumeId: string | null } | null>(null);
@@ -297,6 +305,10 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   onStatusChangeRef.current = onStatusChange;
   const onSessionStartedRef = useRef(onSessionStarted);
   onSessionStartedRef.current = onSessionStarted;
+  const onAgentSessionOpenedRef = useRef(onAgentSessionOpened);
+  onAgentSessionOpenedRef.current = onAgentSessionOpened;
+  const onAgentSessionClosedRef = useRef(onAgentSessionClosed);
+  onAgentSessionClosedRef.current = onAgentSessionClosed;
 
   // Track status changes and notify parent
   const prevStatusRef = useRef<{ status: SessionStatus; conn: ConnectionState } | null>(null);
@@ -338,9 +350,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       case "turn_complete":
         dispatch({
           type: "TURN_COMPLETE",
-          cost: event.cost,
-          turns: event.num_turns,
-          sessionId: event.session_id,
+          cost: event.cost ?? null,
+          turns: event.num_turns ?? 1,
+          sessionId: event.session_id ?? "",
         });
         onSessionChangeRef.current?.();
         break;
@@ -352,6 +364,15 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "session_stopped":
         dispatch({ type: "STATUS", status: "disconnected" });
+        break;
+      case "agent_session_opened":
+        onAgentSessionOpenedRef.current?.(event.session_id);
+        break;
+      case "agent_session_closed":
+        onAgentSessionClosedRef.current?.(event.session_id);
+        break;
+      case "user_message":
+        dispatch({ type: "USER_MESSAGE", text: event.text });
         break;
     }
   }, []);
@@ -368,7 +389,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     }
   }, []);
 
-  const { send: wsSend, close: wsClose, connectionState } = useWebSocket(wsActive, handleEvent, handleOpen);
+  const { send: wsSend, close: wsClose, connectionState } = useWebSocket(wsActive, handleEvent, handleOpen, wsEndpoint);
   const wsSendRef = useRef(wsSend);
   wsSendRef.current = wsSend;
 
@@ -388,7 +409,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     async function init() {
       dispatch({ type: "RESET" });
 
-      if (resumeId) {
+      if (resumeId && !skipHistory) {
         try {
           const detail = await getSession(resumeId);
           if (cancelled) return;

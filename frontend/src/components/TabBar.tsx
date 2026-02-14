@@ -14,11 +14,14 @@ export function TabBar() {
         return (
           <div
             key={tab.sessionId}
-            className={`tab ${isActive ? "active" : ""}`}
+            className={`tab ${isActive ? "active" : ""} ${tab.isOrchestrator ? "tab-orchestrator" : ""}`}
             onClick={() => switchTab(tab.sessionId)}
           >
             <span className={`tab-status ${statusIcon}`} />
-            <span className="tab-title">{tab.title || "New session"}</span>
+            <span className="tab-title">
+              {tab.isOrchestrator && <span className="tab-orch-icon">&#9881; </span>}
+              {tab.title || "New session"}
+            </span>
             <button
               className="tab-close"
               onClick={(e) => {

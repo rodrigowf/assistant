@@ -12,7 +12,7 @@ import type { TabState, TabsState, SessionStatus, ConnectionState } from "../typ
 // -------------------------------------------------------------------
 
 type TabsAction =
-  | { type: "OPEN_TAB"; sessionId: string; title: string }
+  | { type: "OPEN_TAB"; sessionId: string; title: string; isOrchestrator?: boolean }
   | { type: "CLOSE_TAB"; sessionId: string }
   | { type: "SWITCH_TAB"; sessionId: string }
   | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title">> }
@@ -39,6 +39,7 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
         title: action.title || "New session",
         status: "connecting",
         connectionState: "disconnected",
+        isOrchestrator: action.isOrchestrator,
       };
       return {
         tabs: [...state.tabs, tab],
@@ -98,12 +99,13 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
 interface TabsContextValue {
   tabs: TabState[];
   activeTabId: string | null;
-  openTab: (sessionId: string, title?: string) => void;
+  openTab: (sessionId: string, title?: string, isOrchestrator?: boolean) => void;
   closeTab: (sessionId: string) => void;
   switchTab: (sessionId: string) => void;
   updateTab: (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title">>) => void;
   replaceTabId: (oldId: string, newId: string) => void;
   isTabOpen: (sessionId: string) => boolean;
+  hasActiveOrchestrator: () => boolean;
 }
 
 const TabsContext = createContext<TabsContextValue | null>(null);
@@ -111,8 +113,8 @@ const TabsContext = createContext<TabsContextValue | null>(null);
 export function TabsProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
 
-  const openTab = useCallback((sessionId: string, title = "New session") => {
-    dispatch({ type: "OPEN_TAB", sessionId, title });
+  const openTab = useCallback((sessionId: string, title = "New session", isOrchestrator?: boolean) => {
+    dispatch({ type: "OPEN_TAB", sessionId, title, isOrchestrator });
   }, []);
 
   const closeTab = useCallback((sessionId: string) => {
@@ -139,6 +141,11 @@ export function TabsProvider({ children }: { children: ReactNode }) {
     [state.tabs]
   );
 
+  const hasActiveOrchestrator = useCallback(
+    () => state.tabs.some((t) => t.isOrchestrator),
+    [state.tabs]
+  );
+
   return (
     <TabsContext.Provider
       value={{
@@ -150,6 +157,7 @@ export function TabsProvider({ children }: { children: ReactNode }) {
         updateTab,
         replaceTabId,
         isTabOpen,
+        hasActiveOrchestrator,
       }}
     >
       {children}

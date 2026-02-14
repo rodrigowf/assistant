@@ -41,6 +41,7 @@ def list_sessions(store: SessionStore = Depends(get_store)):
             last_activity=s.last_activity.isoformat(),
             title=s.title,
             message_count=s.message_count,
+            is_orchestrator=s.is_orchestrator,
         )
         for s in store.list_sessions()
     ]

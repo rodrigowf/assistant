@@ -14,11 +14,19 @@ function TabInstance({
   resumeId,
   onSessionChange,
   instancesRef,
+  wsEndpoint,
+  isOrchestrator,
+  onAgentSessionOpened,
+  onAgentSessionClosed,
 }: {
   sessionId: string;
   resumeId: string | null;
   onSessionChange: () => void;
   instancesRef: React.RefObject<Map<string, ChatInstance>>;
+  wsEndpoint?: string;
+  isOrchestrator?: boolean;
+  onAgentSessionOpened?: (sessionId: string) => void;
+  onAgentSessionClosed?: (sessionId: string) => void;
 }) {
   const { updateTab, replaceTabId } = useTabsContext();
   const tabIdRef = useRef(sessionId);
@@ -53,6 +61,10 @@ function TabInstance({
     onSessionChange,
     onStatusChange,
     onSessionStarted,
+    wsEndpoint,
+    skipHistory: isOrchestrator,
+    onAgentSessionOpened,
+    onAgentSessionClosed,
   });
 
   // Register instance so ChatPanelContainer can access it
@@ -74,8 +86,22 @@ export function ChatPanelContainer({
 }: {
   onSessionChange: () => void;
 }) {
-  const { tabs, activeTabId } = useTabsContext();
+  const { tabs, activeTabId, openTab, closeTab } = useTabsContext();
   const instancesRef = useRef<Map<string, ChatInstance>>(new Map());
+
+  const handleAgentSessionOpened = useCallback(
+    (agentSessionId: string) => {
+      openTab(agentSessionId, `Agent ${agentSessionId.slice(0, 8)}`);
+    },
+    [openTab]
+  );
+
+  const handleAgentSessionClosed = useCallback(
+    (agentSessionId: string) => {
+      closeTab(agentSessionId);
+    },
+    [closeTab]
+  );
 
   const activeInstance = activeTabId ? instancesRef.current.get(activeTabId) : undefined;
 
@@ -89,6 +115,10 @@ export function ChatPanelContainer({
           resumeId={tab.sessionId.startsWith("new-") ? null : tab.sessionId}
           onSessionChange={onSessionChange}
           instancesRef={instancesRef}
+          wsEndpoint={tab.isOrchestrator ? "/api/orchestrator/chat" : undefined}
+          isOrchestrator={tab.isOrchestrator}
+          onAgentSessionOpened={tab.isOrchestrator ? handleAgentSessionOpened : undefined}
+          onAgentSessionClosed={tab.isOrchestrator ? handleAgentSessionClosed : undefined}
         />
       ))}
 

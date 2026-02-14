@@ -179,6 +179,13 @@ class SessionStore:
             return []
         return detail.messages[-max_messages:]
 
+    def get_session_info(self, session_id: str) -> SessionInfo | None:
+        """Get lightweight summary info for a single session (no full parse)."""
+        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            return None
+        return self._parse_session_info(jsonl_path, session_id)
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session's JSONL file. Returns True if deleted."""
         jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
@@ -221,6 +228,7 @@ class SessionStore:
         first_timestamp: str | None = None
         last_timestamp: str | None = None
         message_count = 0
+        is_orchestrator = False
 
         try:
             with open(jsonl_path) as f:
@@ -235,6 +243,10 @@ class SessionStore:
 
                     msg_type = obj.get("type")
                     ts = obj.get("timestamp")
+
+                    # Detect orchestrator metadata (first line)
+                    if msg_type == "orchestrator_meta" and obj.get("orchestrator"):
+                        is_orchestrator = True
 
                     if ts:
                         if first_timestamp is None:
@@ -257,6 +269,7 @@ class SessionStore:
             last_activity=_parse_timestamp(last_timestamp or first_timestamp),
             title=first_user_text[:100] if first_user_text else "(empty session)",
             message_count=message_count,
+            is_orchestrator=is_orchestrator,
         )
 
     def _first_user_text(self, messages: list[dict]) -> str:

@@ -15,9 +15,10 @@ from manager.auth import AuthManager
 from manager.config import ManagerConfig
 from manager.store import SessionStore
 
-from .connections import ConnectionManager
+from .connections import ConnectionManager, OrchestratorConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
-from .routes import auth, chat, sessions
+from .pool import SessionPool
+from .routes import auth, chat, orchestrator, sessions
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,8 @@ async def lifespan(app: FastAPI):
     app.state.store = SessionStore(config.project_dir)
     app.state.auth = AuthManager()
     app.state.connections = ConnectionManager()
+    app.state.orchestrator_connections = OrchestratorConnectionManager()
+    app.state.pool = SessionPool()
 
     project_path = Path(config.project_dir)
 
@@ -76,5 +79,6 @@ def create_app() -> FastAPI:
     app.include_router(sessions.router)
     app.include_router(chat.router)
     app.include_router(auth.router)
+    app.include_router(orchestrator.router)
 
     return app

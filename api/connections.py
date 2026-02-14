@@ -34,3 +34,49 @@ class ConnectionManager:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+
+class OrchestratorConnectionManager:
+    """Track the single active orchestrator session.
+
+    Only ONE orchestrator session can be active at a time.
+    """
+
+    def __init__(self) -> None:
+        self._active: tuple[WebSocket, object] | None = None
+        self._session_id: str | None = None
+
+    def connect(self, session_id: str, ws: WebSocket, session: object) -> bool:
+        """Register the orchestrator session. Returns False if one is already active."""
+        if self._active is not None:
+            return False
+        self._active = (ws, session)
+        self._session_id = session_id
+        return True
+
+    async def disconnect(self) -> None:
+        """Disconnect the active orchestrator session."""
+        if self._active is not None:
+            _, session = self._active
+            try:
+                if hasattr(session, "stop"):
+                    await session.stop()
+            except Exception:
+                pass
+            self._active = None
+            self._session_id = None
+
+    def get_active(self) -> tuple[str, WebSocket, object] | None:
+        """Get the active orchestrator (session_id, ws, session) or None."""
+        if self._active is None or self._session_id is None:
+            return None
+        ws, session = self._active
+        return (self._session_id, ws, session)
+
+    @property
+    def is_active(self) -> bool:
+        return self._active is not None
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id

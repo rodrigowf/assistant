@@ -15,6 +15,7 @@ class SessionInfoResponse(BaseModel):
     last_activity: str
     title: str
     message_count: int
+    is_orchestrator: bool = False
 
 
 class ContentBlockResponse(BaseModel):

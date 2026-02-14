@@ -11,6 +11,13 @@ VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 # This puts sessions, memory, credentials in a dedicated folder
 export CLAUDE_CONFIG_DIR="$PROJECT_DIR/.claude_config"
 
+# Load .env file if it exists
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
+
 if [ ! -f "$VENV_PYTHON" ]; then
     echo "Error: Virtual environment not found at $PROJECT_DIR/.venv/" >&2
     echo "Run: python3 -m venv $PROJECT_DIR/.venv && $PROJECT_DIR/.venv/bin/pip install chromadb sentence-transformers claude-agent-sdk" >&2

@@ -1129,3 +1129,117 @@ pre.field-value {
   margin: 8px 0;
   color: var(--text-muted);
 }
+
+/* Orchestrator */
+
+.sidebar-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.new-orchestrator-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius);
+  background: rgba(155, 89, 182, 0.15);
+  color: #9b59b6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--transition);
+}
+
+.new-orchestrator-btn:hover {
+  background: #9b59b6;
+  color: white;
+}
+
+.orchestrator-badge {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(155, 89, 182, 0.15);
+  color: #9b59b6;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+.tab-orchestrator {
+  border-top: 2px solid #9b59b6;
+}
+
+.tab-orch-icon {
+  color: #9b59b6;
+  font-size: 0.75rem;
+}
+
+/* Modal */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  max-width: 400px;
+  width: 90%;
+}
+
+.modal-title {
+  font-size: 1rem;
+  color: var(--text-bright);
+  margin-bottom: 8px;
+}
+
+.modal-body {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.modal-btn {
+  padding: 8px 16px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  font-weight: 500;
+  transition: background var(--transition);
+}
+
+.modal-btn-secondary {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.modal-btn-secondary:hover {
+  background: var(--bg-hover);
+}
+
+.modal-btn-primary {
+  background: #9b59b6;
+  color: white;
+}
+
+.modal-btn-primary:hover {
+  background: #8e44ad;
+}
