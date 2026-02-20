@@ -677,57 +677,57 @@ class TestSessionStoreOrchestrator:
 
 
 # ---------------------------------------------------------------------------
-# OrchestratorConnectionManager tests
+# SessionPool orchestrator tests
 # ---------------------------------------------------------------------------
 
 
-class TestOrchestratorConnectionManager:
-    def test_connect_and_is_active(self):
-        from api.connections import OrchestratorConnectionManager
+class TestSessionPoolOrchestrator:
+    def test_set_and_has_orchestrator(self):
+        from api.pool import SessionPool
 
-        ocm = OrchestratorConnectionManager()
-        assert not ocm.is_active
+        pool = SessionPool()
+        assert not pool.has_orchestrator()
+        assert pool.orchestrator_id is None
 
+        mock_session = MagicMock()
+        pool.set_orchestrator("s1", mock_session)
+        assert pool.has_orchestrator()
+        assert pool.orchestrator_id == "s1"
+        assert pool.get_orchestrator() is mock_session
+
+    def test_subscribe_orchestrator(self):
+        from api.pool import SessionPool
+
+        pool = SessionPool()
         mock_ws = MagicMock()
         mock_session = MagicMock()
-        assert ocm.connect("s1", mock_ws, mock_session) is True
-        assert ocm.is_active
-        assert ocm.session_id == "s1"
+        pool.set_orchestrator("s1", mock_session)
 
-    def test_rejects_second_connection(self):
-        from api.connections import OrchestratorConnectionManager
+        assert pool.subscribe_orchestrator("s1", mock_ws) is True
+        assert pool.orchestrator_subscriber_count == 1
 
-        ocm = OrchestratorConnectionManager()
+        # Wrong ID — should fail
+        assert pool.subscribe_orchestrator("other", mock_ws) is False
+
+    def test_subscribe_without_active_orchestrator(self):
+        from api.pool import SessionPool
+
+        pool = SessionPool()
         mock_ws = MagicMock()
-        assert ocm.connect("s1", mock_ws, MagicMock()) is True
-        assert ocm.connect("s2", mock_ws, MagicMock()) is False
+        assert pool.subscribe_orchestrator("s1", mock_ws) is False
 
     @pytest.mark.asyncio
-    async def test_disconnect(self):
-        from api.connections import OrchestratorConnectionManager
+    async def test_stop_orchestrator(self):
+        from api.pool import SessionPool
 
-        ocm = OrchestratorConnectionManager()
+        pool = SessionPool()
         mock_session = AsyncMock()
-        ocm.connect("s1", MagicMock(), mock_session)
+        pool.set_orchestrator("s1", mock_session)
 
-        await ocm.disconnect()
-        assert not ocm.is_active
-        assert ocm.session_id is None
+        await pool.stop_orchestrator()
+        assert not pool.has_orchestrator()
+        assert pool.orchestrator_id is None
         mock_session.stop.assert_called_once()
-
-    def test_get_active(self):
-        from api.connections import OrchestratorConnectionManager
-
-        ocm = OrchestratorConnectionManager()
-        assert ocm.get_active() is None
-
-        mock_ws = MagicMock()
-        mock_session = MagicMock()
-        ocm.connect("s1", mock_ws, mock_session)
-
-        active = ocm.get_active()
-        assert active is not None
-        assert active[0] == "s1"
 
 
 # ---------------------------------------------------------------------------

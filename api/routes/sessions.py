@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.deps import get_pool, get_store
 from api.models import (
@@ -19,7 +19,6 @@ router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
 def _convert_blocks(blocks) -> list[ContentBlockResponse]:
-    """Convert ContentBlock list to ContentBlockResponse list."""
     return [
         ContentBlockResponse(
             type=b.type,
@@ -50,24 +49,27 @@ def list_sessions(store: SessionStore = Depends(get_store)):
 
 
 @router.get("/pool/live", response_model=list[PoolSessionResponse])
-def list_pool_sessions(request: Request, pool: SessionPool = Depends(get_pool), store: SessionStore = Depends(get_store)):
-    """List sessions currently live in the backend (survives browser close).
+def list_pool_sessions(
+    pool: SessionPool = Depends(get_pool),
+    store: SessionStore = Depends(get_store),
+):
+    """List sessions currently live in the backend pool.
 
-    Used by the frontend on startup to re-attach to sessions that are
-    still running in the backend. Includes the orchestrator session even
-    though it lives in OrchestratorConnectionManager rather than the pool.
+    Used by the frontend on startup to re-attach to sessions that are still
+    running after a browser close/refresh.
+
+    For orchestrators, sdk_session_id == local_id because the orchestrator
+    JSONL is keyed by local_id (not a separate SDK session ID).
     """
-    ocm = request.app.state.orchestrator_connections
-    orchestrator_local_id = ocm.session_id  # None if no orchestrator running
+    result: list[PoolSessionResponse] = []
 
-    result = []
-
-    # Orchestrator session lives outside the pool — include it first
-    if ocm.is_active and orchestrator_local_id:
-        info = store.get_session_info(orchestrator_local_id)
+    # Orchestrator session (at most one)
+    if pool.has_orchestrator():
+        oid = pool.orchestrator_id
+        info = store.get_session_info(oid) if oid else None
         result.append(PoolSessionResponse(
-            local_id=orchestrator_local_id,
-            sdk_session_id=orchestrator_local_id,  # orchestrator JSONL is keyed by local_id
+            local_id=oid,
+            sdk_session_id=oid,  # orchestrator JSONL is keyed by local_id
             status="idle",
             cost=0.0,
             turns=0,
@@ -75,17 +77,15 @@ def list_pool_sessions(request: Request, pool: SessionPool = Depends(get_pool), 
             is_orchestrator=True,
         ))
 
+    # Regular agent sessions
     for s in pool.list_sessions():
         local_id = s["session_id"]
         sdk_id = s.get("sdk_session_id")
-
-        # Try to get a title from the JSONL store via the SDK session ID
         title = None
         if sdk_id:
             info = store.get_session_info(sdk_id)
             if info:
                 title = info.title
-
         result.append(PoolSessionResponse(
             local_id=local_id,
             sdk_session_id=sdk_id,
@@ -159,7 +159,7 @@ def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
 
 @router.post("/{local_id}/close", status_code=204)
 async def close_pool_session(local_id: str, pool: SessionPool = Depends(get_pool)):
-    """Close an active session in the pool (removes it from list_agent_sessions)."""
-    if not pool.has(local_id):
-        return  # Already closed — no-op
-    await pool.close(local_id)
+    """Close an active session in the pool."""
+    if pool.has(local_id):
+        await pool.close(local_id)
+    # If not found, silently succeed (already closed)

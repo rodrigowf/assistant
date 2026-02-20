@@ -456,7 +456,6 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
 
   const handleOpen = useCallback(() => {
     const pending = pendingStartRef.current;
-    console.log("[useChatInstance] handleOpen: pending=", pending, "localId=", localIdRef.current);
     if (pending) {
       pendingStartRef.current = null;
       const startMsg: Record<string, unknown> = {
@@ -466,7 +465,6 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       if (pending.resumeSdkId) {
         startMsg.resume_sdk_id = pending.resumeSdkId;
       }
-      console.log("[useChatInstance] sending start:", startMsg);
       wsSendRef.current?.(startMsg);
     }
   }, []);
