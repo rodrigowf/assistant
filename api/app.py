@@ -18,7 +18,7 @@ from manager.store import SessionStore
 from .connections import ConnectionManager, OrchestratorConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
 from .pool import SessionPool
-from .routes import auth, chat, orchestrator, sessions
+from .routes import auth, chat, orchestrator, sessions, voice
 
 logger = logging.getLogger(__name__)
 
@@ -80,5 +80,6 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(auth.router)
     app.include_router(orchestrator.router)
+    app.include_router(voice.router)
 
     return app

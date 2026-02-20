@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid as _uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -18,6 +19,7 @@ from manager.types import Event, TurnComplete
 logger = logging.getLogger(__name__)
 
 
+
 class SessionPool:
     """Shared pool of Claude Code sessions with per-session locking and broadcast.
 
@@ -25,11 +27,9 @@ class SessionPool:
     Sessions are independent — they survive orchestrator disconnects and can
     have multiple WebSocket subscribers receiving events simultaneously.
 
-    Note on session IDs: The Claude Code SDK returns a placeholder ID at
-    connect time.  The *real* session ID (used for JSONL storage) only
-    arrives in the first ``ResultMessage``.  The pool delays the
-    ``agent_session_opened`` notification until after the first ``send()``,
-    so the frontend only ever sees the real, stable ID.
+    Sessions are keyed by a stable **local ID** (UUID) that never changes.
+    The Claude Code SDK session ID is stored as an attribute on the
+    ``SessionManager`` and used only for resume operations and JSONL lookups.
     """
 
     def __init__(self) -> None:
@@ -37,8 +37,6 @@ class SessionPool:
         self._subscribers: dict[str, set[WebSocket]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._watchers: set[WebSocket] = set()
-        # Sessions that haven't been announced to watchers yet
-        self._pending_announce: set[str] = set()
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -47,23 +45,37 @@ class SessionPool:
     async def create(
         self,
         config: ManagerConfig,
-        session_id: str | None = None,
+        local_id: str | None = None,
+        resume_sdk_id: str | None = None,
         fork: bool = False,
     ) -> str:
-        """Create, start, and register a SessionManager. Returns session_id.
+        """Create, start, and register a SessionManager. Returns the stable local_id.
 
-        The ``agent_session_opened`` notification is deferred until after the
-        first ``send()`` completes, when we have the real session ID.
+        The session is announced to watchers immediately — the local_id is
+        stable and will never change.
         """
-        sm = SessionManager(session_id=session_id, fork=fork, config=config)
-        new_id = await sm.start()
+        lid = local_id or str(_uuid.uuid4())
+        sm = SessionManager(
+            session_id=resume_sdk_id,
+            local_id=lid,
+            fork=fork,
+            config=config,
+        )
+        await sm.start()
 
-        self._sessions[new_id] = sm
-        self._subscribers[new_id] = set()
-        self._locks[new_id] = asyncio.Lock()
-        self._pending_announce.add(new_id)
+        self._sessions[lid] = sm
+        self._subscribers[lid] = set()
+        self._locks[lid] = asyncio.Lock()
 
-        return new_id
+        # Announce immediately — local_id is stable from creation.
+        # Include sdk_session_id so the frontend can load history for resumed sessions.
+        await self._notify_watchers({
+            "type": "agent_session_opened",
+            "session_id": lid,
+            "sdk_session_id": sm.sdk_session_id,
+        })
+
+        return lid
 
     async def close(self, session_id: str) -> None:
         """Stop a session, notify subscribers, and clean up."""
@@ -71,24 +83,19 @@ class SessionPool:
         if sm is None:
             return
 
-        try:
-            await sm.stop()
-        except Exception:
-            logger.warning("Error stopping pooled session %s", session_id, exc_info=True)
-
-        # Notify subscribers that the session is closed
+        # Notify while subscribers/watchers are still registered
         await self._broadcast(session_id, {"type": "session_stopped"})
+        await self._notify_watchers({"type": "agent_session_closed", "session_id": session_id})
 
-        # Notify watchers (only if this session was already announced)
-        if session_id not in self._pending_announce:
-            await self._notify_watchers({
-                "type": "agent_session_closed",
-                "session_id": session_id,
-            })
-
-        self._pending_announce.discard(session_id)
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
+
+        # sm.stop() uses anyio cancel scopes that must exit in the same task
+        # they were entered — calling it from any other task raises RuntimeError
+        # and propagates CancelledError through the ASGI stack, killing other
+        # WebSocket handlers. The session is already removed from the pool so
+        # no new work will reach it; the SDK subprocess exits when the client
+        # is garbage-collected.
 
     async def interrupt(self, session_id: str) -> None:
         """Interrupt the current response for a session."""
@@ -111,9 +118,10 @@ class SessionPool:
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all active sessions with status info."""
         result = []
-        for sid, sm in self._sessions.items():
+        for lid, sm in self._sessions.items():
             result.append({
-                "session_id": sid,
+                "session_id": lid,
+                "sdk_session_id": sm.sdk_session_id,
                 "status": sm.status.value,
                 "cost": sm.cost,
                 "turns": sm.turns,
@@ -172,6 +180,8 @@ class SessionPool:
         If source_ws is provided, a ``user_message`` event is broadcast to
         OTHER subscribers (so they see what was sent). The source WS already
         knows what it sent.
+
+        The session_id is always the stable local_id — it never changes.
         """
         sm = self._sessions.get(session_id)
         if sm is None:
@@ -188,48 +198,13 @@ class SessionPool:
             )
 
             async for event in sm.send(text):
-                # Check for session ID change (SDK assigns real ID on first query)
-                if isinstance(event, TurnComplete) and event.session_id and event.session_id != session_id:
-                    new_id = event.session_id
-                    self._rekey(session_id, new_id)
-                    session_id = new_id
-
-                # Broadcast serialized event to all subscribers
                 payload = serialize_event(event)
                 await self._broadcast(session_id, payload)
                 yield event
 
-            # After the first send completes, announce the session with the real ID
-            if session_id in self._pending_announce:
-                self._pending_announce.discard(session_id)
-                await self._notify_watchers({
-                    "type": "agent_session_opened",
-                    "session_id": session_id,
-                })
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _rekey(self, old_id: str, new_id: str) -> None:
-        """Re-key internal maps when the SDK assigns a new session ID."""
-        logger.info("Pool re-keying session %s → %s", old_id, new_id)
-
-        sm = self._sessions.pop(old_id, None)
-        if sm is not None:
-            self._sessions[new_id] = sm
-
-        subs = self._subscribers.pop(old_id, None)
-        if subs is not None:
-            self._subscribers[new_id] = subs
-
-        lock = self._locks.pop(old_id, None)
-        if lock is not None:
-            self._locks[new_id] = lock
-
-        if old_id in self._pending_announce:
-            self._pending_announce.discard(old_id)
-            self._pending_announce.add(new_id)
 
     async def _broadcast(
         self,

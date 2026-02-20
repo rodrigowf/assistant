@@ -80,6 +80,18 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
+    def get_openai_definitions(self) -> list[dict[str, Any]]:
+        """Return tool definitions in OpenAI function calling format (for Realtime API)."""
+        return [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            }
+            for tool in self._tools.values()
+        ]
+
     async def execute(
         self, name: str, tool_input: dict[str, Any], context: dict[str, Any]
     ) -> str:

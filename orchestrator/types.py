@@ -97,3 +97,10 @@ class ErrorEvent(OrchestratorEvent):
 
     error: str
     detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceInterrupted(OrchestratorEvent):
+    """The user interrupted the assistant's voice response (barge-in)."""
+
+    partial_text: str = ""

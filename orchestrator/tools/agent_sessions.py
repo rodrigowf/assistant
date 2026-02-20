@@ -13,7 +13,11 @@ logger = logging.getLogger(__name__)
 
 @registry.register(
     name="list_agent_sessions",
-    description="List all currently active Claude Code agent sessions with their status.",
+    description=(
+        "List all currently active Claude Code agent sessions with their status. "
+        "Each session has a session_id (use with send_to_agent_session/close_agent_session) "
+        "and a sdk_session_id (use with open_agent_session to resume after closing)."
+    ),
     input_schema={
         "type": "object",
         "properties": {},
@@ -24,12 +28,15 @@ async def list_agent_sessions(context: dict[str, Any]) -> str:
     store = context["store"]
     sessions = pool.list_sessions()
 
-    # Enrich with history data from the store (message count, title)
+    # Enrich with history data from the store (message count, title).
+    # The store uses SDK session IDs (JSONL filenames).
     for s in sessions:
-        info = store.get_session_info(s["session_id"])
-        if info:
-            s["message_count"] = info.message_count
-            s["title"] = info.title
+        sdk_id = s.get("sdk_session_id")
+        if sdk_id:
+            info = store.get_session_info(sdk_id)
+            if info:
+                s["message_count"] = info.message_count
+                s["title"] = info.title
 
     return json.dumps({"sessions": sessions, "count": len(sessions)})
 
@@ -37,32 +44,38 @@ async def list_agent_sessions(context: dict[str, Any]) -> str:
 @registry.register(
     name="open_agent_session",
     description=(
-        "Start a new Claude Code agent session or resume an existing one. "
-        "Returns the session_id of the opened session."
+        "Start a new Claude Code agent session or resume a past one from history. "
+        "To resume a past session, pass its sdk_session_id (returned by list_agent_sessions "
+        "or list_history). Omit all parameters to start a fresh session. "
+        "Returns the session_id to use with send_to_agent_session and close_agent_session."
     ),
     input_schema={
         "type": "object",
         "properties": {
-            "session_id": {
+            "resume_sdk_id": {
                 "type": "string",
-                "description": "Optional session ID to resume. Omit to start a new session.",
+                "description": (
+                    "The sdk_session_id of a past session to resume from history. "
+                    "This is the Claude SDK session ID, NOT the session_id returned by "
+                    "open_agent_session. Get it from list_agent_sessions or list_history."
+                ),
             },
         },
     },
 )
-async def open_agent_session(context: dict[str, Any], session_id: str = "") -> str:
+async def open_agent_session(context: dict[str, Any], resume_sdk_id: str = "") -> str:
     from manager.config import ManagerConfig
 
     pool = context["pool"]
     config = context.get("manager_config") or ManagerConfig.load()
-    resume_id = session_id if session_id else None
+    sdk_id = resume_sdk_id if resume_sdk_id else None
 
     try:
-        new_id = await pool.create(config, session_id=resume_id)
+        local_id = await pool.create(config, resume_sdk_id=sdk_id)
     except Exception as e:
         return json.dumps({"error": f"Failed to start session: {e}"})
 
-    return json.dumps({"session_id": new_id, "status": "started"})
+    return json.dumps({"session_id": local_id, "status": "started"})
 
 
 @registry.register(
@@ -114,8 +127,14 @@ async def close_agent_session(context: dict[str, Any], session_id: str) -> str:
 async def read_agent_session(
     context: dict[str, Any], session_id: str, max_messages: int = 20
 ) -> str:
+    pool = context["pool"]
     store = context["store"]
-    previews = store.get_preview(session_id, max_messages=max_messages)
+
+    # session_id is the local_id; look up the SDK session ID for JSONL store
+    sm = pool.get(session_id)
+    sdk_id = sm.sdk_session_id if sm else session_id
+
+    previews = store.get_preview(sdk_id, max_messages=max_messages)
     if not previews:
         return json.dumps({"error": f"No messages found for session {session_id}"})
 
@@ -166,16 +185,14 @@ async def send_to_agent_session(
 
     try:
         # pool.send() acquires the per-session lock and broadcasts events
-        # to all WebSocket subscribers (e.g., the frontend agent tab)
+        # to all WebSocket subscribers (e.g., the frontend agent tab).
+        # session_id is the stable local_id — it never changes.
         async for event in pool.send(session_id, message):
             if isinstance(event, TextComplete):
                 texts.append(event.text)
             elif isinstance(event, TurnComplete):
                 cost = event.cost or 0.0
                 turns = event.num_turns
-                # Session ID may change after first query (SDK re-key)
-                if event.session_id:
-                    session_id = event.session_id
     except Exception as e:
         return json.dumps({"error": f"Failed to send message: {e}"})
 

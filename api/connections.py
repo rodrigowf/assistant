@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from starlette.websockets import WebSocket
+import orjson
+from starlette.websockets import WebSocket, WebSocketState
 
 from manager.session import SessionManager
 
@@ -37,45 +38,80 @@ class ConnectionManager:
 
 
 class OrchestratorConnectionManager:
-    """Track the single active orchestrator session.
+    """Track the single active orchestrator session with multiple WebSocket subscribers.
 
-    Only ONE orchestrator session can be active at a time.
+    Only ONE orchestrator session can be active at a time, but multiple
+    WebSocket connections (e.g. two browser windows) can subscribe to it
+    simultaneously and all receive the same events.
     """
 
     def __init__(self) -> None:
-        self._active: tuple[WebSocket, object] | None = None
+        self._session: object | None = None
         self._session_id: str | None = None
+        self._subscribers: set[WebSocket] = set()
 
     def connect(self, session_id: str, ws: WebSocket, session: object) -> bool:
         """Register the orchestrator session. Returns False if one is already active."""
-        if self._active is not None:
+        if self._session is not None:
             return False
-        self._active = (ws, session)
+        self._session = session
         self._session_id = session_id
+        self._subscribers = {ws}
         return True
 
-    async def disconnect(self) -> None:
-        """Disconnect the active orchestrator session."""
-        if self._active is not None:
-            _, session = self._active
+    def subscribe(self, session_id: str, ws: WebSocket) -> bool:
+        """Add a WebSocket subscriber to the active session.
+
+        Returns True if the session matched and ws was added,
+        False if there is no active session or the session_id doesn't match.
+        """
+        if self._session is None or self._session_id != session_id:
+            return False
+        self._subscribers.add(ws)
+        return True
+
+    def unsubscribe(self, ws: WebSocket) -> None:
+        """Remove a WebSocket subscriber (called when a browser disconnects)."""
+        self._subscribers.discard(ws)
+
+    async def broadcast(self, payload: dict) -> None:
+        """Send a JSON payload to all subscribed WebSockets."""
+        if not self._subscribers:
+            return
+        data = orjson.dumps(payload)
+        dead: list[WebSocket] = []
+        for ws in self._subscribers:
             try:
-                if hasattr(session, "stop"):
-                    await session.stop()
+                if ws.client_state == WebSocketState.CONNECTED:
+                    await ws.send_bytes(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._subscribers.discard(ws)
+
+    async def disconnect(self) -> None:
+        """Stop the orchestrator session and clear all state."""
+        if self._session is not None:
+            try:
+                if hasattr(self._session, "stop"):
+                    await self._session.stop()
             except Exception:
                 pass
-            self._active = None
+            self._session = None
             self._session_id = None
+            self._subscribers.clear()
 
-    def get_active(self) -> tuple[str, WebSocket, object] | None:
-        """Get the active orchestrator (session_id, ws, session) or None."""
-        if self._active is None or self._session_id is None:
-            return None
-        ws, session = self._active
-        return (self._session_id, ws, session)
+    def get_session(self) -> object | None:
+        """Return the active OrchestratorSession, or None."""
+        return self._session
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
 
     @property
     def is_active(self) -> bool:
-        return self._active is not None
+        return self._session is not None
 
     @property
     def session_id(self) -> str | None:

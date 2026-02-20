@@ -5,32 +5,43 @@ import { SessionItem } from "./SessionItem";
 interface Props {
   sessions: SessionInfo[];
   onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => void;
   onNew: () => void;
   onNewOrchestrator: () => void;
   onSelectOrchestrator: (id: string, title: string) => void;
 }
 
-export function Sidebar({ sessions, onDelete, onNew, onNewOrchestrator, onSelectOrchestrator }: Props) {
-  const { tabs, activeTabId, openTab, switchTab, isTabOpen } = useTabsContext();
+export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator }: Props) {
+  const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
 
   const handleSelect = (id: string) => {
-    if (isTabOpen(id)) {
-      switchTab(id);
+    // Check if a tab is already open for this SDK session ID
+    const existingTab = findTabByResumeId(id);
+    if (existingTab) {
+      switchTab(existingTab.sessionId);
     } else {
       const session = sessions.find((s) => s.session_id === id);
       if (session?.is_orchestrator) {
         // Route through the orchestrator confirmation flow
         onSelectOrchestrator(id, session.title || "Untitled");
       } else {
-        openTab(id, session?.title || "Untitled");
+        // Generate a stable local_id, pass SDK session ID as resumeSdkId
+        const localId = crypto.randomUUID();
+        openTab(localId, session?.title || "Untitled", false, id);
       }
     }
   };
 
-  // Build a map of open tab statuses for sidebar indicators
-  const tabStatusMap = new Map<string, string>();
+  // Build a map from SDK session ID → tab status icon for sidebar indicators
+  const sdkTabStatusMap = new Map<string, string | null>();
+  const sdkTabOpenSet = new Set<string>();
+  const activeTab = activeTabId ? tabs.find((t) => t.sessionId === activeTabId) : null;
+
   for (const tab of tabs) {
-    tabStatusMap.set(tab.sessionId, getTabStatusIcon(tab));
+    if (tab.resumeSdkId) {
+      sdkTabStatusMap.set(tab.resumeSdkId, getTabStatusIcon(tab));
+      sdkTabOpenSet.add(tab.resumeSdkId);
+    }
   }
 
   return (
@@ -58,11 +69,12 @@ export function Sidebar({ sessions, onDelete, onNew, onNewOrchestrator, onSelect
           <SessionItem
             key={s.session_id}
             session={s}
-            active={s.session_id === activeTabId}
-            tabOpen={isTabOpen(s.session_id)}
-            tabStatus={tabStatusMap.get(s.session_id)}
+            active={activeTab?.resumeSdkId === s.session_id}
+            tabOpen={sdkTabOpenSet.has(s.session_id)}
+            tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
             onClick={() => handleSelect(s.session_id)}
             onDelete={() => onDelete(s.session_id)}
+            onRename={(title) => onRename(s.session_id, title)}
           />
         ))}
         {sessions.length === 0 && (

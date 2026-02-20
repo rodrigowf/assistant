@@ -7,11 +7,11 @@ import { ChatPanelContainer } from "./components/ChatPanelContainer";
 import { OrchestratorModal } from "./components/OrchestratorModal";
 import { TabsProvider, useTabsContext } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
-
-let tabCounter = 0;
+import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
 
 function AppContent() {
-  const { sessions, refresh, deleteSession } = useSessions();
+  const { sessions, refresh, deleteSession, renameSession } = useSessions();
+  useReconnectPoolSessions();
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
   // Pending orchestrator action: either open new or resume existing
@@ -20,8 +20,8 @@ function AppContent() {
   >(null);
 
   const handleNewSession = useCallback(() => {
-    const tempId = `new-${++tabCounter}`;
-    openTab(tempId, "New session");
+    const localId = crypto.randomUUID();
+    openTab(localId, "New session");
   }, [openTab]);
 
   const handleDeleteSession = useCallback(
@@ -42,10 +42,12 @@ function AppContent() {
 
   const openOrchestrator = useCallback((action: { type: "new" } | { type: "resume"; id: string; title: string }) => {
     if (action.type === "new") {
-      const tempId = `new-${++tabCounter}`;
-      openTab(tempId, "Orchestrator", true);
+      const localId = crypto.randomUUID();
+      openTab(localId, "Orchestrator", true);
     } else {
-      openTab(action.id, action.title, true);
+      // Resuming from history: generate a stable local_id, pass SDK ID as resumeSdkId
+      const localId = crypto.randomUUID();
+      openTab(localId, action.title, true, action.id);
     }
   }, [openTab]);
 
@@ -88,6 +90,7 @@ function AppContent() {
       <Sidebar
         sessions={sessions}
         onDelete={handleDeleteSession}
+        onRename={renameSession}
         onNew={handleNewSession}
         onNewOrchestrator={handleNewOrchestrator}
         onSelectOrchestrator={handleSelectOrchestrator}

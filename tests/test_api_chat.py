@@ -21,11 +21,13 @@ def _mock_session_manager(session_id="test-123", events=None):
     sm.stop = AsyncMock()
     sm.interrupt = AsyncMock()
     sm.session_id = session_id
+    sm.local_id = session_id
+    sm.sdk_session_id = "sdk-" + session_id
 
     send_events = events or [
         TextDelta(text="Hello"),
         TextComplete(text="Hello world"),
-        TurnComplete(cost=0.01, num_turns=1, session_id=session_id),
+        TurnComplete(cost=0.01, num_turns=1, session_id="sdk-" + session_id),
     ]
 
     async def _send(text):
@@ -56,7 +58,7 @@ def _make_pool(mock_sm, session_id="test-123"):
 
     # has() returns False initially (no pre-existing session)
     pool.has = MagicMock(return_value=False)
-    # create() returns the session_id and registers the SM
+    # create() returns the local_id
     pool.create = AsyncMock(return_value=session_id)
     # get() returns the SM after create
     pool.get = MagicMock(return_value=mock_sm)
@@ -112,13 +114,13 @@ class TestWebSocketChat:
         client, pool, mock_sm = pool_client
 
         with client.websocket_connect("/api/sessions/chat") as ws:
-            # Start session
-            ws.send_text(orjson.dumps({"type": "start"}).decode())
+            # Start session with a local_id
+            ws.send_text(orjson.dumps({"type": "start", "local_id": "my-local-1"}).decode())
             # First response is "connecting" status
             resp = orjson.loads(ws.receive_bytes())
             assert resp["type"] == "status"
             assert resp["status"] == "connecting"
-            # Then session_started
+            # Then session_started with the local_id
             resp = orjson.loads(ws.receive_bytes())
             assert resp["type"] == "session_started"
             assert resp["session_id"] == "test-123"
@@ -206,25 +208,29 @@ class TestWebSocketChat:
 
     def test_resume_session(self, pool_client):
         client, pool, _ = pool_client
-        mock_sm = _mock_session_manager(session_id="resumed-456")
-        pool.create = AsyncMock(return_value="resumed-456")
+        mock_sm = _mock_session_manager(session_id="local-456")
+        pool.create = AsyncMock(return_value="local-456")
         pool.get = MagicMock(return_value=mock_sm)
 
         with client.websocket_connect("/api/sessions/chat") as ws:
             ws.send_text(orjson.dumps({
-                "type": "start", "session_id": "old-123", "fork": True,
+                "type": "start",
+                "local_id": "local-456",
+                "resume_sdk_id": "old-sdk-123",
+                "fork": True,
             }).decode())
             # First we get "connecting" status
             resp = orjson.loads(ws.receive_bytes())
             assert resp["type"] == "status"
             assert resp["status"] == "connecting"
-            # Then session_started
+            # Then session_started with the local_id
             resp = orjson.loads(ws.receive_bytes())
             assert resp["type"] == "session_started"
-            assert resp["session_id"] == "resumed-456"
+            assert resp["session_id"] == "local-456"
 
-            # Verify pool.create was called with resume args
+            # Verify pool.create was called with local_id and resume args
             pool.create.assert_awaited_once()
             call_kwargs = pool.create.call_args
-            assert call_kwargs.kwargs.get("session_id") == "old-123"
+            assert call_kwargs.kwargs.get("local_id") == "local-456"
+            assert call_kwargs.kwargs.get("resume_sdk_id") == "old-sdk-123"
             assert call_kwargs.kwargs.get("fork") is True

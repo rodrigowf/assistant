@@ -1,0 +1,521 @@
+{
+  "id": "2ea7c038497c65e5",
+  "title": "Hello, my friend",
+  "createdAt": 1771421949700,
+  "updatedAt": 1771422360109,
+  "transcript": [
+    {
+      "role": "user",
+      "text": "Hello, my friend. Can you hear me?",
+      "timestamp": 1771421962729
+    },
+    {
+      "role": "assistant",
+      "text": "Hey there! I can hear you loud and clear. What can I help you with today?",
+      "timestamp": 1771421963651
+    },
+    {
+      "role": "assistant",
+      "text": "That sounds awesome!",
+      "timestamp": 1771421976324
+    },
+    {
+      "role": "user",
+      "text": "Okay, we are working on a really exciting project right here.",
+      "timestamp": 1771421976841
+    },
+    {
+      "role": "user",
+      "text": "It's my assistant, my new personal assistant project. It's gonna look a lot like you do.",
+      "timestamp": 1771421986392
+    },
+    {
+      "role": "user",
+      "text": "Uh, so I want you to...",
+      "timestamp": 1771421988520
+    },
+    {
+      "role": "user",
+      "text": "Oh.",
+      "timestamp": 1771421989715
+    },
+    {
+      "role": "user",
+      "text": "Use cloud code because",
+      "timestamp": 1771421992105
+    },
+    {
+      "role": "user",
+      "text": "PlotCode has full knowledge about this project.",
+      "timestamp": 1771421996393
+    },
+    {
+      "role": "user",
+      "text": "Because Cloud Code currently is the...",
+      "timestamp": 1771422000494
+    },
+    {
+      "role": "user",
+      "text": "Part of this project that we have here in the folder that you're looking at",
+      "timestamp": 1771422004739
+    },
+    {
+      "role": "user",
+      "text": "and",
+      "timestamp": 1771422007180
+    },
+    {
+      "role": "user",
+      "text": "Yeah, so if you ask",
+      "timestamp": 1771422009203
+    },
+    {
+      "role": "user",
+      "text": "cloud code, what this project is about exactly.",
+      "timestamp": 1771422014157
+    },
+    {
+      "role": "user",
+      "text": "especially if it looks to the README file.",
+      "timestamp": 1771422018068
+    },
+    {
+      "role": "user",
+      "text": "I think, and ask it to give all this information back to you.",
+      "timestamp": 1771422023075
+    },
+    {
+      "role": "user",
+      "text": "I think you have a pretty good understanding of what this project is about, okay?",
+      "timestamp": 1771422029370
+    },
+    {
+      "role": "assistant",
+      "text": "Sure, I'm asking Claude Code to look at the README right now and gather all the key details. It might take a few moments, so let's give it a second to process the information.",
+      "timestamp": 1771422034967
+    },
+    {
+      "role": "assistant",
+      "text": "Here’s what Claude Code found: This project is a personal AI assistant built on the Claude Agent SDK. It’s a transparent, self-improving, and local-first assistant. All the code is readable, and it can create or edit its own skills. It runs entirely on your machine, with no cloud sync.\n\nThe core architecture includes a FastAPI backend, a Claude SDK wrapper, a React frontend, and a set of custom slash commands. You can chat through a local web UI, run code, manage files, and extend its skills easily.\n\nIt’s built with Python, Node.js, FastAPI, React, and is MIT licensed. \n\nSo, it’s a full-featured, developer-native personal assistant that’s highly customizable and runs locally.",
+      "timestamp": 1771422059674
+    },
+    {
+      "role": "user",
+      "text": "Okay.",
+      "timestamp": 1771422136159
+    },
+    {
+      "role": "user",
+      "text": "So, uh, so you got a solid understanding of what we got here, right?",
+      "timestamp": 1771422142294
+    },
+    {
+      "role": "user",
+      "text": "I mean",
+      "timestamp": 1771422142510
+    },
+    {
+      "role": "user",
+      "text": "I even have the",
+      "timestamp": 1771422144621
+    },
+    {
+      "role": "user",
+      "text": "So we have a",
+      "timestamp": 1771422146557
+    },
+    {
+      "role": "user",
+      "text": "a skill.",
+      "timestamp": 1771422146981
+    },
+    {
+      "role": "user",
+      "text": "to spin up a test environment for the front-end.",
+      "timestamp": 1771422150898
+    },
+    {
+      "role": "user",
+      "text": "which is just a wrapper for this.",
+      "timestamp": 1771422154146
+    },
+    {
+      "role": "user",
+      "text": "customized, clothed.",
+      "timestamp": 1771422155205
+    },
+    {
+      "role": "user",
+      "text": "Uh...",
+      "timestamp": 1771422156384
+    },
+    {
+      "role": "user",
+      "text": "agent, right?",
+      "timestamp": 1771422158676
+    },
+    {
+      "role": "user",
+      "text": "Uh, and this record...",
+      "timestamp": 1771422160328
+    },
+    {
+      "role": "user",
+      "text": "I have it open here right now, so you can even use Cloud Codes to debug it.",
+      "timestamp": 1771422166367
+    },
+    {
+      "role": "user",
+      "text": "using the skills that we have for doing that.",
+      "timestamp": 1771422170361
+    },
+    {
+      "role": "assistant",
+      "text": "Got it. So now we've got a solid understanding of the project and its structure, including the skill to spin up a test environment for the frontend and how it all wraps around the customized Claude agent.",
+      "timestamp": 1771422176094
+    },
+    {
+      "role": "user",
+      "text": "Uh but uh yeah, I'll I'll want your help like doing brain. No way.",
+      "timestamp": 1771422176885
+    },
+    {
+      "role": "user",
+      "text": "Wait.",
+      "timestamp": 1771422177986
+    },
+    {
+      "role": "user",
+      "text": "Wait, wait, wait, wait.",
+      "timestamp": 1771422178620
+    },
+    {
+      "role": "user",
+      "text": "Yes, but I want you to help me to brainstorm a little bit about this",
+      "timestamp": 1771422184783
+    },
+    {
+      "role": "user",
+      "text": "And then later you need to use the same current conversation that we got with Cloud Code.",
+      "timestamp": 1771422192438
+    },
+    {
+      "role": "user",
+      "text": "Please don't start a new thread or a new session.",
+      "timestamp": 1771422195769
+    },
+    {
+      "role": "user",
+      "text": "Just keep the conversation because later",
+      "timestamp": 1771422198596
+    },
+    {
+      "role": "user",
+      "text": "We'll we'll explore a little bit more and try to",
+      "timestamp": 1771422202311
+    },
+    {
+      "role": "user",
+      "text": "All right.",
+      "timestamp": 1771422203963
+    },
+    {
+      "role": "user",
+      "text": "advance with it, okay?",
+      "timestamp": 1771422205763
+    },
+    {
+      "role": "assistant",
+      "text": "Got it! We'll keep this same conversation thread active with Claude Code. We can brainstorm now, and then dive deeper into testing or debugging later. What kind of brainstorming help do you need right now?",
+      "timestamp": 1771422208766
+    },
+    {
+      "role": "user",
+      "text": "Yes, so okay. I want to implement",
+      "timestamp": 1771422224429
+    },
+    {
+      "role": "user",
+      "text": "voice.",
+      "timestamp": 1771422225224
+    },
+    {
+      "role": "user",
+      "text": "into this application.",
+      "timestamp": 1771422227759
+    },
+    {
+      "role": "user",
+      "text": "Right so",
+      "timestamp": 1771422229384
+    },
+    {
+      "role": "user",
+      "text": "I want, uh...",
+      "timestamp": 1771422231656
+    },
+    {
+      "role": "assistant",
+      "text": "You're thinking about adding voice capabilities",
+      "timestamp": 1771422232078
+    },
+    {
+      "role": "user",
+      "text": "So...",
+      "timestamp": 1771422233872
+    },
+    {
+      "role": "user",
+      "text": "Here's the thing",
+      "timestamp": 1771422234674
+    },
+    {
+      "role": "user",
+      "text": "we got this orchestrator.",
+      "timestamp": 1771422236574
+    },
+    {
+      "role": "user",
+      "text": "right",
+      "timestamp": 1771422237289
+    },
+    {
+      "role": "user",
+      "text": "which is",
+      "timestamp": 1771422241080
+    },
+    {
+      "role": "assistant",
+      "text": "Yes, you've got",
+      "timestamp": 1771422241165
+    },
+    {
+      "role": "user",
+      "text": "One custom conversation with",
+      "timestamp": 1771422246296
+    },
+    {
+      "role": "user",
+      "text": "with our own wrapper for just a simple",
+      "timestamp": 1771422248863
+    },
+    {
+      "role": "user",
+      "text": "LLM",
+      "timestamp": 1771422249678
+    },
+    {
+      "role": "user",
+      "text": "which can run tools to orchestrate different conversations.",
+      "timestamp": 1771422255779
+    },
+    {
+      "role": "user",
+      "text": "So, I think...",
+      "timestamp": 1771422257018
+    },
+    {
+      "role": "user",
+      "text": "we can turn this orchestrator.",
+      "timestamp": 1771422259517
+    },
+    {
+      "role": "user",
+      "text": "into an open...",
+      "timestamp": 1771422262340
+    },
+    {
+      "role": "user",
+      "text": "AI",
+      "timestamp": 1771422264334
+    },
+    {
+      "role": "user",
+      "text": "Real-time API voice conversation, right?",
+      "timestamp": 1771422266940
+    },
+    {
+      "role": "user",
+      "text": "Like, there is this API.",
+      "timestamp": 1771422269068
+    },
+    {
+      "role": "user",
+      "text": "Thank you. ",
+      "timestamp": 1771422271591
+    },
+    {
+      "role": "user",
+      "text": "from OpenAI.",
+      "timestamp": 1771422272001
+    },
+    {
+      "role": "user",
+      "text": "which is what we are using right now, by the way.",
+      "timestamp": 1771422274388
+    },
+    {
+      "role": "user",
+      "text": "which allows us, the developers, to...",
+      "timestamp": 1771422278139
+    },
+    {
+      "role": "user",
+      "text": "Bye.",
+      "timestamp": 1771422278926
+    },
+    {
+      "role": "user",
+      "text": "manage a real-time conversation with",
+      "timestamp": 1771422283952
+    },
+    {
+      "role": "user",
+      "text": "a multimodal",
+      "timestamp": 1771422284926
+    },
+    {
+      "role": "user",
+      "text": "OpenAI model.",
+      "timestamp": 1771422287034
+    },
+    {
+      "role": "user",
+      "text": "uh, like GPT-5, I think.",
+      "timestamp": 1771422290762
+    },
+    {
+      "role": "user",
+      "text": "And like within this voice conversation,",
+      "timestamp": 1771422295835
+    },
+    {
+      "role": "user",
+      "text": "Bye. ",
+      "timestamp": 1771422296419
+    },
+    {
+      "role": "user",
+      "text": "osu!",
+      "timestamp": 1771422297300
+    },
+    {
+      "role": "user",
+      "text": "وإلى اللقاء",
+      "timestamp": 1771422299480
+    },
+    {
+      "role": "user",
+      "text": "The voice goes directly to the model.",
+      "timestamp": 1771422302414
+    },
+    {
+      "role": "user",
+      "text": "into his audio understanding capabilities.",
+      "timestamp": 1771422306858
+    },
+    {
+      "role": "user",
+      "text": "through the multimodality.",
+      "timestamp": 1771422308054
+    },
+    {
+      "role": "user",
+      "text": "directly through WebRTC.",
+      "timestamp": 1771422311328
+    },
+    {
+      "role": "user",
+      "text": "Thank you. Bye bye. Bye bye. Bye. ",
+      "timestamp": 1771422312470
+    },
+    {
+      "role": "user",
+      "text": "through a web RTC connection between.",
+      "timestamp": 1771422315267
+    },
+    {
+      "role": "user",
+      "text": "the front end of our application.",
+      "timestamp": 1771422318012
+    },
+    {
+      "role": "user",
+      "text": "and",
+      "timestamp": 1771422319663
+    },
+    {
+      "role": "user",
+      "text": "the model, right?",
+      "timestamp": 1771422321399
+    },
+    {
+      "role": "user",
+      "text": "through the OpenAI API.",
+      "timestamp": 1771422322744
+    },
+    {
+      "role": "user",
+      "text": "Yes.",
+      "timestamp": 1771422324032
+    },
+    {
+      "role": "user",
+      "text": "using WebRTC. Sorry if I'm being a little bit redundant.",
+      "timestamp": 1771422327912
+    },
+    {
+      "role": "user",
+      "text": "But I just want to make this really clear.",
+      "timestamp": 1771422330736
+    },
+    {
+      "role": "user",
+      "text": "Uh, so...",
+      "timestamp": 1771422333075
+    },
+    {
+      "role": "user",
+      "text": "I want to, uh, like...",
+      "timestamp": 1771422335466
+    },
+    {
+      "role": "user",
+      "text": "Find a smart way of replacing or like",
+      "timestamp": 1771422340322
+    },
+    {
+      "role": "user",
+      "text": "of replacing the normal model that we use for this orchestration.",
+      "timestamp": 1771422346944
+    },
+    {
+      "role": "user",
+      "text": "Shem, sorry.",
+      "timestamp": 1771422349122
+    },
+    {
+      "role": "user",
+      "text": "To replace the model we used for this orchestrator.",
+      "timestamp": 1771422353896
+    },
+    {
+      "role": "user",
+      "text": "by the",
+      "timestamp": 1771422354529
+    },
+    {
+      "role": "user",
+      "text": "by the",
+      "timestamp": 1771422356896
+    },
+    {
+      "role": "user",
+      "text": "Bye.",
+      "timestamp": 1771422360106
+    }
+  ]
+}71422360107
+    }
+  ]
+}

@@ -88,18 +88,23 @@ async def chat_ws(ws: WebSocket):
 async def _handle_start(
     ws: WebSocket, pool: SessionPool, msg: dict,
 ) -> tuple[SessionManager | None, str | None]:
-    """Start or resume a session via the pool. Returns (sm, session_id) or (None, None)."""
-    resume_id = msg.get("session_id")
+    """Start or resume a session via the pool. Returns (sm, session_id) or (None, None).
+
+    The frontend sends ``local_id`` (stable tab UUID) and optionally
+    ``resume_sdk_id`` (Claude Code SDK session ID for resuming from history).
+    """
+    local_id = msg.get("local_id")
+    resume_sdk_id = msg.get("resume_sdk_id") or msg.get("session_id")
     fork = msg.get("fork", False)
 
-    # Check if this session already exists in the pool
-    if resume_id and pool.has(resume_id):
-        sm = pool.get(resume_id)
-        pool.subscribe(resume_id, ws)
+    # Check if this session already exists in the pool (re-subscribing)
+    if local_id and pool.has(local_id):
+        sm = pool.get(local_id)
+        pool.subscribe(local_id, ws)
         await ws.send_bytes(orjson.dumps({
-            "type": "session_started", "session_id": resume_id,
+            "type": "session_started", "session_id": local_id,
         }))
-        return sm, resume_id
+        return sm, local_id
 
     # Create a new session via the pool
     from manager.config import ManagerConfig
@@ -109,7 +114,7 @@ async def _handle_start(
             "type": "status", "status": "connecting",
         }))
         session_id = await asyncio.wait_for(
-            pool.create(config, session_id=resume_id, fork=fork),
+            pool.create(config, local_id=local_id, resume_sdk_id=resume_sdk_id, fork=fork),
             timeout=30.0,
         )
     except asyncio.TimeoutError:
@@ -144,16 +149,11 @@ async def _handle_send(
 ) -> str | None:
     """Stream events to the WebSocket via pool broadcast.
 
-    Returns the (potentially updated) session_id — the pool may re-key the
-    session after the first query when the SDK assigns the real ID.
+    The session_id is the stable local_id and never changes.
     """
-    from manager.types import TurnComplete
-
     try:
         async for event in pool.send(session_id, text, source_ws=ws):
-            # Track session ID changes so the caller updates its local ref
-            if isinstance(event, TurnComplete) and event.session_id:
-                session_id = event.session_id
+            pass  # Events already broadcast by pool
     except Exception as e:
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "send_failed",

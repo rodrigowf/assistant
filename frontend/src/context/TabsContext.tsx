@@ -12,11 +12,10 @@ import type { TabState, TabsState, SessionStatus, ConnectionState } from "../typ
 // -------------------------------------------------------------------
 
 type TabsAction =
-  | { type: "OPEN_TAB"; sessionId: string; title: string; isOrchestrator?: boolean }
+  | { type: "OPEN_TAB"; sessionId: string; title: string; isOrchestrator?: boolean; resumeSdkId?: string }
   | { type: "CLOSE_TAB"; sessionId: string }
   | { type: "SWITCH_TAB"; sessionId: string }
-  | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title">> }
-  | { type: "REPLACE_TAB_ID"; oldId: string; newId: string };
+  | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title">> };
 
 // -------------------------------------------------------------------
 // Reducer
@@ -36,6 +35,7 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
       }
       const tab: TabState = {
         sessionId: action.sessionId,
+        resumeSdkId: action.resumeSdkId,
         title: action.title || "New session",
         status: "connecting",
         connectionState: "disconnected",
@@ -77,16 +77,6 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
         ),
       };
 
-    case "REPLACE_TAB_ID": {
-      const wasActive = state.activeTabId === action.oldId;
-      return {
-        tabs: state.tabs.map((t) =>
-          t.sessionId === action.oldId ? { ...t, sessionId: action.newId } : t
-        ),
-        activeTabId: wasActive ? action.newId : state.activeTabId,
-      };
-    }
-
     default:
       return state;
   }
@@ -99,13 +89,14 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
 interface TabsContextValue {
   tabs: TabState[];
   activeTabId: string | null;
-  openTab: (sessionId: string, title?: string, isOrchestrator?: boolean) => void;
+  openTab: (sessionId: string, title?: string, isOrchestrator?: boolean, resumeSdkId?: string) => void;
   closeTab: (sessionId: string) => void;
   switchTab: (sessionId: string) => void;
   updateTab: (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title">>) => void;
-  replaceTabId: (oldId: string, newId: string) => void;
   isTabOpen: (sessionId: string) => boolean;
   hasActiveOrchestrator: () => boolean;
+  /** Find a tab that was opened to resume a given SDK session ID. */
+  findTabByResumeId: (sdkId: string) => TabState | undefined;
 }
 
 const TabsContext = createContext<TabsContextValue | null>(null);
@@ -113,8 +104,8 @@ const TabsContext = createContext<TabsContextValue | null>(null);
 export function TabsProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
 
-  const openTab = useCallback((sessionId: string, title = "New session", isOrchestrator?: boolean) => {
-    dispatch({ type: "OPEN_TAB", sessionId, title, isOrchestrator });
+  const openTab = useCallback((sessionId: string, title = "New session", isOrchestrator?: boolean, resumeSdkId?: string) => {
+    dispatch({ type: "OPEN_TAB", sessionId, title, isOrchestrator, resumeSdkId });
   }, []);
 
   const closeTab = useCallback((sessionId: string) => {
@@ -132,10 +123,6 @@ export function TabsProvider({ children }: { children: ReactNode }) {
     []
   );
 
-  const replaceTabId = useCallback((oldId: string, newId: string) => {
-    dispatch({ type: "REPLACE_TAB_ID", oldId, newId });
-  }, []);
-
   const isTabOpen = useCallback(
     (sessionId: string) => state.tabs.some((t) => t.sessionId === sessionId),
     [state.tabs]
@@ -143,6 +130,11 @@ export function TabsProvider({ children }: { children: ReactNode }) {
 
   const hasActiveOrchestrator = useCallback(
     () => state.tabs.some((t) => t.isOrchestrator),
+    [state.tabs]
+  );
+
+  const findTabByResumeId = useCallback(
+    (sdkId: string) => state.tabs.find((t) => t.resumeSdkId === sdkId),
     [state.tabs]
   );
 
@@ -155,9 +147,9 @@ export function TabsProvider({ children }: { children: ReactNode }) {
         closeTab,
         switchTab,
         updateTab,
-        replaceTabId,
         isTabOpen,
         hasActiveOrchestrator,
+        findTabByResumeId,
       }}
     >
       {children}

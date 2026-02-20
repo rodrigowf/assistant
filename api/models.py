@@ -39,6 +39,17 @@ class SessionDetailResponse(SessionInfoResponse):
     messages: list[MessagePreviewResponse] = []
 
 
+class PoolSessionResponse(BaseModel):
+    """A session that is currently live in the pool (not just in JSONL history)."""
+    local_id: str
+    sdk_session_id: str | None = None
+    status: str
+    cost: float
+    turns: int
+    title: str | None = None
+    is_orchestrator: bool = False
+
+
 class AuthStatusResponse(BaseModel):
     authenticated: bool
 

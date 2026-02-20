@@ -33,7 +33,7 @@ export interface SessionDetail extends SessionInfo {
 // WebSocket event types (server → client)
 
 export type ServerEvent =
-  | { type: "session_started"; session_id: string }
+  | { type: "session_started"; session_id: string; voice?: boolean; voice_session_update?: Record<string, unknown> }
   | { type: "session_stopped" }
   | { type: "text_delta"; text: string }
   | { type: "text_complete"; text: string }
@@ -45,9 +45,25 @@ export type ServerEvent =
   | { type: "compact_complete"; trigger: string }
   | { type: "status"; status: string }
   | { type: "error"; error: string; detail?: string }
-  | { type: "agent_session_opened"; session_id: string }
+  | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }
   | { type: "agent_session_closed"; session_id: string }
-  | { type: "user_message"; text: string; source?: string };
+  | { type: "user_message"; text: string; source?: string }
+  | { type: "voice_command"; command: Record<string, unknown> };
+
+// OpenAI Realtime API event types (subset used by voice integration)
+export interface RealtimeEvent {
+  type: string;
+  [key: string]: unknown;
+}
+
+export type VoiceStatus =
+  | "off"
+  | "connecting"
+  | "active"
+  | "speaking"
+  | "thinking"
+  | "tool_use"
+  | "error";
 
 // Chat state types
 
@@ -90,7 +106,8 @@ export type ConnectionState =
 export type TabStatusIcon = "active" | "waiting" | "idle" | "error" | "loading";
 
 export interface TabState {
-  sessionId: string;
+  sessionId: string;         // Stable local ID (never changes)
+  resumeSdkId?: string;      // SDK session ID for resuming from history
   title: string;
   status: SessionStatus;
   connectionState: ConnectionState;

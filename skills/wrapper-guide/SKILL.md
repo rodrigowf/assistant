@@ -54,24 +54,32 @@ The manager wraps the `claude-agent-sdk` to provide a clean async interface.
 
 The heart of the manager. Wraps a single Claude Code conversation.
 
+**Dual ID System:**
+Each session has two IDs:
+- `local_id` — Stable UUID generated at creation time. Used as the primary key throughout the system (pool, tabs, orchestrator). Never changes.
+- `sdk_session_id` — The Claude Code SDK's session ID. Only available after the first message is sent. Used for resuming sessions and looking up JSONL files on disk.
+
 **Lifecycle:**
 ```python
-sm = SessionManager(session_id=None, fork=False, config=None)
-await sm.start()           # Connect to SDK, get session_id
+sm = SessionManager(session_id="sdk-id-to-resume", local_id="stable-uuid", config=config)
+await sm.start()           # Connect to SDK, returns local_id (stable)
 async for event in sm.send("Hello"):  # Stream events
-    ...
+    ...                    # sdk_session_id becomes available after first response
 await sm.stop()            # Disconnect
 ```
 
 **Key methods:**
-- `start()` → Connect to SDK, return session_id
+- `start()` → Connect to SDK, return `local_id` (stable, never changes)
 - `send(prompt)` → Yields `Event` objects as response streams
 - `command(slash_cmd)` → Send `/compact`, `/help`, etc.
 - `interrupt()` → Stop current response
 - `stop()` → Disconnect
 
 **Properties:**
-- `session_id`, `status`, `cost`, `turns`, `is_active`
+- `local_id` — Stable local UUID (primary identifier)
+- `sdk_session_id` — Claude SDK session ID (available after first message)
+- `session_id` — Alias for `local_id`
+- `status`, `cost`, `turns`, `is_active`
 
 **Internal flow in `_process_message()`:**
 - `StreamEvent` with `content_block_delta` → `TextDelta` / `ThinkingDelta`
@@ -148,6 +156,7 @@ FastAPI server providing REST + WebSocket interfaces.
 | `routes/chat.py` | WebSocket endpoint for real-time streaming |
 | `routes/sessions.py` | REST endpoints for session CRUD |
 | `routes/auth.py` | Auth status and login endpoints |
+| `pool.py` | `SessionPool` - manages all active sessions, keyed by local_id |
 | `connections.py` | `ConnectionManager` - tracks active WebSocket sessions |
 | `serializers.py` | Converts manager Events to JSON dicts |
 | `models.py` | Pydantic response models |
@@ -166,19 +175,31 @@ The `lifespan` context manager initializes:
 
 **CORS:** Allows `http://localhost:5173` (frontend dev server)
 
+### SessionPool (`pool.py`)
+
+Manages all active sessions, keyed by stable `local_id`.
+
+**Key methods:**
+- `create(config, local_id=None, resume_sdk_id=None, fork=False)` → Creates session, returns `local_id`
+- `send(local_id, prompt)` → Yields events from session
+- `has(local_id)` → Check if session exists
+- `list_sessions()` → Returns list with both `session_id` (local) and `sdk_session_id`
+
+Sessions are announced to watchers immediately on creation (no waiting for SDK ID).
+
 ### WebSocket Protocol (`routes/chat.py`)
 
 Endpoint: `WS /api/sessions/chat`
 
 **Client → Server messages:**
 ```json
-{"type": "start"}                          // New session
-{"type": "start", "session_id": "..."}     // Resume session
-{"type": "start", "fork": true}            // Fork session
-{"type": "send", "text": "..."}            // Send message
-{"type": "command", "text": "/compact"}    // Slash command
-{"type": "interrupt"}                       // Stop response
-{"type": "stop"}                            // End session
+{"type": "start", "local_id": "..."}                              // New session (frontend-generated UUID)
+{"type": "start", "local_id": "...", "resume_sdk_id": "..."}     // Resume session
+{"type": "start", "local_id": "...", "fork": true}               // Fork session
+{"type": "send", "text": "..."}                                   // Send message
+{"type": "command", "text": "/compact"}                            // Slash command
+{"type": "interrupt"}                                              // Stop response
+{"type": "stop"}                                                   // End session
 ```
 
 **Server → Client messages:**
@@ -214,11 +235,11 @@ Endpoint: `WS /api/sessions/chat`
 
 ### ConnectionManager (`connections.py`)
 
-Tracks active (session_id → WebSocket, SessionManager) pairs.
+Tracks active (local_id → WebSocket) pairs for WebSocket routing.
 
-- `connect(session_id, ws, sm)` → Register connection
-- `disconnect(session_id)` → Cleanup, call `sm.stop()`
-- `is_active(session_id)` → Check if connected
+- `connect(local_id, ws)` → Register connection
+- `disconnect(local_id)` → Cleanup
+- `is_active(local_id)` → Check if connected
 - `active_count` → Number of active connections
 
 ### Event Serialization (`serializers.py`)
@@ -251,20 +272,50 @@ React application for the chat interface.
 
 | File | Purpose |
 |------|---------|
-| `hooks/useChat.ts` | Central state machine (reducer + WebSocket) |
+| `context/TabsContext.tsx` | Tab state management (open/close/switch tabs) |
+| `hooks/useChatInstance.ts` | Per-tab chat state machine (reducer + WebSocket) |
 | `hooks/useWebSocket.ts` | WebSocket connection management |
 | `hooks/useSessions.ts` | Session list from REST API |
 | `api/websocket.ts` | `ChatSocket` class - low-level WS |
 | `api/rest.ts` | REST API client functions |
 | `types.ts` | TypeScript type definitions |
-| `App.tsx` | Root component |
+| `App.tsx` | Root component, tab creation |
+| `components/ChatPanelContainer.tsx` | Renders active tab's ChatPanel |
 | `components/ChatPanel.tsx` | Main chat layout |
+| `components/Sidebar.tsx` | Session history list, opens tabs |
 | `components/Message.tsx` | Individual message rendering |
 | `components/ToolUseBlock.tsx` | Tool use display |
 
-### State Management (`hooks/useChat.ts`)
+### Tab Management (`context/TabsContext.tsx`)
 
-Uses `useReducer` for predictable state updates.
+Multi-tab system using `useReducer`. Each tab is identified by a stable `local_id` (UUID generated by the frontend via `crypto.randomUUID()`).
+
+**Tab state:**
+```typescript
+interface TabState {
+  sessionId: string;     // Stable local UUID (never changes)
+  title: string;
+  status: SessionStatus;
+  connectionState: ConnectionState;
+  isOrchestrator?: boolean;
+  resumeSdkId?: string;  // SDK session ID for resuming from history
+}
+```
+
+**Actions:** `OPEN_TAB`, `CLOSE_TAB`, `SWITCH_TAB`, `UPDATE_TAB`
+
+**Key helpers:**
+- `openTab(sessionId, title?, isOrchestrator?, resumeSdkId?)` → Open new tab with stable UUID
+- `findTabByResumeId(sdkId)` → Find tab that's resuming a specific SDK session
+
+### Per-Tab Chat State (`hooks/useChatInstance.ts`)
+
+Each tab gets its own `useChatInstance` hook. Uses `useReducer` for predictable state updates.
+
+**Options:**
+```typescript
+{ localId, resumeSdkId, isOrchestrator }
+```
 
 **State shape:**
 ```typescript
@@ -289,6 +340,8 @@ interface ChatState {
 - `TOOL_RESULT` → Attach result to matching tool_use block by `toolUseId`
 - `TURN_COMPLETE` → Update cost/turns, status=idle
 - `STATUS` / `ERROR` → Update status or error
+
+**WebSocket start message:** Sends `{ type: "start", local_id, resume_sdk_id }` — the backend uses `local_id` as the pool key and `resume_sdk_id` to resume the Claude SDK session.
 
 **Message building logic:**
 - `ensureAssistantMessage()` → Creates assistant message if needed
@@ -319,25 +372,25 @@ interface ChatState {
 ### Session Flow
 
 **Starting new session:**
-1. User clicks "New Session"
-2. `useChat.startSession(null)` called
-3. Close existing WS, dispatch `RESET`
-4. Set `wsActive=true` → useWebSocket opens connection
-5. On WS open, send `{"type": "start"}`
-6. Receive `{"type": "session_started", "session_id": "..."}`
-7. Dispatch `SESSION_STARTED` → status=idle
+1. User clicks "+" → `App` generates `localId = crypto.randomUUID()`
+2. `openTab(localId, "New session")` → tab appears with stable ID
+3. `ChatPanelContainer` mounts `useChatInstance({ localId })`
+4. On WS open, send `{"type": "start", "local_id": localId}`
+5. Backend creates session in pool keyed by `localId`
+6. Receive `{"type": "session_started", "session_id": localId}` → status=idle
+7. Tab ID stays the same throughout — no ID replacement needed
 
-**Resuming session:**
-1. User clicks past session
-2. `useChat.startSession(sessionId)` called
-3. REST fetch `GET /api/sessions/{id}` → get messages
-4. Dispatch `LOAD_HISTORY` → populate messages
-5. Open WS, send `{"type": "start", "session_id": "..."}`
-6. Continue from there
+**Resuming session from sidebar:**
+1. User clicks past session in `Sidebar`
+2. `Sidebar` generates `localId = crypto.randomUUID()`, opens tab with `resumeSdkId` set to the history session's SDK ID
+3. REST fetch `GET /api/sessions/{sdkId}` → get messages, dispatch `LOAD_HISTORY`
+4. On WS open, send `{"type": "start", "local_id": localId, "resume_sdk_id": sdkId}`
+5. Backend creates session with `resume_sdk_id` for Claude SDK continuation
+6. Tab uses stable `localId`, `resumeSdkId` links it to the sidebar entry
 
 **Sending message:**
 1. User types, presses Enter
-2. `useChat.send(text)` → dispatch `USER_MESSAGE` (optimistic)
+2. `send(text)` → dispatch `USER_MESSAGE` (optimistic)
 3. WS send `{"type": "send", "text": "..."}`
 4. Stream events arrive → dispatch each action
 5. `TURN_COMPLETE` → status=idle, refresh session list
