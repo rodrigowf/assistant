@@ -7,6 +7,8 @@ export interface SessionInfo {
   title: string;
   message_count: number;
   is_orchestrator?: boolean;
+  /** Set when the session is currently live in the pool — this is the stable tab key. */
+  local_id?: string;
 }
 
 export interface ContentBlock {

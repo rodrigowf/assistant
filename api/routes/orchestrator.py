@@ -101,8 +101,13 @@ async def _handle_start(
     """Start, resume, or reconnect to the orchestrator session.
 
     The frontend sends ``local_id`` (stable tab UUID) and optionally
-    ``resume_sdk_id`` (the same UUID for orchestrators, since their JSONL is
-    keyed by local_id).
+    ``resume_sdk_id`` (the original session_id for the JSONL file when
+    resuming from history).
+
+    The pool is keyed by ``local_id``. The JSONL file is keyed by
+    ``resume_sdk_id`` (or ``local_id`` for new sessions). This decoupling
+    allows mode transitions (text↔voice) and reconnections to work correctly
+    while preserving conversation history across sessions.
 
     Returns (session, subscribed). subscribed=True when this ws was registered.
     """
@@ -112,13 +117,30 @@ async def _handle_start(
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
         session = pool.get_orchestrator()
-        pool.subscribe_orchestrator(local_id, ws)
-        await ws.send_bytes(orjson.dumps({
-            "type": "session_started",
-            "session_id": local_id,
-            "voice": getattr(session, "is_voice", False),
-        }))
-        return session, True
+        current_voice = getattr(session, "is_voice", False)
+
+        if voice and not current_voice:
+            # Text→voice transition: stop text session, fall through to create voice
+            await pool.stop_orchestrator()
+        elif not voice and current_voice:
+            # Text WS reconnecting while voice is active — subscribe without
+            # disrupting the voice session (the text WS auto-connects on mount).
+            pool.subscribe_orchestrator(local_id, ws)
+            await ws.send_bytes(orjson.dumps({
+                "type": "session_started",
+                "session_id": local_id,
+                "voice": current_voice,
+            }))
+            return session, True
+        else:
+            # Same mode — just reconnect
+            pool.subscribe_orchestrator(local_id, ws)
+            await ws.send_bytes(orjson.dumps({
+                "type": "session_started",
+                "session_id": local_id,
+                "voice": current_voice,
+            }))
+            return session, True
 
     # --- A different orchestrator is already active ---
     if pool.has_orchestrator():
@@ -195,7 +217,40 @@ async def _handle_voice_event(
 ) -> None:
     """Process a mirrored OpenAI Realtime event and send back any voice commands."""
     try:
+        event_type = event.get("type", "")
+
+        # Broadcast tool_use when a tool call starts so the chat UI shows it
+        if event_type == "response.function_call_arguments.done":
+            import json as _json
+            call_id = event.get("call_id", "")
+            name = event.get("name", "")
+            try:
+                tool_input = _json.loads(event.get("arguments", "{}"))
+            except Exception:
+                tool_input = {}
+            if call_id and name:
+                await pool.broadcast_orchestrator({
+                    "type": "tool_use",
+                    "tool_use_id": call_id,
+                    "tool_name": name,
+                    "tool_input": tool_input,
+                })
+
         commands = await session.process_voice_event(event)
+
+        # Broadcast tool_result after execution completes
+        if event_type == "response.function_call_arguments.done" and commands:
+            for cmd in commands:
+                if cmd.get("type") == "conversation.item.create":
+                    item = cmd.get("item", {})
+                    if item.get("type") == "function_call_output":
+                        await pool.broadcast_orchestrator({
+                            "type": "tool_result",
+                            "tool_use_id": item.get("call_id", ""),
+                            "output": item.get("output", ""),
+                            "is_error": False,
+                        })
+
         for cmd in commands:
             await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
     except Exception as e:

@@ -34,7 +34,20 @@ def _convert_blocks(blocks) -> list[ContentBlockResponse]:
 
 
 @router.get("", response_model=list[SessionInfoResponse])
-def list_sessions(store: SessionStore = Depends(get_store)):
+def list_sessions(
+    store: SessionStore = Depends(get_store),
+    pool: SessionPool = Depends(get_pool),
+):
+    # Build a reverse map: sdk_session_id → local_id for all live pool sessions.
+    # This lets the frontend find the correct tab for a session that the orchestrator
+    # opened (where the tab is keyed by local_id, not sdk_session_id).
+    sdk_to_local: dict[str, str] = {}
+    for s in pool.list_sessions():
+        sdk_id = s.get("sdk_session_id")
+        local_id = s.get("session_id")  # pool keys sessions by local_id
+        if sdk_id and local_id:
+            sdk_to_local[sdk_id] = local_id
+
     return [
         SessionInfoResponse(
             session_id=s.session_id,
@@ -43,6 +56,7 @@ def list_sessions(store: SessionStore = Depends(get_store)):
             title=s.title,
             message_count=s.message_count,
             is_orchestrator=s.is_orchestrator,
+            local_id=sdk_to_local.get(s.session_id),
         )
         for s in store.list_sessions()
     ]
@@ -57,19 +71,19 @@ def list_pool_sessions(
 
     Used by the frontend on startup to re-attach to sessions that are still
     running after a browser close/refresh.
-
-    For orchestrators, sdk_session_id == local_id because the orchestrator
-    JSONL is keyed by local_id (not a separate SDK session ID).
     """
     result: list[PoolSessionResponse] = []
 
     # Orchestrator session (at most one)
     if pool.has_orchestrator():
         oid = pool.orchestrator_id
-        info = store.get_session_info(oid) if oid else None
+        session = pool.get_orchestrator()
+        # The JSONL is keyed by jsonl_id (== resume_id when resuming, else local_id)
+        jsonl_id = getattr(session, "jsonl_id", oid) if session else oid
+        info = store.get_session_info(jsonl_id) if jsonl_id else None
         result.append(PoolSessionResponse(
             local_id=oid,
-            sdk_session_id=oid,  # orchestrator JSONL is keyed by local_id
+            sdk_session_id=jsonl_id,
             status="idle",
             cost=0.0,
             turns=0,
@@ -158,8 +172,29 @@ def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
 
 
 @router.post("/{local_id}/close", status_code=204)
-async def close_pool_session(local_id: str, pool: SessionPool = Depends(get_pool)):
-    """Close an active session in the pool."""
+async def close_pool_session(
+    local_id: str,
+    pool: SessionPool = Depends(get_pool),
+    store: SessionStore = Depends(get_store),
+):
+    """Close an active session in the pool.
+
+    If the session was genuinely new (not resumed from history) and was
+    never used (zero turns), its JSONL file is deleted to prevent orphaned
+    files from accumulating on disk. Resumed sessions are never deleted
+    here — they have existing history that must be preserved.
+    """
+    sm = pool.get(local_id)
+    sdk_id = sm.sdk_session_id if sm else None
+    is_new_unused = (
+        sm is not None
+        and sm.turns == 0
+        and not getattr(sm, "is_resumed", False)
+    )
+
     if pool.has(local_id):
         await pool.close(local_id)
-    # If not found, silently succeed (already closed)
+
+    # Clean up JSONL only for genuinely new sessions that were never used
+    if is_new_unused and sdk_id:
+        store.delete_session(sdk_id)

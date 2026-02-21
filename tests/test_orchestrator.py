@@ -600,27 +600,33 @@ class TestOrchestratorSession:
             sid = await session1.start()
 
         # Manually write some history
-        session1._append_jsonl({
+        session1._writer.append({
             "type": "user",
             "message": {"role": "user", "content": "Hello"},
             "timestamp": "2026-01-01T00:00:00Z",
         })
-        session1._append_jsonl({
+        session1._writer.append({
             "type": "assistant",
             "message": {"role": "assistant", "content": "Hi there!"},
             "timestamp": "2026-01-01T00:00:01Z",
         })
         await session1.stop()
 
-        # Resume session
-        session2 = OrchestratorSession(config=config, context={"orchestrator_sessions": {}}, session_id=sid)
+        # Resume session — local_id is different (simulating new tab), session_id
+        # is the original for JSONL continuity
+        session2 = OrchestratorSession(
+            config=config, context={"orchestrator_sessions": {}},
+            session_id=sid, local_id="new-tab-id",
+        )
         with patch("orchestrator.session.AnthropicProvider"):
-            sid2 = await session2.start()
+            local_id2 = await session2.start()
 
-        assert sid2 == sid
+        assert local_id2 == "new-tab-id"
+        assert session2.jsonl_id == sid
         assert len(session2._agent.history) == 2
         assert session2._agent.history[0]["content"] == "Hello"
-        assert session2._agent.history[1]["content"] == "Hi there!"
+        # Assistant messages are now in content block format
+        assert session2._agent.history[1]["content"] == [{"type": "text", "text": "Hi there!"}]
         await session2.stop()
 
 

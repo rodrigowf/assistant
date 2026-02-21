@@ -62,51 +62,57 @@ export function ChatPanel({
       )}
       {/* Hide text input when voice is active */}
       {!voiceActive && (
-        <ChatInput
-          onSend={onSend}
-          onInterrupt={onInterrupt}
-          disabled={status === "disconnected" || status === "connecting"}
-          streaming={isStreaming}
-        />
-      )}
-      {isOrchestrator && voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
-        <div className="voice-bar">
-          <VoiceButton
-            status={voiceStatus}
-            onStart={onVoiceStart}
-            onStop={onVoiceStop}
+        <div className="chat-input-bar">
+          <ChatInput
+            onSend={onSend}
+            onInterrupt={onInterrupt}
+            disabled={status === "disconnected" || status === "connecting"}
+            streaming={isStreaming}
           />
-          {voiceActive && onMuteToggle && (
-            <>
-              <button
-                className={`voice-mute-btn ${isMuted ? "muted" : ""}`}
-                onClick={onMuteToggle}
-                title={isMuted ? "Unmute microphone" : "Mute microphone"}
-                aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
-              >
-                {isMuted ? <MicMutedIcon /> : <MicIcon />}
-              </button>
-              <AudioLevelIndicator level={micLevel ?? 0} label="Mic" />
-              <AudioLevelIndicator level={speakerLevel ?? 0} label="Speaker" />
-            </>
-          )}
-          {voiceActive && (
-            <span className="voice-status-label">
-              {voiceStatus === "active" && (isMuted ? "Muted" : "Listening…")}
-              {voiceStatus === "speaking" && "Speaking…"}
-              {voiceStatus === "thinking" && "Thinking…"}
-              {voiceStatus === "tool_use" && "Using tool…"}
-              {voiceStatus === "connecting" && "Connecting…"}
-            </span>
-          )}
         </div>
       )}
-      <StatusBar
-        status={status}
-        connectionState={connectionState}
-        cost={cost}
-        turns={turns}
-      />
+      {isOrchestrator && voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
+        <div className="voice-bar-container">
+          <div className="voice-bar">
+            <VoiceButton
+              status={voiceStatus}
+              onStart={onVoiceStart}
+              onStop={onVoiceStop}
+            />
+            {voiceActive && onMuteToggle && (
+              <>
+                <button
+                  className={`voice-mute-btn ${isMuted ? "muted" : ""}`}
+                  onClick={onMuteToggle}
+                  title={isMuted ? "Unmute microphone" : "Mute microphone"}
+                  aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+                >
+                  {isMuted ? <MicMutedIcon /> : <MicIcon />}
+                </button>
+                <AudioLevelIndicator level={micLevel ?? 0} label="Mic" />
+                <AudioLevelIndicator level={speakerLevel ?? 0} label="Speaker" />
+              </>
+            )}
+            {voiceActive && (
+              <span className="voice-status-label">
+                {voiceStatus === "active" && (isMuted ? "Muted" : "Listening…")}
+                {voiceStatus === "speaking" && "Speaking…"}
+                {voiceStatus === "thinking" && "Thinking…"}
+                {voiceStatus === "tool_use" && "Using tool…"}
+                {voiceStatus === "connecting" && "Connecting…"}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+      <div className="status-bar-container">
+        <StatusBar
+          status={status}
+          connectionState={connectionState}
+          cost={cost}
+          turns={turns}
+        />
+      </div>
     </main>
   );
 }

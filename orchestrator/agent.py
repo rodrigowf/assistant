@@ -73,7 +73,12 @@ class OrchestratorAgent:
         # Add user message to history
         self._history.append({"role": "user", "content": prompt})
 
-        system = build_system_prompt(self._config, self._context)
+        # Build system prompt with conversation history for context continuity
+        system = build_system_prompt(
+            self._config,
+            self._context,
+            history=self._history,
+        )
         tools = self._registry.get_definitions()
 
         total_input_tokens = 0

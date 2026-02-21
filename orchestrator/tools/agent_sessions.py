@@ -67,8 +67,16 @@ async def open_agent_session(context: dict[str, Any], resume_sdk_id: str = "") -
     from manager.config import ManagerConfig
 
     pool = context["pool"]
+    store = context["store"]
     config = context.get("manager_config") or ManagerConfig.load()
     sdk_id = resume_sdk_id if resume_sdk_id else None
+
+    # Validate that the session actually exists before trying to resume
+    if sdk_id and store.get_session_info(sdk_id) is None:
+        return json.dumps({
+            "error": f"Session {sdk_id!r} not found in history. "
+            "Use list_history to see available sessions."
+        })
 
     try:
         local_id = await pool.create(config, resume_sdk_id=sdk_id)

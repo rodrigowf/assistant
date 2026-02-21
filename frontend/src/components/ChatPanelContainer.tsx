@@ -73,13 +73,19 @@ function TabInstance({
  * active orchestrator tab (hooks can't be conditional).
  */
 function OrchestratorChatPanel({
+  sessionId,
+  resumeSdkId,
   instance,
   onSessionChange,
 }: {
+  sessionId: string;
+  resumeSdkId?: string | null;
   instance: ChatInstance;
   onSessionChange: () => void;
 }) {
   const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, micLevel, speakerLevel } = useVoiceOrchestrator({
+    localId: sessionId,
+    resumeSdkId,
     onUserTranscript: (text) => {
       instance.addDisplayMessage("user", text);
     },
@@ -88,6 +94,9 @@ function OrchestratorChatPanel({
     },
     onAssistantComplete: (text) => {
       instance.voiceAssistantComplete(text);
+    },
+    onToolUse: (callId, toolName, toolInput) => {
+      instance.dispatchToolUse(callId, toolName, toolInput);
     },
     onTurnComplete: () => {
       onSessionChange();
@@ -187,6 +196,8 @@ export function ChatPanelContainer({
           >
             {tab.isOrchestrator ? (
               <OrchestratorChatPanel
+                sessionId={tab.sessionId}
+                resumeSdkId={tab.resumeSdkId}
                 instance={inst}
                 onSessionChange={onSessionChange}
               />

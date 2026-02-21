@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .index_utils import remove_session_from_index
 from .types import ContentBlock, MessagePreview, SessionDetail, SessionInfo
 
 
@@ -132,7 +133,12 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     def list_sessions(self) -> list[SessionInfo]:
-        """List all sessions for this project, sorted by most recent first."""
+        """List all sessions for this project, sorted by most recent first.
+
+        JSONL files that can't be parsed (no valid timestamps) are skipped
+        but NOT deleted — they may be in-progress sessions or have a format
+        we don't understand yet.
+        """
         if not self._sessions_dir.is_dir():
             return []
 
@@ -196,7 +202,10 @@ class SessionStore:
         return True
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session's JSONL file. Returns True if deleted."""
+        """Delete a session's JSONL file and remove it from the vector index.
+
+        Returns True if deleted.
+        """
         jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
         if jsonl_path.is_file():
             jsonl_path.unlink()
@@ -205,6 +214,8 @@ class SessionStore:
             if session_id in titles:
                 del titles[session_id]
                 self._save_titles(titles)
+            # Remove from vector index
+            remove_session_from_index(session_id, collection_name="history")
             return True
         return False
 

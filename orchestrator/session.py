@@ -12,6 +12,7 @@ from typing import Any
 
 from orchestrator.agent import OrchestratorAgent
 from orchestrator.config import OrchestratorConfig
+from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.providers.anthropic import AnthropicProvider
 from orchestrator.tools import registry
 from orchestrator.types import (
@@ -24,6 +25,9 @@ from orchestrator.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Messages to keep verbatim in the voice system prompt; older ones are summarized.
+MAX_VOICE_HISTORY_MESSAGES = 20
 
 
 def _mangle_path(project_path: str) -> str:
@@ -66,24 +70,36 @@ class OrchestratorSession:
     ) -> None:
         self._config = config
         self._context = context
-        self._resume_id = session_id
-        self._local_id = local_id  # Stable ID from frontend, if provided
-        self._session_id: str | None = None
+        self._resume_id = session_id  # Original session_id for JSONL continuity
+        self._local_id = local_id or str(uuid.uuid4())
         self._agent: OrchestratorAgent | None = None
         self._jsonl_path: Path | None = None
+        self._writer: HistoryWriter | None = None
         self._voice = voice
         self._voice_provider = None  # Set in start() if voice=True
+        self._history_summary: str | None = None
 
     @property
-    def session_id(self) -> str | None:
-        return self._session_id
+    def local_id(self) -> str:
+        """The pool key — stable frontend tab UUID used for reconnection."""
+        return self._local_id
+
+    @property
+    def jsonl_id(self) -> str:
+        """The JSONL filename stem — resume_id when resuming, else local_id."""
+        return self._resume_id or self._local_id
 
     @property
     def is_voice(self) -> bool:
         return self._voice
 
     async def start(self) -> str:
-        """Initialize the session. Returns the session ID."""
+        """Initialize the session.
+
+        Returns the local_id (pool key). The JSONL file uses ``jsonl_id``
+        which equals the original session_id when resuming so we append to
+        the same history file.
+        """
         # Import tools to ensure they're registered
         import orchestrator.tools.agent_sessions  # noqa: F401
         import orchestrator.tools.search  # noqa: F401
@@ -99,7 +115,6 @@ class OrchestratorSession:
                 max_tokens=self._config.max_tokens,
             )
 
-        # Create agent
         self._agent = OrchestratorAgent(
             config=self._config,
             registry=registry,
@@ -107,28 +122,25 @@ class OrchestratorSession:
             context=self._context,
         )
 
-        # Determine session ID — use local_id if provided, resume_id if
-        # resuming, otherwise generate a new UUID
-        if self._local_id:
-            self._session_id = self._local_id
-        elif self._resume_id:
-            self._session_id = self._resume_id
-        else:
-            self._session_id = str(uuid.uuid4())
-
         self._jsonl_path = self._get_jsonl_path()
+        self._writer = HistoryWriter(self._jsonl_path)
 
-        # If resuming, load history from JSONL
+        # If resuming, load history from the existing JSONL
         if self._resume_id and self._jsonl_path.is_file():
-            history = self._load_history()
+            loader = HistoryLoader(self._jsonl_path)
+            history = loader.load()
             self._agent.history = history
+            if self._voice and len(history) > MAX_VOICE_HISTORY_MESSAGES:
+                self._history_summary = await self._summarize_history(
+                    history[:-MAX_VOICE_HISTORY_MESSAGES]
+                )
         else:
-            # Write session metadata as first line
+            # New session — write metadata as first line
             self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
             meta: dict[str, Any] = {
                 "type": "orchestrator_meta",
                 "orchestrator": True,
-                "session_id": self._session_id,
+                "session_id": self.jsonl_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             if self._voice:
@@ -136,9 +148,9 @@ class OrchestratorSession:
                 meta["voice"] = True
                 meta["openai_model"] = VOICE_MODEL
                 meta["voice_name"] = VOICE_NAME
-            self._append_jsonl(meta)
+            self._writer.append(meta)
 
-        return self._session_id
+        return self._local_id
 
     def get_session_update(self) -> dict[str, Any] | None:
         """Return the OpenAI session.update payload for voice mode.
@@ -151,7 +163,13 @@ class OrchestratorSession:
             return None
 
         from orchestrator.prompt import build_system_prompt
-        system = build_system_prompt(self._config, self._context)
+        history = self._agent.history if self._agent else None
+        system = build_system_prompt(
+            self._config,
+            self._context,
+            history=history,
+            history_summary=self._history_summary,
+        )
         tools = registry.get_openai_definitions()
         return self._voice_provider.get_session_update_payload(system, tools)
 
@@ -178,7 +196,7 @@ class OrchestratorSession:
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
             if transcript:
-                self._append_jsonl({
+                self._writer.append({
                     "type": "user",
                     "message": {"role": "user", "content": f"[voice] {transcript}"},
                     "source": "voice_transcription",
@@ -191,7 +209,7 @@ class OrchestratorSession:
             if item.get("role") == "user":
                 for c in item.get("content", []):
                     if c.get("type") == "input_text" and c.get("text"):
-                        self._append_jsonl({
+                        self._writer.append({
                             "type": "user",
                             "message": {"role": "user", "content": c["text"]},
                             "source": "voice_transcription",
@@ -217,7 +235,7 @@ class OrchestratorSession:
             if call_id and name:
                 result = await registry.execute(name, tool_input, self._context)
                 # Persist tool call + result to JSONL
-                self._append_jsonl({
+                self._writer.append({
                     "type": "tool_use",
                     "tool_call_id": call_id,
                     "tool_name": name,
@@ -225,7 +243,7 @@ class OrchestratorSession:
                     "source": "voice",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
-                self._append_jsonl({
+                self._writer.append({
                     "type": "tool_result",
                     "tool_call_id": call_id,
                     "output": result,
@@ -247,7 +265,7 @@ class OrchestratorSession:
         elif event_type == "response.audio_transcript.done":
             transcript = event.get("transcript", "")
             if transcript:
-                self._append_jsonl({
+                self._writer.append({
                     "type": "assistant",
                     "message": {"role": "assistant", "content": transcript},
                     "source": "voice_response",
@@ -256,7 +274,7 @@ class OrchestratorSession:
 
         # Barge-in interruption — mark in JSONL
         elif event_type == "input_audio_buffer.speech_started":
-            self._append_jsonl({
+            self._writer.append({
                 "type": "voice_interrupted",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
@@ -269,7 +287,7 @@ class OrchestratorSession:
             raise RuntimeError("Session not started")
 
         # Persist user message
-        self._append_jsonl({
+        self._writer.append({
             "type": "user",
             "message": {"role": "user", "content": prompt},
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -282,7 +300,7 @@ class OrchestratorSession:
             if isinstance(event, TextComplete):
                 assistant_text_parts.append(event.text)
             elif isinstance(event, ToolUseStart):
-                self._append_jsonl({
+                self._writer.append({
                     "type": "tool_use",
                     "tool_call_id": event.tool_call_id,
                     "tool_name": event.tool_name,
@@ -290,7 +308,7 @@ class OrchestratorSession:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
             elif isinstance(event, ToolResultEvent):
-                self._append_jsonl({
+                self._writer.append({
                     "type": "tool_result",
                     "tool_call_id": event.tool_call_id,
                     "output": event.output,
@@ -301,7 +319,7 @@ class OrchestratorSession:
 
         # Persist assistant text response
         if assistant_text_parts:
-            self._append_jsonl({
+            self._writer.append({
                 "type": "assistant",
                 "message": {
                     "role": "assistant",
@@ -320,6 +338,58 @@ class OrchestratorSession:
         if self._agent:
             await self._agent.interrupt()
 
+    async def _summarize_history(self, messages: list[dict[str, Any]]) -> str:
+        """Summarize older conversation messages using a fast Anthropic call.
+
+        Called when history exceeds MAX_VOICE_HISTORY_MESSAGES so voice
+        sessions get a concise digest of what happened earlier.
+        """
+        if not messages:
+            return ""
+
+        # Build a compact transcript for the summarizer
+        lines: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            label = "User" if role == "user" else "Assistant"
+            if isinstance(content, str):
+                lines.append(f"{label}: {content.strip()[:500]}")
+            elif isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", "").strip()[:300])
+                    elif block.get("type") == "tool_use":
+                        parts.append(f"[tool: {block.get('name', '?')}]")
+                if parts:
+                    lines.append(f"{label}: {' '.join(parts)}")
+
+        transcript = "\n".join(lines)
+
+        try:
+            import anthropic
+            client = anthropic.AsyncAnthropic()
+            response = await client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=512,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Summarize the following conversation in 3-5 concise sentences, "
+                        "focusing on what was discussed, decisions made, and any important context "
+                        "the assistant should remember. Be factual and brief.\n\n"
+                        f"{transcript}"
+                    ),
+                }],
+            )
+            return response.content[0].text if response.content else ""
+        except Exception as e:
+            logger.warning("Failed to summarize history: %s", e)
+            return ""
+
     def _get_jsonl_path(self) -> Path:
         """Get the JSONL file path for this session."""
         import os
@@ -334,69 +404,4 @@ class OrchestratorSession:
         mangled = _mangle_path(project_dir)
         sessions_dir = base / "projects" / mangled
         sessions_dir.mkdir(parents=True, exist_ok=True)
-        return sessions_dir / f"{self._session_id}.jsonl"
-
-    def _append_jsonl(self, data: dict[str, Any]) -> None:
-        """Append a line to the session's JSONL file."""
-        if self._jsonl_path is None:
-            return
-        try:
-            with open(self._jsonl_path, "a") as f:
-                f.write(json.dumps(data) + "\n")
-        except Exception as e:
-            logger.warning("Failed to write to JSONL: %s", e)
-
-    def _load_history(self) -> list[dict[str, Any]]:
-        """Load conversation history from the JSONL file.
-
-        Reconstructs the full message history including tool calls and results.
-        Tool results are stored as separate JSONL entries and grouped into a
-        single user message (as required by the Anthropic API).
-        """
-        if self._jsonl_path is None or not self._jsonl_path.is_file():
-            return []
-
-        history: list[dict[str, Any]] = []
-        # Buffer to accumulate tool_result entries between assistant messages
-        pending_tool_results: list[dict[str, Any]] = []
-        try:
-            with open(self._jsonl_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    msg_type = obj.get("type")
-                    if msg_type == "tool_result":
-                        pending_tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": obj.get("tool_call_id", ""),
-                            "content": obj.get("output", ""),
-                            **({"is_error": True} if obj.get("is_error") else {}),
-                        })
-                    elif msg_type in ("user", "assistant"):
-                        # Flush any buffered tool results as a user message first
-                        if pending_tool_results:
-                            history.append({
-                                "role": "user",
-                                "content": pending_tool_results,
-                            })
-                            pending_tool_results = []
-                        msg = obj.get("message", {})
-                        history.append({
-                            "role": msg.get("role", msg_type),
-                            "content": msg.get("content", ""),
-                        })
-
-            # Flush any trailing tool results
-            if pending_tool_results:
-                history.append({"role": "user", "content": pending_tool_results})
-
-        except Exception as e:
-            logger.warning("Failed to load history: %s", e)
-
-        return history
+        return sessions_dir / f"{self.jsonl_id}.jsonl"

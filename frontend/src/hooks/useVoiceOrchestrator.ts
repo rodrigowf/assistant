@@ -21,6 +21,10 @@ import { ChatSocket } from "../api/websocket";
 import type { RealtimeEvent, ServerEvent, VoiceStatus } from "../types";
 
 interface UseVoiceOrchestratorOptions {
+  /** The stable local_id of the orchestrator tab — used as pool key. */
+  localId?: string;
+  /** The original session ID for JSONL continuity when resuming from history. */
+  resumeSdkId?: string | null;
   /** Called for each user transcript received (to add to message list). */
   onUserTranscript?: (text: string) => void;
   /** Called for each assistant transcript delta. */
@@ -287,17 +291,24 @@ export function useVoiceOrchestrator(
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
 
-    // 0. Stop the text orchestrator session first to release the lock
+    // Notify the text session it's about to be replaced (disconnects its WS).
+    // The backend handles the text→voice transition atomically — no need to
+    // wait for an explicit stop acknowledgment.
     optsRef.current.onBeforeStart?.();
-    // Give the backend a moment to process the stop
-    await new Promise((r) => setTimeout(r, 300));
 
     // 1. Open orchestrator WebSocket in voice mode
     const socket = new ChatSocket(handleServerEvent, "/api/orchestrator/chat");
     wsRef.current = socket;
     socket.connect(() => {
-      // WebSocket open → send voice_start
-      socket.send({ type: "voice_start" });
+      // WebSocket open → send voice_start with local_id (pool key) and
+      // resume_sdk_id (original JSONL session ID for history continuity).
+      const lid = optsRef.current.localId;
+      const resumeId = optsRef.current.resumeSdkId;
+      const payload: Record<string, unknown> = { type: "voice_start", local_id: lid };
+      if (resumeId) {
+        payload.resume_sdk_id = resumeId;
+      }
+      socket.send(payload);
     });
 
     // 2. Establish WebRTC connection in parallel

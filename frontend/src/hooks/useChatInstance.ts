@@ -333,6 +333,10 @@ export interface ChatInstance {
   voiceAssistantDelta: (text: string) => void;
   /** Finalize a voice assistant transcript in the chat. */
   voiceAssistantComplete: (text: string) => void;
+  /** Add a tool use block to the chat (for voice mode tool calls). */
+  dispatchToolUse: (toolUseId: string, toolName: string, toolInput: Record<string, unknown>) => void;
+  /** Add a tool result to a pending tool use block (for voice mode tool results). */
+  dispatchToolResult: (toolUseId: string, output: string, isError: boolean) => void;
 }
 
 interface UseChatInstanceOptions {
@@ -379,6 +383,8 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   onSessionClosedRef.current = onSessionClosed;
   const localIdRef = useRef(localId);
   localIdRef.current = localId;
+  const resumeSdkIdRef = useRef(resumeSdkId);
+  resumeSdkIdRef.current = resumeSdkId;
 
   // Track status changes and notify parent
   const prevStatusRef = useRef<{ status: SessionStatus; conn: ConnectionState } | null>(null);
@@ -539,7 +545,11 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
 
   const restart = useCallback(() => {
     // Re-send start on the existing WebSocket to re-register with the orchestrator
-    wsSend({ type: "start", local_id: localIdRef.current });
+    const msg: Record<string, unknown> = { type: "start", local_id: localIdRef.current };
+    if (resumeSdkIdRef.current) {
+      msg.resume_sdk_id = resumeSdkIdRef.current;
+    }
+    wsSend(msg);
   }, [wsSend]);
 
   const sendVoiceEvent = useCallback(
@@ -574,6 +584,20 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     []
   );
 
+  const dispatchToolUse = useCallback(
+    (toolUseId: string, toolName: string, toolInput: Record<string, unknown>) => {
+      dispatch({ type: "TOOL_USE", toolUseId, toolName, toolInput });
+    },
+    []
+  );
+
+  const dispatchToolResult = useCallback(
+    (toolUseId: string, output: string, isError: boolean) => {
+      dispatch({ type: "TOOL_RESULT", toolUseId, output, isError });
+    },
+    []
+  );
+
   return {
     messages: state.messages,
     status: state.status,
@@ -592,5 +616,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     addDisplayMessage,
     voiceAssistantDelta,
     voiceAssistantComplete,
+    dispatchToolUse,
+    dispatchToolResult,
   };
 }

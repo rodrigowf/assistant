@@ -206,6 +206,11 @@ class SessionManager:
     def turns(self) -> int:
         return self._turns
 
+    @property
+    def is_resumed(self) -> bool:
+        """True if this session was resumed from an existing SDK session."""
+        return self._resume_id is not None
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
