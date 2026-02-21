@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -63,13 +64,15 @@ class SessionManager:
         self,
         session_id: str | None = None,
         *,
+        local_id: str | None = None,
         fork: bool = False,
         config: ManagerConfig | None = None,
     ) -> None:
         self._config = config or ManagerConfig.load()
-        self._resume_id = session_id
+        self._local_id = local_id or str(uuid.uuid4())
+        self._resume_id = session_id  # SDK session ID for resume
         self._fork = fork
-        self._session_id: str | None = None
+        self._sdk_session_id: str | None = None
         self._client: ClaudeSDKClient | None = None
         self._status = SessionStatus.DISCONNECTED
         self._cost: float = 0.0
@@ -91,28 +94,26 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def start(self) -> str:
-        """Connect to Claude Code and return the session ID."""
-        import uuid
+        """Connect to Claude Code and return the local session ID.
 
+        The local ID is stable and never changes.  The real SDK session ID
+        is captured from ``server_info`` (if available) or from the first
+        ``ResultMessage`` after a query, and stored as ``sdk_session_id``.
+        """
         options = self._build_options()
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
 
-        # Use resume_id if provided (resuming existing session).
-        # Otherwise check server_info or generate a new UUID.
-        # Note: The actual SDK session ID comes back in ResultMessage after
-        # queries, so for new sessions _session_id may be updated later.
+        # Capture the SDK session ID if available at connect time.
         if self._resume_id:
-            self._session_id = self._resume_id
+            self._sdk_session_id = self._resume_id
         else:
             server_info = await self._client.get_server_info()
             if server_info:
-                self._session_id = server_info.get("session_id") or str(uuid.uuid4())
-            else:
-                self._session_id = str(uuid.uuid4())
+                self._sdk_session_id = server_info.get("session_id")
 
         self._status = SessionStatus.IDLE
-        return self._session_id or ""
+        return self._local_id
 
     async def stop(self) -> None:
         """Disconnect from Claude Code."""
@@ -172,8 +173,19 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     @property
-    def session_id(self) -> str | None:
-        return self._session_id
+    def local_id(self) -> str:
+        """Stable local identifier (never changes)."""
+        return self._local_id
+
+    @property
+    def session_id(self) -> str:
+        """Alias for local_id — the stable session identifier."""
+        return self._local_id
+
+    @property
+    def sdk_session_id(self) -> str | None:
+        """The Claude Code SDK session ID (may arrive later via ResultMessage)."""
+        return self._sdk_session_id
 
     @property
     def is_active(self) -> bool:
@@ -193,6 +205,11 @@ class SessionManager:
     @property
     def turns(self) -> int:
         return self._turns
+
+    @property
+    def is_resumed(self) -> bool:
+        """True if this session was resumed from an existing SDK session."""
+        return self._resume_id is not None
 
     # ------------------------------------------------------------------
     # Internals
@@ -301,10 +318,9 @@ class SessionManager:
             self._turns += msg.num_turns
             if msg.total_cost_usd is not None:
                 self._cost += msg.total_cost_usd
-            # Update session_id from ResultMessage if we didn't have one
-            # (for new sessions where we generated a placeholder UUID)
-            if msg.session_id and not self._resume_id:
-                self._session_id = msg.session_id
+            # Always capture the SDK session ID from ResultMessage
+            if msg.session_id:
+                self._sdk_session_id = msg.session_id
             yield TurnComplete(
                 cost=msg.total_cost_usd,
                 usage=msg.usage or {},

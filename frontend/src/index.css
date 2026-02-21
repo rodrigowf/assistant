@@ -1,53 +1,76 @@
-/* Theme and base styles */
+/* ── Theme ──────────────────────────────────────────────────── */
 
 :root {
-  --bg: #18191a;
-  --bg-surface: #212223;
-  --bg-elevated: #2a2b2c;
-  --bg-hover: #333435;
-  --border: #3a3b3c;
-  --border-subtle: #2a2b2c;
-  --text: #b8b9ba;
-  --text-muted: #808182;
-  --text-bright: #e4e5e6;
-  --accent: hsl(276, 65%, 70%);
-  --accent-hover: hsl(276, 53%, 55%);
-  --accent-subtle: hsla(276, 53%, 55%, 0.123);
-  --user-bg: #262728;
-  --error: #d45d5d;
-  --success: #5cb87a;
-  --thinking-border: #c9a856;
-  --tool-border: #6a9fcf;
+  /* Backgrounds — clear contrast-based depth hierarchy */
+  --bg:          #0d0d0f;   /* page canvas — darkest */
+  --bg-surface:  #171719;   /* sidebar, topbars — noticeably lighter */
+  --bg-elevated: #1e1e22;   /* tool blocks, cards */
+  --bg-hover:    #252529;   /* hover highlight */
+  --bg-input:    #1a1a1e;   /* text input */
 
-  /* Semantic tool colors - action-based HSL palette (desaturated) */
-  --tool-read: hsl(210, 28%, 55%);       /* Cool blue - observation, inspection */
-  --tool-write: hsl(160, 28%, 48%);      /* Teal-green - creation, modification */
-  --tool-execute: hsl(35, 32%, 50%);     /* Warm brown - terminal, processing */
-  --tool-script: hsl(14, 28%, 52%);      /* Golden amber - script execution */
-  --tool-navigate: hsl(320, 22%, 55%);   /* Dusty rose - active browser control */
-  --tool-capture: hsl(195, 32%, 52%);    /* Sky cyan - screenshots, snapshots */
-  --tool-interact: hsl(30, 38%, 55%);    /* Warm coral - user prompts, dialogs */
-  --tool-todo: hsl(280, 22%, 55%);       /* Soft violet - task tracking, progress */
-  --tool-task: hsl(257, 18%, 52%);       /* Deep indigo - agent delegation */
-  --tool-system: hsl(220, 10%, 52%);     /* Neutral slate - misc, unknown */
+  /* Borders — used sparingly, not for major separations */
+  --border:        #2a2a30;
+  --border-subtle: #1c1c20;
+  --border-strong: #3c3c44;
 
-  /* Background variants (low opacity) */
-  --tool-read-bg: hsla(210, 40%, 55%, 0.08);
-  --tool-write-bg: hsla(160, 40%, 45%, 0.08);
-  --tool-execute-bg: hsla(35, 45%, 45%, 0.08);
-  --tool-script-bg: hsla(14, 38%, 49%, 0.08);
-  --tool-navigate-bg: hsla(320, 35%, 55%, 0.08);
-  --tool-capture-bg: hsla(195, 50%, 50%, 0.08);
-  --tool-interact-bg: hsla(30, 50%, 55%, 0.08);
-  --tool-todo-bg: hsla(280, 35%, 45%, 0.1);
-  --tool-task-bg: hsla(257, 20%, 35%, 0.08);
-  --tool-system-bg: hsla(220, 15%, 50%, 0.08);
-  --radius: 8px;
-  --radius-lg: 12px;
-  --sidebar-width: 280px;
-  --transition: 150ms ease;
+  /* Text */
+  --text:        #c0c0c8;
+  --text-muted:  #6a6a74;
+  --text-bright: #eeeef2;
+  --text-dim:    #38383f;
 
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  /* Accent — cool slate-blue, refined and readable */
+  --accent:        hsl(220, 38%, 66%);
+  --accent-hover:  hsl(220, 42%, 56%);
+  --accent-subtle: hsla(220, 38%, 66%, 0.12);
+  --accent-glow:   hsla(220, 38%, 66%, 0.2);
+
+  /* User message bubble — barely-there cool tint for clear contrast */
+  --user-bg:     #18181f;
+  --user-border: #28283a;
+
+  /* Semantic status */
+  --error:      #d45f5f;
+  --error-bg:   rgba(212, 95, 95, 0.1);
+  --success:    #4aaa7a;
+  --success-bg: rgba(74, 170, 122, 0.1);
+
+  --thinking-border: #c4923a;
+  --tool-border:     #5888cc;
+
+  /* Tool colors — muted, intentional */
+  --tool-read:     hsl(210, 42%, 60%);
+  --tool-write:    hsl(155, 36%, 52%);
+  --tool-execute:  hsl(35,  46%, 56%);
+  --tool-script:   hsl(25,  44%, 54%);
+  --tool-navigate: hsl(315, 28%, 58%);
+  --tool-capture:  hsl(190, 42%, 54%);
+  --tool-interact: hsl(28,  50%, 56%);
+  --tool-todo:     hsl(275, 28%, 58%);
+  --tool-task:     hsl(252, 30%, 56%);
+  --tool-system:   hsl(220, 14%, 52%);
+
+  --tool-read-bg:     hsla(210, 45%, 55%, 0.07);
+  --tool-write-bg:    hsla(155, 40%, 48%, 0.07);
+  --tool-execute-bg:  hsla(35,  50%, 48%, 0.07);
+  --tool-script-bg:   hsla(25,  48%, 50%, 0.07);
+  --tool-navigate-bg: hsla(315, 35%, 55%, 0.07);
+  --tool-capture-bg:  hsla(190, 45%, 52%, 0.07);
+  --tool-interact-bg: hsla(28,  55%, 55%, 0.07);
+  --tool-todo-bg:     hsla(275, 35%, 50%, 0.08);
+  --tool-task-bg:     hsla(252, 35%, 48%, 0.07);
+  --tool-system-bg:   hsla(220, 15%, 46%, 0.07);
+
+  /* Layout tokens */
+  --radius:        7px;
+  --radius-lg:     12px;
+  --radius-xl:     18px;
+  --sidebar-width: 256px;
+  --topbar-height: 44px;
+  --transition:      130ms ease;
+  --transition-slow: 220ms ease;
+
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
   line-height: 1.5;
   color: var(--text);
   background-color: var(--bg);
@@ -57,48 +80,18 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-*, *::before, *::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-body {
-  min-height: 100vh;
-}
+body { min-height: 100vh; }
 
-#root {
-  height: 100vh;
-  display: flex;
-}
+#root { height: 100vh; display: flex; }
 
-button {
-  font-family: inherit;
-  cursor: pointer;
-  border: none;
-  background: none;
-  color: inherit;
-}
+button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
 
-input, textarea {
-  font-family: inherit;
-  color: inherit;
-  background: none;
-  border: none;
-  outline: none;
-}
+input, textarea { font-family: inherit; color: inherit; background: none; border: none; outline: none; }
 
 /* Scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--text-muted);
-}
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }

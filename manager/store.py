@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .index_utils import remove_session_from_index
 from .types import ContentBlock, MessagePreview, SessionDetail, SessionInfo
 
 
@@ -132,7 +133,12 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     def list_sessions(self) -> list[SessionInfo]:
-        """List all sessions for this project, sorted by most recent first."""
+        """List all sessions for this project, sorted by most recent first.
+
+        JSONL files that can't be parsed (no valid timestamps) are skipped
+        but NOT deleted — they may be in-progress sessions or have a format
+        we don't understand yet.
+        """
         if not self._sessions_dir.is_dir():
             return []
 
@@ -179,11 +185,37 @@ class SessionStore:
             return []
         return detail.messages[-max_messages:]
 
+    def get_session_info(self, session_id: str) -> SessionInfo | None:
+        """Get lightweight summary info for a single session (no full parse)."""
+        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            return None
+        return self._parse_session_info(jsonl_path, session_id)
+
+    def rename_session(self, session_id: str, title: str) -> bool:
+        """Store a custom title for a session. Returns True if the session exists."""
+        if not (self._sessions_dir / f"{session_id}.jsonl").is_file():
+            return False
+        titles = self._load_titles()
+        titles[session_id] = title.strip()
+        self._save_titles(titles)
+        return True
+
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session's JSONL file. Returns True if deleted."""
+        """Delete a session's JSONL file and remove it from the vector index.
+
+        Returns True if deleted.
+        """
         jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
         if jsonl_path.is_file():
             jsonl_path.unlink()
+            # Also remove any custom title
+            titles = self._load_titles()
+            if session_id in titles:
+                del titles[session_id]
+                self._save_titles(titles)
+            # Remove from vector index
+            remove_session_from_index(session_id, collection_name="history")
             return True
         return False
 
@@ -192,12 +224,33 @@ class SessionStore:
         """Path to the sessions directory."""
         return self._sessions_dir
 
+    def _titles_path(self) -> Path:
+        return self._sessions_dir / ".titles.json"
+
+    def _load_titles(self) -> dict[str, str]:
+        try:
+            with open(self._titles_path()) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_titles(self, titles: dict[str, str]) -> None:
+        try:
+            with open(self._titles_path(), "w") as f:
+                json.dump(titles, f)
+        except OSError:
+            pass
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _read_messages(self, jsonl_path: Path) -> list[dict]:
-        """Read all user/assistant/system message lines from a JSONL file."""
+        """Read user/assistant/tool_use/tool_result lines from a JSONL file.
+
+        Includes orchestrator-format standalone tool records so _to_previews
+        can attach them to the surrounding assistant messages.
+        """
         messages: list[dict] = []
         try:
             with open(jsonl_path) as f:
@@ -209,7 +262,7 @@ class SessionStore:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if obj.get("type") in ("user", "assistant", "system"):
+                    if obj.get("type") in ("user", "assistant", "system", "tool_use", "tool_result"):
                         messages.append(obj)
         except (OSError, PermissionError):
             pass
@@ -221,6 +274,7 @@ class SessionStore:
         first_timestamp: str | None = None
         last_timestamp: str | None = None
         message_count = 0
+        is_orchestrator = False
 
         try:
             with open(jsonl_path) as f:
@@ -235,6 +289,10 @@ class SessionStore:
 
                     msg_type = obj.get("type")
                     ts = obj.get("timestamp")
+
+                    # Detect orchestrator metadata (first line)
+                    if msg_type == "orchestrator_meta" and obj.get("orchestrator"):
+                        is_orchestrator = True
 
                     if ts:
                         if first_timestamp is None:
@@ -251,12 +309,16 @@ class SessionStore:
         if first_timestamp is None:
             return None
 
+        titles = self._load_titles()
+        title = titles.get(session_id) or (first_user_text[:100] if first_user_text else "(empty session)")
+
         return SessionInfo(
             session_id=session_id,
             started_at=_parse_timestamp(first_timestamp),
             last_activity=_parse_timestamp(last_timestamp or first_timestamp),
-            title=first_user_text[:100] if first_user_text else "(empty session)",
+            title=title,
             message_count=message_count,
+            is_orchestrator=is_orchestrator,
         )
 
     def _first_user_text(self, messages: list[dict]) -> str:
@@ -267,18 +329,65 @@ class SessionStore:
         return ""
 
     def _to_previews(self, messages: list[dict]) -> list[MessagePreview]:
-        """Convert raw messages to MessagePreview objects."""
+        """Convert raw messages to MessagePreview objects.
+
+        Handles both the Claude SDK native format (tool blocks nested inside
+        message.content[]) and the orchestrator format (standalone tool_use /
+        tool_result records interspersed between user/assistant lines).
+        """
         previews: list[MessagePreview] = []
+        # Pending standalone tool records (orchestrator JSONL format):
+        # tool_use records come after a user message; tool_result records
+        # come after those. Both get merged into the next assistant message.
+        pending_tool_uses: list[ContentBlock] = []
+        pending_tool_results: dict[str, str] = {}  # tool_call_id → output
+
         for msg in messages:
             msg_type = msg.get("type")
+
+            # Collect standalone tool_use records (orchestrator format)
+            if msg_type == "tool_use":
+                pending_tool_uses.append(ContentBlock(
+                    type="tool_use",
+                    tool_use_id=msg.get("tool_call_id"),
+                    tool_name=msg.get("tool_name"),
+                    tool_input=msg.get("tool_input", {}),
+                ))
+                continue
+
+            # Collect standalone tool_result records (orchestrator format)
+            if msg_type == "tool_result":
+                call_id = msg.get("tool_call_id", "")
+                output = msg.get("output", "")
+                pending_tool_results[call_id] = output
+                continue
+
             if msg_type not in ("user", "assistant"):
                 continue
 
             role = msg_type
             text = _extract_text(msg)
+            # Start with any blocks embedded in message.content (SDK format)
             blocks = _extract_blocks(msg)
             ts = msg.get("timestamp")
             timestamp = _parse_timestamp(ts) if ts else None
+
+            # For assistant messages: merge in any pending orchestrator tool records
+            if role == "assistant" and pending_tool_uses:
+                extra: list[ContentBlock] = []
+                for tu in pending_tool_uses:
+                    result_output = pending_tool_results.get(tu.tool_use_id or "", "")
+                    extra.append(ContentBlock(
+                        type="tool_use",
+                        tool_use_id=tu.tool_use_id,
+                        tool_name=tu.tool_name,
+                        tool_input=tu.tool_input,
+                        output=result_output,
+                        is_error=False,
+                    ))
+                blocks = extra + blocks
+                pending_tool_uses = []
+                pending_tool_results = {}
 
             previews.append(MessagePreview(
                 role=role,

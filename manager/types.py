@@ -110,6 +110,7 @@ class SessionInfo:
     last_activity: datetime
     title: str  # first user prompt, truncated
     message_count: int
+    is_orchestrator: bool = False
 
 
 @dataclass(slots=True)
@@ -145,6 +146,7 @@ class SessionDetail:
     title: str
     message_count: int
     messages: list[MessagePreview] = field(default_factory=list)
+    is_orchestrator: bool = False
 
 
 # ---------------------------------------------------------------------------

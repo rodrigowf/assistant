@@ -15,6 +15,9 @@ class SessionInfoResponse(BaseModel):
     last_activity: str
     title: str
     message_count: int
+    is_orchestrator: bool = False
+    # Set when this session is currently live in the pool (local_id is the stable tab key)
+    local_id: str | None = None
 
 
 class ContentBlockResponse(BaseModel):
@@ -36,6 +39,17 @@ class MessagePreviewResponse(BaseModel):
 
 class SessionDetailResponse(SessionInfoResponse):
     messages: list[MessagePreviewResponse] = []
+
+
+class PoolSessionResponse(BaseModel):
+    """A session that is currently live in the pool (not just in JSONL history)."""
+    local_id: str
+    sdk_session_id: str | None = None
+    status: str
+    cost: float
+    turns: int
+    title: str | None = None
+    is_orchestrator: bool = False
 
 
 class AuthStatusResponse(BaseModel):

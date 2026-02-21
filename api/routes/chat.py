@@ -7,9 +7,8 @@ import logging
 import orjson
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from api.connections import ConnectionManager
+from api.pool import SessionPool
 from api.serializers import serialize_event
-from manager.config import ManagerConfig
 from manager.session import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -19,7 +18,7 @@ router = APIRouter(tags=["chat"])
 @router.websocket("/api/sessions/chat")
 async def chat_ws(ws: WebSocket):
     await ws.accept()
-    cm: ConnectionManager = ws.app.state.connections
+    pool: SessionPool = ws.app.state.pool
 
     sm: SessionManager | None = None
     session_id: str | None = None
@@ -38,7 +37,7 @@ async def chat_ws(ws: WebSocket):
             msg_type = msg.get("type", "")
 
             if msg_type == "start":
-                sm, session_id = await _handle_start(ws, cm, msg)
+                sm, session_id = await _handle_start(ws, pool, msg)
                 if sm is None:
                     continue
 
@@ -49,7 +48,7 @@ async def chat_ws(ws: WebSocket):
                         "detail": "Send a 'start' message first",
                     }))
                     continue
-                await _handle_send(ws, sm, msg.get("text", ""))
+                session_id = await _handle_send(ws, sm, pool, session_id, msg.get("text", ""))
 
             elif msg_type == "command":
                 if sm is None:
@@ -60,15 +59,15 @@ async def chat_ws(ws: WebSocket):
                 await _handle_command(ws, sm, msg.get("text", ""))
 
             elif msg_type == "interrupt":
-                if sm is not None:
-                    await sm.interrupt()
+                if sm is not None and session_id:
+                    await pool.interrupt(session_id)
                     await ws.send_bytes(orjson.dumps({
                         "type": "status", "status": "interrupted",
                     }))
 
             elif msg_type == "stop":
                 if session_id:
-                    await cm.disconnect(session_id)
+                    pool.unsubscribe(session_id, ws)
                 sm = None
                 session_id = None
                 await ws.send_bytes(orjson.dumps({"type": "session_stopped"}))
@@ -83,24 +82,41 @@ async def chat_ws(ws: WebSocket):
         pass
     finally:
         if session_id:
-            await cm.disconnect(session_id)
+            pool.unsubscribe(session_id, ws)
 
 
 async def _handle_start(
-    ws: WebSocket, cm: ConnectionManager, msg: dict,
+    ws: WebSocket, pool: SessionPool, msg: dict,
 ) -> tuple[SessionManager | None, str | None]:
-    """Start or resume a session. Returns (sm, session_id) or (None, None)."""
-    resume_id = msg.get("session_id")
-    fork = msg.get("fork", False)
-    config = ManagerConfig.load()
+    """Start or resume a session via the pool. Returns (sm, session_id) or (None, None).
 
-    sm = SessionManager(session_id=resume_id, fork=fork, config=config)
+    The frontend sends ``local_id`` (stable tab UUID) and optionally
+    ``resume_sdk_id`` (Claude Code SDK session ID for resuming from history).
+    """
+    local_id = msg.get("local_id")
+    resume_sdk_id = msg.get("resume_sdk_id") or msg.get("session_id")
+    fork = msg.get("fork", False)
+
+    # Check if this session already exists in the pool (re-subscribing)
+    if local_id and pool.has(local_id):
+        sm = pool.get(local_id)
+        pool.subscribe(local_id, ws)
+        await ws.send_bytes(orjson.dumps({
+            "type": "session_started", "session_id": local_id,
+        }))
+        return sm, local_id
+
+    # Create a new session via the pool
+    from manager.config import ManagerConfig
+    config = ManagerConfig.load()
     try:
-        # Send status to frontend while connecting
         await ws.send_bytes(orjson.dumps({
             "type": "status", "status": "connecting",
         }))
-        session_id = await asyncio.wait_for(sm.start(), timeout=30.0)
+        session_id = await asyncio.wait_for(
+            pool.create(config, local_id=local_id, resume_sdk_id=resume_sdk_id, fork=fork),
+            timeout=30.0,
+        )
     except asyncio.TimeoutError:
         logger.warning("Session start timed out after 30s")
         await ws.send_bytes(orjson.dumps({
@@ -116,24 +132,34 @@ async def _handle_start(
         }))
         return None, None
 
-    cm.connect(session_id, ws, sm)
+    sm = pool.get(session_id)
+    pool.subscribe(session_id, ws)
     await ws.send_bytes(orjson.dumps({
         "type": "session_started", "session_id": session_id,
     }))
     return sm, session_id
 
 
-async def _handle_send(ws: WebSocket, sm: SessionManager, text: str) -> None:
-    """Stream events from sm.send() to the WebSocket."""
+async def _handle_send(
+    ws: WebSocket,
+    sm: SessionManager,
+    pool: SessionPool,
+    session_id: str | None,
+    text: str,
+) -> str | None:
+    """Stream events to the WebSocket via pool broadcast.
+
+    The session_id is the stable local_id and never changes.
+    """
     try:
-        async for event in sm.send(text):
-            payload = serialize_event(event)
-            await ws.send_bytes(orjson.dumps(payload))
+        async for event in pool.send(session_id, text, source_ws=ws):
+            pass  # Events already broadcast by pool
     except Exception as e:
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "send_failed",
             "detail": str(e),
         }))
+    return session_id
 
 
 async def _handle_command(ws: WebSocket, sm: SessionManager, text: str) -> None:

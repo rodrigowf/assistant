@@ -54,3 +54,43 @@ def serialize_event(event: Event) -> dict[str, Any]:
     if isinstance(event, CompactComplete):
         return {"type": "compact_complete", "trigger": event.trigger}
     return {"type": "unknown"}
+
+
+def serialize_orchestrator_event(event: object) -> dict[str, Any]:
+    """Convert an orchestrator OrchestratorEvent to a JSON-compatible dict."""
+    from orchestrator.types import (
+        TextDelta as OTextDelta,
+        TextComplete as OTextComplete,
+        ToolUseStart,
+        ToolResultEvent,
+        TurnComplete as OTurnComplete,
+        ErrorEvent,
+    )
+
+    if isinstance(event, OTextDelta):
+        return {"type": "text_delta", "text": event.text}
+    if isinstance(event, OTextComplete):
+        return {"type": "text_complete", "text": event.text}
+    if isinstance(event, ToolUseStart):
+        return {
+            "type": "tool_use",
+            "tool_use_id": event.tool_call_id,
+            "tool_name": event.tool_name,
+            "tool_input": event.tool_input,
+        }
+    if isinstance(event, ToolResultEvent):
+        return {
+            "type": "tool_result",
+            "tool_use_id": event.tool_call_id,
+            "output": event.output,
+            "is_error": event.is_error,
+        }
+    if isinstance(event, OTurnComplete):
+        return {
+            "type": "turn_complete",
+            "input_tokens": event.input_tokens,
+            "output_tokens": event.output_tokens,
+        }
+    if isinstance(event, ErrorEvent):
+        return {"type": "error", "error": event.error, "detail": event.detail}
+    return {"type": "unknown"}

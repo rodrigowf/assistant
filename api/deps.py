@@ -9,6 +9,7 @@ from manager.config import ManagerConfig
 from manager.store import SessionStore
 
 from .connections import ConnectionManager
+from .pool import SessionPool
 
 
 def get_config(request: Request) -> ManagerConfig:
@@ -25,3 +26,7 @@ def get_auth(request: Request) -> AuthManager:
 
 def get_connections(request: Request) -> ConnectionManager:
     return request.app.state.connections
+
+
+def get_pool(request: Request) -> SessionPool:
+    return request.app.state.pool

@@ -9,10 +9,10 @@ export class ChatSocket {
   private onOpen: OpenHandler | null = null;
   private _url: string;
 
-  constructor(handler: EventHandler) {
+  constructor(handler: EventHandler, endpoint = "/api/sessions/chat") {
     this.handler = handler;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    this._url = `${proto}//${location.host}/api/sessions/chat`;
+    this._url = `${proto}//${location.host}${endpoint}`;
   }
 
   connect(onOpen?: OpenHandler): void {

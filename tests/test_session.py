@@ -83,16 +83,35 @@ def _make_mock_client(init_messages=None, response_messages_fn=None, server_info
 
 class TestSessionManagerLifecycle:
     @pytest.mark.asyncio
-    async def test_start_returns_session_id(self):
+    async def test_start_returns_local_id(self):
+        """start() returns the stable local_id, not the SDK session ID."""
         client = _make_mock_client(server_info={"session_id": "abc-123"})
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager(local_id="my-local-id")
+            sid = await sm.start()
+
+            # Returns the local_id (stable identifier)
+            assert sid == "my-local-id"
+            assert sm.local_id == "my-local-id"
+            assert sm.session_id == "my-local-id"  # alias for local_id
+            # SDK session ID captured from server_info
+            assert sm.sdk_session_id == "abc-123"
+            assert sm.status == SessionStatus.IDLE
+
+    @pytest.mark.asyncio
+    async def test_start_generates_local_id(self):
+        """If no local_id is provided, one is generated."""
+        client = _make_mock_client(server_info={"session_id": "sdk-abc"})
 
         with patch("manager.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             sid = await sm.start()
 
-            assert sid == "abc-123"
-            assert sm.session_id == "abc-123"
-            assert sm.status == SessionStatus.IDLE
+            # A UUID was generated as local_id
+            assert sid == sm.local_id
+            assert len(sid) > 0
+            assert sm.sdk_session_id == "sdk-abc"
 
     @pytest.mark.asyncio
     async def test_stop_disconnects(self):
@@ -111,24 +130,26 @@ class TestSessionManagerLifecycle:
         client = _make_mock_client(server_info={"session_id": "ctx"})
 
         with patch("manager.session.ClaudeSDKClient", return_value=client):
-            async with SessionManager() as sm:
-                assert sm.session_id == "ctx"
+            async with SessionManager(local_id="ctx-local") as sm:
+                assert sm.local_id == "ctx-local"
+                assert sm.sdk_session_id == "ctx"
 
             client.disconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_resume_uses_provided_session_id(self):
-        """When resuming a session, start() returns the provided session_id."""
-        # server_info doesn't include session_id (realistic scenario)
+    async def test_resume_stores_sdk_session_id(self):
+        """When resuming, the SDK session ID is stored separately from local_id."""
         client = _make_mock_client(server_info={"commands": [], "output_style": "plain"})
 
         with patch("manager.session.ClaudeSDKClient", return_value=client):
-            sm = SessionManager(session_id="existing-session-abc")
+            sm = SessionManager(session_id="existing-session-abc", local_id="local-xyz")
             sid = await sm.start()
 
-            # Should use the resume_id, not generate a new UUID
-            assert sid == "existing-session-abc"
-            assert sm.session_id == "existing-session-abc"
+            # Returns local_id
+            assert sid == "local-xyz"
+            assert sm.local_id == "local-xyz"
+            # SDK session ID captured from the resume_id
+            assert sm.sdk_session_id == "existing-session-abc"
 
 
 class TestSessionManagerSend:
