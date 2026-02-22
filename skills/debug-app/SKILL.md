@@ -54,7 +54,7 @@ Use these MCP tools to automate browser interaction with the frontend.
 
 ### Opening the Application
 
-Use the new_page tool to open a browser tab at the frontend URL (http://localhost:5173). This creates a new Chrome page you can control.
+Use the new_page tool to open a browser tab at the frontend URL (https://localhost:5173). This creates a new Chrome page you can control.
 
 ### Taking Snapshots
 

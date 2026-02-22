@@ -31,15 +31,15 @@ scripts/
 ## 🌐 Access URLs
 
 ### Gallery Index
-- **Local:** http://localhost:5173/visualizations/index.html
-- **Network:** http://192.168.0.28:5173/visualizations/index.html
+- **Local:** https://localhost:5173/visualizations/index.html
+- **Network:** https://192.168.0.28:5173/visualizations/index.html
 
 ### Individual Visualizations
 | Name | Description | URL |
 |------|-------------|-----|
-| Example | Animated interactive rectangle | http://192.168.0.28:5173/visualizations/example.html |
-| System Stats | Real-time monitoring dashboard | http://192.168.0.28:5173/visualizations/system-stats.html |
-| Remote Demo | Fire TV remote control demo | http://192.168.0.28:5173/visualizations/remote-demo.html |
+| Example | Animated interactive rectangle | https://192.168.0.28:5173/visualizations/example.html |
+| System Stats | Real-time monitoring dashboard | https://192.168.0.28:5173/visualizations/system-stats.html |
+| Remote Demo | Fire TV remote control demo | https://192.168.0.28:5173/visualizations/remote-demo.html |
 
 ## 🚀 Quick Start
 
@@ -49,7 +49,7 @@ Simply open any URL in your browser. No build step needed!
 
 ```bash
 # Local access
-xdg-open http://localhost:5173/visualizations/index.html
+xdg-open https://localhost:5173/visualizations/index.html
 
 # Or use the helper script
 scripts/run.sh scripts/get_visualization_url.py index
@@ -66,7 +66,7 @@ scripts/test_visualization_on_tv.sh
 **Option B: Direct ADB command**
 ```bash
 adb shell am start -a android.intent.action.VIEW \
-    -d "http://192.168.0.28:5173/visualizations/example.html"
+    -d "https://192.168.0.28:5173/visualizations/example.html"
 ```
 
 **Option C: Via /tv-remote skill** (if available)
@@ -84,7 +84,7 @@ touch frontend/public/visualizations/my-viz.html
 # (Use example.html as a template)
 
 # Access immediately - no build needed!
-http://localhost:5173/visualizations/my-viz.html
+https://localhost:5173/visualizations/my-viz.html
 ```
 
 ## 🛠️ Utilities
@@ -265,7 +265,7 @@ Just ask Claude to:
 ```
 Browser/Fire TV
       ↓
-   HTTP GET http://192.168.0.28:5173/visualizations/example.html
+   HTTP GET https://192.168.0.28:5173/visualizations/example.html
       ↓
   Vite Dev Server (port 5173)
       ↓
@@ -295,7 +295,7 @@ lsof -ti:5173
 ls -la frontend/public/visualizations/
 
 # 3. Test with curl
-curl -I http://localhost:5173/visualizations/example.html
+curl -I https://localhost:5173/visualizations/example.html
 # Should return: HTTP/1.1 200 OK
 ```
 
@@ -306,7 +306,7 @@ curl -I http://localhost:5173/visualizations/example.html
 adb devices
 
 # 2. Test URL in desktop browser first
-xdg-open http://192.168.0.28:5173/visualizations/example.html
+xdg-open https://192.168.0.28:5173/visualizations/example.html
 
 # 3. Check firewall
 sudo ufw status
@@ -359,7 +359,7 @@ sudo ufw status
 
 - **Documentation:** `frontend/public/visualizations/README.md`
 - **Quick Reference:** `frontend/public/visualizations/QUICKSTART.md`
-- **Gallery:** http://localhost:5173/visualizations/index.html
+- **Gallery:** https://localhost:5173/visualizations/index.html
 - **Examples:** Use existing `.html` files as templates
 
 ## 🎉 Success Criteria
@@ -385,4 +385,4 @@ You now have a complete, working visualization system that:
 - Provides utilities for easy URL generation and testing
 - Has comprehensive documentation and quick-start guides
 
-**Start exploring:** http://localhost:5173/visualizations/index.html
+**Start exploring:** https://localhost:5173/visualizations/index.html

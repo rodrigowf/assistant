@@ -112,8 +112,8 @@ scripts/run.sh scripts/create_visualization.py \
 2. **Run the creation script** with appropriate arguments
 3. **Report the results** including:
    - Success message with file path
-   - Local URL: `http://localhost:5173/visualizations/filename.html`
-   - Network URL: `http://<local-ip>:5173/visualizations/filename.html`
+   - Local URL: `https://localhost:5173/visualizations/filename.html`
+   - Network URL: `https://<local-ip>:5173/visualizations/filename.html`
    - If display-tv was used, confirm whether it opened successfully
 4. **Provide next steps**:
    - How to view it in browser
@@ -134,7 +134,7 @@ To display an existing visualization on Fire TV:
 
 ```
 adb shell am start -a android.intent.action.VIEW \
-  -d "http://<local-ip>:5173/visualizations/filename.html"
+  -d "https://<local-ip>:5173/visualizations/filename.html"
 ```
 
 Or use the `/tv-remote` skill if available.
@@ -184,4 +184,4 @@ Or use the `/tv-remote` skill if available.
 
 - `/tv-remote` - Control Fire TV (launch apps, navigate)
 - `/connect-tv` - Connect to Fire TV via ADB
-- Gallery available at: `http://localhost:5173/visualizations/index.html`
+- Gallery available at: `https://localhost:5173/visualizations/index.html`

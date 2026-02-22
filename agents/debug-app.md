@@ -51,7 +51,7 @@ When debugging, start servers with verbose output to capture logs:
 Use Chrome DevTools MCP tools to interact with the running application:
 
 **Navigation and Snapshots:**
-- `navigate_page` to load the app (typically http://localhost:5173)
+- `navigate_page` to load the app (typically https://localhost:5173)
 - `take_snapshot` to get the current page structure and element UIDs
 - `take_screenshot` to capture visual state
 

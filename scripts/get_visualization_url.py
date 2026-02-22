@@ -62,7 +62,7 @@ def main():
     else:
         host = "localhost"
 
-    url = f"http://{host}:{args.port}/visualizations/{filename}"
+    url = f"https://{host}:{args.port}/visualizations/{filename}"
     print(url)
 
 

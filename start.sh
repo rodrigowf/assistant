@@ -29,7 +29,7 @@ cd "$SCRIPT_DIR"
 
 echo ""
 echo -e "${GREEN}✓ Backend running at:${NC}  http://localhost:8000"
-echo -e "${GREEN}✓ Frontend running at:${NC} http://localhost:5173"
+echo -e "${GREEN}✓ Frontend running at:${NC} https://localhost:5173"
 echo ""
 echo "Press Ctrl+C to stop both servers"
 

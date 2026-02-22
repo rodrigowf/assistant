@@ -369,7 +369,7 @@ def create_visualization(filename, title, content):
 def get_network_url(filename, port=5173):
     """Generate the network URL for the visualization."""
     local_ip = get_local_ip()
-    return f"http://{local_ip}:{port}/visualizations/{filename}"
+    return f"https://{local_ip}:{port}/visualizations/{filename}"
 
 
 def display_on_tv(url):
@@ -448,7 +448,7 @@ def main():
     network_url = get_network_url(filename, args.port)
 
     if args.show_url or args.display_tv:
-        print(f"🌐 Local URL: http://localhost:{args.port}/visualizations/{filename}")
+        print(f"🌐 Local URL: https://localhost:{args.port}/visualizations/{filename}")
         print(f"🌐 Network URL: {network_url}")
 
     # Display on TV if requested

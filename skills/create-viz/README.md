@@ -69,8 +69,8 @@ Make a dashboard called system-overview and show it on the Fire TV
 
 After creation, you'll receive:
 - ✅ Success message with file path
-- 🌐 Local URL: `http://localhost:5173/visualizations/filename.html`
-- 🌐 Network URL: `http://192.168.0.28:5173/visualizations/filename.html`
+- 🌐 Local URL: `https://localhost:5173/visualizations/filename.html`
+- 🌐 Network URL: `https://192.168.0.28:5173/visualizations/filename.html`
 - 📺 Fire TV status (if display-tv was used)
 
 ## File Locations
@@ -154,7 +154,7 @@ scripts/run.sh scripts/get_visualization_url.py demo --network
 
 # Display on TV
 adb shell am start -a android.intent.action.VIEW \
-  -d "http://192.168.0.28:5173/visualizations/demo.html"
+  -d "https://192.168.0.28:5173/visualizations/demo.html"
 ```
 
 **Option 3: Use tv-remote skill**
@@ -299,7 +299,7 @@ adb connect <fire-tv-ip>:5555
 scripts/run.sh scripts/get_visualization_url.py filename --network
 
 # Test in browser first
-xdg-open http://localhost:5173/visualizations/filename.html
+xdg-open https://localhost:5173/visualizations/filename.html
 ```
 
 ## Related Skills & Tools
@@ -307,14 +307,14 @@ xdg-open http://localhost:5173/visualizations/filename.html
 - `/tv-remote` - Control Fire TV
 - `/connect-tv` - Connect to Fire TV
 - `/recall` - Search for visualization examples
-- Gallery: http://localhost:5173/visualizations/index.html
+- Gallery: https://localhost:5173/visualizations/index.html
 
 ## Examples Gallery
 
 Visit the visualization gallery to see all available visualizations:
 
 ```
-http://localhost:5173/visualizations/index.html
+https://localhost:5173/visualizations/index.html
 ```
 
 ## Tips

@@ -71,8 +71,8 @@ Claude will parse and execute the appropriate command.
 
 After creation:
 - ✅ File path confirmation
-- 🌐 Local URL: `http://localhost:5173/visualizations/NAME.html`
-- 🌐 Network URL: `http://192.168.0.28:5173/visualizations/NAME.html`
+- 🌐 Local URL: `https://localhost:5173/visualizations/NAME.html`
+- 🌐 Network URL: `https://192.168.0.28:5173/visualizations/NAME.html`
 - 📺 TV status (if display-tv used)
 
 ## File Location
@@ -107,7 +107,7 @@ scripts/run.sh scripts/create_visualization.py \
 
 ## View All Visualizations
 ```
-http://localhost:5173/visualizations/index.html
+https://localhost:5173/visualizations/index.html
 ```
 
 ## Related Skills

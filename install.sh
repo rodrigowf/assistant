@@ -140,7 +140,7 @@ echo
 echo "  2. Start the frontend (new terminal):"
 echo "     ${BLUE}cd frontend && npm run dev${NC}"
 echo
-echo "  3. Open ${BLUE}http://localhost:5173${NC} in your browser"
+echo "  3. Open ${BLUE}https://localhost:5173${NC} in your browser"
 echo
 if ! command -v claude &> /dev/null || ! claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
     warn "Don't forget to authenticate Claude Code:"

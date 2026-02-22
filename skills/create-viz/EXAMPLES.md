@@ -11,7 +11,7 @@
 Output:
 - Creates: `frontend/public/visualizations/hello.html`
 - Uses: Basic template (default)
-- URL: `http://192.168.0.28:5173/visualizations/hello.html`
+- URL: `https://192.168.0.28:5173/visualizations/hello.html`
 
 ---
 
@@ -282,7 +282,7 @@ setInterval(updateWeather, 600000); // Update every 10 minutes
 
 ### 2. View in browser
 ```bash
-xdg-open http://localhost:5173/visualizations/test.html
+xdg-open https://localhost:5173/visualizations/test.html
 ```
 
 ### 3. Edit if needed
@@ -339,7 +339,7 @@ Show test visualization on Fire TV
 
 ### Tip 5: Reusing Visualizations
 - Copy existing file as starting point
-- Browse gallery for examples: `http://localhost:5173/visualizations/`
+- Browse gallery for examples: `https://localhost:5173/visualizations/`
 - Check out existing visualizations for patterns
 - Templates are just starting points - customize freely
 
@@ -429,7 +429,7 @@ adb devices
 **Solution**:
 ```bash
 # Open gallery
-xdg-open http://localhost:5173/visualizations/index.html
+xdg-open https://localhost:5173/visualizations/index.html
 
 # Or list files
 ls frontend/public/visualizations/
@@ -441,7 +441,7 @@ ls frontend/public/visualizations/
 
 After creating visualizations:
 
-1. **Browse gallery**: http://localhost:5173/visualizations/index.html
+1. **Browse gallery**: https://localhost:5173/visualizations/index.html
 2. **Edit files**: Customize HTML/CSS/JS directly
 3. **Display on TV**: Use `display-tv` flag or `/tv-remote` skill
 4. **Integrate with data**: Add API calls or WebSocket connections

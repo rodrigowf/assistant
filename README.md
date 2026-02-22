@@ -179,7 +179,7 @@ scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --reload
 cd frontend && npm run dev
 ```
 
-Open **http://localhost:5173** and start chatting.
+Open **https://localhost:5173** and start chatting.
 
 **Shortcut**: Use `/debug-app` skill to launch both backend and frontend with browser automation.
 

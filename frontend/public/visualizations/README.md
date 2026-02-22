@@ -14,8 +14,8 @@ frontend/public/visualizations/
 
 Files placed in this directory are automatically served by Vite at:
 
-- **Local access:** `http://localhost:5173/visualizations/<filename>.html`
-- **Network access:** `http://192.168.0.28:5173/visualizations/<filename>.html`
+- **Local access:** `https://localhost:5173/visualizations/<filename>.html`
+- **Network access:** `https://192.168.0.28:5173/visualizations/<filename>.html`
 
 ## 🚀 Quick Start
 
@@ -54,7 +54,7 @@ EOF
 ### 3. Access it immediately
 
 No build step needed! Access at:
-- `http://localhost:5173/visualizations/my-viz.html`
+- `https://localhost:5173/visualizations/my-viz.html`
 
 ### 4. Display on Fire TV
 
@@ -63,7 +63,7 @@ Using the `/tv-remote` skill or ADB commands:
 ```bash
 # Open visualization on Fire TV
 adb shell am start -a android.intent.action.VIEW \
-    -d "http://192.168.0.28:5173/visualizations/example.html"
+    -d "https://192.168.0.28:5173/visualizations/example.html"
 ```
 
 ## 📊 Example Visualization

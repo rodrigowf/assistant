@@ -32,8 +32,9 @@ logs/
 /todos/
 /plugins/
 
-# Secrets and credentials
+# Secrets, credentials, and certificates
 secrets/
+certs/
 
 # Temporary files
 .index-temp/

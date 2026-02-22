@@ -10,13 +10,13 @@
 ## 🚀 Access Visualizations
 
 ### Example Visualization
-- **Local:** http://localhost:5173/visualizations/example.html
-- **Network:** http://192.168.0.28:5173/visualizations/example.html
+- **Local:** https://localhost:5173/visualizations/example.html
+- **Network:** https://192.168.0.28:5173/visualizations/example.html
 - **Features:** Interactive colored rectangle with animations
 
 ### System Stats Dashboard
-- **Local:** http://localhost:5173/visualizations/system-stats.html
-- **Network:** http://192.168.0.28:5173/visualizations/system-stats.html
+- **Local:** https://localhost:5173/visualizations/system-stats.html
+- **Network:** https://192.168.0.28:5173/visualizations/system-stats.html
 - **Features:** Real-time CPU/Memory/Disk monitoring (simulated data)
 
 ## 🔧 Quick Commands
@@ -31,7 +31,7 @@ scripts/run.sh scripts/get_visualization_url.py system-stats --network
 
 # Display on Fire TV (requires ADB connection)
 adb shell am start -a android.intent.action.VIEW \
-    -d "http://192.168.0.28:5173/visualizations/example.html"
+    -d "https://192.168.0.28:5173/visualizations/example.html"
 ```
 
 ## 📝 Create New Visualization
@@ -45,7 +45,7 @@ adb shell am start -a android.intent.action.VIEW \
 
 3. Access immediately at:
    ```
-   http://localhost:5173/visualizations/my-viz.html
+   https://localhost:5173/visualizations/my-viz.html
    ```
 
 No build step required! Files are served directly by Vite.
@@ -55,7 +55,7 @@ No build step required! Files are served directly by Vite.
 ### Option 1: Via ADB Command
 ```bash
 adb shell am start -a android.intent.action.VIEW \
-    -d "http://192.168.0.28:5173/visualizations/<your-file>.html"
+    -d "https://192.168.0.28:5173/visualizations/<your-file>.html"
 ```
 
 ### Option 2: Via /tv-remote skill (if available)
