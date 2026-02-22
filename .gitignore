@@ -32,6 +32,9 @@ logs/
 /todos/
 /plugins/
 
+# Secrets and credentials
+secrets/
+
 # Temporary files
 .index-temp/
 *.egg-info/

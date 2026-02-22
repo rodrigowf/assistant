@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>System Stats</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            font-family: 'Monaco', 'Courier New', monospace;
+            color: #00ff00;
+            padding: 40px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 3rem;
+            margin-bottom: 40px;
+            text-shadow: 0 0 10px #00ff00;
+            animation: glow 2s ease-in-out infinite alternate;
+        }
+
+        @keyframes glow {
+            from { text-shadow: 0 0 10px #00ff00, 0 0 20px #00ff00; }
+            to { text-shadow: 0 0 20px #00ff00, 0 0 30px #00ff00, 0 0 40px #00ff00; }
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: rgba(0, 0, 0, 0.4);
+            border: 2px solid #00ff00;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 30px rgba(0, 255, 0, 0.5);
+        }
+
+        .card-title {
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #00ff00;
+            padding-bottom: 10px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 15px 0;
+            font-size: 1.1rem;
+        }
+
+        .stat-label {
+            color: #88ff88;
+        }
+
+        .stat-value {
+            font-weight: bold;
+            color: #00ff00;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 25px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid #00ff00;
+            border-radius: 5px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00ff00, #00cc00);
+            transition: width 0.5s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #000;
+            font-weight: bold;
+        }
+
+        .timestamp {
+            text-align: center;
+            margin-top: 30px;
+            font-size: 1.2rem;
+            opacity: 0.7;
+        }
+
+        .metric-large {
+            font-size: 3rem;
+            text-align: center;
+            margin: 20px 0;
+            font-weight: bold;
+        }
+
+        .grid-full {
+            grid-column: 1 / -1;
+        }
+
+        .activity-log {
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+
+        .activity-log::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .activity-log::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.5);
+        }
+
+        .activity-log::-webkit-scrollbar-thumb {
+            background: #00ff00;
+            border-radius: 4px;
+        }
+
+        .log-entry {
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(0, 255, 0, 0.2);
+        }
+
+        .log-time {
+            color: #88ff88;
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🖥️ SYSTEM MONITOR</h1>
+
+        <div class="grid">
+            <!-- CPU Usage -->
+            <div class="card">
+                <div class="card-title">⚡ CPU Usage</div>
+                <div class="metric-large" id="cpu-percent">0%</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="cpu-progress" style="width: 0%">0%</div>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Cores:</span>
+                    <span class="stat-value" id="cpu-cores">-</span>
+                </div>
+            </div>
+
+            <!-- Memory Usage -->
+            <div class="card">
+                <div class="card-title">💾 Memory Usage</div>
+                <div class="metric-large" id="memory-percent">0%</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="memory-progress" style="width: 0%">0%</div>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Used:</span>
+                    <span class="stat-value" id="memory-used">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Total:</span>
+                    <span class="stat-value" id="memory-total">-</span>
+                </div>
+            </div>
+
+            <!-- Disk Usage -->
+            <div class="card">
+                <div class="card-title">💿 Disk Usage</div>
+                <div class="metric-large" id="disk-percent">0%</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="disk-progress" style="width: 0%">0%</div>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Used:</span>
+                    <span class="stat-value" id="disk-used">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Free:</span>
+                    <span class="stat-value" id="disk-free">-</span>
+                </div>
+            </div>
+
+            <!-- Network -->
+            <div class="card">
+                <div class="card-title">🌐 Network</div>
+                <div class="stat-row">
+                    <span class="stat-label">Local IP:</span>
+                    <span class="stat-value" id="local-ip">192.168.0.28</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Hostname:</span>
+                    <span class="stat-value" id="hostname">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Uptime:</span>
+                    <span class="stat-value" id="uptime">-</span>
+                </div>
+            </div>
+
+            <!-- Activity Log -->
+            <div class="card grid-full">
+                <div class="card-title">📊 Activity Log</div>
+                <div class="activity-log" id="activity-log">
+                    <div class="log-entry">
+                        <span class="log-time">[--:--:--]</span>
+                        <span>System monitor initialized...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="timestamp" id="timestamp">
+            Loading...
+        </div>
+    </div>
+
+    <script>
+        // Simulated data - in a real implementation, this would fetch from an API
+        function generateRandomStats() {
+            return {
+                cpu: {
+                    percent: Math.floor(Math.random() * 100),
+                    cores: navigator.hardwareConcurrency || 4
+                },
+                memory: {
+                    percent: Math.floor(Math.random() * 100),
+                    used: (Math.random() * 8).toFixed(1) + ' GB',
+                    total: '16 GB'
+                },
+                disk: {
+                    percent: Math.floor(Math.random() * 100),
+                    used: Math.floor(Math.random() * 500) + ' GB',
+                    free: Math.floor(Math.random() * 500) + ' GB'
+                },
+                network: {
+                    hostname: 'assistant-dev',
+                    uptime: Math.floor(Math.random() * 24) + 'h ' + Math.floor(Math.random() * 60) + 'm'
+                }
+            };
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+
+        function updateStats() {
+            const stats = generateRandomStats();
+
+            // Update CPU
+            document.getElementById('cpu-percent').textContent = stats.cpu.percent + '%';
+            document.getElementById('cpu-progress').style.width = stats.cpu.percent + '%';
+            document.getElementById('cpu-progress').textContent = stats.cpu.percent + '%';
+            document.getElementById('cpu-cores').textContent = stats.cpu.cores;
+
+            // Update Memory
+            document.getElementById('memory-percent').textContent = stats.memory.percent + '%';
+            document.getElementById('memory-progress').style.width = stats.memory.percent + '%';
+            document.getElementById('memory-progress').textContent = stats.memory.percent + '%';
+            document.getElementById('memory-used').textContent = stats.memory.used;
+            document.getElementById('memory-total').textContent = stats.memory.total;
+
+            // Update Disk
+            document.getElementById('disk-percent').textContent = stats.disk.percent + '%';
+            document.getElementById('disk-progress').style.width = stats.disk.percent + '%';
+            document.getElementById('disk-progress').textContent = stats.disk.percent + '%';
+            document.getElementById('disk-used').textContent = stats.disk.used;
+            document.getElementById('disk-free').textContent = stats.disk.free;
+
+            // Update Network
+            document.getElementById('hostname').textContent = stats.network.hostname;
+            document.getElementById('uptime').textContent = stats.network.uptime;
+
+            // Update timestamp
+            const now = new Date();
+            document.getElementById('timestamp').textContent =
+                `Last Updated: ${now.toLocaleTimeString()}`;
+
+            // Add to activity log
+            addLogEntry(`Stats refreshed - CPU: ${stats.cpu.percent}%, MEM: ${stats.memory.percent}%`);
+        }
+
+        function addLogEntry(message) {
+            const log = document.getElementById('activity-log');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `
+                <span class="log-time">[${time}]</span>
+                <span>${message}</span>
+            `;
+
+            log.insertBefore(entry, log.firstChild);
+
+            // Keep only last 20 entries
+            while (log.children.length > 20) {
+                log.removeChild(log.lastChild);
+            }
+        }
+
+        // Initialize
+        addLogEntry('System monitor started');
+        updateStats();
+
+        // Update every 3 seconds
+        setInterval(updateStats, 3000);
+
+        // Detect if running on Fire TV
+        const isFireTV = /AFT/.test(navigator.userAgent);
+        if (isFireTV) {
+            addLogEntry('Running on Fire TV device detected');
+        }
+
+        // Log when page becomes visible/hidden
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                addLogEntry('Page hidden (user switched away)');
+            } else {
+                addLogEntry('Page visible (user returned)');
+            }
+        });
+    </script>
+</body>
+</html>

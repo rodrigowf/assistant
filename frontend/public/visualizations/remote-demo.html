@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fire TV Remote Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(135deg, #232526 0%, #414345 100%);
+            font-family: 'Arial', sans-serif;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 40px;
+        }
+
+        .title {
+            font-size: 3rem;
+            margin-bottom: 20px;
+            text-align: center;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        .subtitle {
+            font-size: 1.5rem;
+            margin-bottom: 40px;
+            opacity: 0.8;
+            text-align: center;
+        }
+
+        .control-area {
+            background: rgba(255, 255, 255, 0.1);
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 20px;
+            padding: 60px;
+            backdrop-filter: blur(10px);
+            position: relative;
+        }
+
+        .selector {
+            width: 200px;
+            height: 200px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 50%;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            transition: all 0.3s ease;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 4rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        .selector.selected {
+            transform: translate(-50%, -50%) scale(1.1);
+            box-shadow: 0 20px 60px rgba(102, 126, 234, 0.8);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 250px);
+            grid-template-rows: repeat(3, 250px);
+            gap: 30px;
+            position: relative;
+        }
+
+        .grid-item {
+            background: rgba(255, 255, 255, 0.05);
+            border: 3px solid rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            font-size: 3rem;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+
+        .grid-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+
+        .grid-item.selected {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-color: white;
+            transform: scale(1.05);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.6);
+        }
+
+        .item-label {
+            font-size: 1.2rem;
+            margin-top: 10px;
+            opacity: 0.9;
+        }
+
+        .instructions {
+            margin-top: 50px;
+            text-align: center;
+            max-width: 800px;
+        }
+
+        .instruction-box {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 10px 0;
+        }
+
+        .key-display {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px 30px;
+            border-radius: 10px;
+            font-size: 1.2rem;
+            font-family: 'Courier New', monospace;
+            border: 2px solid #00ff00;
+            min-width: 200px;
+        }
+
+        .key-label {
+            color: #00ff00;
+            margin-bottom: 10px;
+        }
+
+        .key-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: white;
+        }
+
+        .history {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px;
+            border-radius: 10px;
+            max-height: 150px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+
+        .history-entry {
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .timestamp {
+            color: #888;
+            margin-right: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="title">🎮 Fire TV Remote Control Demo</div>
+    <div class="subtitle">Use your Fire TV remote to navigate!</div>
+
+    <div class="control-area">
+        <div class="grid" id="grid">
+            <div class="grid-item" data-pos="0">
+                <span>🎬</span>
+                <div class="item-label">Movies</div>
+            </div>
+            <div class="grid-item" data-pos="1">
+                <span>📺</span>
+                <div class="item-label">TV Shows</div>
+            </div>
+            <div class="grid-item" data-pos="2">
+                <span>🎵</span>
+                <div class="item-label">Music</div>
+            </div>
+            <div class="grid-item" data-pos="3">
+                <span>🎮</span>
+                <div class="item-label">Games</div>
+            </div>
+            <div class="grid-item selected" data-pos="4">
+                <span>⭐</span>
+                <div class="item-label">Featured</div>
+            </div>
+            <div class="grid-item" data-pos="5">
+                <span>⚙️</span>
+                <div class="item-label">Settings</div>
+            </div>
+            <div class="grid-item" data-pos="6">
+                <span>🔍</span>
+                <div class="item-label">Search</div>
+            </div>
+            <div class="grid-item" data-pos="7">
+                <span>📱</span>
+                <div class="item-label">Apps</div>
+            </div>
+            <div class="grid-item" data-pos="8">
+                <span>ℹ️</span>
+                <div class="item-label">About</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="instructions">
+        <div class="instruction-box">
+            <strong>Arrow Keys:</strong> Navigate between items<br>
+            <strong>Enter/Select:</strong> Choose an item<br>
+            <strong>Back:</strong> Go back (B key on keyboard)
+        </div>
+    </div>
+
+    <div class="key-display">
+        <div class="key-label">Last Key Pressed:</div>
+        <div class="key-value" id="last-key">-</div>
+    </div>
+
+    <div class="history" id="history">
+        <div class="history-entry">
+            <span class="timestamp">[--:--:--]</span>
+            <span>Ready! Use your Fire TV remote to navigate.</span>
+        </div>
+    </div>
+
+    <script>
+        let currentPosition = 4; // Start at center
+        const gridSize = 3;
+
+        function updateSelection() {
+            const items = document.querySelectorAll('.grid-item');
+            items.forEach((item, index) => {
+                if (index === currentPosition) {
+                    item.classList.add('selected');
+                } else {
+                    item.classList.remove('selected');
+                }
+            });
+        }
+
+        function addHistory(message) {
+            const history = document.getElementById('history');
+            const entry = document.createElement('div');
+            entry.className = 'history-entry';
+            const time = new Date().toLocaleTimeString();
+            entry.innerHTML = `
+                <span class="timestamp">[${time}]</span>
+                <span>${message}</span>
+            `;
+            history.insertBefore(entry, history.firstChild);
+
+            // Keep only last 10 entries
+            while (history.children.length > 10) {
+                history.removeChild(history.lastChild);
+            }
+        }
+
+        function selectItem() {
+            const items = document.querySelectorAll('.grid-item');
+            const selectedItem = items[currentPosition];
+            const label = selectedItem.querySelector('.item-label').textContent;
+
+            addHistory(`✅ Selected: ${label}`);
+
+            // Visual feedback
+            selectedItem.style.transform = 'scale(1.2)';
+            setTimeout(() => {
+                selectedItem.style.transform = '';
+            }, 200);
+        }
+
+        // Keyboard event handler (Fire TV remote sends keyboard events)
+        document.addEventListener('keydown', (e) => {
+            const keyDisplay = document.getElementById('last-key');
+            keyDisplay.textContent = e.key || e.code;
+
+            const row = Math.floor(currentPosition / gridSize);
+            const col = currentPosition % gridSize;
+
+            switch(e.key) {
+                case 'ArrowUp':
+                    e.preventDefault();
+                    if (row > 0) {
+                        currentPosition -= gridSize;
+                        updateSelection();
+                        addHistory('⬆️ Moved up');
+                    }
+                    break;
+
+                case 'ArrowDown':
+                    e.preventDefault();
+                    if (row < gridSize - 1) {
+                        currentPosition += gridSize;
+                        updateSelection();
+                        addHistory('⬇️ Moved down');
+                    }
+                    break;
+
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    if (col > 0) {
+                        currentPosition--;
+                        updateSelection();
+                        addHistory('⬅️ Moved left');
+                    }
+                    break;
+
+                case 'ArrowRight':
+                    e.preventDefault();
+                    if (col < gridSize - 1) {
+                        currentPosition++;
+                        updateSelection();
+                        addHistory('➡️ Moved right');
+                    }
+                    break;
+
+                case 'Enter':
+                    e.preventDefault();
+                    selectItem();
+                    break;
+
+                case 'Escape':
+                case 'Backspace':
+                case 'b':
+                case 'B':
+                    e.preventDefault();
+                    addHistory('⬅️ Back button pressed');
+                    break;
+
+                default:
+                    addHistory(`Key pressed: ${e.key}`);
+            }
+        });
+
+        // Mouse/touch support for testing
+        document.querySelectorAll('.grid-item').forEach((item, index) => {
+            item.addEventListener('click', () => {
+                currentPosition = index;
+                updateSelection();
+                selectItem();
+            });
+        });
+
+        // Detect Fire TV
+        const isFireTV = /AFT/.test(navigator.userAgent);
+        if (isFireTV) {
+            addHistory('🔥 Fire TV detected! Remote controls active.');
+        } else {
+            addHistory('💻 Desktop browser detected. Use arrow keys to simulate remote.');
+        }
+
+        // Initialize
+        updateSelection();
+    </script>
+</body>
+</html>

@@ -180,6 +180,7 @@ async def read_agent_session(
 async def send_to_agent_session(
     context: dict[str, Any], session_id: str, message: str
 ) -> str:
+    import asyncio
     from manager.types import TextComplete, TurnComplete
 
     pool = context["pool"]
@@ -191,16 +192,26 @@ async def send_to_agent_session(
     cost = 0.0
     turns = 0
 
-    try:
-        # pool.send() acquires the per-session lock and broadcasts events
-        # to all WebSocket subscribers (e.g., the frontend agent tab).
-        # session_id is the stable local_id — it never changes.
+    async def _collect() -> None:
+        nonlocal cost, turns
         async for event in pool.send(session_id, message):
             if isinstance(event, TextComplete):
                 texts.append(event.text)
             elif isinstance(event, TurnComplete):
                 cost = event.cost or 0.0
                 turns = event.num_turns
+
+    try:
+        # pool.send() acquires the per-session lock and broadcasts events
+        # to all WebSocket subscribers (e.g., the frontend agent tab).
+        # Timeout prevents the orchestrator from hanging indefinitely if
+        # the SDK subprocess dies or the lock is held too long.
+        await asyncio.wait_for(_collect(), timeout=300.0)
+    except asyncio.TimeoutError:
+        return json.dumps({
+            "error": f"Timed out waiting for response from session {session_id}. "
+            "The session may be busy with another request or unresponsive."
+        })
     except Exception as e:
         return json.dumps({"error": f"Failed to send message: {e}"})
 
@@ -210,6 +221,39 @@ async def send_to_agent_session(
         "cost": cost,
         "turns": turns,
     })
+
+
+@registry.register(
+    name="interrupt_agent_session",
+    description=(
+        "Interrupt an actively executing Claude Code agent session. "
+        "Use this to stop an agent that is running undesired actions or taking too long. "
+        "The agent will stop processing immediately."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "The session ID to interrupt.",
+            },
+        },
+        "required": ["session_id"],
+    },
+)
+async def interrupt_agent_session(context: dict[str, Any], session_id: str) -> str:
+    pool = context["pool"]
+
+    if not pool.has(session_id):
+        return json.dumps({"error": f"No active session with ID {session_id}"})
+
+    try:
+        await pool.interrupt(session_id)
+    except Exception as e:
+        logger.warning("Error interrupting session %s: %s", session_id, e)
+        return json.dumps({"error": f"Failed to interrupt session: {e}"})
+
+    return json.dumps({"session_id": session_id, "status": "interrupted"})
 
 
 @registry.register(

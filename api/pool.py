@@ -54,6 +54,13 @@ class SessionPool:
     # Agent session lifecycle
     # ------------------------------------------------------------------
 
+    def find_by_sdk_id(self, sdk_session_id: str) -> str | None:
+        """Return the local_id of a pool session with the given SDK session ID, or None."""
+        for lid, sm in self._sessions.items():
+            if sm.sdk_session_id == sdk_session_id:
+                return lid
+        return None
+
     async def create(
         self,
         config: ManagerConfig,
@@ -61,7 +68,26 @@ class SessionPool:
         resume_sdk_id: str | None = None,
         fork: bool = False,
     ) -> str:
-        """Create, start, and register a SessionManager. Returns the stable local_id."""
+        """Create, start, and register a SessionManager. Returns the stable local_id.
+
+        If *resume_sdk_id* is given and a session with that SDK ID is already
+        in the pool **and healthy**, return the existing local_id instead of
+        creating a duplicate.
+        """
+        # Deduplicate: reuse an existing pool session with the same SDK ID
+        if resume_sdk_id and not fork:
+            existing = self.find_by_sdk_id(resume_sdk_id)
+            if existing:
+                sm = self._sessions[existing]
+                if sm.is_active:
+                    return existing
+                # Existing session is dead — clean it up and fall through
+                # to create a fresh one.
+                logger.info("Replacing dead session %s (status=%s)", existing, sm.status.value)
+                self._sessions.pop(existing, None)
+                self._subscribers.pop(existing, None)
+                self._locks.pop(existing, None)
+
         lid = local_id or str(_uuid.uuid4())
         sm = SessionManager(
             session_id=resume_sdk_id,
