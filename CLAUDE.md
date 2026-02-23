@@ -32,9 +32,9 @@ This project separates **public framework** from **private data** for easy shari
 assistant/                    # PUBLIC - shareable framework
 ├── default-skills/           # General-purpose skills (actual files)
 ├── default-scripts/          # General-purpose scripts (actual files)
+├── default-agents/           # General-purpose agents (actual files)
 ├── .claude_config/           # Claude Code SDK config
 │   └── skills → ../context/skills  # SDK skill discovery
-├── agents/                   # Agent definitions
 ├── manager/                  # Python wrapper for Claude Code SDK (~400 lines)
 ├── orchestrator/             # Orchestrator agent — controls Claude Code instances
 │   └── providers/            # Model providers (Anthropic text, OpenAI realtime voice)
@@ -51,16 +51,18 @@ context/                      # PRIVATE - Git submodule (assistant-context repo)
 ├── memory/                   # Memory markdown files
 ├── skills/                   # Symlinks to default-skills + personalized skills
 ├── scripts/                  # Symlinks to default-scripts + personalized scripts
+├── agents/                   # Symlinks to default-agents + personalized agents
 ├── secrets/                  # OAuth credentials and tokens
 ├── certs/                    # SSL certificates
 └── .env                      # Environment variables
 ```
 
 **Public/Private separation:**
-- `default-skills/` and `default-scripts/` contain general-purpose tools (shareable)
+- `default-skills/`, `default-scripts/`, and `default-agents/` contain general-purpose tools (shareable)
 - `context/` is a Git submodule pointing to a private repo (`assistant-context`)
 - `context/skills/` has symlinks to `default-skills/*` plus personalized skill folders
 - `context/scripts/` has symlinks to `default-scripts/*` plus personalized scripts
+- `context/agents/` has symlinks to `default-agents/*` plus personalized agents
 - Swap the `context/` submodule to migrate to a new environment
 
 `CLAUDE_CONFIG_DIR` is set to `.claude_config/` by `context/scripts/run.sh`. All code references `context/` directly via `utils/paths.py`.
@@ -143,15 +145,15 @@ The orchestrator supports a realtime voice mode powered by the OpenAI Realtime A
 You can extend and modify your own capabilities:
 
 - **Skills** (`context/skills/`): Create with `/scaffold-skill`, modify existing ones directly
-- **Agents** (`agents/`): Create with `/scaffold-agent` for specialized subagents
+- **Agents** (`context/agents/`): Create with `/scaffold-agent` for specialized subagents
 - **Scripts** (`context/scripts/`): Shared tools any skill can reference
 - **Wrapper** (`api/`, `manager/`, `frontend/`): The application code itself
 
 Run Python scripts through the venv: `context/scripts/run.sh context/scripts/<script>.py [args]`
 
 **General vs Personalized:**
-- General-purpose skills/scripts live in `default-skills/` and `default-scripts/`
-- Personalized ones live directly in `context/skills/` and `context/scripts/`
+- General-purpose items live in `default-skills/`, `default-scripts/`, and `default-agents/`
+- Personalized ones live directly in `context/skills/`, `context/scripts/`, and `context/agents/`
 - The context folders have symlinks to the defaults, so all are accessible from one place
 
 ### Skill and Script Maintenance

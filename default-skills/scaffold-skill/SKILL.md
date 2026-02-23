@@ -41,7 +41,8 @@ assistant/
 │       └── $0.sh (or .py)
 ├── default-skills/         # General-purpose skills (shareable, public repo)
 ├── default-scripts/        # General-purpose scripts (shareable, public repo)
-└── agents/                 # Agent definitions
+├── default-agents/         # General-purpose agents (shareable, public repo)
+└── context/agents/         # All agents (symlinks to default-agents + personalized)
 ```
 
 ## Architecture Principle

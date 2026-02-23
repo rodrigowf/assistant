@@ -16,7 +16,7 @@ Additional context: $ARGUMENTS
 
 1. **Understand what the user wants** — What specialized task should this agent handle?
 2. **Design the agent** — Decide on tools, model, permissions, and system prompt
-3. **Create the agent file** — Write to `agents/$0.md`
+3. **Create the agent file** — Write to `context/agents/$0.md`
 
 ## Gathering Context
 
@@ -27,7 +27,9 @@ Ask the user if not clear from conversation:
 
 ## Agent Location
 
-Create at: `agents/$0.md`
+Create at: `context/agents/$0.md`
+
+Note: General-purpose agents live in `default-agents/` and are symlinked from `context/agents/`. Personalized agents go directly in `context/agents/`.
 
 ## Agent File Format
 
