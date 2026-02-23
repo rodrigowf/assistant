@@ -7,7 +7,7 @@ Example of a skill that creates files, optionally using a generator script.
 name: {{SKILL_NAME}}
 description: {{DESCRIPTION}}
 argument-hint: "{{ARGUMENT_HINT}}"
-allowed-tools: Write, Read, Bash(mkdir *), Bash(scripts/*)
+allowed-tools: Write, Read, Bash(mkdir *), Bash(context/scripts/*)
 ---
 
 # Generate: $0
@@ -58,13 +58,13 @@ For complex generation, use a centralized script:
 name: new-service
 description: Scaffold a new microservice with all boilerplate
 argument-hint: "[service-name]"
-allowed-tools: Bash(scripts/*)
+allowed-tools: Bash(context/scripts/*)
 ---
 
 # Create Service: $0
 
 Run the service generator:
-scripts/generate-service.sh $0
+context/scripts/generate-service.sh $0
 
 This will create:
 - Service directory structure
@@ -74,4 +74,4 @@ This will create:
 - Test scaffolding
 ```
 
-The script `scripts/generate-service.sh` contains the actual generation logic.
+The script `context/scripts/generate-service.sh` contains the actual generation logic.

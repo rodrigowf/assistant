@@ -2,7 +2,7 @@
 name: recall
 description: Search memory and conversation history for relevant information. Use when you need to find past decisions, patterns, or context.
 argument-hint: "<query> [--n COUNT]"
-allowed-tools: Bash(scripts/run.sh *), Read
+allowed-tools: Bash(context/scripts/run.sh *), Read
 ---
 
 # Recall: $ARGUMENTS
@@ -30,8 +30,8 @@ The index is updated automatically:
 
 2. Run the search script against both collections:
 
-   For memory: scripts/run.sh scripts/search.py <query> --collection memory --n <count>
-   For history: scripts/run.sh scripts/search.py <query> --collection history --n <count>
+   For memory: context/scripts/run.sh context/scripts/search.py <query> --collection memory --n <count>
+   For history: context/scripts/run.sh context/scripts/search.py <query> --collection history --n <count>
 
 3. Review the results. Each result includes:
    - `text`: The matched chunk content
@@ -45,7 +45,7 @@ The index is updated automatically:
 
 ## Notes
 
-- If the index is empty, run: scripts/run.sh scripts/index-memory.py
+- If the index is empty, run: context/scripts/run.sh context/scripts/index-memory.py
 - Distance interpretation: < 0.3 = highly relevant, 0.3-0.7 = relevant, > 1.0 = likely noise
 - Memory files are at: context/memory/
 - Session files are at: context/*.jsonl

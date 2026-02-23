@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Usage: scripts/index-memory.py [options]
+Usage: context/scripts/index-memory.py [options]
 Description: Index memory and session history into the vector store.
 
 This indexes from the context/ directory:
@@ -13,9 +13,9 @@ Options:
     --reset          Clear collections before indexing
 
 Examples:
-    scripts/index-memory.py
-    scripts/index-memory.py --memory-only
-    scripts/index-memory.py --reset
+    context/scripts/index-memory.py
+    context/scripts/index-memory.py --memory-only
+    context/scripts/index-memory.py --reset
 """
 import argparse
 import json

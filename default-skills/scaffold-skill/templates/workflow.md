@@ -41,7 +41,7 @@ This example shows a skill that references a centralized script.
 name: deploy
 description: Deploy the application to a target environment
 argument-hint: "[environment]"
-allowed-tools: Read, Bash(scripts/*)
+allowed-tools: Read, Bash(context/scripts/*)
 ---
 
 # Deploy to: $0
@@ -55,7 +55,7 @@ allowed-tools: Read, Bash(scripts/*)
 ## Deploy
 
 Run the deployment script:
-scripts/deploy.sh $0
+context/scripts/deploy.sh $0
 
 ## Post-deploy
 
@@ -64,4 +64,4 @@ scripts/deploy.sh $0
 3. Report results
 ```
 
-The actual deployment logic lives in `scripts/deploy.sh`, keeping the skill declarative.
+The actual deployment logic lives in `context/scripts/deploy.sh`, keeping the skill declarative.

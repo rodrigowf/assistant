@@ -29,7 +29,7 @@ Ensure the logs directory exists. Create it if missing by running mkdir for the 
 
 Start the FastAPI backend with uvicorn, using the factory pattern. The command structure is:
 
-Run the uvicorn module through scripts/run.sh with the api.app:create_app factory on port 8000. Pipe output through tee to save a timestamped log file in the logs directory. Run in background with ampersand.
+Run the uvicorn module through context/scripts/run.sh with the api.app:create_app factory on port 8000. Pipe output through tee to save a timestamped log file in the logs directory. Run in background with ampersand.
 
 Example log filename format: api_YYYYMMDD_HHMMSS.log
 

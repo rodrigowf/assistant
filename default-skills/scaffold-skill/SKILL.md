@@ -17,8 +17,8 @@ Additional context: $ARGUMENTS
 1. **Understand what the user wants to capture** — Look at the conversation context, ask clarifying questions if needed
 2. **Design the skill** — Decide what instructions and scripts are needed
 3. **Create the files**:
-   - Skill definition in `skills/$0/SKILL.md`
-   - Any required scripts in `scripts/` (the centralized scripts folder)
+   - Skill definition in `context/skills/$0/SKILL.md`
+   - Any required scripts in `context/scripts/` (the centralized scripts folder)
 
 ## Gathering Context
 
@@ -33,11 +33,14 @@ Use the conversation history — if we just did something the user wants to capt
 
 ```
 assistant/
-├── skills/                 # Skill definitions (declarative)
-│   └── $0/
-│       └── SKILL.md
-├── scripts/                # Shared script library (executable)
-│   └── $0.sh (or .py)
+├── context/                # Private data (Git submodule)
+│   ├── skills/             # All skill definitions (declarative)
+│   │   └── $0/
+│   │       └── SKILL.md
+│   └── scripts/            # All scripts (executable)
+│       └── $0.sh (or .py)
+├── default-skills/         # General-purpose skills (shareable, public repo)
+├── default-scripts/        # General-purpose scripts (shareable, public repo)
 └── agents/                 # Agent definitions
 ```
 
@@ -45,9 +48,10 @@ assistant/
 
 **Skills are declarative. Scripts are executable.**
 
-- `skills/` contains SKILL.md files that describe *what* to do and *when*
-- `scripts/` contains the shared library of executables that do the *how*
-- Skills reference scripts by path: `scripts/my-script.sh`
+- `context/skills/` contains SKILL.md files that describe *what* to do and *when*
+- `context/scripts/` contains executables that do the *how*
+- `default-skills/` and `default-scripts/` hold general-purpose tools (symlinked from context/)
+- Skills reference scripts by path: `context/scripts/my-script.sh`
 
 This separation keeps skills agent-agnostic — any AI that can run shell commands can use them.
 
@@ -74,18 +78,18 @@ When a skill needs executable logic, reference the centralized scripts folder:
 
 ```markdown
 To perform the action, run:
-scripts/my-script.sh $ARGUMENTS
+context/scripts/my-script.sh $ARGUMENTS
 ```
 
 Or for specific arguments:
 ```markdown
 Run the deployment script:
-scripts/deploy.sh $0 $1
+context/scripts/deploy.sh $0 $1
 ```
 
 ## Script Guidelines
 
-When creating scripts in `scripts/`:
+When creating scripts in `context/scripts/`:
 
 1. **Naming**: Use the skill name or a descriptive name (e.g., `deploy.sh`, `backup-db.py`)
 2. **Language**: Bash for simple tasks, Python for complex logic
@@ -97,7 +101,7 @@ When creating scripts in `scripts/`:
 Bash script header:
 ```bash
 #!/usr/bin/env bash
-# Usage: scripts/example.sh <arg1> <arg2>
+# Usage: context/scripts/example.sh <arg1> <arg2>
 # Description: What this script does
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -107,7 +111,7 @@ Python script header:
 ```python
 #!/usr/bin/env python3
 """
-Usage: scripts/example.py <arg1> <arg2>
+Usage: context/scripts/example.py <arg1> <arg2>
 Description: What this script does
 """
 import sys
@@ -126,8 +130,8 @@ Available in skill instructions:
 ## After Creation
 
 Tell the user:
-- Skill created at: `skills/$0/SKILL.md`
-- Scripts created at: `scripts/` (if any)
+- Skill created at: `context/skills/$0/SKILL.md`
+- Scripts created at: `context/scripts/` (if any)
 - How to invoke: `/$0 [arguments]`
 - They may need to restart for it to appear in autocomplete
 

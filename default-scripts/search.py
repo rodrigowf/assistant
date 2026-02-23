@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Usage: scripts/search.py <query> [options]
+Usage: context/scripts/search.py <query> [options]
 Description: Search the vector index for relevant chunks.
 
 Options:
@@ -11,10 +11,10 @@ Options:
     --json               Output as JSON for programmatic use
 
 Examples:
-    scripts/search.py "architecture decisions"
-    scripts/search.py "how to create skills" --n 10
-    scripts/search.py "embedding pipeline" --collection history
-    scripts/search.py "session management" --file memory/ --json
+    context/scripts/search.py "architecture decisions"
+    context/scripts/search.py "how to create skills" --n 10
+    context/scripts/search.py "embedding pipeline" --collection history
+    context/scripts/search.py "session management" --file memory/ --json
 """
 import argparse
 import json
@@ -37,7 +37,7 @@ def search(query, collection_name="memory", n_results=5, threshold=1.5, file_fil
     from sentence_transformers import SentenceTransformer
 
     if not INDEX_DIR.exists():
-        print("Error: No index found. Run 'scripts/embed.py index <path>' first.", file=sys.stderr)
+        print("Error: No index found. Run 'context/scripts/embed.py index <path>' first.", file=sys.stderr)
         sys.exit(1)
 
     client = chromadb.PersistentClient(path=str(INDEX_DIR))

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/install-prerequisites.sh
+# Usage: context/scripts/install-prerequisites.sh
 # Description: Check and install system prerequisites for the assistant.
 #
 # This script checks for required system dependencies and provides

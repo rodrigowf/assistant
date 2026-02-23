@@ -3,7 +3,7 @@
 Clean up the history index, keeping only specified sessions.
 
 Usage:
-    scripts/cleanup-history-index.py <session_id1> <session_id2> ...
+    context/scripts/cleanup-history-index.py <session_id1> <session_id2> ...
 
 This script will:
 1. Get all chunks from the 'history' collection

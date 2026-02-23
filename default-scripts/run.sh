@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: scripts/run.sh <script.py> [args...]
+# Usage: context/scripts/run.sh <script.py> [args...]
 # Description: Run a Python script using the project's virtual environment.
 set -euo pipefail
 

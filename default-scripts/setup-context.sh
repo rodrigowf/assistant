@@ -4,7 +4,7 @@
 # Creates the symlink structure needed for Claude SDK compatibility:
 # - .claude_config/projects/<mangled-path> -> ../../context
 #
-# Usage: scripts/setup-context.sh
+# Usage: context/scripts/setup-context.sh
 
 set -e
 

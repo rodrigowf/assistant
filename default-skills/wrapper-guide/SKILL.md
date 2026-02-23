@@ -253,14 +253,14 @@ Tracks active (local_id → WebSocket) pairs for WebSocket routing.
 
 **MemoryWatcher:**
 - Uses `watchfiles` to monitor memory directory
-- Triggers `scripts/index-memory.py --memory-only` on .md changes
+- Triggers `context/scripts/index-memory.py --memory-only` on .md changes
 - Debounced 1s
 
 **HistoryIndexer:**
 - Runs every 120s
 - Hashes session file names/sizes/mtimes
 - Only re-indexes if changed
-- Triggers `scripts/index-memory.py --history-only`
+- Triggers `context/scripts/index-memory.py --history-only`
 
 ---
 

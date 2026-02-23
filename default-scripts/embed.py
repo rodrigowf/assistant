@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Usage: scripts/embed.py <command> [options]
+Usage: context/scripts/embed.py <command> [options]
 Description: Core embedding pipeline — chunk files and store in ChromaDB.
 
 Commands:
@@ -17,10 +17,10 @@ Commands:
         Show collection statistics.
 
 Examples:
-    scripts/embed.py index memory/
-    scripts/embed.py index history/2026-02-05-session.md --collection history
-    scripts/embed.py stats
-    scripts/embed.py reset --collection history
+    context/scripts/embed.py index context/memory/
+    context/scripts/embed.py index history/2026-02-05-session.md --collection history
+    context/scripts/embed.py stats
+    context/scripts/embed.py reset --collection history
 """
 import argparse
 import hashlib
