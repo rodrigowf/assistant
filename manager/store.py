@@ -3,22 +3,14 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from utils.paths import get_sessions_dir, get_titles_path, get_session_path
+
 from .index_utils import remove_session_from_index
 from .types import ContentBlock, MessagePreview, SessionDetail, SessionInfo
-
-
-def _mangle_path(project_path: str) -> str:
-    """Convert an absolute path to Claude Code's mangled directory name.
-
-    ``/home/rodrigo/Projects/assistant`` becomes
-    ``-home-rodrigo-Projects-assistant``.
-    """
-    return project_path.rstrip("/").replace("/", "-")
 
 
 def _parse_timestamp(ts: str) -> datetime:
@@ -105,7 +97,7 @@ class SessionStore:
 
     Sessions are stored as JSONL files at::
 
-        ~/.claude/projects/<mangled-project-path>/<session-id>.jsonl
+        context/<session-id>.jsonl
 
     Each line is a JSON object with a ``type`` field: ``user``, ``assistant``,
     ``system``, ``progress``, ``file-history-snapshot``, ``queue-operation``.
@@ -116,17 +108,8 @@ class SessionStore:
         self._sessions_dir = self._resolve_sessions_dir()
 
     def _resolve_sessions_dir(self) -> Path:
-        """Compute the path to Claude Code's session directory for this project.
-
-        Respects CLAUDE_CONFIG_DIR if set, otherwise uses ~/.claude.
-        """
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir:
-            base = Path(config_dir)
-        else:
-            base = Path.home() / ".claude"
-        mangled = _mangle_path(self._project_dir)
-        return base / "projects" / mangled
+        """Get the sessions directory (uses context/ directly)."""
+        return get_sessions_dir()
 
     # ------------------------------------------------------------------
     # Public API
@@ -225,7 +208,7 @@ class SessionStore:
         return self._sessions_dir
 
     def _titles_path(self) -> Path:
-        return self._sessions_dir / ".titles.json"
+        return get_titles_path()
 
     def _load_titles(self) -> dict[str, str]:
         try:

@@ -22,6 +22,7 @@ interface Props {
   error: string | null;
   onSend: (text: string) => void;
   onInterrupt: () => void;
+  isActive?: boolean;
   // Voice mode props (orchestrator only)
   isOrchestrator?: boolean;
   voiceStatus?: VoiceStatus;
@@ -42,6 +43,7 @@ export function ChatPanel({
   error,
   onSend,
   onInterrupt,
+  isActive,
   isOrchestrator,
   voiceStatus,
   onVoiceStart,
@@ -56,7 +58,7 @@ export function ChatPanel({
 
   return (
     <main className="chat-panel">
-      <MessageList messages={messages} />
+      <MessageList messages={messages} isActive={isActive} />
       {error && (
         <div className="error-banner">{error}</div>
       )}

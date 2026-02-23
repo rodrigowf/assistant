@@ -27,6 +27,12 @@ import {
   MdError,
   MdCheckCircle,
   MdMoreHoriz,
+  MdOpenInNew,
+  MdClose,
+  MdVisibility,
+  MdSend,
+  MdStop,
+  MdHistory,
 } from "react-icons/md";
 
 interface Props {
@@ -43,7 +49,7 @@ type ToolInput = Record<string, unknown>;
 // Tool Categories (semantic, action-based coloring)
 // ---------------------------------------------------------------------------
 
-type ToolCategory = "read" | "write" | "execute" | "script" | "navigate" | "capture" | "interact" | "todo" | "task" | "system";
+type ToolCategory = "read" | "write" | "execute" | "script" | "navigate" | "capture" | "interact" | "todo" | "task" | "agent" | "search" | "system";
 
 function getToolCategory(toolName: string): ToolCategory {
   // Read/inspect tools (passive observation)
@@ -63,6 +69,18 @@ function getToolCategory(toolName: string): ToolCategory {
 
   // User interaction
   if (toolName === "AskUserQuestion") return "interact";
+
+  // Orchestrator agent session tools
+  if (["list_agent_sessions", "open_agent_session", "close_agent_session",
+       "read_agent_session", "send_to_agent_session", "interrupt_agent_session",
+       "list_history"].includes(toolName)) return "agent";
+
+  // Orchestrator search tools
+  if (["search_history", "search_memory"].includes(toolName)) return "search";
+
+  // Orchestrator file tools — reuse existing categories
+  if (toolName === "read_file") return "read";
+  if (toolName === "write_file") return "write";
 
   // Browser MCP tools - categorize by action type
   if (toolName.startsWith("mcp__chrome-devtools__")) {
@@ -136,6 +154,11 @@ function getLanguageFromPath(filePath: string): string {
 // Summary formatter (for collapsed view)
 // ---------------------------------------------------------------------------
 
+function shortId(id: unknown): string {
+  if (typeof id !== "string") return "";
+  return id.slice(0, 8);
+}
+
 function formatToolSummary(toolName: string, input: ToolInput): string {
   switch (toolName) {
     case "Read":
@@ -177,6 +200,35 @@ function formatToolSummary(toolName: string, input: ToolInput): string {
       return "Exit plan mode";
     case "NotebookEdit":
       return input.notebook_path ? `Edit notebook ${formatFilePath(input.notebook_path)}` : "Edit notebook";
+
+    // Orchestrator tools
+    case "list_agent_sessions":
+      return "List active sessions";
+    case "open_agent_session":
+      return input.resume_sdk_id ? "Resume session" : "Open agent session";
+    case "close_agent_session":
+      return input.session_id ? `Close session ${shortId(input.session_id)}` : "Close session";
+    case "read_agent_session":
+      return input.session_id ? `Read session ${shortId(input.session_id)}` : "Read session";
+    case "send_to_agent_session": {
+      if (input.message) {
+        const msg = String(input.message);
+        return msg.slice(0, 60) + (msg.length > 60 ? "..." : "");
+      }
+      return "Send to agent";
+    }
+    case "interrupt_agent_session":
+      return input.session_id ? `Interrupt session ${shortId(input.session_id)}` : "Interrupt session";
+    case "list_history":
+      return "List session history";
+    case "search_history":
+      return input.query ? `Search history "${input.query}"` : "Search history";
+    case "search_memory":
+      return input.query ? `Search memory "${input.query}"` : "Search memory";
+    case "read_file":
+      return input.path ? `Read ${formatFilePath(input.path)}` : "Read file";
+    case "write_file":
+      return input.path ? `Write ${formatFilePath(input.path)}` : "Write file";
   }
 
   // MCP Chrome DevTools
@@ -289,6 +341,29 @@ function getToolIcon(toolName: string, complete: boolean, isError?: boolean): Re
       return <MdEditNote className={iconClass} />;
     case "NotebookEdit":
       return <MdBook className={iconClass} />;
+
+    // Orchestrator tools
+    case "list_agent_sessions":
+      return <MdList className={iconClass} />;
+    case "open_agent_session":
+      return <MdOpenInNew className={iconClass} />;
+    case "close_agent_session":
+      return <MdClose className={iconClass} />;
+    case "read_agent_session":
+      return <MdVisibility className={iconClass} />;
+    case "send_to_agent_session":
+      return <MdSend className={iconClass} />;
+    case "interrupt_agent_session":
+      return <MdStop className={iconClass} />;
+    case "list_history":
+      return <MdHistory className={iconClass} />;
+    case "search_history":
+    case "search_memory":
+      return <MdSearch className={iconClass} />;
+    case "read_file":
+      return <MdDescription className={iconClass} />;
+    case "write_file":
+      return <MdCode className={iconClass} />;
   }
 
   if (toolName.startsWith("mcp__chrome-devtools__")) {
@@ -471,6 +546,47 @@ function TaskInputView({ description, prompt, subagentType }: {
   );
 }
 
+function SendToAgentInputView({ sessionId, message }: { sessionId: string; message: string }) {
+  return (
+    <div className="agent-session-view">
+      <div className="tool-field">
+        <span className="field-label">Session</span>
+        <span className="field-value">{sessionId}</span>
+      </div>
+      <div className="tool-field multiline">
+        <span className="field-label">Message</span>
+        <pre className="field-value task-prompt">{message}</pre>
+      </div>
+    </div>
+  );
+}
+
+function SearchInputView({ query, maxResults }: { query: string; maxResults?: number }) {
+  return (
+    <div className="search-input-view">
+      <div className="tool-field">
+        <span className="field-label">Query</span>
+        <span className="field-value">{query}</span>
+      </div>
+      {maxResults !== undefined && (
+        <div className="tool-field">
+          <span className="field-label">Max</span>
+          <span className="field-value">{maxResults}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FileReadInputView({ path }: { path: string }) {
+  return (
+    <div className="tool-field">
+      <span className="field-label">File</span>
+      <span className="field-value">{path}</span>
+    </div>
+  );
+}
+
 function GenericInputView({ input }: { input: ToolInput }) {
   return <pre className="generic-json">{JSON.stringify(input, null, 2)}</pre>;
 }
@@ -520,6 +636,62 @@ function renderToolInput(toolName: string, input: ToolInput) {
             description={input.description ? String(input.description) : undefined}
             prompt={String(input.prompt)}
             subagentType={input.subagent_type ? String(input.subagent_type) : undefined}
+          />
+        );
+      }
+      break;
+
+    // Orchestrator tools
+    case "send_to_agent_session":
+      if (input.session_id && input.message) {
+        return (
+          <SendToAgentInputView
+            sessionId={String(input.session_id)}
+            message={String(input.message)}
+          />
+        );
+      }
+      break;
+    case "read_agent_session":
+      if (input.session_id) {
+        return (
+          <div className="agent-session-view">
+            <div className="tool-field">
+              <span className="field-label">Session</span>
+              <span className="field-value">{String(input.session_id)}</span>
+            </div>
+            {input.max_messages !== undefined && (
+              <div className="tool-field">
+                <span className="field-label">Max</span>
+                <span className="field-value">{String(input.max_messages)} messages</span>
+              </div>
+            )}
+          </div>
+        );
+      }
+      break;
+    case "search_history":
+    case "search_memory":
+      if (input.query) {
+        return (
+          <SearchInputView
+            query={String(input.query)}
+            maxResults={input.max_results !== undefined ? Number(input.max_results) : undefined}
+          />
+        );
+      }
+      break;
+    case "read_file":
+      if (input.path) {
+        return <FileReadInputView path={String(input.path)} />;
+      }
+      break;
+    case "write_file":
+      if (input.path && input.content) {
+        return (
+          <WriteInputView
+            filePath={String(input.path)}
+            content={String(input.content)}
           />
         );
       }
@@ -685,6 +857,58 @@ function BashBlock({ toolInput, result, isError, complete }: Props) {
   );
 }
 
+// Send-to-agent block — shows message preview in header (like BashBlock)
+function SendToAgentBlock({ toolInput, result, isError, complete }: Props) {
+  const [expanded, setExpanded] = useState(false);
+  const icon = getToolIcon("send_to_agent_session", complete, isError);
+  const category = getToolCategory("send_to_agent_session");
+
+  const sessionId = toolInput.session_id ? String(toolInput.session_id) : "";
+  const message = toolInput.message ? String(toolInput.message) : "";
+
+  return (
+    <div className={`tool-block tool-${category} ${isError ? "tool-error" : ""}`}>
+      <button
+        className="tool-toggle bash-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="tool-icon">{icon}</span>
+        <div className="send-agent-header-content">
+          {sessionId && <span className="send-agent-session-id">session {shortId(sessionId)}</span>}
+          <span className="send-agent-message-preview">{message || "Send to agent"}</span>
+        </div>
+        {complete && (
+          <span className={`tool-status ${isError ? "status-error" : "status-ok"}`}>
+            {isError ? <MdError className="status-icon" /> : <MdCheckCircle className="status-icon" />}
+            {isError ? "error" : "done"}
+          </span>
+        )}
+        <span className="toggle-arrow">{expanded ? "▼" : "▶"}</span>
+      </button>
+      {expanded && (
+        <div className="tool-content">
+          <details open>
+            <summary className="tool-section-header">Input</summary>
+            <div className="tool-input">
+              <SendToAgentInputView sessionId={sessionId} message={message} />
+            </div>
+          </details>
+          {result !== undefined && (
+            <details open={result.length < 500}>
+              <summary className="tool-section-header">
+                Output {result.length > 500 && `(${result.length} chars)`}
+              </summary>
+              <div className={`tool-result ${isError ? "result-error" : ""}`}>
+                <pre>{result}</pre>
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -705,6 +929,11 @@ export function ToolUseBlock({ toolName, toolInput, result, isError, complete }:
   // Bash tool has special header showing description + command
   if (toolName === "Bash") {
     return <BashBlock {...{ toolName, toolInput, result, isError, complete }} />;
+  }
+
+  // Send-to-agent shows message preview in header (like Bash)
+  if (toolName === "send_to_agent_session") {
+    return <SendToAgentBlock {...{ toolName, toolInput, result, isError, complete }} />;
   }
 
   const summary = formatToolSummary(toolName, toolInput);

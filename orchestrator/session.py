@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from utils.paths import get_sessions_dir
+
 from orchestrator.agent import OrchestratorAgent
 from orchestrator.config import OrchestratorConfig
 from orchestrator.persistence import HistoryLoader, HistoryWriter
@@ -28,11 +30,6 @@ logger = logging.getLogger(__name__)
 
 # Messages to keep verbatim in the voice system prompt; older ones are summarized.
 MAX_VOICE_HISTORY_MESSAGES = 20
-
-
-def _mangle_path(project_path: str) -> str:
-    """Convert an absolute path to Claude Code's mangled directory name."""
-    return project_path.rstrip("/").replace("/", "-")
 
 
 class OrchestratorSession:
@@ -391,17 +388,10 @@ class OrchestratorSession:
             return ""
 
     def _get_jsonl_path(self) -> Path:
-        """Get the JSONL file path for this session."""
-        import os
+        """Get the JSONL file path for this session.
 
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir:
-            base = Path(config_dir)
-        else:
-            base = Path.home() / ".claude"
-
-        project_dir = str(Path(self._config.project_dir).resolve())
-        mangled = _mangle_path(project_dir)
-        sessions_dir = base / "projects" / mangled
+        Uses context/ directly for portability.
+        """
+        sessions_dir = get_sessions_dir()
         sessions_dir.mkdir(parents=True, exist_ok=True)
         return sessions_dir / f"{self.jsonl_id}.jsonl"

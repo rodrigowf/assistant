@@ -1,4 +1,4 @@
-"""Tests for index-memory.py — indexes Claude Code native storage."""
+"""Tests for index-memory.py — indexes memory and session history from context/."""
 
 import sys
 from pathlib import Path
@@ -40,18 +40,6 @@ class TestRunEmbed:
             assert index_memory.run_embed("index", "memory/") is False
 
 
-class TestGetClaudeConfigDir:
-    def test_uses_env_var_if_set(self, monkeypatch):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/custom/path")
-        result = index_memory.get_claude_config_dir()
-        assert result == Path("/custom/path")
-
-    def test_defaults_to_home_claude(self, monkeypatch):
-        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-        result = index_memory.get_claude_config_dir()
-        assert result == Path.home() / ".claude"
-
-
 class TestExtractSessionText:
     def test_extracts_user_and_assistant_messages(self, tmp_path):
         jsonl = tmp_path / "test.jsonl"
@@ -87,24 +75,19 @@ class TestExtractSessionText:
 
 class TestIndexMemory:
     @pytest.fixture
-    def setup_claude_dirs(self, tmp_path, monkeypatch):
-        """Set up temporary Claude Code directory structure."""
-        # Create mangled project directory
-        project_dir = tmp_path / "projects" / "-test-project"
-        memory_dir = project_dir / "memory"
+    def setup_context_dirs(self, tmp_path):
+        """Set up temporary context/ directory structure."""
+        memory_dir = tmp_path / "context" / "memory"
         memory_dir.mkdir(parents=True)
 
         # Add memory files
         (memory_dir / "MEMORY.md").write_text("# Memory\nTest content")
         (memory_dir / "patterns.md").write_text("# Patterns\nMore content")
 
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        monkeypatch.setattr(index_memory, "PROJECT_DIR", Path("/test/project"))
+        return tmp_path, memory_dir
 
-        return tmp_path, project_dir
-
-    def test_indexes_memory_files(self, setup_claude_dirs):
-        tmp_path, project_dir = setup_claude_dirs
+    def test_indexes_memory_files(self, setup_context_dirs):
+        tmp_path, memory_dir = setup_context_dirs
         calls = []
 
         def fake_run_embed(command, *args):
@@ -112,7 +95,7 @@ class TestIndexMemory:
             return True
 
         with patch.object(index_memory, "run_embed", side_effect=fake_run_embed):
-            with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
+            with patch("utils.paths.PROJECT_ROOT", tmp_path):
                 index_memory.index_memory(reset=False)
 
         commands = [c[0] for c in calls]
@@ -122,24 +105,21 @@ class TestIndexMemory:
         index_call = next(c for c in calls if c[0] == "index")
         assert "memory" in index_call[1]
 
-    def test_skips_empty_memory_dir(self, tmp_path, monkeypatch, capsys):
-        project_dir = tmp_path / "projects" / "-test-project"
-        memory_dir = project_dir / "memory"
+    def test_skips_empty_memory_dir(self, tmp_path, capsys):
+        memory_dir = tmp_path / "context" / "memory"
         memory_dir.mkdir(parents=True)
         # Empty memory dir
 
-        with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
             index_memory.index_memory(reset=False)
 
         captured = capsys.readouterr()
         assert "No memory files" in captured.out
 
-    def test_skips_missing_memory_dir(self, tmp_path, monkeypatch, capsys):
-        project_dir = tmp_path / "projects" / "-test-project"
-        project_dir.mkdir(parents=True)
-        # No memory subdir
+    def test_skips_missing_memory_dir(self, tmp_path, capsys):
+        # No context/memory dir
 
-        with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
             index_memory.index_memory(reset=False)
 
         captured = capsys.readouterr()
@@ -148,27 +128,23 @@ class TestIndexMemory:
 
 class TestIndexHistory:
     @pytest.fixture
-    def setup_sessions(self, tmp_path, monkeypatch):
-        """Set up temporary session files."""
-        project_dir = tmp_path / "projects" / "-test-project"
-        project_dir.mkdir(parents=True)
+    def setup_sessions(self, tmp_path):
+        """Set up temporary session files in context/."""
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
 
-        # Add session files
-        (project_dir / "session1.jsonl").write_text(
+        # Add session files at context/ root (where they live now)
+        (context_dir / "session1.jsonl").write_text(
             '{"type": "user", "message": {"content": [{"type": "text", "text": "Hello"}]}}\n'
         )
-        (project_dir / "session2.jsonl").write_text(
+        (context_dir / "session2.jsonl").write_text(
             '{"type": "assistant", "message": {"content": [{"type": "text", "text": "Hi"}]}}\n'
         )
 
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        # Use tmp_path as PROJECT_DIR so .index-temp can be created
-        monkeypatch.setattr(index_memory, "PROJECT_DIR", tmp_path)
-
-        return tmp_path, project_dir
+        return tmp_path, context_dir
 
     def test_indexes_session_files(self, setup_sessions):
-        tmp_path, project_dir = setup_sessions
+        tmp_path, sessions_dir = setup_sessions
         calls = []
 
         def fake_run_embed(command, *args):
@@ -176,8 +152,10 @@ class TestIndexHistory:
             return True
 
         with patch.object(index_memory, "run_embed", side_effect=fake_run_embed):
-            with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
-                index_memory.index_history(reset=False)
+            with patch("utils.paths.PROJECT_ROOT", tmp_path):
+                # Also need to patch PROJECT_DIR in index_memory for temp file handling
+                with patch.object(index_memory, "PROJECT_DIR", tmp_path):
+                    index_memory.index_history(reset=False)
 
         commands = [c[0] for c in calls]
         assert "index" in commands
@@ -186,11 +164,10 @@ class TestIndexHistory:
         index_call = next(c for c in calls if c[0] == "index")
         assert "history" in index_call[1]
 
-    def test_skips_missing_project_dir(self, tmp_path, monkeypatch, capsys):
-        project_dir = tmp_path / "projects" / "-nonexistent"
-        monkeypatch.setattr(index_memory, "PROJECT_DIR", tmp_path)
+    def test_skips_missing_context_dir(self, tmp_path, capsys):
+        # No context/ dir at all
 
-        with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
             index_memory.index_history(reset=False)
 
         captured = capsys.readouterr()
@@ -198,38 +175,33 @@ class TestIndexHistory:
 
 
 class TestMain:
-    def test_runs_with_memory_only_flag(self, tmp_path, monkeypatch):
-        project_dir = tmp_path / "projects" / "-test-project"
-        memory_dir = project_dir / "memory"
+    def test_runs_with_memory_only_flag(self, tmp_path):
+        memory_dir = tmp_path / "context" / "memory"
         memory_dir.mkdir(parents=True)
         (memory_dir / "test.md").write_text("content")
 
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        monkeypatch.setattr(index_memory, "PROJECT_DIR", tmp_path)
-
-        with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
-            with patch.object(index_memory, "run_embed", return_value=True) as mock_embed:
-                with patch("sys.argv", ["index-memory.py", "--memory-only"]):
-                    index_memory.main()
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            with patch.object(index_memory, "PROJECT_DIR", tmp_path):
+                with patch.object(index_memory, "run_embed", return_value=True) as mock_embed:
+                    with patch("sys.argv", ["index-memory.py", "--memory-only"]):
+                        index_memory.main()
 
         # Should have called index for memory
         calls = [c[0][0] for c in mock_embed.call_args_list]
         # Index should be called if memory files exist
         # Stats is always called
 
-    def test_runs_with_history_only_flag(self, tmp_path, monkeypatch):
-        project_dir = tmp_path / "projects" / "-test-project"
-        project_dir.mkdir(parents=True)
-        (project_dir / "session.jsonl").write_text(
+    def test_runs_with_history_only_flag(self, tmp_path):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        (context_dir / "session.jsonl").write_text(
             '{"type": "user", "message": {"content": "test"}}\n'
         )
 
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        monkeypatch.setattr(index_memory, "PROJECT_DIR", tmp_path)
-
-        with patch.object(index_memory, "get_project_data_dir", return_value=project_dir):
-            with patch.object(index_memory, "run_embed", return_value=True):
-                with patch("sys.argv", ["index-memory.py", "--history-only"]):
-                    index_memory.main()
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            with patch.object(index_memory, "PROJECT_DIR", tmp_path):
+                with patch.object(index_memory, "run_embed", return_value=True):
+                    with patch("sys.argv", ["index-memory.py", "--history-only"]):
+                        index_memory.main()
 
         # Should complete without error

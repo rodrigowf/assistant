@@ -77,11 +77,13 @@ function OrchestratorChatPanel({
   resumeSdkId,
   instance,
   onSessionChange,
+  isActive,
 }: {
   sessionId: string;
   resumeSdkId?: string | null;
   instance: ChatInstance;
   onSessionChange: () => void;
+  isActive?: boolean;
 }) {
   const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, micLevel, speakerLevel } = useVoiceOrchestrator({
     localId: sessionId,
@@ -119,6 +121,7 @@ function OrchestratorChatPanel({
       error={instance.error}
       onSend={instance.send}
       onInterrupt={instance.interrupt}
+      isActive={isActive}
       isOrchestrator={true}
       voiceStatus={voiceStatus}
       onVoiceStart={startVoice}
@@ -200,6 +203,7 @@ export function ChatPanelContainer({
                 resumeSdkId={tab.resumeSdkId}
                 instance={inst}
                 onSessionChange={onSessionChange}
+                isActive={isActive}
               />
             ) : (
               <ChatPanel
@@ -211,6 +215,7 @@ export function ChatPanelContainer({
                 error={inst.error}
                 onSend={inst.send}
                 onInterrupt={inst.interrupt}
+                isActive={isActive}
               />
             )}
           </div>

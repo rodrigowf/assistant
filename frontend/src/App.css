@@ -385,6 +385,8 @@
   so all elements sit within the same invisible column.
 */
 .message {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
   width: 100%;
   max-width: 900px;
   margin: 0 auto;
@@ -575,6 +577,8 @@
 .tool-block.tool-system  { border-left-color: var(--tool-system);   background: var(--tool-system-bg);   }
 .tool-block.tool-todo    { border-left-color: var(--tool-todo);     background: var(--tool-todo-bg);     }
 .tool-block.tool-task    { border-left-color: var(--tool-task);     background: var(--tool-task-bg);     }
+.tool-block.tool-agent   { border-left-color: var(--tool-agent);   background: var(--tool-agent-bg);   }
+.tool-block.tool-search  { border-left-color: var(--tool-search);  background: var(--tool-search-bg);  }
 .tool-block.tool-error   { border-left-color: var(--error) !important; background: var(--error-bg) !important; }
 
 .tool-toggle,
@@ -599,6 +603,8 @@
 .tool-todo .tool-toggle,     .tool-todo .tool-header     { color: var(--tool-todo);     }
 .tool-task .tool-toggle,     .tool-task .tool-header     { color: var(--tool-task);     }
 .tool-system .tool-toggle,   .tool-system .tool-header   { color: var(--tool-system);   }
+.tool-agent .tool-toggle,    .tool-agent .tool-header    { color: var(--tool-agent);    }
+.tool-search .tool-toggle,   .tool-search .tool-header   { color: var(--tool-search);   }
 
 .tool-toggle:hover { background: rgba(255, 255, 255, 0.02); }
 
@@ -832,6 +838,36 @@ pre.field-value {
 .todo-text { flex: 1; color: var(--text); }
 .todo-item-completed .todo-text   { text-decoration: line-through; color: var(--text-muted); }
 .todo-item-in-progress .todo-text { color: var(--text-bright); font-weight: 600; }
+
+/* Send-to-agent tool — two-line header like Bash */
+.send-agent-header-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.send-agent-session-id {
+  font-size: 0.67rem;
+  color: var(--text-muted);
+  font-family: "SF Mono", "Fira Code", monospace;
+  letter-spacing: 0.02em;
+}
+
+.send-agent-message-preview {
+  font-size: 0.77rem;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Agent session input views */
+.agent-session-view { display: flex; flex-direction: column; gap: 6px; }
+.search-input-view  { display: flex; flex-direction: column; gap: 6px; }
 
 .generic-json {
   font-size: 0.78rem;
@@ -1311,4 +1347,109 @@ pre.field-value {
 .modal-btn-primary:hover {
   background: var(--accent-hover);
   box-shadow: 0 0 12px var(--accent-glow);
+}
+
+/* ============================================================
+   Topbar row (hamburger + tab bar)
+   ============================================================ */
+
+.topbar-row {
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+}
+
+.topbar-row .tab-bar { flex: 1; min-width: 0; }
+
+/* Hamburger — hidden on desktop, shown on mobile */
+.sidebar-toggle-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  background: var(--bg-surface);
+  transition: color var(--transition);
+}
+
+.sidebar-toggle-btn:hover { color: var(--text-bright); }
+
+/* Sidebar backdrop — only rendered when sidebar is open (mobile) */
+.sidebar-backdrop {
+  display: none;
+}
+
+/* ============================================================
+   Mobile responsive — max-width: 768px
+   ============================================================ */
+
+@media (max-width: 768px) {
+  /* ---- Sidebar drawer ---- */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: -280px;
+    width: 280px;
+    height: 100%;
+    z-index: 50;
+    transition: left 220ms ease;
+  }
+
+  .sidebar.sidebar-open { left: 0; }
+
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 49;
+  }
+
+  /* ---- Hamburger visible ---- */
+  .sidebar-toggle-btn { display: flex; }
+
+  /* ---- Tab bar ---- */
+  .tab { max-width: 140px; min-width: 56px; }
+  .tab-close { opacity: 1; width: 24px; height: 24px; font-size: 0.82rem; }
+
+  /* ---- Messages ---- */
+  .message { max-width: none; padding: 5px 12px; }
+  .user-text { max-width: 85%; }
+
+  /* ---- Chat input ---- */
+  .chat-input {
+    max-width: none;
+    padding: 10px 12px 12px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .chat-input textarea { font-size: 16px; } /* prevent iOS zoom */
+
+  .send-btn,
+  .interrupt-btn { width: 44px; height: 44px; }
+
+  /* ---- Voice bar ---- */
+  .voice-bar {
+    max-width: none;
+    padding: 7px 12px;
+    padding-bottom: calc(7px + env(safe-area-inset-bottom));
+  }
+
+  .voice-btn { width: 44px; height: 44px; }
+  .voice-mute-btn { width: 44px; height: 44px; }
+
+  /* ---- Status bar ---- */
+  .status-bar {
+    max-width: none;
+    padding: 4px 12px;
+  }
+
+  .status-center { display: none; }
+
+  /* ---- Code / tool blocks ---- */
+  .tool-input pre,
+  .tool-result pre { max-height: 150px; }
+
+  pre.field-value { max-height: 120px; }
 }

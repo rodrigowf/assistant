@@ -83,11 +83,10 @@ class TestOrchestratorConfig:
         config = OrchestratorConfig.load()
         assert config.model == "claude-opus-4-6"
 
-    def test_memory_path_uses_config_dir(self, monkeypatch):
+    def test_memory_path_uses_context_dir(self, monkeypatch):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/my-config")
         config = OrchestratorConfig.load()
-        assert config.memory_path.startswith("/tmp/my-config/projects/")
-        assert config.memory_path.endswith("ORCHESTRATOR_MEMORY.md")
+        assert "context/memory/ORCHESTRATOR_MEMORY.md" in config.memory_path
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +560,8 @@ class TestOrchestratorAgent:
 class TestOrchestratorSession:
     @pytest.mark.asyncio
     async def test_start_creates_jsonl(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        import utils.paths as _paths
+        monkeypatch.setattr(_paths, "PROJECT_ROOT", tmp_path)
 
         from orchestrator.session import OrchestratorSession
         from orchestrator.config import OrchestratorConfig
@@ -587,7 +587,8 @@ class TestOrchestratorSession:
 
     @pytest.mark.asyncio
     async def test_resume_loads_history(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        import utils.paths as _paths
+        monkeypatch.setattr(_paths, "PROJECT_ROOT", tmp_path)
 
         from orchestrator.session import OrchestratorSession
         from orchestrator.config import OrchestratorConfig
@@ -638,16 +639,17 @@ class TestOrchestratorSession:
 class TestSessionStoreOrchestrator:
     def test_detects_orchestrator_session(self, tmp_path, monkeypatch):
         """SessionStore should detect orchestrator: true in JSONL metadata."""
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        import utils.paths as _paths
+        monkeypatch.setattr(_paths, "PROJECT_ROOT", tmp_path)
 
         from manager.store import SessionStore
 
-        # Create a sessions directory matching the expected path
-        sessions_dir = tmp_path / "projects" / "-tmp"
-        sessions_dir.mkdir(parents=True)
+        # Create context dir (where sessions live)
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
 
         # Write an orchestrator JSONL
-        jsonl = sessions_dir / "orch-session-1.jsonl"
+        jsonl = context_dir / "orch-session-1.jsonl"
         lines = [
             json.dumps({"type": "orchestrator_meta", "orchestrator": True, "timestamp": "2026-01-01T00:00:00Z"}),
             json.dumps({"type": "user", "message": {"content": "Hello orchestrator"}, "timestamp": "2026-01-01T00:00:01Z"}),
@@ -655,28 +657,29 @@ class TestSessionStoreOrchestrator:
         ]
         jsonl.write_text("\n".join(lines))
 
-        store = SessionStore("/tmp")
+        store = SessionStore(str(tmp_path))
         sessions = store.list_sessions()
         assert len(sessions) == 1
         assert sessions[0].is_orchestrator is True
 
     def test_regular_session_not_orchestrator(self, tmp_path, monkeypatch):
         """Regular sessions should have is_orchestrator=False."""
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        import utils.paths as _paths
+        monkeypatch.setattr(_paths, "PROJECT_ROOT", tmp_path)
 
         from manager.store import SessionStore
 
-        sessions_dir = tmp_path / "projects" / "-tmp"
-        sessions_dir.mkdir(parents=True)
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
 
-        jsonl = sessions_dir / "regular-session.jsonl"
+        jsonl = context_dir / "regular-session.jsonl"
         lines = [
             json.dumps({"type": "user", "message": {"content": "Hello"}, "timestamp": "2026-01-01T00:00:00Z"}),
             json.dumps({"type": "assistant", "message": {"content": "Hi!"}, "timestamp": "2026-01-01T00:00:01Z"}),
         ]
         jsonl.write_text("\n".join(lines))
 
-        store = SessionStore("/tmp")
+        store = SessionStore(str(tmp_path))
         sessions = store.list_sessions()
         assert len(sessions) == 1
         assert sessions[0].is_orchestrator is False

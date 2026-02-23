@@ -49,6 +49,8 @@
   --tool-todo:     hsl(275, 28%, 58%);
   --tool-task:     hsl(252, 30%, 56%);
   --tool-system:   hsl(220, 14%, 52%);
+  --tool-agent:    hsl(185, 45%, 52%);
+  --tool-search:   hsl(260, 35%, 58%);
 
   --tool-read-bg:     hsla(210, 45%, 55%, 0.07);
   --tool-write-bg:    hsla(155, 40%, 48%, 0.07);
@@ -60,6 +62,8 @@
   --tool-todo-bg:     hsla(275, 35%, 50%, 0.08);
   --tool-task-bg:     hsla(252, 35%, 48%, 0.07);
   --tool-system-bg:   hsla(220, 15%, 46%, 0.07);
+  --tool-agent-bg:    hsla(185, 48%, 48%, 0.07);
+  --tool-search-bg:   hsla(260, 40%, 52%, 0.07);
 
   /* Layout tokens */
   --radius:        7px;
@@ -82,9 +86,9 @@
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-body { min-height: 100vh; }
+html, body { height: 100%; overflow: hidden; }
 
-#root { height: 100vh; display: flex; }
+#root { height: 100%; display: flex; overflow: hidden; }
 
 button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
 

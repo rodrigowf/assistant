@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -78,7 +79,10 @@ async def search_history(
     if not index_dir:
         return json.dumps({"error": "Index directory not configured"})
 
-    results = _do_search(query, "history", max_results, index_dir)
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(
+        None, _do_search, query, "history", max_results, index_dir
+    )
     return json.dumps({"query": query, "results": results, "count": len(results)})
 
 
@@ -107,5 +111,8 @@ async def search_memory(
     if not index_dir:
         return json.dumps({"error": "Index directory not configured"})
 
-    results = _do_search(query, "memory", max_results, index_dir)
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(
+        None, _do_search, query, "memory", max_results, index_dir
+    )
     return json.dumps({"query": query, "results": results, "count": len(results)})

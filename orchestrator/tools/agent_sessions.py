@@ -72,11 +72,19 @@ async def open_agent_session(context: dict[str, Any], resume_sdk_id: str = "") -
     sdk_id = resume_sdk_id if resume_sdk_id else None
 
     # Validate that the session actually exists before trying to resume
-    if sdk_id and store.get_session_info(sdk_id) is None:
-        return json.dumps({
-            "error": f"Session {sdk_id!r} not found in history. "
-            "Use list_history to see available sessions."
-        })
+    if sdk_id:
+        session_info = store.get_session_info(sdk_id)
+        if session_info is None:
+            return json.dumps({
+                "error": f"Session {sdk_id!r} not found in history. "
+                "Use list_history to see available sessions."
+            })
+        if session_info.is_orchestrator:
+            return json.dumps({
+                "error": f"Session {sdk_id!r} is an orchestrator session and cannot "
+                "be resumed as an agent session. Only agent sessions (type='agent') "
+                "from list_history can be resumed."
+            })
 
     try:
         local_id = await pool.create(config, resume_sdk_id=sdk_id)
@@ -258,7 +266,11 @@ async def interrupt_agent_session(context: dict[str, Any], session_id: str) -> s
 
 @registry.register(
     name="list_history",
-    description="List all past conversation sessions (both regular and orchestrator).",
+    description=(
+        "List all past conversation sessions. Each session has a 'type' field: "
+        "'agent' sessions can be resumed with open_agent_session, "
+        "'orchestrator' sessions CANNOT be resumed as agent sessions."
+    ),
     input_schema={
         "type": "object",
         "properties": {
@@ -279,5 +291,6 @@ async def list_history(context: dict[str, Any], limit: int = 20) -> str:
             "title": s.title,
             "message_count": s.message_count,
             "last_activity": s.last_activity.isoformat(),
+            "type": "orchestrator" if s.is_orchestrator else "agent",
         })
     return json.dumps({"sessions": result, "total": len(sessions)})
