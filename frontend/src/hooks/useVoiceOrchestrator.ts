@@ -230,7 +230,8 @@ export function useVoiceOrchestrator(
     const micData = new Uint8Array(micAnalyser.frequencyBinCount);
     let speakerData: Uint8Array | null = null;
 
-    function computeRMS(data: Uint8Array): number {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function computeRMS(data: any): number {
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
         const v = (data[i] - 128) / 128;
@@ -257,7 +258,7 @@ export function useVoiceOrchestrator(
         }
       }
       if (speakerAnalyser && speakerData) {
-        speakerAnalyser.getByteTimeDomainData(speakerData);
+        speakerAnalyser.getByteTimeDomainData(speakerData as Uint8Array<ArrayBuffer>);
         setSpeakerLevel(computeRMS(speakerData));
       }
     }, 66); // ~15fps

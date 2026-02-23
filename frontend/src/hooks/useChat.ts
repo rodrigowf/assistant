@@ -332,9 +332,9 @@ export function useChat(options: UseChatOptions = {}): UseChatResult {
       case "turn_complete":
         dispatch({
           type: "TURN_COMPLETE",
-          cost: event.cost,
-          turns: event.num_turns,
-          sessionId: event.session_id,
+          cost: event.cost ?? null,
+          turns: event.num_turns ?? 0,
+          sessionId: event.session_id ?? "",
         });
         // Refresh session list after each turn (updates title, message count, etc.)
         onSessionChangeRef.current?.();
