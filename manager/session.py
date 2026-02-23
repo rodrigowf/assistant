@@ -24,6 +24,31 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import StreamEvent
 
+# Monkey-patch the SDK's message parser to handle unknown message types gracefully
+# instead of raising an exception (e.g., rate_limit_event is not handled by the SDK)
+def _patch_sdk_message_parser():
+    """Patch SDK to ignore unknown message types instead of crashing."""
+    try:
+        from claude_agent_sdk._internal import message_parser
+        original_parse = message_parser.parse_message
+
+        def patched_parse(data):
+            try:
+                return original_parse(data)
+            except Exception as e:
+                if "Unknown message type" in str(e):
+                    # Return None for unknown types - we'll filter these out
+                    logger.debug("Ignoring unknown message type: %s", data.get("type", "unknown"))
+                    return None
+                raise
+
+        message_parser.parse_message = patched_parse
+        logger.debug("SDK message parser patched for unknown message type handling")
+    except Exception as e:
+        logger.warning("Could not patch SDK message parser: %s", e)
+
+_patch_sdk_message_parser()
+
 from .config import ManagerConfig
 from .types import (
     CompactComplete,
@@ -162,19 +187,12 @@ class SessionManager:
         self._status = SessionStatus.STREAMING
         await self._client.query(prompt)
 
-        try:
-            async for msg in self._client.receive_response():
-                async for event in self._process_message(msg):
-                    yield event
-        except Exception as e:
-            # Handle SDK errors gracefully (e.g., unhandled message types like rate_limit_event)
-            # Log the error but don't crash the stream - the response may still be usable
-            error_msg = str(e)
-            if "Unknown message type" in error_msg:
-                logger.warning("SDK received unknown message type (continuing): %s", error_msg)
-            else:
-                logger.exception("Error during message streaming")
-                raise
+        async for msg in self._client.receive_response():
+            # Skip None messages (from patched parser ignoring unknown types)
+            if msg is None:
+                continue
+            async for event in self._process_message(msg):
+                yield event
 
         self._status = SessionStatus.IDLE
 

@@ -4,15 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import shutil
-import time
 from pathlib import Path
-
-import httpx
-
-logger = logging.getLogger(__name__)
 
 
 def _get_auth_env() -> dict[str, str]:
@@ -46,8 +40,6 @@ class AuthManager:
 
     # Claude OAuth URLs for headless auth
     AUTH_URL = "https://console.anthropic.com/settings/workspaces/default/oauth_tokens"
-    # Token refresh endpoint (OAuth2 standard)
-    TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 
     def __init__(self, cli_path: str | None = None, headless: bool = False) -> None:
         self._cli = cli_path or shutil.which("claude") or "claude"
@@ -75,10 +67,11 @@ class AuthManager:
 
         return False
 
-    def _check_credentials_file(self, allow_refresh: bool = True) -> bool:
-        """Check if credentials file exists and has valid tokens.
+    def _check_credentials_file(self) -> bool:
+        """Check if credentials file exists and has tokens.
 
-        If token is expired and allow_refresh is True, attempts to refresh it.
+        Note: We don't check token expiry here - the SDK handles auth internally
+        and will refresh tokens as needed. We just verify credentials exist.
         """
         try:
             if not self._credentials_path.exists():
@@ -87,75 +80,12 @@ class AuthManager:
             data = json.loads(self._credentials_path.read_text())
             oauth = data.get("claudeAiOauth", {})
 
-            # Check if we have an access token
+            # Check if we have an access token (SDK will handle refresh if expired)
             if not oauth.get("accessToken"):
-                return False
-
-            # Check if token is expired (with 1 min buffer)
-            expires_at = oauth.get("expiresAt", 0)
-            if expires_at and expires_at < (time.time() * 1000) + 60000:
-                # Token is expired - try to refresh if we have a refresh token
-                if allow_refresh and oauth.get("refreshToken"):
-                    logger.info("Access token expired, attempting refresh...")
-                    if self._refresh_token_sync(data):
-                        # Refresh succeeded, check again (without allow_refresh to avoid recursion)
-                        return self._check_credentials_file(allow_refresh=False)
                 return False
 
             return True
         except (json.JSONDecodeError, OSError):
-            return False
-
-    def _refresh_token_sync(self, credentials_data: dict) -> bool:
-        """Synchronously refresh the access token using the refresh token.
-
-        This updates the credentials file in place if successful.
-        """
-        oauth = credentials_data.get("claudeAiOauth", {})
-        refresh_token = oauth.get("refreshToken")
-        if not refresh_token:
-            return False
-
-        try:
-            # Make the token refresh request
-            with httpx.Client(timeout=30.0) as client:
-                response = client.post(
-                    self.TOKEN_URL,
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                )
-
-                if response.status_code != 200:
-                    logger.warning(f"Token refresh failed: {response.status_code} {response.text[:200]}")
-                    return False
-
-                token_data = response.json()
-
-                # Update the credentials
-                oauth["accessToken"] = token_data["access_token"]
-                if "refresh_token" in token_data:
-                    oauth["refreshToken"] = token_data["refresh_token"]
-
-                # Calculate new expiry (token_data has expires_in in seconds)
-                expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
-                oauth["expiresAt"] = int(time.time() * 1000) + (expires_in * 1000)
-
-                # Update scopes if provided
-                if "scope" in token_data:
-                    oauth["scopes"] = token_data["scope"].split()
-
-                # Write back to file
-                self._credentials_path.write_text(json.dumps(credentials_data))
-                logger.info("Token refresh successful, credentials updated")
-                return True
-
-        except Exception as e:
-            logger.warning(f"Token refresh error: {e}")
             return False
 
     async def _cli_auth_status(self) -> bool:
