@@ -80,9 +80,9 @@ class AuthManager:
             if not oauth.get("accessToken"):
                 return False
 
-            # Check if token is expired (with 5 min buffer)
+            # Check if token is expired (with 1 min buffer)
             expires_at = oauth.get("expiresAt", 0)
-            if expires_at and expires_at < (time.time() * 1000) + 300000:
+            if expires_at and expires_at < (time.time() * 1000) + 60000:
                 return False
 
             return True

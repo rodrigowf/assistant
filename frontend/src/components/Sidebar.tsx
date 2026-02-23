@@ -1,6 +1,7 @@
 import type { SessionInfo } from "../types";
 import { useTabsContext, getTabStatusIcon } from "../context/TabsContext";
 import { SessionItem } from "./SessionItem";
+import { generateUUID } from "../utils/uuid";
 
 interface Props {
   sessions: SessionInfo[];
@@ -43,7 +44,7 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
       }
       onSelectOrchestrator(sdkId, session.title || "Untitled");
     } else {
-      const newLocalId = crypto.randomUUID();
+      const newLocalId = generateUUID();
       openTab(newLocalId, session?.title || "Untitled", false, sdkId);
     }
     onClose?.();

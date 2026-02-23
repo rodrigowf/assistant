@@ -104,11 +104,22 @@ class SessionStore:
     """
 
     def __init__(self, project_dir: str | Path) -> None:
-        self._project_dir = str(Path(project_dir).resolve())
+        self._project_dir = Path(project_dir).resolve()
         self._sessions_dir = self._resolve_sessions_dir()
 
     def _resolve_sessions_dir(self) -> Path:
-        """Get the sessions directory (uses context/ directly)."""
+        """Get the sessions directory.
+
+        First tries to use the project_dir/context/ if it exists (for deployments
+        where the project_dir differs from the hardcoded paths). Falls back to
+        get_sessions_dir() for backwards compatibility.
+        """
+        # Try project_dir-relative path first (supports different deployments)
+        project_context = self._project_dir / "context"
+        if project_context.is_dir():
+            return project_context
+
+        # Fall back to hardcoded path from utils
         return get_sessions_dir()
 
     # ------------------------------------------------------------------
@@ -208,7 +219,8 @@ class SessionStore:
         return self._sessions_dir
 
     def _titles_path(self) -> Path:
-        return get_titles_path()
+        """Get the titles file path (relative to sessions dir for portability)."""
+        return self._sessions_dir / ".titles.json"
 
     def _load_titles(self) -> dict[str, str]:
         try:

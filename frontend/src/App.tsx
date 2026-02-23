@@ -8,6 +8,7 @@ import { OrchestratorModal } from "./components/OrchestratorModal";
 import { TabsProvider, useTabsContext } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
 import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
+import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
   const { sessions, refresh, deleteSession, renameSession } = useSessions();
@@ -20,7 +21,7 @@ function AppContent() {
   >(null);
 
   const handleNewSession = useCallback(() => {
-    const localId = crypto.randomUUID();
+    const localId = generateUUID();
     openTab(localId, "New session");
   }, [openTab]);
 
@@ -42,11 +43,11 @@ function AppContent() {
 
   const openOrchestrator = useCallback((action: { type: "new" } | { type: "resume"; id: string; title: string }) => {
     if (action.type === "new") {
-      const localId = crypto.randomUUID();
+      const localId = generateUUID();
       openTab(localId, "Orchestrator", true);
     } else {
       // Resuming from history: generate a stable local_id, pass SDK ID as resumeSdkId
-      const localId = crypto.randomUUID();
+      const localId = generateUUID();
       openTab(localId, action.title, true, action.id);
     }
   }, [openTab]);
