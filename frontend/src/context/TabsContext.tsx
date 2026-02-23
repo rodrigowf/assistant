@@ -5,7 +5,7 @@ import {
   useCallback,
   type ReactNode,
 } from "react";
-import type { TabState, TabsState, SessionStatus, ConnectionState } from "../types";
+import type { TabState, TabsState } from "../types";
 
 // -------------------------------------------------------------------
 // Actions
