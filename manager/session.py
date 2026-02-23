@@ -162,9 +162,19 @@ class SessionManager:
         self._status = SessionStatus.STREAMING
         await self._client.query(prompt)
 
-        async for msg in self._client.receive_response():
-            async for event in self._process_message(msg):
-                yield event
+        try:
+            async for msg in self._client.receive_response():
+                async for event in self._process_message(msg):
+                    yield event
+        except Exception as e:
+            # Handle SDK errors gracefully (e.g., unhandled message types like rate_limit_event)
+            # Log the error but don't crash the stream - the response may still be usable
+            error_msg = str(e)
+            if "Unknown message type" in error_msg:
+                logger.warning("SDK received unknown message type (continuing): %s", error_msg)
+            else:
+                logger.exception("Error during message streaming")
+                raise
 
         self._status = SessionStatus.IDLE
 
