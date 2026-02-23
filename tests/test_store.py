@@ -280,3 +280,30 @@ class TestSessionStoreDeleteSession:
         store = SessionStore(tmp_path)
         store._sessions_dir = sessions_dir
         assert store.delete_session("nope") is False
+
+    def test_delete_removes_from_index(self, tmp_path, monkeypatch):
+        """Test that deleting a session also removes it from the vector index."""
+        from unittest.mock import MagicMock, patch
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "indexed-session.jsonl").write_text("{}")
+
+        store = SessionStore(tmp_path)
+        store._sessions_dir = sessions_dir
+
+        # Mock the remove_session_from_index function
+        with patch("manager.store.remove_session_from_index") as mock_remove:
+            mock_remove.return_value = True
+
+            # Delete the session
+            result = store.delete_session("indexed-session")
+
+            # Verify session was deleted
+            assert result is True
+            assert not (sessions_dir / "indexed-session.jsonl").exists()
+
+            # Verify index removal was called
+            mock_remove.assert_called_once_with(
+                "indexed-session", collection_name="history"
+            )

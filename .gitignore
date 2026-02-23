@@ -21,7 +21,10 @@ frontend/node_modules/
 # Local logs
 logs/
 
-# Claude Code local data
+# Context is now a submodule (assistant-context repo)
+# context/
+
+# Claude Code SDK config (symlink to context/)
 .claude_config/
 
 # Claude Code runtime artifacts (created if CLAUDE_CONFIG_DIR is not set)
@@ -31,6 +34,10 @@ logs/
 /projects/
 /todos/
 /plugins/
+
+# Secrets, credentials, and certificates
+secrets/
+certs/
 
 # Temporary files
 .index-temp/

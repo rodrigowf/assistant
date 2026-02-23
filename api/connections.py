@@ -1,4 +1,4 @@
-"""ConnectionManager — tracks active WebSocket sessions."""
+"""ConnectionManager — tracks active WebSocket sessions (legacy, for auth route)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from manager.session import SessionManager
 
 
 class ConnectionManager:
-    """Track active WebSocket connections and their SessionManager instances."""
+    """Track active WebSocket connections and their SessionManager instances.
+
+    Used by the auth route to look up sessions by WebSocket.
+    """
 
     def __init__(self) -> None:
         self._active: dict[str, tuple[WebSocket, SessionManager]] = {}

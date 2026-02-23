@@ -3,6 +3,7 @@ import type {
   ChatMessage,
   MessageBlock,
   MessagePreview,
+  RealtimeEvent,
   ServerEvent,
   SessionStatus,
   ConnectionState,
@@ -49,7 +50,10 @@ type Action =
   | { type: "TOOL_RESULT"; toolUseId: string; output: string; isError: boolean }
   | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string }
   | { type: "STATUS"; status: SessionStatus }
-  | { type: "ERROR"; error: string };
+  | { type: "ERROR"; error: string }
+  | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
+  | { type: "VOICE_ASSISTANT_DELTA"; text: string }
+  | { type: "VOICE_ASSISTANT_COMPLETE"; text: string };
 
 // -------------------------------------------------------------------
 // Reducer
@@ -109,13 +113,17 @@ function reducer(state: ChatState, action: Action): ChatState {
             }
           } else if (b.type === "tool_use") {
             const result = b.tool_use_id ? toolResults.get(b.tool_use_id) : undefined;
+            // result may come from a separate tool_result block (SDK format)
+            // or directly on the tool_use block's output field (orchestrator format)
+            const resultOutput = result?.output ?? b.output ?? undefined;
+            const resultIsError = result?.isError ?? false;
             blocks.push({
               type: "tool_use",
               toolUseId: b.tool_use_id || "",
               toolName: b.tool_name || "",
               toolInput: (b.tool_input as Record<string, unknown>) || {},
-              result: result?.output,
-              isError: result?.isError,
+              result: resultOutput,
+              isError: resultIsError,
               complete: true,
             });
           }
@@ -251,6 +259,46 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "ERROR":
       return { ...state, error: action.error };
 
+    case "DISPLAY_MESSAGE":
+      return {
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            id: nextId(),
+            role: action.role,
+            blocks: [{ type: "text", content: action.text, streaming: false }],
+          },
+        ],
+      };
+
+    case "VOICE_ASSISTANT_DELTA":
+      return {
+        ...state,
+        messages: updateLastAssistantBlock(state.messages, (blocks) => {
+          const last = blocks[blocks.length - 1];
+          if (last?.type === "text" && last.streaming) {
+            return [
+              ...blocks.slice(0, -1),
+              { ...last, content: last.content + action.text },
+            ];
+          }
+          return [...blocks, { type: "text", content: action.text, streaming: true }];
+        }),
+      };
+
+    case "VOICE_ASSISTANT_COMPLETE":
+      return {
+        ...state,
+        messages: updateLastAssistantBlock(state.messages, (blocks) => {
+          const last = blocks[blocks.length - 1];
+          if (last?.type === "text" && last.streaming) {
+            return [...blocks.slice(0, -1), { ...last, content: action.text, streaming: false }];
+          }
+          return [...blocks, { type: "text", content: action.text, streaming: false }];
+        }),
+      };
+
     default:
       return state;
   }
@@ -271,32 +319,72 @@ export interface ChatInstance {
   send: (text: string) => void;
   command: (text: string) => void;
   interrupt: () => void;
+  /** Stop the current session (releases orchestrator lock). */
+  stop: () => void;
+  /** Restart the session (send start again after a stop). */
+  restart: () => void;
+  /** Send a voice_event to the backend (voice mode only). */
+  sendVoiceEvent: (event: RealtimeEvent) => void;
+  /** Send voice_start to switch this orchestrator session to voice mode. */
+  startVoiceMode: () => void;
+  /** Add a display-only message (no backend send). Used for voice transcripts. */
+  addDisplayMessage: (role: "user" | "assistant", text: string) => void;
+  /** Stream a voice assistant transcript delta into the chat. */
+  voiceAssistantDelta: (text: string) => void;
+  /** Finalize a voice assistant transcript in the chat. */
+  voiceAssistantComplete: (text: string) => void;
+  /** Add a tool use block to the chat (for voice mode tool calls). */
+  dispatchToolUse: (toolUseId: string, toolName: string, toolInput: Record<string, unknown>) => void;
+  /** Add a tool result to a pending tool use block (for voice mode tool results). */
+  dispatchToolResult: (toolUseId: string, output: string, isError: boolean) => void;
 }
 
 interface UseChatInstanceOptions {
-  /** Session ID to resume. If null, starts a new session. */
-  resumeId: string | null;
+  /** Stable local ID for this session (never changes). */
+  localId: string;
+  /** SDK session ID to resume from history. Null for new sessions. */
+  resumeSdkId: string | null;
   /** Called when a turn completes (to refresh session list). */
   onSessionChange?: () => void;
   /** Called when status or connection state changes (for tab status sync). */
   onStatusChange?: (status: SessionStatus, connectionState: ConnectionState) => void;
-  /** Called when session is established and we have a session ID. */
-  onSessionStarted?: (sessionId: string) => void;
+  /** WebSocket endpoint path (default: /api/sessions/chat). */
+  wsEndpoint?: string;
+  /** Skip loading history from REST API (for orchestrator sessions). */
+  skipHistory?: boolean;
+  /** Called when pool notifies that an agent session was opened. */
+  onAgentSessionOpened?: (sessionId: string, sdkSessionId?: string) => void;
+  /** Called when pool notifies that an agent session was closed. */
+  onAgentSessionClosed?: (sessionId: string) => void;
+  /** Called when backend sends a voice_command (voice mode: forward to OpenAI). */
+  onVoiceCommand?: (command: Record<string, unknown>) => void;
+  /** Called when the backend closes this session (session_stopped event). */
+  onSessionClosed?: () => void;
 }
 
 export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
-  const { resumeId, onSessionChange, onStatusChange, onSessionStarted } = options;
+  const { localId, resumeSdkId, onSessionChange, onStatusChange, wsEndpoint, skipHistory, onAgentSessionOpened, onAgentSessionClosed, onVoiceCommand, onSessionClosed } = options;
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [wsActive, setWsActive] = useState(false);
-  const pendingStartRef = useRef<{ resumeId: string | null } | null>(null);
+  const pendingStartRef = useRef<{ resumeSdkId: string | null } | null>(null);
 
   // Stable refs for callbacks
   const onSessionChangeRef = useRef(onSessionChange);
   onSessionChangeRef.current = onSessionChange;
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
-  const onSessionStartedRef = useRef(onSessionStarted);
-  onSessionStartedRef.current = onSessionStarted;
+  const onAgentSessionOpenedRef = useRef(onAgentSessionOpened);
+  onAgentSessionOpenedRef.current = onAgentSessionOpened;
+  const onAgentSessionClosedRef = useRef(onAgentSessionClosed);
+  onAgentSessionClosedRef.current = onAgentSessionClosed;
+  const onVoiceCommandRef = useRef(onVoiceCommand);
+  onVoiceCommandRef.current = onVoiceCommand;
+  const onSessionClosedRef = useRef(onSessionClosed);
+  onSessionClosedRef.current = onSessionClosed;
+  const localIdRef = useRef(localId);
+  localIdRef.current = localId;
+  const resumeSdkIdRef = useRef(resumeSdkId);
+  resumeSdkIdRef.current = resumeSdkId;
 
   // Track status changes and notify parent
   const prevStatusRef = useRef<{ status: SessionStatus; conn: ConnectionState } | null>(null);
@@ -305,7 +393,10 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     switch (event.type) {
       case "session_started":
         dispatch({ type: "SESSION_STARTED", sessionId: event.session_id });
-        onSessionStartedRef.current?.(event.session_id);
+        // Voice mode: send session.update to OpenAI via voice bridge
+        if (event.voice_session_update) {
+          onVoiceCommandRef.current?.(event.voice_session_update as Record<string, unknown>);
+        }
         break;
       case "text_delta":
         dispatch({ type: "TEXT_DELTA", text: event.text });
@@ -338,9 +429,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       case "turn_complete":
         dispatch({
           type: "TURN_COMPLETE",
-          cost: event.cost,
-          turns: event.num_turns,
-          sessionId: event.session_id,
+          cost: event.cost ?? null,
+          turns: event.num_turns ?? 1,
+          sessionId: "",  // Don't update sessionId — local_id is stable
         });
         onSessionChangeRef.current?.();
         break;
@@ -352,6 +443,19 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "session_stopped":
         dispatch({ type: "STATUS", status: "disconnected" });
+        onSessionClosedRef.current?.();
+        break;
+      case "agent_session_opened":
+        onAgentSessionOpenedRef.current?.(event.session_id, event.sdk_session_id);
+        break;
+      case "agent_session_closed":
+        onAgentSessionClosedRef.current?.(event.session_id);
+        break;
+      case "user_message":
+        dispatch({ type: "USER_MESSAGE", text: event.text });
+        break;
+      case "voice_command":
+        onVoiceCommandRef.current?.(event.command);
         break;
     }
   }, []);
@@ -360,15 +464,18 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     const pending = pendingStartRef.current;
     if (pending) {
       pendingStartRef.current = null;
-      if (pending.resumeId) {
-        wsSendRef.current?.({ type: "start", session_id: pending.resumeId });
-      } else {
-        wsSendRef.current?.({ type: "start" });
+      const startMsg: Record<string, unknown> = {
+        type: "start",
+        local_id: localIdRef.current,
+      };
+      if (pending.resumeSdkId) {
+        startMsg.resume_sdk_id = pending.resumeSdkId;
       }
+      wsSendRef.current?.(startMsg);
     }
   }, []);
 
-  const { send: wsSend, close: wsClose, connectionState } = useWebSocket(wsActive, handleEvent, handleOpen);
+  const { send: wsSend, close: wsClose, connectionState } = useWebSocket(wsActive, handleEvent, handleOpen, wsEndpoint);
   const wsSendRef = useRef(wsSend);
   wsSendRef.current = wsSend;
 
@@ -388,9 +495,10 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     async function init() {
       dispatch({ type: "RESET" });
 
-      if (resumeId) {
+      // Load history using the SDK session ID (JSONL filename)
+      if (resumeSdkId && !skipHistory) {
         try {
-          const detail = await getSession(resumeId);
+          const detail = await getSession(resumeSdkId);
           if (cancelled) return;
           dispatch({ type: "LOAD_HISTORY", messages: detail.messages });
         } catch {
@@ -399,7 +507,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       }
 
       if (cancelled) return;
-      pendingStartRef.current = { resumeId };
+      pendingStartRef.current = { resumeSdkId };
       setWsActive(true);
     }
 
@@ -410,7 +518,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       wsClose();
       setWsActive(false);
     };
-  }, [resumeId, wsClose]);
+  }, [localId, resumeSdkId, wsClose]);
 
   const send = useCallback(
     (text: string) => {
@@ -431,6 +539,65 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     wsSend({ type: "interrupt" });
   }, [wsSend]);
 
+  const stop = useCallback(() => {
+    wsSend({ type: "stop" });
+  }, [wsSend]);
+
+  const restart = useCallback(() => {
+    // Re-send start on the existing WebSocket to re-register with the orchestrator
+    const msg: Record<string, unknown> = { type: "start", local_id: localIdRef.current };
+    if (resumeSdkIdRef.current) {
+      msg.resume_sdk_id = resumeSdkIdRef.current;
+    }
+    wsSend(msg);
+  }, [wsSend]);
+
+  const sendVoiceEvent = useCallback(
+    (event: RealtimeEvent) => {
+      wsSend({ type: "voice_event", event });
+    },
+    [wsSend]
+  );
+
+  const startVoiceMode = useCallback(() => {
+    wsSend({ type: "voice_start" });
+  }, [wsSend]);
+
+  const addDisplayMessage = useCallback(
+    (role: "user" | "assistant", text: string) => {
+      dispatch({ type: "DISPLAY_MESSAGE", role, text });
+    },
+    []
+  );
+
+  const voiceAssistantDelta = useCallback(
+    (text: string) => {
+      dispatch({ type: "VOICE_ASSISTANT_DELTA", text });
+    },
+    []
+  );
+
+  const voiceAssistantComplete = useCallback(
+    (text: string) => {
+      dispatch({ type: "VOICE_ASSISTANT_COMPLETE", text });
+    },
+    []
+  );
+
+  const dispatchToolUse = useCallback(
+    (toolUseId: string, toolName: string, toolInput: Record<string, unknown>) => {
+      dispatch({ type: "TOOL_USE", toolUseId, toolName, toolInput });
+    },
+    []
+  );
+
+  const dispatchToolResult = useCallback(
+    (toolUseId: string, output: string, isError: boolean) => {
+      dispatch({ type: "TOOL_RESULT", toolUseId, output, isError });
+    },
+    []
+  );
+
   return {
     messages: state.messages,
     status: state.status,
@@ -442,5 +609,14 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     send,
     command,
     interrupt,
+    stop,
+    restart,
+    sendVoiceEvent,
+    startVoiceMode,
+    addDisplayMessage,
+    voiceAssistantDelta,
+    voiceAssistantComplete,
+    dispatchToolUse,
+    dispatchToolResult,
   };
 }

@@ -9,35 +9,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
 from pathlib import Path
+
+from utils.paths import get_memory_dir, get_sessions_dir, get_project_dir
 
 logger = logging.getLogger(__name__)
 
 
-def _mangle_path(project_path: str) -> str:
-    """Convert an absolute path to Claude Code's mangled directory name."""
-    return project_path.rstrip("/").replace("/", "-")
-
-
-def _get_claude_data_dir(project_dir: Path) -> Path:
-    """Get the Claude Code data directory for a project."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    if config_dir:
-        base = Path(config_dir)
-    else:
-        base = Path.home() / ".claude"
-    mangled = _mangle_path(str(project_dir.resolve()))
-    return base / "projects" / mangled
-
-
 async def _run_index_script(project_dir: Path, *args: str) -> bool:
     """Run the index-memory.py script with given arguments. Returns True on success."""
-    run_sh = project_dir / "scripts" / "run.sh"
-    index_py = project_dir / "scripts" / "index-memory.py"
+    run_sh = project_dir / "context" / "scripts" / "run.sh"
+    index_py = project_dir / "context" / "scripts" / "index-memory.py"
 
     if not run_sh.exists() or not index_py.exists():
-        logger.warning("Indexer scripts not found")
+        logger.warning("Indexer scripts not found at context/scripts/")
         return False
 
     proc = await asyncio.create_subprocess_exec(
@@ -67,8 +52,8 @@ class MemoryWatcher:
         self._running = True
 
     def _get_memory_dir(self) -> Path:
-        """Get the Claude Code memory directory for this project."""
-        return _get_claude_data_dir(self._project_dir) / "memory"
+        """Get the memory directory (uses context/memory/ directly)."""
+        return get_memory_dir()
 
     async def run(self) -> None:
         """Watch memory directory and index on changes."""
@@ -140,8 +125,8 @@ class HistoryIndexer:
         self._last_hash: str | None = None
 
     def _get_sessions_dir(self) -> Path:
-        """Get the Claude Code sessions directory for this project."""
-        return _get_claude_data_dir(self._project_dir)
+        """Get the sessions directory (uses context/ directly)."""
+        return get_sessions_dir()
 
     def _compute_sessions_hash(self) -> str:
         """Compute a hash of all session file mtimes and sizes."""

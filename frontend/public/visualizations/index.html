@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visualization Gallery</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+            padding: 40px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 3.5rem;
+            text-align: center;
+            margin-bottom: 20px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+        }
+
+        .subtitle {
+            text-align: center;
+            font-size: 1.3rem;
+            opacity: 0.9;
+            margin-bottom: 50px;
+        }
+
+        .info-box {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 40px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 15px;
+        }
+
+        .info-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .info-label {
+            font-weight: bold;
+            opacity: 0.8;
+        }
+
+        .info-value {
+            font-family: 'Courier New', monospace;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 5px 10px;
+            border-radius: 5px;
+        }
+
+        .gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 30px;
+        }
+
+        .viz-card {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 25px;
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.3s ease;
+            cursor: pointer;
+            text-decoration: none;
+            color: white;
+            display: block;
+        }
+
+        .viz-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+
+        .viz-icon {
+            font-size: 4rem;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .viz-title {
+            font-size: 1.8rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .viz-description {
+            opacity: 0.9;
+            line-height: 1.6;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+
+        .viz-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+            margin-top: 15px;
+        }
+
+        .tag {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 60px;
+            opacity: 0.7;
+            font-size: 0.9rem;
+        }
+
+        .code-snippet {
+            background: rgba(0, 0, 0, 0.4);
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            margin-top: 10px;
+            overflow-x: auto;
+        }
+
+        .section-title {
+            font-size: 2rem;
+            margin: 40px 0 20px 0;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.3);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 Visualization Gallery</h1>
+        <div class="subtitle">Interactive HTML visualizations for the Assistant project</div>
+
+        <div class="info-box">
+            <h3 style="margin-bottom: 15px;">📡 System Information</h3>
+            <div class="info-grid">
+                <div class="info-item">
+                    <span class="info-label">Local IP:</span>
+                    <span class="info-value" id="local-ip">192.168.0.28</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Port:</span>
+                    <span class="info-value">5173</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Status:</span>
+                    <span class="info-value">🟢 Active</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Visualizations:</span>
+                    <span class="info-value" id="viz-count">-</span>
+                </div>
+            </div>
+        </div>
+
+        <h2 class="section-title">Featured</h2>
+
+        <div class="gallery">
+            <a href="assistant-infograph.html" class="viz-card" style="border: 3px solid #667eea; background: linear-gradient(135deg, rgba(102, 126, 234, 0.2) 0%, rgba(118, 75, 162, 0.2) 100%);">
+                <div class="viz-icon">📊</div>
+                <div class="viz-title">Assistant Project Infograph</div>
+                <div class="viz-description">
+                    Beautiful interactive infograph explaining the entire Personal AI Assistant project.
+                    Overview, architecture, components, achievements, and workflow—all in one visual guide.
+                </div>
+                <div class="viz-tags">
+                    <span class="tag">⭐ Featured</span>
+                    <span class="tag">Infograph</span>
+                    <span class="tag">Project Overview</span>
+                </div>
+            </a>
+        </div>
+
+        <h2 class="section-title">Available Visualizations</h2>
+
+        <div class="gallery">
+            <a href="example.html" class="viz-card">
+                <div class="viz-icon">🎨</div>
+                <div class="viz-title">Example Visualization</div>
+                <div class="viz-description">
+                    A simple demonstration of the visualization system with an animated,
+                    interactive colored rectangle. Click to change colors!
+                </div>
+                <div class="viz-tags">
+                    <span class="tag">Interactive</span>
+                    <span class="tag">Animation</span>
+                    <span class="tag">Demo</span>
+                </div>
+            </a>
+
+            <a href="system-stats.html" class="viz-card">
+                <div class="viz-icon">🖥️</div>
+                <div class="viz-title">System Monitor</div>
+                <div class="viz-description">
+                    Real-time system statistics dashboard showing CPU, memory, disk usage,
+                    and network information with auto-refreshing metrics.
+                </div>
+                <div class="viz-tags">
+                    <span class="tag">Dashboard</span>
+                    <span class="tag">Real-time</span>
+                    <span class="tag">Monitoring</span>
+                </div>
+            </a>
+
+            <a href="remote-demo.html" class="viz-card">
+                <div class="viz-icon">🎮</div>
+                <div class="viz-title">Fire TV Remote Demo</div>
+                <div class="viz-description">
+                    Interactive demo showing Fire TV remote control integration. Navigate
+                    with arrow keys, select with Enter, perfect for 10-foot UI testing.
+                </div>
+                <div class="viz-tags">
+                    <span class="tag">Fire TV</span>
+                    <span class="tag">Remote Control</span>
+                    <span class="tag">Interactive</span>
+                </div>
+            </a>
+        </div>
+
+        <h2 class="section-title">🚀 Quick Commands</h2>
+
+        <div class="info-box">
+            <h3>Get Visualization URLs</h3>
+            <div class="code-snippet">
+# Get localhost URL<br>
+scripts/run.sh scripts/get_visualization_url.py example<br>
+<br>
+# Get network URL (for Fire TV)<br>
+scripts/run.sh scripts/get_visualization_url.py example --network
+            </div>
+        </div>
+
+        <div class="info-box">
+            <h3>Display on Fire TV</h3>
+            <div class="code-snippet">
+# Open visualization on Fire TV via ADB<br>
+adb shell am start -a android.intent.action.VIEW \<br>
+    -d "https://192.168.0.28:5173/visualizations/example.html"
+            </div>
+        </div>
+
+        <div class="info-box">
+            <h3>Create New Visualization</h3>
+            <div class="code-snippet">
+# Create new HTML file<br>
+touch frontend/public/visualizations/my-viz.html<br>
+<br>
+# Access immediately (no build needed!)<br>
+https://localhost:5173/visualizations/my-viz.html
+            </div>
+        </div>
+
+        <h2 class="section-title">📚 Documentation</h2>
+
+        <div class="info-box">
+            <ul style="line-height: 2; padding-left: 20px;">
+                <li><strong>README.md</strong> - Comprehensive documentation with best practices</li>
+                <li><strong>QUICKSTART.md</strong> - Quick reference guide</li>
+                <li><strong>Example files</strong> - Use as templates for new visualizations</li>
+            </ul>
+        </div>
+
+        <div class="footer">
+            <p>Part of the Personal Assistant project</p>
+            <p style="margin-top: 10px;">Files served directly by Vite - no build step required</p>
+        </div>
+    </div>
+
+    <script>
+        // Count visualization files
+        const vizCount = document.querySelectorAll('.viz-card').length;
+        document.getElementById('viz-count').textContent = vizCount;
+
+        // Try to detect actual IP if possible
+        // (This is a simplified version - real IP detection would need a server endpoint)
+        document.getElementById('local-ip').textContent = window.location.hostname || '192.168.0.28';
+
+        // Add current timestamp
+        console.log('Visualization gallery loaded at:', new Date().toLocaleString());
+    </script>
+</body>
+</html>

@@ -11,7 +11,8 @@ interface UseWebSocketResult {
 export function useWebSocket(
   active: boolean,
   onEvent: EventHandler,
-  onOpen?: () => void
+  onOpen?: () => void,
+  endpoint?: string,
 ): UseWebSocketResult {
   const socketRef = useRef<ChatSocket | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
@@ -39,7 +40,7 @@ export function useWebSocket(
     }
 
     setConnectionState("connecting");
-    const socket = new ChatSocket(handler);
+    const socket = new ChatSocket(handler, endpoint);
     socket.connect(() => {
       setConnectionState("connected");
       onOpenRef.current?.();
@@ -51,7 +52,7 @@ export function useWebSocket(
       socketRef.current = null;
       setConnectionState("disconnected");
     };
-  }, [active, handler]);
+  }, [active, handler, endpoint]);
 
   const send = useCallback((msg: Record<string, unknown>) => {
     socketRef.current?.send(msg);
