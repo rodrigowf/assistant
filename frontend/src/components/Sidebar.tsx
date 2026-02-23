@@ -9,9 +9,11 @@ interface Props {
   onNew: () => void;
   onNewOrchestrator: () => void;
   onSelectOrchestrator: (id: string, title: string) => void;
+  isOpen?: boolean;
+  onClose?: () => void;
 }
 
-export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator }: Props) {
+export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator, isOpen, onClose }: Props) {
   const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
 
   const handleSelect = (sdkId: string, localId?: string) => {
@@ -25,6 +27,7 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
 
     if (existingTab) {
       switchTab(existingTab.sessionId);
+      onClose?.();
       return;
     }
 
@@ -35,6 +38,7 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
       const existingOrchestratorTab = tabs.find((t) => t.isOrchestrator);
       if (existingOrchestratorTab) {
         switchTab(existingOrchestratorTab.sessionId);
+        onClose?.();
         return;
       }
       onSelectOrchestrator(sdkId, session.title || "Untitled");
@@ -42,6 +46,7 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
       const newLocalId = crypto.randomUUID();
       openTab(newLocalId, session?.title || "Untitled", false, sdkId);
     }
+    onClose?.();
   };
 
   // Build indicator maps for the sidebar.
@@ -73,7 +78,9 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
   }
 
   return (
-    <aside className="sidebar">
+    <>
+    {isOpen && <div className="sidebar-backdrop" onClick={onClose} />}
+    <aside className={`sidebar${isOpen ? " sidebar-open" : ""}`}>
       <div className="sidebar-header">
         <h2 className="sidebar-title">Sessions</h2>
         <div className="sidebar-header-actions">
@@ -116,5 +123,6 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
         )}
       </div>
     </aside>
+    </>
   );
 }

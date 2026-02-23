@@ -137,16 +137,35 @@ class OrchestratorAgent:
             if not tool_calls:
                 break
 
-            # Execute tool calls and collect results
+            # Execute tool calls concurrently so a slow tool (e.g.
+            # send_to_agent_session with its 300s timeout) doesn't block
+            # other independent tool calls in the same turn.
+            if self._interrupted:
+                yield ErrorEvent(error="interrupted", detail="Agent was interrupted during tool execution")
+                return
+
+            async def _exec(tc: ToolUseStart) -> tuple[ToolUseStart, str]:
+                r = await self._registry.execute(
+                    tc.tool_name, tc.tool_input, self._context
+                )
+                return tc, r
+
+            results_list = await asyncio.gather(
+                *[_exec(tc) for tc in tool_calls],
+                return_exceptions=True,
+            )
+
             tool_results: list[dict[str, Any]] = []
-            for tc in tool_calls:
+            for item in results_list:
                 if self._interrupted:
                     yield ErrorEvent(error="interrupted", detail="Agent was interrupted during tool execution")
                     return
 
-                result = await self._registry.execute(
-                    tc.tool_name, tc.tool_input, self._context
-                )
+                if isinstance(item, BaseException):
+                    logger.exception("Tool execution failed: %s", item)
+                    continue
+
+                tc, result = item
 
                 is_error = False
                 try:

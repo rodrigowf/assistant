@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -215,44 +216,72 @@ async def _handle_send(
 async def _handle_voice_event(
     pool: SessionPool, session: OrchestratorSession, event: dict,
 ) -> None:
-    """Process a mirrored OpenAI Realtime event and send back any voice commands."""
+    """Process a mirrored OpenAI Realtime event and send back any voice commands.
+
+    Tool calls (response.function_call_arguments.done) are spawned as background
+    tasks so the WebSocket handler can continue processing other voice events
+    (transcripts, interruptions, etc.) without blocking.
+    """
     try:
         event_type = event.get("type", "")
 
-        # Broadcast tool_use when a tool call starts so the chat UI shows it
+        # Tool calls are long-running — spawn as background task to avoid
+        # blocking the WebSocket handler loop.
         if event_type == "response.function_call_arguments.done":
-            import json as _json
-            call_id = event.get("call_id", "")
-            name = event.get("name", "")
-            try:
-                tool_input = _json.loads(event.get("arguments", "{}"))
-            except Exception:
-                tool_input = {}
-            if call_id and name:
-                await pool.broadcast_orchestrator({
-                    "type": "tool_use",
-                    "tool_use_id": call_id,
-                    "tool_name": name,
-                    "tool_input": tool_input,
-                })
+            asyncio.create_task(
+                _handle_voice_tool_call(pool, session, event),
+                name="voice-tool-call",
+            )
+            return
 
         commands = await session.process_voice_event(event)
-
-        # Broadcast tool_result after execution completes
-        if event_type == "response.function_call_arguments.done" and commands:
-            for cmd in commands:
-                if cmd.get("type") == "conversation.item.create":
-                    item = cmd.get("item", {})
-                    if item.get("type") == "function_call_output":
-                        await pool.broadcast_orchestrator({
-                            "type": "tool_result",
-                            "tool_use_id": item.get("call_id", ""),
-                            "output": item.get("output", ""),
-                            "is_error": False,
-                        })
 
         for cmd in commands:
             await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
     except Exception as e:
         logger.exception("Voice event processing failed")
+        await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
+
+
+async def _handle_voice_tool_call(
+    pool: SessionPool, session: OrchestratorSession, event: dict,
+) -> None:
+    """Execute a voice tool call in the background without blocking the WS handler."""
+    try:
+        import json as _json
+        call_id = event.get("call_id", "")
+        name = event.get("name", "")
+        try:
+            tool_input = _json.loads(event.get("arguments", "{}"))
+        except Exception:
+            tool_input = {}
+
+        # Broadcast tool_use so the chat UI shows the tool call starting
+        if call_id and name:
+            await pool.broadcast_orchestrator({
+                "type": "tool_use",
+                "tool_use_id": call_id,
+                "tool_name": name,
+                "tool_input": tool_input,
+            })
+
+        # Execute the tool (this is the potentially long-running part)
+        commands = await session.process_voice_event(event)
+
+        # Broadcast tool_result after execution completes
+        for cmd in commands:
+            if cmd.get("type") == "conversation.item.create":
+                item = cmd.get("item", {})
+                if item.get("type") == "function_call_output":
+                    await pool.broadcast_orchestrator({
+                        "type": "tool_result",
+                        "tool_use_id": item.get("call_id", ""),
+                        "output": item.get("output", ""),
+                        "is_error": False,
+                    })
+
+        for cmd in commands:
+            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+    except Exception as e:
+        logger.exception("Voice tool call execution failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})

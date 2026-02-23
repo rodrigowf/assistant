@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import fs from 'fs'
 import path from 'path'
 
-const certsDir = path.resolve(__dirname, '..', 'certs')
+const certsDir = path.resolve(__dirname, '..', 'context', 'certs')
 const hasLocalCerts = fs.existsSync(path.join(certsDir, 'key.pem'))
 
 // https://vite.dev/config/

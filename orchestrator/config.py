@@ -6,10 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
-def _mangle_path(project_path: str) -> str:
-    """Convert an absolute path to Claude Code's mangled directory name."""
-    return project_path.rstrip("/").replace("/", "-")
+from utils.paths import get_memory_dir
 
 
 @dataclass(slots=True)
@@ -30,14 +27,8 @@ class OrchestratorConfig:
             str(Path(__file__).resolve().parent.parent),
         )
 
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir:
-            base = Path(config_dir)
-        else:
-            base = Path.home() / ".claude"
-
-        mangled = _mangle_path(str(Path(project_dir).resolve()))
-        memory_path = str(base / "projects" / mangled / "memory" / "ORCHESTRATOR_MEMORY.md")
+        # Use context/memory/ directly for the orchestrator memory file
+        memory_path = str(get_memory_dir() / "ORCHESTRATOR_MEMORY.md")
 
         return cls(
             model=os.environ.get("ORCHESTRATOR_MODEL", "claude-sonnet-4-5-20250929"),

@@ -34,7 +34,7 @@ def _resolve_safe_path(base_dir: str, relative_path: str) -> Path | None:
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Relative path to the file (e.g., 'CLAUDE.md' or '.claude_config/projects/.../memory/ORCHESTRATOR_MEMORY.md').",
+                "description": "Relative path to the file (e.g., 'CLAUDE.md' or 'context/memory/ORCHESTRATOR_MEMORY.md').",
             },
         },
         "required": ["path"],

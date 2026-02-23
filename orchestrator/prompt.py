@@ -7,7 +7,7 @@ from typing import Any
 
 from orchestrator.config import OrchestratorConfig
 
-MAX_MEMORY_CHARS = 4000
+MAX_MEMORY_CHARS = 12000
 MAX_HISTORY_MESSAGES = 20
 MAX_HISTORY_CHARS = 6000
 
