@@ -53,10 +53,24 @@ export function listPoolSessions(): Promise<PoolSession[]> {
   return json(`${BASE}/sessions/pool/live`);
 }
 
-export function authStatus(): Promise<{ authenticated: boolean }> {
+export interface AuthStatusResponse {
+  authenticated: boolean;
+  auth_url?: string;
+  headless: boolean;
+}
+
+export function authStatus(): Promise<AuthStatusResponse> {
   return json(`${BASE}/auth/status`);
 }
 
-export function authLogin(): Promise<{ authenticated: boolean }> {
+export function authLogin(): Promise<AuthStatusResponse> {
   return json(`${BASE}/auth/login`, { method: "POST" });
+}
+
+export function authSetCredentials(credentialsJson: string): Promise<AuthStatusResponse> {
+  return json(`${BASE}/auth/credentials`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ credentials_json: credentialsJson }),
+  });
 }

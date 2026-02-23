@@ -155,36 +155,53 @@ This eliminated the "triple-ID-change problem" where tabs would go: `new-N` → 
 
 ---
 
-## Quick Start
+## Installation
+
+The assistant is **ready to deploy** on any machine with the prerequisites installed. The installation script handles everything automatically.
 
 ### Prerequisites
 
-- Python 3.12+
-- Node.js 20+
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
-- `ANTHROPIC_API_KEY` in your environment
-- `OPENAI_API_KEY` in your environment (required for voice mode)
+- **Python 3.12+**
+- **Node.js 20+**
+- **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code && claude auth login`
+- **API Keys** — `ANTHROPIC_API_KEY` (required), `OPENAI_API_KEY` (for voice mode)
 
-Check if you have everything:
+Check prerequisites:
 ```bash
-context/scripts/install-prerequisites.sh
+./default-scripts/install-prerequisites.sh
 ```
 
-### Installation
+### One-Command Installation
 
 ```bash
-git clone https://github.com/yourusername/assistant.git
+git clone https://github.com/rodrigowf/assistant.git
 cd assistant
 ./install.sh
 ```
 
-The installer sets up the Python environment, installs dependencies, and configures the frontend.
+The interactive installer will:
+1. ✓ Check system prerequisites (Python, Node.js, Claude CLI)
+2. ✓ Set up your context (fresh install or import existing)
+3. ✓ Create symlinks to default skills, scripts, and agents
+4. ✓ Configure Claude SDK compatibility
+5. ✓ Install Python dependencies (FastAPI, ChromaDB, etc.)
+6. ✓ Install frontend dependencies (React, Vite)
+7. ✓ Verify the installation
+
+**Installation Options:**
+```bash
+./install.sh                                    # Interactive (recommended)
+./install.sh --new-context                      # Fresh install, no prompts
+./install.sh --import-context URL               # Import existing context repo
+./install.sh --dev                              # Include dev dependencies
+./install.sh --skip-prereqs                     # Skip prerequisite checks
+```
 
 ### Run
 
 ```bash
 # Terminal 1 — Backend
-context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --reload
+context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000
 
 # Terminal 2 — Frontend
 cd frontend && npm run dev
@@ -192,7 +209,23 @@ cd frontend && npm run dev
 
 Open **https://localhost:5173** and start chatting.
 
-**Shortcut**: Use `/debug-app` skill to launch both backend and frontend with browser automation.
+**Tip**: Use `/debug-app` to launch both backend and frontend with browser automation.
+
+### Migrate to Another Machine
+
+Your personal data lives in `context/` (conversations, memory, credentials). To migrate:
+
+1. **If context is a git repo**: Push to private remote, then on new machine:
+   ```bash
+   ./install.sh --import-context git@github.com:you/assistant-context.git
+   ```
+
+2. **Manual migration**: Copy `context/` folder to new machine, then run `./install.sh`
+
+3. **Copy remaining secrets** (not in git):
+   - `context/secrets/` — OAuth tokens
+   - `context/.env` — API keys
+   - `context/certs/` — SSL certificates
 
 ---
 
@@ -447,23 +480,38 @@ npm run lint      # ESLint
 
 ## Production Readiness
 
-### ✅ What's Complete
-- Multi-tab frontend with voice integration
-- Orchestrator agent (all 4 planned phases)
-- Session persistence and resumption
-- Semantic search over history and memory
-- Background indexing (memory + history)
-- Cost and usage tracking per session
-- Dynamic agent tab management
-- WebRTC voice mode with audio visualization
-- Dual ID system (stable local_id + sdk_session_id)
+### ✅ Ready to Deploy
 
-### 🎯 Ready For
-- Multi-agent workflows
-- Voice-first interactions
-- Context-aware task delegation
-- Long-running sessions with history
-- Self-modification and skill creation
+The assistant is **production-ready** and can be deployed on any machine:
+
+| Feature | Status |
+|---------|--------|
+| Multi-tab frontend with voice | ✅ Complete |
+| Orchestrator agent (text + voice) | ✅ Complete |
+| Session persistence & resumption | ✅ Complete |
+| Semantic search (memory + history) | ✅ Complete |
+| Background indexing | ✅ Complete |
+| Cost and usage tracking | ✅ Complete |
+| Dynamic agent tab management | ✅ Complete |
+| WebRTC voice mode | ✅ Complete |
+| **One-command installation** | ✅ Complete |
+| **Public/private separation** | ✅ Complete |
+| **Cross-machine migration** | ✅ Complete |
+
+### 🎯 Deployment Options
+
+- **Local workstation** — Run on your development machine
+- **Home server** — Deploy on a Mac Mini, NUC, or similar
+- **Cloud VM** — AWS EC2, GCP, Azure, DigitalOcean
+- **Headless server** — Backend-only for API access
+
+### 🔐 Data Portability
+
+Your data is fully portable via the `context/` folder:
+- Initialize as a private git repo for version control
+- Import on any machine with `./install.sh --import-context URL`
+- Symlinks to framework skills/agents are created automatically
+- Personal skills, memory, and conversations travel with you
 
 ---
 

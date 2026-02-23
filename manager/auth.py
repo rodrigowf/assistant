@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 
 
@@ -20,16 +21,31 @@ def _get_auth_env() -> dict[str, str]:
     return env
 
 
+def _get_credentials_path() -> Path:
+    """Get path to Claude credentials file."""
+    return Path.home() / ".claude" / ".credentials.json"
+
+
 class AuthManager:
     """Manages authentication for Claude Code sessions.
 
     Claude Code authenticates via OAuth (browser-based login tied to a Claude
     subscription).  The SDK handles the subprocess, but we expose helpers to
     check status and trigger login from the API layer.
+
+    Supports two modes:
+    1. CLI-based: Uses `claude auth status` and `claude setup-token`
+    2. Headless: Directly reads/writes credentials file for environments
+       without a working CLI (e.g., remote servers)
     """
 
-    def __init__(self, cli_path: str | None = None) -> None:
+    # Claude OAuth URLs for headless auth
+    AUTH_URL = "https://console.anthropic.com/settings/workspaces/default/oauth_tokens"
+
+    def __init__(self, cli_path: str | None = None, headless: bool = False) -> None:
         self._cli = cli_path or shutil.which("claude") or "claude"
+        self._headless = headless
+        self._credentials_path = _get_credentials_path()
 
     # ------------------------------------------------------------------
     # Public API
@@ -38,9 +54,43 @@ class AuthManager:
     async def is_authenticated(self) -> bool:
         """Return True if there is a valid auth session.
 
-        Runs ``claude auth status`` which returns JSON with loggedIn status.
-        This doesn't create a session unlike running a prompt.
+        In headless mode, checks the credentials file directly.
+        Otherwise runs ``claude auth status``.
         """
+        # Always try credentials file first (faster and works in headless)
+        if self._check_credentials_file():
+            return True
+
+        # If not headless, also try CLI
+        if not self._headless:
+            return await self._cli_auth_status()
+
+        return False
+
+    def _check_credentials_file(self) -> bool:
+        """Check if credentials file exists and has valid tokens."""
+        try:
+            if not self._credentials_path.exists():
+                return False
+
+            data = json.loads(self._credentials_path.read_text())
+            oauth = data.get("claudeAiOauth", {})
+
+            # Check if we have an access token
+            if not oauth.get("accessToken"):
+                return False
+
+            # Check if token is expired (with 5 min buffer)
+            expires_at = oauth.get("expiresAt", 0)
+            if expires_at and expires_at < (time.time() * 1000) + 300000:
+                return False
+
+            return True
+        except (json.JSONDecodeError, OSError):
+            return False
+
+    async def _cli_auth_status(self) -> bool:
+        """Check auth status using CLI."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._cli, "auth", "status",
@@ -51,7 +101,6 @@ class AuthManager:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode != 0:
                 return False
-            # Parse JSON response: {"loggedIn": true, ...}
             try:
                 data = json.loads(stdout.decode())
                 return data.get("loggedIn", False)
@@ -66,7 +115,13 @@ class AuthManager:
         Runs ``claude setup-token`` which opens a browser for the user to
         authenticate via their Claude subscription.  Returns True if the
         process exits successfully.
+
+        Note: In headless mode, use set_credentials() instead.
         """
+        if self._headless:
+            # Can't open browser in headless mode
+            return False
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._cli, "setup-token",
@@ -80,7 +135,55 @@ class AuthManager:
         except FileNotFoundError:
             return False
 
+    def get_auth_url(self) -> str:
+        """Get the URL for manual OAuth token generation.
+
+        Users can visit this URL to generate an OAuth token, then paste
+        the full credentials JSON into set_credentials().
+        """
+        return self.AUTH_URL
+
+    def set_credentials(self, credentials_json: str) -> bool:
+        """Set credentials directly from JSON string.
+
+        This is used for headless authentication where the user manually
+        copies their credentials from another authenticated machine.
+
+        Args:
+            credentials_json: Full contents of .credentials.json file
+
+        Returns:
+            True if credentials were successfully saved
+        """
+        try:
+            # Validate JSON
+            data = json.loads(credentials_json)
+
+            # Basic validation - must have OAuth data
+            if "claudeAiOauth" not in data:
+                return False
+
+            oauth = data["claudeAiOauth"]
+            if not oauth.get("accessToken"):
+                return False
+
+            # Ensure directory exists
+            self._credentials_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write credentials with secure permissions
+            self._credentials_path.write_text(credentials_json)
+            self._credentials_path.chmod(0o600)
+
+            return True
+        except (json.JSONDecodeError, OSError):
+            return False
+
     @property
     def cli_path(self) -> str:
         """Path to the Claude CLI binary."""
         return self._cli
+
+    @property
+    def is_headless(self) -> bool:
+        """Whether running in headless mode."""
+        return self._headless

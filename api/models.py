@@ -54,6 +54,15 @@ class PoolSessionResponse(BaseModel):
 
 class AuthStatusResponse(BaseModel):
     authenticated: bool
+    # For headless auth: URL to get credentials
+    auth_url: str | None = None
+    # Whether server is in headless mode
+    headless: bool = False
+
+
+class SetCredentialsRequest(BaseModel):
+    """Request to set credentials directly (headless auth)."""
+    credentials_json: str
 
 
 class ErrorResponse(BaseModel):
