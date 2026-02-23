@@ -365,14 +365,25 @@ step "Setting up Claude SDK configuration..."
 # Create .claude_config structure
 mkdir -p .claude_config/projects
 
-# Create mangled path symlink for SDK compatibility
+# The Claude SDK stores session data in .claude_config/projects/<mangled-path>/
+# where <mangled-path> is the absolute project path with / replaced by -.
+# We symlink this to context/ so all session data lives in one place.
 MANGLED=$(echo "$SCRIPT_DIR" | sed 's|/|-|g')
 SYMLINK_PATH=".claude_config/projects/$MANGLED"
 
 if [ -L "$SYMLINK_PATH" ]; then
     info "SDK symlink already exists"
-elif [ -e "$SYMLINK_PATH" ]; then
-    warn "$SYMLINK_PATH exists but is not a symlink - skipping"
+elif [ -d "$SYMLINK_PATH" ]; then
+    # SDK created a real directory (e.g. from a previous run without the symlink).
+    # Move any session files into context/ and replace with the symlink.
+    warn "Found real directory at $SYMLINK_PATH — migrating to symlink"
+    if ls "$SYMLINK_PATH"/*.jsonl &>/dev/null; then
+        cp -n "$SYMLINK_PATH"/*.jsonl context/ 2>/dev/null || true
+        info "Migrated session files to context/"
+    fi
+    rm -rf "$SYMLINK_PATH"
+    ln -s "../../context" "$SYMLINK_PATH"
+    info "Replaced directory with SDK symlink"
 else
     ln -s "../../context" "$SYMLINK_PATH"
     info "Created SDK symlink"
