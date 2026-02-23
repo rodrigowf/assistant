@@ -30,21 +30,33 @@ This is a self-contained Claude Code environment. Everything runs within this fo
 
 ```
 assistant/
-├── .claude_config/  # Claude Code config, sessions & memory (gitignored)
-├── index/           # Vector search index (gitignored)
-├── skills/          # Skill definitions — you can create and modify these
-├── agents/          # Agent definitions — you can create and modify these
-├── scripts/         # Shared executables — you can create and modify these
-├── manager/         # Python wrapper for Claude Code SDK (~400 lines)
-├── orchestrator/    # Orchestrator agent — controls multiple Claude Code instances
-│   └── providers/   # Model providers (Anthropic text, OpenAI realtime voice)
-├── api/             # FastAPI server (REST + WebSocket, ~300 lines)
-├── frontend/        # React multi-tab chat interface
-├── tests/           # Test suite
-└── .venv/           # Python virtual environment
+├── context/            # Private data submodule (assistant-context repo)
+│   ├── *.jsonl         # Conversation JSONL files
+│   ├── <uuid>/         # SDK state directories (subagents, tool-results)
+│   ├── memory/         # Memory markdown files
+│   ├── skills/         # ALL skill definitions (personal + general)
+│   ├── scripts/        # ALL scripts (personal + general)
+│   ├── secrets/        # OAuth credentials and tokens
+│   ├── certs/          # SSL certificates
+│   └── .env            # Environment variables
+├── skills/ → context/skills/    # Symlink for backward compatibility
+├── scripts/ → context/scripts/  # Symlink for backward compatibility
+├── default-skills/     # Symlinks to general-purpose skills (shareable)
+├── default-scripts/    # Symlinks to general-purpose scripts (shareable)
+├── .claude_config/     # Claude Code SDK config (symlinks to context/)
+├── index/              # Vector search index (gitignored)
+├── utils/              # Shared Python utilities (paths.py)
+├── agents/             # Agent definitions
+├── manager/            # Python wrapper for Claude Code SDK (~400 lines)
+├── orchestrator/       # Orchestrator agent — controls multiple Claude Code instances
+│   └── providers/      # Model providers (Anthropic text, OpenAI realtime voice)
+├── api/                # FastAPI server (REST + WebSocket, ~300 lines)
+├── frontend/           # React multi-tab chat interface
+├── tests/              # Test suite
+└── .venv/              # Python virtual environment
 ```
 
-`CLAUDE_CONFIG_DIR` is set to `.claude_config/` by `scripts/run.sh`, keeping all Claude Code data local.
+`CLAUDE_CONFIG_DIR` is set to `.claude_config/` by `scripts/run.sh`. A symlink at `.claude_config/projects/<mangled-path>` points to `context/` for SDK compatibility. All internal code references `context/` directly via `utils/paths.py`.
 
 ---
 
@@ -64,7 +76,22 @@ Or use `/debug-app` which handles both and provides browser automation.
 
 ### Memory & History
 
-Memory lives at `.claude_config/projects/-home-rodrigo-Projects-assistant/memory/`.
+Context files live at `context/` — a Git submodule (`assistant-context` repo):
+
+```
+context/
+├── *.jsonl            # Conversation history (JSONL files)
+├── .titles.json       # Custom session titles
+├── <uuid>/            # SDK state dirs (subagents, tool-results)
+├── memory/            # Memory files (Markdown)
+│   ├── MEMORY.md      # Index file (keep under 200 lines)
+│   └── *.md           # Detailed documents
+├── skills/            # All skill definitions
+├── scripts/           # All scripts
+├── secrets/           # OAuth credentials and tokens
+├── certs/             # SSL certificates
+└── .env               # Environment variables
+```
 
 **How to use memory properly:**
 - `MEMORY.md` is the index file—keep it under 200 lines with references only
@@ -72,18 +99,11 @@ Memory lives at `.claude_config/projects/-home-rodrigo-Projects-assistant/memory
 - In `MEMORY.md`, add one-line references: `- filename.md — Brief description`
 - This keeps the index scannable while allowing unlimited detail in linked files
 
-**Structure:**
-```
-memory/
-├── MEMORY.md           # Index: references to other files, brief preferences
-├── some-plan.md        # Detailed plan for feature X
-├── architecture.md     # Architecture decisions
-└── ...                 # Other detailed documents
-```
-
 Both memory and conversation history are indexed automatically for semantic search via `/recall <query>`:
 - **Memory**: Indexed immediately when files change (file watcher)
 - **History**: Indexed every 2 minutes (if files changed)
+
+**Note**: A symlink at `.claude_config/projects/<mangled>/` points to `context/` for Claude SDK compatibility. Our code references `context/` directly via `utils/paths.py`—never the symlink.
 
 ### Voice Mode (Realtime)
 

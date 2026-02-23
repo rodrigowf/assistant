@@ -1,0 +1,1 @@
+../context/scripts/cleanup-history-index.py
