@@ -32,7 +32,13 @@ async def lifespan(app: FastAPI):
     config = ManagerConfig.load()
     app.state.config = config
     app.state.store = SessionStore(config.project_dir)
-    app.state.auth = AuthManager()
+
+    # Detect headless mode: no DISPLAY, or explicit HEADLESS=1 env var
+    headless = os.environ.get("HEADLESS", "").lower() in ("1", "true", "yes") or (
+        not os.environ.get("DISPLAY") and os.name != "nt"
+    )
+    app.state.auth = AuthManager(headless=headless)
+
     app.state.connections = ConnectionManager()
     app.state.pool = SessionPool()
 

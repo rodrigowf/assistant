@@ -9,6 +9,8 @@ const hasLocalCerts = fs.existsSync(path.join(certsDir, 'key.pem'))
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Use /assistant/ base path for production builds (served on subpath via nginx)
+  base: process.env.NODE_ENV === 'production' ? '/assistant/' : '/',
   server: {
     host: '0.0.0.0', // Listen on all network interfaces
     https: hasLocalCerts
