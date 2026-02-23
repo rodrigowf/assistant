@@ -17,13 +17,13 @@ SCOPES = [
     'https://www.googleapis.com/auth/homegraph',
 ]
 
-# Path to store the token
-TOKEN_PATH = Path(__file__).parent.parent / 'secrets' / 'google_home_token.pickle'
+# Path to store the token (in context submodule)
+TOKEN_PATH = Path(__file__).parent.parent / 'context' / 'secrets' / 'google_home_token.pickle'
 
 
 def get_auth_url():
     """Generate the OAuth authorization URL."""
-    creds_path = Path(__file__).parent.parent / os.environ.get(
+    creds_path = Path(__file__).parent.parent / 'context' / os.environ.get(
         'GOOGLE_HOME_CREDENTIALS_PATH',
         'secrets/client_secret_686393938713-n647q5rb9d1480a6e2jkptvg8u2s7agq.apps.googleusercontent.com.json'
     )

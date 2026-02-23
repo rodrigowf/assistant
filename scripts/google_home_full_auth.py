@@ -19,12 +19,12 @@ SCOPES = [
     'https://www.googleapis.com/auth/userinfo.profile',
 ]
 
-TOKEN_PATH = Path(__file__).parent.parent / 'secrets' / 'google_home_full_token.pickle'
+TOKEN_PATH = Path(__file__).parent.parent / 'context' / 'secrets' / 'google_home_full_token.pickle'
 
 
 def authenticate():
     """Authenticate with comprehensive scopes."""
-    creds_path = Path(__file__).parent.parent / os.environ.get(
+    creds_path = Path(__file__).parent.parent / 'context' / os.environ.get(
         'GOOGLE_HOME_CREDENTIALS_PATH',
         'secrets/client_secret_686393938713-n647q5rb9d1480a6e2jkptvg8u2s7agq.apps.googleusercontent.com.json'
     )
@@ -169,7 +169,7 @@ def main():
 
         # Save results
         if results:
-            output_file = Path(__file__).parent.parent / 'secrets' / 'api_test_results.json'
+            output_file = Path(__file__).parent.parent / 'context' / 'secrets' / 'api_test_results.json'
             with open(output_file, 'w') as f:
                 json.dump(results, f, indent=2, default=str)
             print(f"\n💾 Results saved to: {output_file}")

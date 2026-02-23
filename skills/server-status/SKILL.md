@@ -10,7 +10,7 @@ user-invocable: true
 
 Query the remote server at 192.168.0.200 to check running applications and services.
 
-> **Related Documentation**: See `.claude_config/projects/-home-rodrigo-Projects-assistant/memory/server_hub_project.md` for complete server architecture, application details, and deployment plans.
+> **Related Documentation**: See `context/memory/server_hub_project.md` for complete server architecture, application details, and deployment plans.
 
 ## Purpose
 
@@ -57,7 +57,7 @@ scripts/server_status.py jellyfin
 
 ## Authentication
 
-The script uses environment variables from `.env`:
+The script uses environment variables from `context/.env`:
 - `SERVER_USERNAME` - SSH username
 - `SERVER_PASSWORD` - SSH password
 - Server IP is hardcoded as 192.168.0.200

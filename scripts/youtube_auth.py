@@ -30,10 +30,10 @@ SCOPES = [
     'https://www.googleapis.com/auth/youtube.force-ssl',  # Manage YouTube account
 ]
 
-# Project paths
+# Project paths (secrets are in context submodule)
 PROJECT_ROOT = Path(__file__).parent.parent
-TOKENS_PATH = PROJECT_ROOT / 'secrets' / 'youtube_tokens.json'
-FLOW_STATE_PATH = PROJECT_ROOT / 'secrets' / '.youtube_oauth_state.json'
+TOKENS_PATH = PROJECT_ROOT / 'context' / 'secrets' / 'youtube_tokens.json'
+FLOW_STATE_PATH = PROJECT_ROOT / 'context' / 'secrets' / '.youtube_oauth_state.json'
 
 
 def get_credentials_path() -> Path:

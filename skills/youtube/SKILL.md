@@ -248,6 +248,6 @@ When using the orchestrator (voice or text mode), requests like "play my jazz vi
 ## Notes
 
 - **Quota**: YouTube API has ~10,000 units/day. Search costs more than list operations.
-- **Tokens**: Stored at `secrets/youtube_tokens.json`, auto-refresh when expired.
+- **Tokens**: Stored at `context/secrets/youtube_tokens.json`, auto-refresh when expired.
 - **Scopes**: Current auth has `youtube.readonly` and `youtube.force-ssl` (read + manage).
 - **JSON output**: All scripts support `--json` for programmatic use.

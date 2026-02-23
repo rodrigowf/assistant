@@ -11,10 +11,10 @@ VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 # This puts sessions, memory, credentials in a dedicated folder
 export CLAUDE_CONFIG_DIR="$PROJECT_DIR/.claude_config"
 
-# Load .env file if it exists
-if [ -f "$PROJECT_DIR/.env" ]; then
+# Load .env file from context submodule if it exists
+if [ -f "$PROJECT_DIR/context/.env" ]; then
     set -a
-    source "$PROJECT_DIR/.env"
+    source "$PROJECT_DIR/context/.env"
     set +a
 fi
 

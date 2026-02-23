@@ -32,12 +32,12 @@ SCOPE_OPTIONS = {
     ]
 }
 
-TOKEN_PATH = Path(__file__).parent.parent / 'secrets' / 'google_home_token.pickle'
+TOKEN_PATH = Path(__file__).parent.parent / 'context' / 'secrets' / 'google_home_token.pickle'
 
 
 def try_scope_set(scope_name, scopes):
     """Try to generate auth URL with a specific scope set."""
-    creds_path = Path(__file__).parent.parent / os.environ.get(
+    creds_path = Path(__file__).parent.parent / 'context' / os.environ.get(
         'GOOGLE_HOME_CREDENTIALS_PATH',
         'secrets/client_secret_686393938713-n647q5rb9d1480a6e2jkptvg8u2s7agq.apps.googleusercontent.com.json'
     )

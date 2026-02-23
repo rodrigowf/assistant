@@ -16,12 +16,12 @@ import pickle
 # Google Assistant SDK scope
 SCOPES = ['https://www.googleapis.com/auth/assistant-sdk-prototype']
 
-TOKEN_PATH = Path(__file__).parent.parent / 'secrets' / 'google_assistant_token.pickle'
+TOKEN_PATH = Path(__file__).parent.parent / 'context' / 'secrets' / 'google_assistant_token.pickle'
 
 
 def get_auth_url():
     """Generate the OAuth authorization URL for Assistant SDK."""
-    creds_path = Path(__file__).parent.parent / os.environ.get(
+    creds_path = Path(__file__).parent.parent / 'context' / os.environ.get(
         'GOOGLE_HOME_CREDENTIALS_PATH',
         'secrets/client_secret_686393938713-n647q5rb9d1480a6e2jkptvg8u2s7agq.apps.googleusercontent.com.json'
     )
