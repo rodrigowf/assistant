@@ -23,7 +23,7 @@ frontend/public/visualizations/
 ├── README.md               # Comprehensive documentation
 └── QUICKSTART.md           # Quick reference guide
 
-scripts/
+context/scripts/
 ├── get_visualization_url.py       # Utility to generate URLs
 └── test_visualization_on_tv.sh    # Fire TV testing script
 ```
@@ -52,14 +52,14 @@ Simply open any URL in your browser. No build step needed!
 xdg-open https://localhost:5173/visualizations/index.html
 
 # Or use the helper script
-scripts/run.sh scripts/get_visualization_url.py index
+context/scripts/run.sh context/scripts/get_visualization_url.py index
 ```
 
 ### 2. Display on Fire TV
 
 **Option A: Using the test script**
 ```bash
-scripts/test_visualization_on_tv.sh
+context/scripts/test_visualization_on_tv.sh
 # Then select which visualization to display
 ```
 
@@ -95,13 +95,13 @@ Generate URLs for visualizations:
 
 ```bash
 # Get localhost URL
-scripts/run.sh scripts/get_visualization_url.py example
+context/scripts/run.sh context/scripts/get_visualization_url.py example
 
 # Get network URL (for Fire TV)
-scripts/run.sh scripts/get_visualization_url.py example --network
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network
 
 # Specify custom port
-scripts/run.sh scripts/get_visualization_url.py example --network --port 5173
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network --port 5173
 ```
 
 ### test_visualization_on_tv.sh
@@ -110,14 +110,14 @@ Interactive Fire TV testing:
 
 ```bash
 # Interactive mode
-scripts/test_visualization_on_tv.sh
+context/scripts/test_visualization_on_tv.sh
 
 # Direct selection
-scripts/test_visualization_on_tv.sh 1  # Gallery
-scripts/test_visualization_on_tv.sh 2  # Example
-scripts/test_visualization_on_tv.sh 3  # System Stats
-scripts/test_visualization_on_tv.sh 4  # Remote Demo
-scripts/test_visualization_on_tv.sh 5  # Cycle through all
+context/scripts/test_visualization_on_tv.sh 1  # Gallery
+context/scripts/test_visualization_on_tv.sh 2  # Example
+context/scripts/test_visualization_on_tv.sh 3  # System Stats
+context/scripts/test_visualization_on_tv.sh 4  # Remote Demo
+context/scripts/test_visualization_on_tv.sh 5  # Cycle through all
 ```
 
 ## 📊 Visualization Examples

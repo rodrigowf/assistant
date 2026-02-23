@@ -28,9 +28,9 @@ manager/ (claude-agent-sdk wrapper)
 ```
 
 Key entry points:
-- API: `scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000`
+- API: `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000`
 - Frontend: `cd frontend && npm run dev` (Vite dev server on port 5173)
-- Tests: `scripts/run.sh -m pytest tests/ -v`
+- Tests: `context/scripts/run.sh -m pytest tests/ -v`
 
 ## Debugging Workflow
 
@@ -39,8 +39,8 @@ Key entry points:
 When debugging, start servers with verbose output to capture logs:
 
 **API Server** (run in background, capture logs):
-- Use `scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --log-level debug`
-- Or redirect output: `scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 2>&1 | tee /tmp/api-debug.log &`
+- Use `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --log-level debug`
+- Or redirect output: `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 2>&1 | tee /tmp/api-debug.log &`
 
 **Frontend** (separate terminal):
 - Run `npm run dev` from the frontend directory

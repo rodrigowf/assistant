@@ -87,7 +87,7 @@ Teach it something once, and it can codify that knowledge into a reusable automa
 ### Custom Skills
 Define workflows as YAML + markdown:
 ```yaml
-# skills/standup/SKILL.md
+# context/skills/standup/SKILL.md
 ---
 name: standup
 description: Run my morning routine
@@ -123,9 +123,20 @@ assistant/
 │   ├── context/      # TabsContext (global state)
 │   ├── hooks/        # useChatInstance, useVoiceOrchestrator
 │   └── components/   # ChatPanel, VoiceButton, TabBar
-├── skills/           # Custom slash commands
-├── agents/           # Specialized agent definitions
-└── .claude_config/   # Local data (sessions, memory)
+├── default-skills/   # General-purpose skills (shareable)
+├── default-scripts/  # General-purpose scripts (shareable)
+├── default-agents/   # General-purpose agents (shareable)
+├── context/          # PRIVATE - Git submodule (assistant-context repo)
+│   ├── *.jsonl       # Session files (SDK writes directly)
+│   ├── <uuid>/       # SDK state dirs (subagents, tool-results)
+│   ├── memory/       # Memory markdown files
+│   ├── skills/       # Symlinks to default-skills + personalized
+│   ├── scripts/      # Symlinks to default-scripts + personalized
+│   ├── agents/       # Symlinks to default-agents + personalized
+│   ├── secrets/      # OAuth credentials and tokens
+│   └── .env          # Environment variables
+├── utils/            # Shared Python utilities (paths.py)
+└── .claude_config/   # SDK config (symlink to context/)
 ```
 
 ### Key Design Decisions
@@ -156,7 +167,7 @@ This eliminated the "triple-ID-change problem" where tabs would go: `new-N` → 
 
 Check if you have everything:
 ```bash
-scripts/install-prerequisites.sh
+context/scripts/install-prerequisites.sh
 ```
 
 ### Installation
@@ -173,7 +184,7 @@ The installer sets up the Python environment, installs dependencies, and configu
 
 ```bash
 # Terminal 1 — Backend
-scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --reload
+context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --reload
 
 # Terminal 2 — Frontend
 cd frontend && npm run dev
@@ -240,7 +251,7 @@ Click the microphone button in the orchestrator tab to start voice conversation.
 
 ## Skills: Extensible Automation
 
-Skills are YAML + markdown files in the `skills/` directory. They define slash commands that the assistant executes.
+Skills are YAML + markdown files in the `context/skills/` directory. They define slash commands that the assistant executes.
 
 ### Built-in Skills
 
@@ -263,7 +274,7 @@ Ask the assistant to create a skill:
 3. List PRs waiting for my review"
 ```
 
-Or manually create `skills/standup/SKILL.md`:
+Or manually create `context/skills/standup/SKILL.md`:
 ```yaml
 ---
 name: standup
@@ -284,7 +295,7 @@ Type `/standup` to run it.
 The assistant maintains two types of memory:
 
 ### Agent Memory
-- **Location**: `.claude_config/projects/<project>/memory/MEMORY.md`
+- **Location**: `context/memory/MEMORY.md`
 - **Purpose**: Index file with references to detailed docs
 - **Pattern**: Keep MEMORY.md under 200 lines with one-line references
 - **Details**: Store detailed plans, decisions, and context in separate `.md` files
@@ -300,7 +311,7 @@ memory/
 ```
 
 ### Orchestrator Memory
-- **Location**: `.claude_config/projects/<project>/memory/ORCHESTRATOR_MEMORY.md`
+- **Location**: `context/memory/ORCHESTRATOR_MEMORY.md`
 - **Purpose**: Cross-session context for the orchestrator
 - **Usage**: Orchestrator reads this before each session start
 - **Auto-indexed**: Yes (same as agent memory)
@@ -364,7 +375,7 @@ Your conversations, memory, and credentials stay on your machine. No cloud sync,
 
 ### Run Tests
 ```bash
-scripts/run.sh -m pytest tests/ -v
+context/scripts/run.sh -m pytest tests/ -v
 ```
 
 ### Lint and Type Check

@@ -23,10 +23,10 @@ Files placed in this directory are automatically served by Vite at:
 
 ```bash
 # Get localhost URL
-scripts/run.sh scripts/get_visualization_url.py example
+context/scripts/run.sh context/scripts/get_visualization_url.py example
 
 # Get network URL (for Fire TV or other devices)
-scripts/run.sh scripts/get_visualization_url.py example --network
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network
 ```
 
 ### 2. Create a new visualization
@@ -128,16 +128,16 @@ You can include libraries via CDN for more complex visualizations:
 
 ### Get Visualization URL Script
 
-Location: `scripts/get_visualization_url.py`
+Location: `context/scripts/get_visualization_url.py`
 
 ```bash
 # Usage
-scripts/run.sh scripts/get_visualization_url.py <filename> [--network] [--port PORT]
+context/scripts/run.sh context/scripts/get_visualization_url.py <filename> [--network] [--port PORT]
 
 # Examples
-scripts/run.sh scripts/get_visualization_url.py example
-scripts/run.sh scripts/get_visualization_url.py example --network
-scripts/run.sh scripts/get_visualization_url.py example --network --port 5173
+context/scripts/run.sh context/scripts/get_visualization_url.py example
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network --port 5173
 ```
 
 ## 🔌 Integration with Assistant
@@ -152,7 +152,7 @@ import subprocess
 
 # Generate URL
 result = subprocess.run(
-    ["scripts/run.sh", "scripts/get_visualization_url.py", "my-viz", "--network"],
+    ["context/scripts/run.sh", "context/scripts/get_visualization_url.py", "my-viz", "--network"],
     capture_output=True,
     text=True
 )

@@ -23,11 +23,11 @@
 
 ```bash
 # Get URL for any visualization
-scripts/run.sh scripts/get_visualization_url.py <filename> --network
+context/scripts/run.sh context/scripts/get_visualization_url.py <filename> --network
 
 # Examples:
-scripts/run.sh scripts/get_visualization_url.py example --network
-scripts/run.sh scripts/get_visualization_url.py system-stats --network
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network
+context/scripts/run.sh context/scripts/get_visualization_url.py system-stats --network
 
 # Display on Fire TV (requires ADB connection)
 adb shell am start -a android.intent.action.VIEW \
