@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import * as Diff from "diff";
 import {
   MdCode,
   MdEdit,
@@ -441,7 +442,20 @@ function EditInputView({ filePath, oldString, newString, replaceAll }: {
   newString: string;
   replaceAll?: boolean;
 }) {
-  const language = getLanguageFromPath(filePath);
+  // Generate unified diff
+  const diffLines = useMemo(() => {
+    const changes = Diff.diffLines(oldString, newString);
+    return changes.flatMap((part) => {
+      const lines = part.value.split('\n');
+      // Remove trailing empty line from split
+      if (lines[lines.length - 1] === '') lines.pop();
+      return lines.map((line) => ({
+        type: part.added ? 'add' : part.removed ? 'remove' : 'context',
+        content: line,
+      }));
+    });
+  }, [oldString, newString]);
+
   return (
     <div className="tool-edit-view">
       <div className="tool-field">
@@ -454,37 +468,15 @@ function EditInputView({ filePath, oldString, newString, replaceAll }: {
           <span className="field-value">Replace all occurrences</span>
         </div>
       )}
-      <div className="tool-diff">
-        <div className="diff-section diff-remove">
-          <div className="diff-header">- Remove</div>
-          <SyntaxHighlighter
-            language={language}
-            style={oneDark}
-            customStyle={{
-              margin: 0,
-              fontSize: "0.8rem",
-              background: "rgba(231, 76, 60, 0.1)",
-              maxHeight: "300px",
-            }}
-          >
-            {oldString}
-          </SyntaxHighlighter>
-        </div>
-        <div className="diff-section diff-add">
-          <div className="diff-header">+ Add</div>
-          <SyntaxHighlighter
-            language={language}
-            style={oneDark}
-            customStyle={{
-              margin: 0,
-              fontSize: "0.8rem",
-              background: "rgba(46, 204, 113, 0.1)",
-              maxHeight: "300px",
-            }}
-          >
-            {newString}
-          </SyntaxHighlighter>
-        </div>
+      <div className="unified-diff">
+        {diffLines.map((line, i) => (
+          <div key={i} className={`diff-line diff-line-${line.type}`}>
+            <span className="diff-marker">
+              {line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' '}
+            </span>
+            <span className="diff-content">{line.content || ' '}</span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -587,6 +579,126 @@ function FileReadInputView({ path }: { path: string }) {
   );
 }
 
+function ReadInputView({
+  filePath,
+  offset,
+  limit,
+}: {
+  filePath: string;
+  offset?: number;
+  limit?: number;
+}) {
+  return (
+    <div className="tool-fields">
+      <div className="tool-field">
+        <span className="field-label">File</span>
+        <span className="field-value file-path">{filePath}</span>
+      </div>
+      {(offset !== undefined || limit !== undefined) && (
+        <div className="tool-field">
+          <span className="field-label">Range</span>
+          <span className="field-value">
+            {offset !== undefined && limit !== undefined
+              ? `lines ${offset + 1}–${offset + limit}`
+              : offset !== undefined
+              ? `from line ${offset + 1}`
+              : `first ${limit} lines`}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GrepInputView({
+  pattern,
+  path,
+  glob,
+  outputMode,
+  lineNumbers,
+  context,
+}: {
+  pattern: string;
+  path?: string;
+  glob?: string;
+  outputMode?: string;
+  lineNumbers?: boolean;
+  context?: number;
+}) {
+  return (
+    <div className="tool-fields">
+      <div className="tool-field">
+        <span className="field-label">Pattern</span>
+        <span className="field-value code-value">{pattern}</span>
+      </div>
+      {path && (
+        <div className="tool-field">
+          <span className="field-label">Path</span>
+          <span className="field-value file-path">{path}</span>
+        </div>
+      )}
+      {glob && (
+        <div className="tool-field">
+          <span className="field-label">Glob</span>
+          <span className="field-value code-value">{glob}</span>
+        </div>
+      )}
+      {(outputMode || lineNumbers !== undefined || context !== undefined) && (
+        <div className="tool-field">
+          <span className="field-label">Options</span>
+          <span className="field-value">
+            {[
+              outputMode && outputMode !== "files_with_matches" ? outputMode : null,
+              lineNumbers ? "line numbers" : null,
+              context !== undefined ? `±${context} context` : null,
+            ]
+              .filter(Boolean)
+              .join(", ") || "default"}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EvaluateScriptInputView({
+  func,
+  args,
+}: {
+  func: string;
+  args?: Array<{ uid: string }>;
+}) {
+  return (
+    <div className="tool-fields">
+      <div className="tool-field multiline">
+        <span className="field-label">Script</span>
+        <SyntaxHighlighter
+          language="javascript"
+          style={oneDark}
+          customStyle={{
+            margin: 0,
+            padding: "8px 10px",
+            borderRadius: "var(--radius)",
+            fontSize: "0.78rem",
+            maxHeight: "200px",
+            overflow: "auto",
+          }}
+        >
+          {func}
+        </SyntaxHighlighter>
+      </div>
+      {args && args.length > 0 && (
+        <div className="tool-field">
+          <span className="field-label">Args</span>
+          <span className="field-value">
+            {args.map((a) => a.uid).join(", ")}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GenericInputView({ input }: { input: ToolInput }) {
   return <pre className="generic-json">{JSON.stringify(input, null, 2)}</pre>;
 }
@@ -597,6 +709,32 @@ function GenericInputView({ input }: { input: ToolInput }) {
 
 function renderToolInput(toolName: string, input: ToolInput) {
   switch (toolName) {
+    case "Read":
+      if (input.file_path) {
+        return (
+          <ReadInputView
+            filePath={String(input.file_path)}
+            offset={input.offset !== undefined ? Number(input.offset) : undefined}
+            limit={input.limit !== undefined ? Number(input.limit) : undefined}
+          />
+        );
+      }
+      break;
+    case "Grep":
+      if (input.pattern) {
+        return (
+          <GrepInputView
+            pattern={String(input.pattern)}
+            path={input.path ? String(input.path) : undefined}
+            glob={input.glob ? String(input.glob) : undefined}
+            outputMode={input.output_mode ? String(input.output_mode) : undefined}
+            lineNumbers={input["-n"] !== undefined ? Boolean(input["-n"]) : undefined}
+            context={input.context !== undefined ? Number(input.context) :
+                     input["-C"] !== undefined ? Number(input["-C"]) : undefined}
+          />
+        );
+      }
+      break;
     case "Write":
       if (input.file_path && input.content) {
         return (
@@ -692,6 +830,18 @@ function renderToolInput(toolName: string, input: ToolInput) {
           <WriteInputView
             filePath={String(input.path)}
             content={String(input.content)}
+          />
+        );
+      }
+      break;
+
+    // Chrome DevTools MCP tools
+    case "mcp__chrome-devtools__evaluate_script":
+      if (input.function) {
+        return (
+          <EvaluateScriptInputView
+            func={String(input.function)}
+            args={Array.isArray(input.args) ? input.args as Array<{ uid: string }> : undefined}
           />
         );
       }
@@ -797,6 +947,10 @@ function TodoWriteBlock({ toolInput, isError, complete }: Props) {
 }
 
 // Bash block - shows description + command in collapsed header, only output when expanded
+// Collapsed: Shows truncated preview (5 lines max for multi-line, single line with ellipsis)
+// Expanded: Shows full command with line wrapping, plus output
+const BASH_PREVIEW_LINES = 5;
+
 function BashBlock({ toolInput, result, isError, complete }: Props) {
   const [expanded, setExpanded] = useState(false);
   const icon = getToolIcon("Bash", complete, isError);
@@ -804,6 +958,14 @@ function BashBlock({ toolInput, result, isError, complete }: Props) {
 
   const command = toolInput.command ? String(toolInput.command) : "";
   const description = toolInput.description ? String(toolInput.description) : null;
+
+  // Split command into lines for preview truncation
+  const commandLines = command.split("\n");
+  const isMultiLine = commandLines.length > 1;
+  const isTruncated = commandLines.length > BASH_PREVIEW_LINES;
+  const previewCommand = isTruncated
+    ? commandLines.slice(0, BASH_PREVIEW_LINES).join("\n")
+    : command;
 
   return (
     <div className={`tool-block tool-${category} ${isError ? "tool-error" : ""}`}>
@@ -814,7 +976,7 @@ function BashBlock({ toolInput, result, isError, complete }: Props) {
         <span className="tool-icon">{icon}</span>
         <div className="bash-header-content">
           {description && <span className="bash-description">{description}</span>}
-          <div className="bash-command-wrapper">
+          <div className={`bash-command-wrapper ${expanded ? "bash-command-expanded" : ""}`}>
             <SyntaxHighlighter
               language="bash"
               style={oneDark}
@@ -824,13 +986,35 @@ function BashBlock({ toolInput, result, isError, complete }: Props) {
                 borderRadius: "4px",
                 fontSize: "0.8rem",
                 background: "var(--bg-elevated)",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
+                ...(expanded
+                  ? {
+                      // Expanded: show full command with line wrapping
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      overflow: "visible",
+                    }
+                  : isMultiLine
+                  ? {
+                      // Collapsed multi-line: show preview with limited height
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      overflow: "hidden",
+                    }
+                  : {
+                      // Collapsed single-line: truncate with ellipsis
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }),
               }}
             >
-              {command}
+              {expanded ? command : previewCommand}
             </SyntaxHighlighter>
+            {!expanded && isTruncated && (
+              <div className="bash-truncated-indicator">
+                ... ({commandLines.length - BASH_PREVIEW_LINES} more lines)
+              </div>
+            )}
           </div>
         </div>
         {complete && (

@@ -640,7 +640,25 @@
 
 .bash-command-wrapper { min-width: 0; overflow: hidden; }
 .bash-command-wrapper pre { margin: 0 !important; }
-.bash-command-wrapper code { display: block; overflow: hidden; text-overflow: ellipsis; }
+.bash-command-wrapper code { display: block; }
+
+/* Expanded command: show full content with line wrapping */
+.bash-command-wrapper.bash-command-expanded {
+  overflow: visible;
+}
+.bash-command-wrapper.bash-command-expanded code {
+  white-space: pre-wrap !important;
+  word-break: break-word;
+  overflow: visible;
+}
+
+/* Truncated indicator for long multi-line commands */
+.bash-truncated-indicator {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  padding: 2px 8px;
+  font-style: italic;
+}
 
 .tool-status {
   font-size: 0.67rem;
@@ -720,6 +738,13 @@
   word-break: break-word;
 }
 
+.field-value.code-value {
+  background: var(--bg-elevated);
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle);
+}
+
 pre.field-value {
   margin: 0;
   padding: 7px 10px;
@@ -751,7 +776,57 @@ pre.field-value {
   border: 1px solid var(--border-subtle);
 }
 
-/* Diff view */
+/* Unified Diff view */
+.unified-diff {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.diff-line {
+  display: flex;
+  padding: 0 8px;
+  min-height: 1.5em;
+}
+
+.diff-marker {
+  flex-shrink: 0;
+  width: 20px;
+  text-align: center;
+  user-select: none;
+  color: var(--text-muted);
+}
+
+.diff-content {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-line-remove {
+  background: rgba(224, 92, 92, 0.15);
+}
+.diff-line-remove .diff-marker { color: var(--error); }
+.diff-line-remove .diff-content { color: #f8d7da; }
+
+.diff-line-add {
+  background: rgba(76, 175, 130, 0.15);
+}
+.diff-line-add .diff-marker { color: var(--success); }
+.diff-line-add .diff-content { color: #d4edda; }
+
+.diff-line-context {
+  background: transparent;
+}
+.diff-line-context .diff-content { color: var(--text-muted); }
+
+/* Legacy diff view (keeping for backwards compat) */
 .tool-diff { display: flex; flex-direction: column; gap: 6px; }
 
 .diff-section {
