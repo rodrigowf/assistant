@@ -106,6 +106,29 @@ export function useVoiceOrchestrator(
     }
   }, []);
 
+  const stopAudioAnalysis = useCallback(() => {
+    if (analyserIntervalRef.current) {
+      clearInterval(analyserIntervalRef.current);
+      analyserIntervalRef.current = null;
+    }
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+    setMicLevel(0);
+    setSpeakerLevel(0);
+  }, []);
+
+  const cleanup = useCallback(() => {
+    stopAudioAnalysis();
+    voiceHandlesRef.current?.disconnect();
+    voiceHandlesRef.current = null;
+    wsRef.current?.close();
+    wsRef.current = null;
+    dcReadyRef.current = false;
+    pendingCommandsRef.current = [];
+    setIsMuted(false);
+    setIsAssistantMuted(false);
+  }, [stopAudioAnalysis]);
+
   // Handle server events from the orchestrator WebSocket
   const handleServerEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
@@ -122,12 +145,27 @@ export function useVoiceOrchestrator(
         sendToOpenAI(event.command as RealtimeEvent);
         break;
 
-      case "error":
-        console.error("[voice-orchestrator] Server error:", event.error, (event as { detail?: string }).detail);
+      case "error": {
+        const detail = (event as { detail?: string }).detail;
+        console.error("[voice-orchestrator] Server error:", event.error, detail);
+        setVoiceError(detail || `Server error: ${event.error}`);
+        cleanup();
         updateStatus("error");
+        optsRef.current.onAfterStop?.();
+        break;
+      }
+
+      case "status":
+        // WebSocket disconnected while voice was active
+        if ((event as { status?: string }).status === "disconnected" && voiceHandlesRef.current) {
+          setVoiceError((prev) => prev ?? "Server connection lost");
+          cleanup();
+          updateStatus("error");
+          optsRef.current.onAfterStop?.();
+        }
         break;
     }
-  }, [sendToOpenAI, updateStatus]);
+  }, [sendToOpenAI, updateStatus, cleanup]);
 
   // Handle connection closed (e.g. session expired, network drop)
   const handleConnectionClosed = useCallback(() => {
@@ -243,17 +281,6 @@ export function useVoiceOrchestrator(
     onClose: handleConnectionClosed,
   });
 
-  const stopAudioAnalysis = useCallback(() => {
-    if (analyserIntervalRef.current) {
-      clearInterval(analyserIntervalRef.current);
-      analyserIntervalRef.current = null;
-    }
-    audioCtxRef.current?.close().catch(() => {});
-    audioCtxRef.current = null;
-    setMicLevel(0);
-    setSpeakerLevel(0);
-  }, []);
-
   const startAudioAnalysis = useCallback((handles: VoiceSessionHandles) => {
     const ctx = new AudioContext();
     audioCtxRef.current = ctx;
@@ -304,18 +331,6 @@ export function useVoiceOrchestrator(
     }, 66); // ~15fps
   }, []);
 
-  const cleanup = useCallback(() => {
-    stopAudioAnalysis();
-    voiceHandlesRef.current?.disconnect();
-    voiceHandlesRef.current = null;
-    wsRef.current?.close();
-    wsRef.current = null;
-    dcReadyRef.current = false;
-    pendingCommandsRef.current = [];
-    setIsMuted(false);
-    setIsAssistantMuted(false);
-  }, [stopAudioAnalysis]);
-
   const toggleMute = useCallback(() => {
     const handles = voiceHandlesRef.current;
     if (!handles) return;
@@ -362,9 +377,24 @@ export function useVoiceOrchestrator(
       socket.send(payload);
     });
 
-    // 2. Establish WebRTC connection in parallel
-    const handles = await connect();
+    // 2. Establish WebRTC connection with timeout
+    const CONNECTION_TIMEOUT_MS = 15_000;
+    let handles: VoiceSessionHandles | null = null;
+    try {
+      handles = await Promise.race([
+        connect(),
+        new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error("Voice connection timed out")), CONNECTION_TIMEOUT_MS)
+        ),
+      ]);
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : "Voice connection timed out");
+      cleanup();
+      updateStatus("error");
+      return;
+    }
     if (!handles) {
+      // connect() returned null — onError already set voiceError
       cleanup();
       updateStatus("error");
       return;
