@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -262,6 +263,11 @@ class SessionManager:
             kwargs["resume"] = self._resume_id
         if self._fork:
             kwargs["fork_session"] = True
+
+        # Strip CLAUDECODE to allow launching SDK sessions from within a
+        # Claude Code process (e.g. VSCode extension or the wrapper itself).
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        kwargs["env"] = env
 
         return ClaudeAgentOptions(**kwargs)
 

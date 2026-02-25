@@ -13,9 +13,12 @@ NC='\033[0m' # No Color
 
 echo -e "${BLUE}Starting Assistant Application...${NC}"
 
+# Source nvm if available (npm may not be on PATH in non-interactive shells)
+[ -s "$HOME/.nvm/nvm.sh" ] && source "$HOME/.nvm/nvm.sh"
+
 # Start backend in background
 echo -e "${GREEN}Starting backend (port 8000)...${NC}"
-scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 &
+default-scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 &
 BACKEND_PID=$!
 
 # Give backend a moment to start

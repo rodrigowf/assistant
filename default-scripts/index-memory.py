@@ -24,7 +24,8 @@ import sys
 from pathlib import Path
 
 # Add project root to path for utils import
-SCRIPT_DIR = Path(__file__).parent.resolve()
+# Resolve the file first (follows symlinks), then get parent directory
+SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_DIR))
 

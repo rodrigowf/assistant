@@ -93,6 +93,7 @@ class AuthManager:
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._cli, "auth", "status",
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_get_auth_env(),
@@ -124,7 +125,7 @@ class AuthManager:
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._cli, "setup-token",
-                stdin=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_get_auth_env(),
