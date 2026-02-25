@@ -1022,8 +1022,8 @@ pre.field-value {
 
 .send-btn,
 .interrupt-btn {
-  width: 36px;
-  height: 36px;
+  width: 42px;
+  height: 42px;
   border-radius: var(--radius);
   display: flex;
   align-items: center;
@@ -1073,18 +1073,54 @@ pre.field-value {
 }
 
 .voice-status-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 0.77rem;
   color: var(--text-muted);
 }
 
-/* Voice Start Button — pill-shaped "Start Voice" button */
+/* Status indicator dot */
+.voice-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background-color 150ms ease;
+}
+
+.voice-status-dot.listening {
+  background-color: #4CAF50;  /* Green — actively listening */
+}
+
+.voice-status-dot.muted {
+  background-color: #e57373;  /* Soft red — muted */
+}
+
+.voice-status-dot.speaking {
+  background-color: #64B5F6;  /* Blue — assistant speaking */
+}
+
+.voice-status-dot.thinking {
+  background-color: #FFB74D;  /* Amber/orange — processing */
+}
+
+.voice-status-dot.tool-use {
+  background-color: #BA68C8;  /* Purple — using tools */
+}
+
+.voice-status-dot.connecting {
+  background-color: #90A4AE;  /* Gray — connecting */
+}
+
+/* Voice Start Button — balanced rounded "Start Voice" button */
 .voice-start-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
   padding: 10px 18px;
-  border-radius: 24px;
+  border-radius: 12px;  /* Balanced rounding - not too pill, not too sharp */
   border: 1px solid var(--border);
   background: var(--bg-elevated);
   color: var(--text-muted);
@@ -1178,7 +1214,7 @@ pre.field-value {
 }
 
 /* ============================================================
-   Voice Controls — New pill-shaped buttons
+   Voice Controls — Rounded square buttons
    ============================================================ */
 
 .voice-controls {
@@ -1193,7 +1229,7 @@ pre.field-value {
   justify-content: center;
   gap: 6px;
   padding: 8px 14px;
-  border-radius: 20px;
+  border-radius: 12px;  /* Balanced rounding - not too pill, not too sharp */
   border: 1px solid var(--border);
   background: var(--bg-elevated);
   color: var(--text-muted);
@@ -1214,65 +1250,79 @@ pre.field-value {
   cursor: not-allowed;
 }
 
-/* Stop Session button — red/pink styling */
+/* Stop Session button — softer muted red styling */
 .voice-ctrl--stop {
-  background: rgba(220, 60, 80, 0.15);
-  border-color: rgba(220, 60, 80, 0.3);
-  color: #dc3c50;
+  background: rgba(180, 70, 85, 0.1);
+  border-color: rgba(180, 70, 85, 0.25);
+  color: #b45565;
 }
 
 .voice-ctrl--stop:hover {
-  background: rgba(220, 60, 80, 0.25);
-  border-color: rgba(220, 60, 80, 0.5);
-  color: #ff4d63;
+  background: rgba(180, 70, 85, 0.18);
+  border-color: rgba(180, 70, 85, 0.4);
+  color: #c86575;
 }
 
-/* Mic button — teal/cyan when active */
+/* Mic button — softer muted green when active */
 .voice-ctrl--mic {
   background: var(--bg-elevated);
   color: var(--text-muted);
 }
 
 .voice-ctrl--mic:not(.muted):not(:disabled) {
-  background: rgba(0, 200, 180, 0.12);
-  border-color: rgba(0, 200, 180, 0.3);
-  color: #00c8b4;
+  background: rgba(70, 150, 110, 0.1);
+  border-color: rgba(70, 150, 110, 0.25);
+  color: #55a080;
 }
 
 .voice-ctrl--mic:not(.muted):hover:not(:disabled) {
-  background: rgba(0, 200, 180, 0.2);
-  border-color: rgba(0, 200, 180, 0.5);
-  color: #00e6cf;
+  background: rgba(70, 150, 110, 0.16);
+  border-color: rgba(70, 150, 110, 0.4);
+  color: #65b090;
 }
 
+/* Mic button muted — softer muted red background */
 .voice-ctrl--mic.muted {
-  background: var(--bg-elevated);
-  border-color: var(--border);
-  color: var(--text-muted);
+  background: rgba(180, 70, 85, 0.1);
+  border-color: rgba(180, 70, 85, 0.25);
+  color: #b45565;
 }
 
-/* Assistant/Speaker button — green when active */
+.voice-ctrl--mic.muted:hover:not(:disabled) {
+  background: rgba(180, 70, 85, 0.18);
+  border-color: rgba(180, 70, 85, 0.4);
+  color: #c86575;
+}
+
+/* Assistant/Speaker button — softer muted blue when active */
 .voice-ctrl--assistant {
   background: var(--bg-elevated);
   color: var(--text-muted);
 }
 
 .voice-ctrl--assistant:not(.muted):not(:disabled) {
-  background: rgba(0, 180, 120, 0.12);
-  border-color: rgba(0, 180, 120, 0.3);
-  color: #00b478;
+  background: rgba(80, 130, 180, 0.1);
+  border-color: rgba(80, 130, 180, 0.25);
+  color: #6090b8;
 }
 
 .voice-ctrl--assistant:not(.muted):hover:not(:disabled) {
-  background: rgba(0, 180, 120, 0.2);
-  border-color: rgba(0, 180, 120, 0.5);
-  color: #00d68f;
+  background: rgba(80, 130, 180, 0.16);
+  border-color: rgba(80, 130, 180, 0.4);
+  color: #70a0c8;
 }
 
+/* Assistant button muted — softer muted red background */
 .voice-ctrl--assistant.muted {
-  background: var(--bg-elevated);
-  border-color: var(--border);
-  color: var(--text-muted);
+  background: rgba(180, 70, 85, 0.1);
+  border-color: rgba(180, 70, 85, 0.25);
+  color: #b45565;
+}
+
+.voice-ctrl--assistant.muted:hover:not(:disabled) {
+  background: rgba(180, 70, 85, 0.18);
+  border-color: rgba(180, 70, 85, 0.4);
+  color: #c86575;
 }
 
 /* Volume bars (for mic) — vertical animated bars */
@@ -1290,26 +1340,6 @@ pre.field-value {
   min-height: 3px;
   transition: height 60ms ease-out;
   opacity: 0.9;
-}
-
-/* Volume dots (for speaker) — horizontal dots */
-.volume-dots {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-}
-
-.volume-dot {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.25;
-  transition: opacity 100ms ease-out;
-}
-
-.volume-dot.active {
-  opacity: 1;
 }
 
 /* ============================================================

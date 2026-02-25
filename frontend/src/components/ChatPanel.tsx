@@ -95,6 +95,13 @@ export function ChatPanel({
             )}
             {voiceActive && (
               <span className="voice-status-label">
+                <span className={`voice-status-dot ${
+                  voiceStatus === "active" ? (isMicMuted ? "muted" : "listening") :
+                  voiceStatus === "speaking" ? "speaking" :
+                  voiceStatus === "thinking" ? "thinking" :
+                  voiceStatus === "tool_use" ? "tool-use" :
+                  "connecting"
+                }`} />
                 {voiceStatus === "active" && (isMicMuted ? "Muted" : "Listening…")}
                 {voiceStatus === "speaking" && "Speaking…"}
                 {voiceStatus === "thinking" && "Thinking…"}

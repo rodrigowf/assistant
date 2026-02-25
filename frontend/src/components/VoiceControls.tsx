@@ -46,21 +46,7 @@ export function VoiceControls({
         <StopIcon />
       </button>
 
-      {/* Mute Assistant Button */}
-      <button
-        className={`voice-ctrl voice-ctrl--assistant ${isAssistantMuted ? "muted" : ""}`}
-        onClick={onAssistantMuteToggle}
-        title={isAssistantMuted ? "Unmute assistant" : "Mute assistant"}
-        aria-label={isAssistantMuted ? "Unmute assistant" : "Mute assistant"}
-        disabled={!isActive}
-      >
-        {isAssistantMuted ? <SpeakerMutedIcon /> : <SpeakerIcon />}
-        {!isAssistantMuted && isActive && (
-          <VolumeDots level={speakerLevel} />
-        )}
-      </button>
-
-      {/* Mute My Voice Button */}
+      {/* Mute My Voice Button (center) — green tone */}
       <button
         className={`voice-ctrl voice-ctrl--mic ${isMicMuted ? "muted" : ""}`}
         onClick={onMicMuteToggle}
@@ -69,9 +55,21 @@ export function VoiceControls({
         disabled={!isActive}
       >
         {isMicMuted ? <MicMutedIcon /> : <MicIcon />}
-        {!isMicMuted && isActive && (
-          <VolumeBars level={micLevel} />
-        )}
+        {/* Always show volume bars, but inactive when muted */}
+        <VolumeBars level={isMicMuted ? 0 : micLevel} />
+      </button>
+
+      {/* Mute Assistant Button (right) — blue tone */}
+      <button
+        className={`voice-ctrl voice-ctrl--assistant ${isAssistantMuted ? "muted" : ""}`}
+        onClick={onAssistantMuteToggle}
+        title={isAssistantMuted ? "Unmute assistant" : "Mute assistant"}
+        aria-label={isAssistantMuted ? "Unmute assistant" : "Mute assistant"}
+        disabled={!isActive}
+      >
+        {isAssistantMuted ? <SpeakerMutedIcon /> : <SpeakerIcon />}
+        {/* Always show volume bars, but inactive when muted */}
+        <VolumeBars level={isAssistantMuted ? 0 : speakerLevel} />
       </button>
     </div>
   );
@@ -96,25 +94,13 @@ function VolumeBars({ level }: { level: number }) {
   );
 }
 
-/** Volume dots indicator (for speaker) — dots that light up with level */
-function VolumeDots({ level }: { level: number }) {
-  const normalizedLevel = Math.min(Math.max(level * 3, 0), 1);
-  const activeDots = Math.ceil(normalizedLevel * 3);
-
-  return (
-    <div className="volume-dots">
-      <div className={`volume-dot ${activeDots >= 1 ? "active" : ""}`} />
-      <div className={`volume-dot ${activeDots >= 2 ? "active" : ""}`} />
-      <div className={`volume-dot ${activeDots >= 3 ? "active" : ""}`} />
-    </div>
-  );
-}
 
 function StopIcon() {
+  // Power-off icon: standard IEC 5009 power symbol (circle with line breaking through top)
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="9" />
-      <polyline points="8,10 12,14 16,10" />
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2v6" />
+      <path d="M6.34 6.34a9 9 0 1 0 11.32 0" />
     </svg>
   );
 }
