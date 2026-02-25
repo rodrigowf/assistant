@@ -92,10 +92,12 @@ async def _handle_start(
 
     The frontend sends ``local_id`` (stable tab UUID) and optionally
     ``resume_sdk_id`` (Claude Code SDK session ID for resuming from history).
+    Optionally includes ``mcp_servers`` dict to specify which MCPs to load.
     """
     local_id = msg.get("local_id")
     resume_sdk_id = msg.get("resume_sdk_id") or msg.get("session_id")
     fork = msg.get("fork", False)
+    mcp_servers = msg.get("mcp_servers")  # Optional: dict of MCP servers to load
 
     # Check if this session already exists in the pool (re-subscribing)
     if local_id and pool.has(local_id):
@@ -114,7 +116,13 @@ async def _handle_start(
             "type": "status", "status": "connecting",
         }))
         session_id = await asyncio.wait_for(
-            pool.create(config, local_id=local_id, resume_sdk_id=resume_sdk_id, fork=fork),
+            pool.create(
+                config,
+                local_id=local_id,
+                resume_sdk_id=resume_sdk_id,
+                fork=fork,
+                mcp_servers=mcp_servers,
+            ),
             timeout=30.0,
         )
     except asyncio.TimeoutError:

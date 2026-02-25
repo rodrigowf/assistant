@@ -263,6 +263,10 @@ class SessionManager:
             kwargs["resume"] = self._resume_id
         if self._fork:
             kwargs["fork_session"] = True
+        if self._config.mcp_servers is not None:
+            # Pass MCP servers directly to the SDK
+            # When mcp_servers is provided, it overrides settings from .claude.json
+            kwargs["mcp_servers"] = self._config.mcp_servers
 
         # Strip CLAUDECODE to allow launching SDK sessions from within a
         # Claude Code process (e.g. VSCode extension or the wrapper itself).

@@ -316,6 +316,8 @@ export interface ChatInstance {
   cost: number;
   turns: number;
   error: string | null;
+  /** Currently selected MCP server names */
+  selectedMcps: string[];
   send: (text: string) => void;
   command: (text: string) => void;
   interrupt: () => void;
@@ -323,6 +325,8 @@ export interface ChatInstance {
   stop: () => void;
   /** Restart the session (send start again after a stop). */
   restart: () => void;
+  /** Restart the session with specific MCP servers enabled. */
+  restartWithMcps: (mcpNames: string[]) => void;
   /** Send a voice_event to the backend (voice mode only). */
   sendVoiceEvent: (event: RealtimeEvent) => void;
   /** Send voice_start to switch this orchestrator session to voice mode. */
@@ -366,7 +370,10 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   const { localId, resumeSdkId, onSessionChange, onStatusChange, wsEndpoint, skipHistory, onAgentSessionOpened, onAgentSessionClosed, onVoiceCommand, onSessionClosed } = options;
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [wsActive, setWsActive] = useState(false);
-  const pendingStartRef = useRef<{ resumeSdkId: string | null } | null>(null);
+  const [selectedMcps, setSelectedMcps] = useState<string[]>([]);
+  const pendingStartRef = useRef<{ resumeSdkId: string | null; mcpServers?: Record<string, unknown> } | null>(null);
+  // Track when we're doing an internal MCP restart (don't close tab on session_stopped)
+  const mcpRestartingRef = useRef(false);
 
   // Stable refs for callbacks
   const onSessionChangeRef = useRef(onSessionChange);
@@ -443,7 +450,10 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "session_stopped":
         dispatch({ type: "STATUS", status: "disconnected" });
-        onSessionClosedRef.current?.();
+        // Don't close the tab if we're doing an MCP restart
+        if (!mcpRestartingRef.current) {
+          onSessionClosedRef.current?.();
+        }
         break;
       case "agent_session_opened":
         onAgentSessionOpenedRef.current?.(event.session_id, event.sdk_session_id);
@@ -470,6 +480,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       };
       if (pending.resumeSdkId) {
         startMsg.resume_sdk_id = pending.resumeSdkId;
+      }
+      if (pending.mcpServers) {
+        startMsg.mcp_servers = pending.mcpServers;
       }
       wsSendRef.current?.(startMsg);
     }
@@ -552,6 +565,51 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     wsSend(msg);
   }, [wsSend]);
 
+  const restartWithMcps = useCallback(
+    async (mcpNames: string[]) => {
+      // First, fetch full MCP configs for selected names
+      const { listMcpServers } = await import("../api/rest");
+      const response = await listMcpServers();
+
+      // Build mcp_servers dict with only selected MCPs
+      const mcpServers: Record<string, unknown> = {};
+      for (const name of mcpNames) {
+        if (response.servers[name]) {
+          mcpServers[name] = response.servers[name];
+        }
+      }
+
+      // Update selected MCPs state
+      setSelectedMcps(mcpNames);
+
+      // Mark that we're doing an MCP restart (don't close tab on session_stopped)
+      mcpRestartingRef.current = true;
+
+      // Stop current session and restart with new MCPs
+      wsSend({ type: "stop" });
+
+      // Give a brief delay for the stop to process
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Send start with MCP servers
+      const msg: Record<string, unknown> = {
+        type: "start",
+        local_id: localIdRef.current,
+        mcp_servers: mcpServers,
+      };
+      if (resumeSdkIdRef.current) {
+        msg.resume_sdk_id = resumeSdkIdRef.current;
+      }
+      wsSend(msg);
+
+      // Reset the flag after a short delay (after start completes)
+      setTimeout(() => {
+        mcpRestartingRef.current = false;
+      }, 500);
+    },
+    [wsSend]
+  );
+
   const sendVoiceEvent = useCallback(
     (event: RealtimeEvent) => {
       wsSend({ type: "voice_event", event });
@@ -606,11 +664,13 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     cost: state.cost,
     turns: state.turns,
     error: state.error,
+    selectedMcps,
     send,
     command,
     interrupt,
     stop,
     restart,
+    restartWithMcps,
     sendVoiceEvent,
     startVoiceMode,
     addDisplayMessage,

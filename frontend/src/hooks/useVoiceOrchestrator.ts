@@ -62,12 +62,15 @@ export interface VoiceOrchestratorResult {
   micLevel: number;
   /** Remote speaker audio level (0–1). */
   speakerLevel: number;
+  /** Error message for display (e.g. session expired). Null when no error. */
+  voiceError: string | null;
 }
 
 export function useVoiceOrchestrator(
   options: UseVoiceOrchestratorOptions = {}
 ): VoiceOrchestratorResult {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
+  const [voiceError, setVoiceError] = useState<string | null>(null);
   const voiceHandlesRef = useRef<VoiceSessionHandles | null>(null);
   const wsRef = useRef<ChatSocket | null>(null);
   // Queue commands that arrive before data channel opens
@@ -126,12 +129,42 @@ export function useVoiceOrchestrator(
     }
   }, [sendToOpenAI, updateStatus]);
 
+  // Handle connection closed (e.g. session expired, network drop)
+  const handleConnectionClosed = useCallback(() => {
+    // Only act if voice is currently active (avoid double-firing)
+    if (voiceHandlesRef.current) {
+      // If we don't already have a specific error, set a generic one
+      setVoiceError((prev) => prev ?? "Voice connection lost");
+      cleanup();
+      updateStatus("error");
+      optsRef.current.onAfterStop?.();
+    }
+  }, [cleanup, updateStatus]);
+
   // Handle events from OpenAI data channel
   const handleOpenAIEvent = useCallback((event: RealtimeEvent) => {
     const eventType = event.type;
 
     // Mirror every event to the backend
     wsRef.current?.send({ type: "voice_event", event });
+
+    // Detect OpenAI error events (e.g. session_expired, rate_limit, etc.)
+    if (eventType === "error") {
+      const err = event.error as Record<string, unknown> | undefined;
+      const code = err?.code as string | undefined;
+      const message = err?.message as string | undefined;
+      if (code === "session_expired") {
+        console.warn("[voice-orchestrator] Session expired:", message);
+        setVoiceError(message || "Voice session expired — please restart");
+      } else {
+        console.error("[voice-orchestrator] OpenAI error:", code, message);
+        setVoiceError(message || `Voice error: ${code || "unknown"}`);
+      }
+      cleanup();
+      updateStatus("error");
+      optsRef.current.onAfterStop?.();
+      return; // Don't process further
+    }
 
     // Update status and dispatch UI callbacks
     if (eventType === "response.created") {
@@ -187,7 +220,7 @@ export function useVoiceOrchestrator(
     } else if (eventType === "response.audio_transcript.done") {
       optsRef.current.onAssistantComplete?.((event.transcript as string) || "");
     }
-  }, [updateStatus]);
+  }, [updateStatus, cleanup]);
 
   // Data channel connected → drain queue
   const handleVoiceConnected = useCallback(() => {
@@ -204,8 +237,10 @@ export function useVoiceOrchestrator(
     onConnected: handleVoiceConnected,
     onError: (err) => {
       console.error("[voice-orchestrator] WebRTC error:", err);
+      setVoiceError(err);
       updateStatus("error");
     },
+    onClose: handleConnectionClosed,
   });
 
   const stopAudioAnalysis = useCallback(() => {
@@ -302,6 +337,7 @@ export function useVoiceOrchestrator(
   const startVoice = useCallback(async () => {
     if (voiceStatus !== "off" && voiceStatus !== "error") return;
 
+    setVoiceError(null);
     updateStatus("connecting");
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
@@ -373,5 +409,6 @@ export function useVoiceOrchestrator(
     toggleAssistantMute,
     micLevel,
     speakerLevel,
+    voiceError,
   };
 }

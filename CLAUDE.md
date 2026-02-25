@@ -83,9 +83,9 @@ Start the frontend: `cd frontend && npm run dev`
 
 Or use `/debug-app` which handles both and provides browser automation.
 
-### Memory & History
+### Memory System
 
-The `context/` folder is a Git submodule (`assistant-context` repo) containing all private data:
+The `context/` folder is a Git submodule containing all private data, including the memory system:
 
 ```
 context/
@@ -93,8 +93,8 @@ context/
 ├── .titles.json       # Custom session titles
 ├── <uuid>/            # SDK state dirs (subagents, tool-results)
 ├── memory/            # Memory files (Markdown)
-│   ├── MEMORY.md      # Index file (keep under 200 lines)
-│   └── *.md           # Detailed documents
+│   ├── MEMORY.md      # Authoritative index (keep under 200 lines)
+│   └── *.md           # Detailed topic files
 ├── skills/            # Symlinks to default-skills/* + personalized folders
 ├── scripts/           # Symlinks to default-scripts/* + personalized files
 ├── secrets/           # OAuth credentials and tokens
@@ -102,17 +102,31 @@ context/
 └── .env               # Environment variables
 ```
 
-**How to use memory properly:**
-- `MEMORY.md` is the index file—keep it under 200 lines with references only
-- Store detailed plans, decisions, and context in **separate files** (e.g., `some-plan.md`)
-- In `MEMORY.md`, add one-line references: `- filename.md — Brief description`
-- This keeps the index scannable while allowing unlimited detail in linked files
+**The Shared Memory Index (`context/memory/MEMORY.md`)**
 
-Both memory and conversation history are indexed automatically for semantic search via `/recall <query>`:
-- **Memory**: Indexed immediately when files change (file watcher)
-- **History**: Indexed every 2 minutes (if files changed)
+This file is the **single source of truth** for all skills, memory files, and project references. Both the orchestrator (which loads it dynamically into its prompt) and Claude Code agents rely on this index.
 
-**Note**: `.claude_config/projects/<mangled>/` symlinks to `context/` for SDK compatibility. Code references `context/` directly via `utils/paths.py`.
+**Structure:**
+- Keep `MEMORY.md` under 200 lines with one-line references only
+- Store detailed content in separate `<topic>.md` files
+- Reference format: `- filename.md — Brief description`
+
+**Your maintenance responsibilities:**
+
+When you make changes that affect the memory index, update `MEMORY.md` directly:
+1. **Skills**: Update the Skills Reference table when skills are added, removed, or modified
+2. **Memory files**: Add a reference line when creating new `<topic>.md` files
+3. **Projects**: Update entries when project status changes (started, completed, abandoned)
+
+You have full editing capabilities via Claude Code's tools—use them to keep the index accurate. The orchestrator loads this file dynamically, so your updates are immediately visible to the entire system.
+
+**Semantic search:**
+
+Both memory and conversation history are indexed for search via `/recall <query>`:
+- Memory files: Indexed immediately when changed (file watcher)
+- History: Indexed every 2 minutes (if changed)
+
+**Note**: `.claude_config/projects/<mangled>/` symlinks to `context/` for SDK compatibility.
 
 ### Voice Mode (Realtime)
 

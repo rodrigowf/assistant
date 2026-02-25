@@ -1,8 +1,9 @@
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useEffect, useCallback, useState } from "react";
 import { useTabsContext } from "../context/TabsContext";
 import { useChatInstance, type ChatInstance } from "../hooks/useChatInstance";
 import { useVoiceOrchestrator } from "../hooks/useVoiceOrchestrator";
 import { ChatPanel } from "./ChatPanel";
+import { McpSelectionModal } from "./McpSelectionModal";
 import type { SessionStatus, ConnectionState } from "../types";
 
 /**
@@ -78,14 +79,16 @@ function OrchestratorChatPanel({
   instance,
   onSessionChange,
   isActive,
+  onMcpSettings,
 }: {
   sessionId: string;
   resumeSdkId?: string | null;
   instance: ChatInstance;
   onSessionChange: () => void;
   isActive?: boolean;
+  onMcpSettings?: () => void;
 }) {
-  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel } = useVoiceOrchestrator({
+  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel, voiceError } = useVoiceOrchestrator({
     localId: sessionId,
     resumeSdkId,
     onUserTranscript: (text) => {
@@ -132,6 +135,9 @@ function OrchestratorChatPanel({
       onAssistantMuteToggle={toggleAssistantMute}
       micLevel={micLevel}
       speakerLevel={speakerLevel}
+      voiceError={voiceError}
+      activeMcpCount={instance.selectedMcps.length}
+      onMcpSettings={onMcpSettings}
     />
   );
 }
@@ -146,6 +152,8 @@ export function ChatPanelContainer({
 }) {
   const { tabs, activeTabId, openTab, closeTab } = useTabsContext();
   const instancesRef = useRef<Map<string, ChatInstance>>(new Map());
+  const [showMcpModal, setShowMcpModal] = useState(false);
+  const [mcpModalSessionId, setMcpModalSessionId] = useState<string | null>(null);
 
   const handleAgentSessionOpened = useCallback(
     (agentSessionId: string, sdkSessionId?: string) => {
@@ -167,6 +175,26 @@ export function ChatPanelContainer({
     },
     [closeTab]
   );
+
+  const handleOpenMcpModal = useCallback((sessionId: string) => {
+    setMcpModalSessionId(sessionId);
+    setShowMcpModal(true);
+  }, []);
+
+  const handleCloseMcpModal = useCallback(() => {
+    setShowMcpModal(false);
+    setMcpModalSessionId(null);
+  }, []);
+
+  const handleMcpConfirm = useCallback((selectedMcps: string[]) => {
+    if (mcpModalSessionId) {
+      const inst = instancesRef.current.get(mcpModalSessionId);
+      if (inst) {
+        inst.restartWithMcps(selectedMcps);
+      }
+    }
+    handleCloseMcpModal();
+  }, [mcpModalSessionId, handleCloseMcpModal]);
 
   const activeInstance = activeTabId ? instancesRef.current.get(activeTabId) : undefined;
 
@@ -206,6 +234,7 @@ export function ChatPanelContainer({
                 instance={inst}
                 onSessionChange={onSessionChange}
                 isActive={isActive}
+                onMcpSettings={() => handleOpenMcpModal(tab.sessionId)}
               />
             ) : (
               <ChatPanel
@@ -218,6 +247,8 @@ export function ChatPanelContainer({
                 onSend={inst.send}
                 onInterrupt={inst.interrupt}
                 isActive={isActive}
+                activeMcpCount={inst.selectedMcps.length}
+                onMcpSettings={() => handleOpenMcpModal(tab.sessionId)}
               />
             )}
           </div>
@@ -236,6 +267,15 @@ export function ChatPanelContainer({
             </div>
           </div>
         </main>
+      )}
+
+      {/* MCP Selection Modal */}
+      {showMcpModal && mcpModalSessionId && (
+        <McpSelectionModal
+          selectedMcps={instancesRef.current.get(mcpModalSessionId)?.selectedMcps ?? []}
+          onConfirm={handleMcpConfirm}
+          onCancel={handleCloseMcpModal}
+        />
       )}
     </>
   );

@@ -74,3 +74,21 @@ export function authSetCredentials(credentialsJson: string): Promise<AuthStatusR
     body: JSON.stringify({ credentials_json: credentialsJson }),
   });
 }
+
+// MCP Server Management
+
+export interface McpServerConfig {
+  type?: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+export interface McpServersResponse {
+  servers: Record<string, McpServerConfig>;
+  project_dir: string;
+}
+
+export function listMcpServers(): Promise<McpServersResponse> {
+  return json(`${BASE}/mcp/servers`);
+}

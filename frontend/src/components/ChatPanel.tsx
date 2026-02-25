@@ -26,6 +26,11 @@ interface Props {
   onAssistantMuteToggle?: () => void;
   micLevel?: number;
   speakerLevel?: number;
+  /** Voice error message (e.g. session expired). */
+  voiceError?: string | null;
+  // MCP settings
+  activeMcpCount?: number;
+  onMcpSettings?: () => void;
 }
 
 export function ChatPanel({
@@ -48,6 +53,9 @@ export function ChatPanel({
   onAssistantMuteToggle,
   micLevel,
   speakerLevel,
+  voiceError,
+  activeMcpCount,
+  onMcpSettings,
 }: Props) {
   const isStreaming = status === "streaming" || status === "thinking" || status === "tool_use";
   const voiceActive = voiceStatus && voiceStatus !== "off" && voiceStatus !== "error";
@@ -66,6 +74,8 @@ export function ChatPanel({
             onInterrupt={onInterrupt}
             disabled={status === "disconnected" || status === "connecting"}
             streaming={isStreaming}
+            activeMcpCount={activeMcpCount}
+            onMcpSettings={onMcpSettings}
           />
         </div>
       )}
@@ -74,11 +84,16 @@ export function ChatPanel({
           <div className="voice-bar">
             {/* Show start button when voice is off */}
             {!voiceActive && (
-              <VoiceButton
-                status={voiceStatus}
-                onStart={onVoiceStart}
-                onStop={onVoiceStop}
-              />
+              <>
+                <VoiceButton
+                  status={voiceStatus}
+                  onStart={onVoiceStart}
+                  onStop={onVoiceStop}
+                />
+                {voiceStatus === "error" && voiceError && (
+                  <span className="voice-error-message">{voiceError}</span>
+                )}
+              </>
             )}
             {/* Show new pill controls when voice is active */}
             {voiceActive && onMicMuteToggle && onAssistantMuteToggle && (

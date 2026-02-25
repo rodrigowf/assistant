@@ -4,11 +4,55 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from orchestrator.tools import registry
 
 logger = logging.getLogger(__name__)
+
+
+def _get_mcp_configs(mcp_names: list[str]) -> dict[str, dict]:
+    """Load MCP configurations for the given names from .claude.json.
+
+    Returns a dict mapping MCP name to its configuration, only for
+    names that exist in the config.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        config_path = Path(config_dir) / ".claude.json"
+    else:
+        project_root = Path(__file__).resolve().parent.parent.parent
+        config_path = project_root / ".claude_config" / ".claude.json"
+
+    if not config_path.is_file():
+        logger.warning("Claude config not found at %s", config_path)
+        return {}
+
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error("Failed to load Claude config: %s", e)
+        return {}
+
+    # Get project-specific MCP servers
+    project_root = Path(__file__).resolve().parent.parent.parent
+    project_dir = str(project_root)
+    projects = config.get("projects", {})
+    project_config = projects.get(project_dir, {})
+    available_mcps = project_config.get("mcpServers", {})
+
+    # Return only the requested MCPs that exist
+    result = {}
+    for name in mcp_names:
+        if name in available_mcps:
+            result[name] = available_mcps[name]
+        else:
+            logger.warning("MCP server %r not found in config", name)
+
+    return result
 
 
 @registry.register(
@@ -47,6 +91,7 @@ async def list_agent_sessions(context: dict[str, Any]) -> str:
         "Start a new Claude Code agent session or resume a past one from history. "
         "To resume a past session, pass its sdk_session_id (returned by list_agent_sessions "
         "or list_history). Omit all parameters to start a fresh session. "
+        "You can specify which MCP servers to load for extended capabilities. "
         "Returns the session_id to use with send_to_agent_session and close_agent_session."
     ),
     input_schema={
@@ -60,10 +105,23 @@ async def list_agent_sessions(context: dict[str, Any]) -> str:
                     "open_agent_session. Get it from list_agent_sessions or list_history."
                 ),
             },
+            "mcp_servers": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "List of MCP server names to enable for this session. "
+                    "Examples: ['obs'], ['youtube'], ['chrome-devtools', 'ubuntu-desktop-control']. "
+                    "If not specified, the session starts with no MCPs (default Claude Code tools only)."
+                ),
+            },
         },
     },
 )
-async def open_agent_session(context: dict[str, Any], resume_sdk_id: str = "") -> str:
+async def open_agent_session(
+    context: dict[str, Any],
+    resume_sdk_id: str = "",
+    mcp_servers: list[str] | None = None,
+) -> str:
     from manager.config import ManagerConfig
 
     pool = context["pool"]
@@ -86,12 +144,25 @@ async def open_agent_session(context: dict[str, Any], resume_sdk_id: str = "") -
                 "from list_history can be resumed."
             })
 
+    # Build MCP servers dict if names provided
+    mcp_servers_config: dict[str, dict] | None = None
+    if mcp_servers:
+        mcp_servers_config = _get_mcp_configs(mcp_servers)
+        if not mcp_servers_config:
+            return json.dumps({
+                "error": f"No valid MCP servers found from: {mcp_servers}. "
+                "Check available MCPs in the system prompt."
+            })
+
     try:
-        local_id = await pool.create(config, resume_sdk_id=sdk_id)
+        local_id = await pool.create(config, resume_sdk_id=sdk_id, mcp_servers=mcp_servers_config)
     except Exception as e:
         return json.dumps({"error": f"Failed to start session: {e}"})
 
-    return json.dumps({"session_id": local_id, "status": "started"})
+    result = {"session_id": local_id, "status": "started"}
+    if mcp_servers_config:
+        result["mcp_servers"] = list(mcp_servers_config.keys())
+    return json.dumps(result)
 
 
 @registry.register(

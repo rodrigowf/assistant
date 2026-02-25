@@ -1051,6 +1051,40 @@ pre.field-value {
 
 .interrupt-btn:hover { background: rgba(212, 95, 95, 0.18); }
 
+/* MCP settings button in chat input */
+.send-btn.mcp-btn {
+  position: relative;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.send-btn.mcp-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.send-btn.mcp-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.mcp-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  background: var(--accent);
+  color: white;
+  padding: 1px 4px;
+  border-radius: 6px;
+  min-width: 12px;
+  text-align: center;
+  line-height: 1.2;
+}
+
 /* ============================================================
    Voice bar
    ============================================================ */
@@ -1169,6 +1203,14 @@ pre.field-value {
 
 .voice-start-label {
   white-space: nowrap;
+}
+
+.voice-error-message {
+  font-size: 0.8rem;
+  color: #dc3c50;
+  max-width: 300px;
+  text-align: center;
+  line-height: 1.3;
 }
 
 @keyframes spin {
@@ -1689,6 +1731,93 @@ pre.field-value {
 .modal-btn-primary:hover {
   background: var(--accent-hover);
   box-shadow: 0 0 12px var(--accent-glow);
+}
+
+.modal-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ============================================================
+   MCP Selection Modal
+   ============================================================ */
+
+.mcp-modal {
+  max-width: 480px;
+}
+
+.mcp-description {
+  margin-bottom: 16px;
+}
+
+.mcp-loading,
+.mcp-error,
+.mcp-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.mcp-error {
+  color: var(--error);
+}
+
+.mcp-server-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+  margin-bottom: 20px;
+  padding: 4px 0;
+}
+
+.mcp-server-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.mcp-server-item:hover {
+  background: var(--bg-hover);
+}
+
+.mcp-server-item.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-elevated));
+}
+
+.mcp-server-item input[type="checkbox"] {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.mcp-server-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mcp-server-name {
+  font-weight: 600;
+  color: var(--text-bright);
+  font-size: 0.9rem;
+}
+
+.mcp-server-command {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  word-break: break-all;
 }
 
 /* ============================================================

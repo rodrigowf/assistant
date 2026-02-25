@@ -11,6 +11,10 @@ from pathlib import Path
 _DEFAULT_PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
+# Type alias for MCP server configuration
+McpServerConfig = dict  # Can be McpStdioServerConfig, McpSSEServerConfig, etc.
+
+
 @dataclass
 class ManagerConfig:
     """Configuration for the manager library."""
@@ -20,6 +24,7 @@ class ManagerConfig:
     permission_mode: str = "default"
     max_budget_usd: float | None = None
     max_turns: int | None = None
+    mcp_servers: dict[str, McpServerConfig] | None = None
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> ManagerConfig:
