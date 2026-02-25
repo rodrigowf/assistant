@@ -54,6 +54,10 @@ export interface VoiceOrchestratorResult {
   isMuted: boolean;
   /** Toggle microphone mute on/off. */
   toggleMute: () => void;
+  /** Whether the assistant audio is muted. */
+  isAssistantMuted: boolean;
+  /** Toggle assistant audio mute on/off. */
+  toggleAssistantMute: () => void;
   /** Mic input audio level (0–1). */
   micLevel: number;
   /** Remote speaker audio level (0–1). */
@@ -73,6 +77,7 @@ export function useVoiceOrchestrator(
 
   // Mute state
   const [isMuted, setIsMuted] = useState(false);
+  const [isAssistantMuted, setIsAssistantMuted] = useState(false);
 
   // Audio level analysis
   const [micLevel, setMicLevel] = useState(0);
@@ -273,6 +278,7 @@ export function useVoiceOrchestrator(
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
     setIsMuted(false);
+    setIsAssistantMuted(false);
   }, [stopAudioAnalysis]);
 
   const toggleMute = useCallback(() => {
@@ -284,6 +290,14 @@ export function useVoiceOrchestrator(
     });
     setIsMuted(newMuted);
   }, [isMuted]);
+
+  const toggleAssistantMute = useCallback(() => {
+    const handles = voiceHandlesRef.current;
+    if (!handles) return;
+    const newMuted = !isAssistantMuted;
+    handles.audioElement.muted = newMuted;
+    setIsAssistantMuted(newMuted);
+  }, [isAssistantMuted]);
 
   const startVoice = useCallback(async () => {
     if (voiceStatus !== "off" && voiceStatus !== "error") return;
@@ -355,6 +369,8 @@ export function useVoiceOrchestrator(
     isActive: voiceStatus !== "off" && voiceStatus !== "error",
     isMuted,
     toggleMute,
+    isAssistantMuted,
+    toggleAssistantMute,
     micLevel,
     speakerLevel,
   };

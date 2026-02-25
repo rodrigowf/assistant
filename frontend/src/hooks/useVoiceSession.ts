@@ -23,6 +23,8 @@ export interface VoiceSessionHandles {
   micStream: MediaStream;
   /** The remote audio MediaStream (for audio analysis). May be null until ontrack fires. */
   remoteStream: MediaStream | null;
+  /** The audio element playing assistant audio (for muting). */
+  audioElement: HTMLAudioElement;
 }
 
 interface UseVoiceSessionOptions {
@@ -128,6 +130,7 @@ export function useVoiceSession(options: UseVoiceSessionOptions): {
         },
         micStream: micStream!,
         get remoteStream() { return remoteStream; },
+        audioElement: audioEl!,
       };
 
       return handles;

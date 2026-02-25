@@ -42,7 +42,10 @@ export type ServerEvent =
   | { type: "thinking_delta"; text: string }
   | { type: "thinking_complete"; text: string }
   | { type: "tool_use"; tool_use_id: string; tool_name: string; tool_input: Record<string, unknown> }
+  | { type: "tool_executing"; tool_use_id: string; tool_name: string }
+  | { type: "tool_progress"; tool_use_id: string; tool_name: string; elapsed_seconds: number; message?: string }
   | { type: "tool_result"; tool_use_id: string; output: string; is_error: boolean }
+  | { type: "nested_session_event"; session_id: string; event_type: string; event_data: Record<string, unknown> }
   | { type: "turn_complete"; cost?: number | null; usage?: Record<string, unknown>; num_turns?: number; session_id?: string; is_error?: boolean; result?: string | null; input_tokens?: number; output_tokens?: number }
   | { type: "compact_complete"; trigger: string }
   | { type: "status"; status: string }
@@ -86,6 +89,8 @@ export type MessageBlock =
       result?: string;
       isError?: boolean;
       complete: boolean;
+      /** True when the tool has started executing (non-blocking status update) */
+      executing?: boolean;
     };
 
 export type SessionStatus =

@@ -11,6 +11,20 @@ from orchestrator.tools import registry
 
 logger = logging.getLogger(__name__)
 
+# Cache model at module level to avoid reloading on every search call
+_model = None
+
+
+def _get_model():
+    """Lazy-load and cache the SentenceTransformer model."""
+    global _model
+    if _model is None:
+        logger.info("Loading SentenceTransformer model (first search call)...")
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        logger.info("SentenceTransformer model loaded.")
+    return _model
+
 
 def _do_search(
     query: str,
@@ -20,23 +34,26 @@ def _do_search(
 ) -> list[dict[str, Any]]:
     """Run a semantic search against a ChromaDB collection."""
     import chromadb
-    from sentence_transformers import SentenceTransformer
 
     try:
         client = chromadb.PersistentClient(path=index_dir)
         collection = client.get_collection(collection_name)
     except Exception as e:
-        return [{"error": f"Collection '{collection_name}' not available: {e}"}]
+        logger.error("Failed to open collection '%s' at %s: %s", collection_name, index_dir, e)
+        raise RuntimeError(f"Collection '{collection_name}' not available: {e}") from e
 
-    if collection.count() == 0:
+    count = collection.count()
+    if count == 0:
+        logger.info("Collection '%s' is empty, returning no results.", collection_name)
         return []
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    logger.info("Searching '%s' collection (%d chunks) for: %s", collection_name, count, query)
+    model = _get_model()
     query_embedding = model.encode([query])[0].tolist()
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=min(max_results, collection.count()),
+        n_results=min(max_results, count),
     )
 
     formatted = []
@@ -51,6 +68,7 @@ def _do_search(
             "distance": round(distance, 4),
         })
 
+    logger.info("Search returned %d results (filtered from %d).", len(formatted), len(results["documents"][0]))
     return formatted
 
 

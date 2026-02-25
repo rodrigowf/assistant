@@ -85,7 +85,7 @@ function OrchestratorChatPanel({
   onSessionChange: () => void;
   isActive?: boolean;
 }) {
-  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, micLevel, speakerLevel } = useVoiceOrchestrator({
+  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel } = useVoiceOrchestrator({
     localId: sessionId,
     resumeSdkId,
     onUserTranscript: (text) => {
@@ -126,8 +126,10 @@ function OrchestratorChatPanel({
       voiceStatus={voiceStatus}
       onVoiceStart={startVoice}
       onVoiceStop={stopVoice}
-      isMuted={isMuted}
-      onMuteToggle={toggleMute}
+      isMicMuted={isMuted}
+      onMicMuteToggle={toggleMute}
+      isAssistantMuted={isAssistantMuted}
+      onAssistantMuteToggle={toggleAssistantMute}
       micLevel={micLevel}
       speakerLevel={speakerLevel}
     />
