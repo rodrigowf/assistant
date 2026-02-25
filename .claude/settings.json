@@ -11,7 +11,8 @@
       "WebSearch",
       "Task(*)",
       "Skill(*)",
-      "mcp__chrome-devtools__*"
+      "mcp__chrome-devtools__*",
+      "mcp__ubuntu-desktop-control__*"
     ]
   }
 }

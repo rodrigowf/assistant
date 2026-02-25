@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-import os
+import logging
+import subprocess
+import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def get_index_dir() -> Path:
@@ -38,6 +42,9 @@ def get_collection(name: str = "history"):
 def remove_session_from_index(session_id: str, collection_name: str = "history") -> bool:
     """Remove all chunks for a session from the vector index.
 
+    Runs in a subprocess to protect the main server process from segfaults
+    in ChromaDB's native code (e.g. corrupted HNSW index).
+
     Args:
         session_id: The session ID to remove
         collection_name: The collection name (default: "history")
@@ -45,36 +52,73 @@ def remove_session_from_index(session_id: str, collection_name: str = "history")
     Returns:
         True if chunks were deleted, False otherwise
     """
-    collection = get_collection(collection_name)
-    if collection is None:
-        # ChromaDB not available, skip silently
-        return False
+    index_dir = str(get_index_dir())
+
+    # Run in subprocess so a ChromaDB segfault can't crash the server
+    script = f"""
+import sys
+import chromadb
+
+try:
+    client = chromadb.PersistentClient(path={index_dir!r})
+    collection = client.get_collection({collection_name!r})
+except Exception as e:
+    print(f"Collection not available: {{e}}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    results = collection.get(where={{"file_path": {{"$contains": "{session_id}.md"}}}})
+except Exception:
+    # Fallback: fetch all and filter (older ChromaDB versions)
+    results = collection.get()
+
+if not results["ids"]:
+    sys.exit(0)
+
+# Filter to matching chunks
+to_delete = []
+for chunk_id, metadata in zip(results["ids"], results["metadatas"]):
+    fp = metadata.get("file_path", "")
+    if "/{session_id}.md" in fp or ".index-temp/{session_id}.md" in fp:
+        to_delete.append(chunk_id)
+
+if to_delete:
+    collection.delete(ids=to_delete)
+    print(f"Deleted {{len(to_delete)}} chunks")
+    sys.exit(0)
+else:
+    sys.exit(0)
+"""
 
     try:
-        # Query for all chunks belonging to this session
-        # The file_path in metadata looks like: .index-temp/SESSION_ID.md
-        results = collection.get()
-
-        if not results["ids"]:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if result.returncode < 0:
+                logger.error(
+                    "Index cleanup for session %s crashed (signal %d): %s",
+                    session_id, -result.returncode, stderr,
+                )
+            else:
+                logger.warning(
+                    "Index cleanup for session %s failed (exit %d): %s",
+                    session_id, result.returncode, stderr,
+                )
             return False
 
-        # Find chunks matching this session ID
-        chunks_to_delete = []
-        for chunk_id, metadata in zip(results["ids"], results["metadatas"]):
-            file_path = metadata.get("file_path", "")
-            # Check if this chunk belongs to the session
-            # Path format: /path/to/.index-temp/SESSION_ID.md
-            if f"/{session_id}.md" in file_path or f".index-temp/{session_id}.md" in file_path:
-                chunks_to_delete.append(chunk_id)
+        stdout = result.stdout.strip()
+        if stdout:
+            logger.info("Index cleanup for session %s: %s", session_id, stdout)
+        return True
 
-        if chunks_to_delete:
-            collection.delete(ids=chunks_to_delete)
-            return True
-
+    except subprocess.TimeoutExpired:
+        logger.warning("Index cleanup for session %s timed out", session_id)
         return False
-
     except Exception as e:
-        # Silently fail - don't break session deletion if index cleanup fails
-        import sys
-        print(f"Warning: Failed to remove session {session_id} from index: {e}", file=sys.stderr)
+        logger.warning("Index cleanup for session %s error: %s", session_id, e)
         return False

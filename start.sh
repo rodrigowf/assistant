@@ -16,9 +16,14 @@ echo -e "${BLUE}Starting Assistant Application...${NC}"
 # Source nvm if available (npm may not be on PATH in non-interactive shells)
 [ -s "$HOME/.nvm/nvm.sh" ] && source "$HOME/.nvm/nvm.sh"
 
-# Start backend in background
+# Ensure logs directory exists
+mkdir -p "$SCRIPT_DIR/logs"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Start backend in background (setsid ensures survival if parent shell exits)
 echo -e "${GREEN}Starting backend (port 8000)...${NC}"
-default-scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 &
+setsid "$SCRIPT_DIR/default-scripts/run.sh" -m uvicorn api.app:create_app --factory --port 8000 \
+  > "$SCRIPT_DIR/logs/api_${TIMESTAMP}.log" 2>&1 &
 BACKEND_PID=$!
 
 # Give backend a moment to start
@@ -26,13 +31,15 @@ sleep 2
 
 # Start frontend in background
 echo -e "${GREEN}Starting frontend (port 5173)...${NC}"
-cd frontend && npm run dev &
+cd frontend
+setsid npm run dev > "$SCRIPT_DIR/logs/frontend_${TIMESTAMP}.log" 2>&1 &
 FRONTEND_PID=$!
 cd "$SCRIPT_DIR"
 
 echo ""
 echo -e "${GREEN}✓ Backend running at:${NC}  http://localhost:8000"
 echo -e "${GREEN}✓ Frontend running at:${NC} https://localhost:5173"
+echo -e "${BLUE}Logs:${NC} logs/api_${TIMESTAMP}.log, logs/frontend_${TIMESTAMP}.log"
 echo ""
 echo "Press Ctrl+C to stop both servers"
 

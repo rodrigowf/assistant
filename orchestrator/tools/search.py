@@ -1,75 +1,89 @@
-"""Search tools — semantic search over history and memory."""
+"""Search tools — semantic search over history and memory.
+
+All ChromaDB access runs in a subprocess to:
+1. Prevent segfaults in ChromaDB's native code from crashing the server
+2. Avoid concurrent multi-process access to the same ChromaDB index
+   (the background indexer also accesses it via subprocess)
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from orchestrator.tools import registry
 
 logger = logging.getLogger(__name__)
 
-# Cache model at module level to avoid reloading on every search call
-_model = None
+# Path to the search script
+_SEARCH_SCRIPT = Path(__file__).resolve().parent.parent.parent / "default-scripts" / "search.py"
+_RUN_SH = Path(__file__).resolve().parent.parent.parent / "context" / "scripts" / "run.sh"
 
 
-def _get_model():
-    """Lazy-load and cache the SentenceTransformer model."""
-    global _model
-    if _model is None:
-        logger.info("Loading SentenceTransformer model (first search call)...")
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("SentenceTransformer model loaded.")
-    return _model
-
-
-def _do_search(
+async def _do_search_subprocess(
     query: str,
     collection_name: str,
     max_results: int,
-    index_dir: str,
 ) -> list[dict[str, Any]]:
-    """Run a semantic search against a ChromaDB collection."""
-    import chromadb
+    """Run semantic search in a subprocess via search.py.
+
+    This ensures ChromaDB is never opened in the server process,
+    preventing index corruption from concurrent access and protecting
+    against segfaults in ChromaDB's native code.
+    """
+    args = [
+        str(_RUN_SH), str(_SEARCH_SCRIPT),
+        query,
+        "--collection", collection_name,
+        "--n", str(max_results),
+        "--json",
+    ]
+
+    logger.info("Searching '%s' for: %s", collection_name, query)
 
     try:
-        client = chromadb.PersistentClient(path=index_dir)
-        collection = client.get_collection(collection_name)
-    except Exception as e:
-        logger.error("Failed to open collection '%s' at %s: %s", collection_name, index_dir, e)
-        raise RuntimeError(f"Collection '{collection_name}' not available: {e}") from e
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=60,
+        )
+    except asyncio.TimeoutError:
+        logger.error("Search subprocess timed out for query: %s", query)
+        proc.kill()
+        return [{"error": "Search timed out"}]
 
-    count = collection.count()
-    if count == 0:
-        logger.info("Collection '%s' is empty, returning no results.", collection_name)
+    if proc.returncode != 0:
+        stderr_text = stderr.decode().strip()
+        if proc.returncode < 0:
+            logger.error(
+                "Search subprocess crashed (signal %d) for '%s': %s",
+                -proc.returncode, collection_name, stderr_text,
+            )
+            return [{"error": f"Search crashed (signal {-proc.returncode})"}]
+        else:
+            # Non-zero exit could mean empty collection or missing index
+            logger.warning("Search returned exit %d: %s", proc.returncode, stderr_text)
+            return []
+
+    # Parse JSON output
+    stdout_text = stdout.decode().strip()
+    if not stdout_text or stdout_text == "No results found.":
         return []
 
-    logger.info("Searching '%s' collection (%d chunks) for: %s", collection_name, count, query)
-    model = _get_model()
-    query_embedding = model.encode([query])[0].tolist()
+    try:
+        results = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        logger.error("Failed to parse search output: %s", stdout_text[:200])
+        return []
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(max_results, count),
-    )
-
-    formatted = []
-    for i, doc in enumerate(results["documents"][0]):
-        meta = results["metadatas"][0][i]
-        distance = results["distances"][0][i]
-        if distance > 1.5:
-            continue
-        formatted.append({
-            "text": doc,
-            "file_path": meta.get("file_path", ""),
-            "distance": round(distance, 4),
-        })
-
-    logger.info("Search returned %d results (filtered from %d).", len(formatted), len(results["documents"][0]))
-    return formatted
+    logger.info("Search returned %d results.", len(results))
+    return results
 
 
 @registry.register(
@@ -93,14 +107,7 @@ def _do_search(
 async def search_history(
     context: dict[str, Any], query: str, max_results: int = 5
 ) -> str:
-    index_dir = context.get("index_dir", "")
-    if not index_dir:
-        return json.dumps({"error": "Index directory not configured"})
-
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(
-        None, _do_search, query, "history", max_results, index_dir
-    )
+    results = await _do_search_subprocess(query, "history", max_results)
     return json.dumps({"query": query, "results": results, "count": len(results)})
 
 
@@ -125,12 +132,5 @@ async def search_history(
 async def search_memory(
     context: dict[str, Any], query: str, max_results: int = 5
 ) -> str:
-    index_dir = context.get("index_dir", "")
-    if not index_dir:
-        return json.dumps({"error": "Index directory not configured"})
-
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(
-        None, _do_search, query, "memory", max_results, index_dir
-    )
+    results = await _do_search_subprocess(query, "memory", max_results)
     return json.dumps({"query": query, "results": results, "count": len(results)})

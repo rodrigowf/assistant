@@ -27,17 +27,21 @@ Ensure the logs directory exists. Create it if missing by running mkdir for the 
 
 ### Backend Server
 
-Start the FastAPI backend with uvicorn, using the factory pattern. The command structure is:
+Start the FastAPI backend with uvicorn, using the factory pattern. **IMPORTANT**: Use `setsid` to fully detach the process from the shell's process group — otherwise the server dies when the Bash tool's shell exits.
 
-Run the uvicorn module through context/scripts/run.sh with the api.app:create_app factory on port 8000. Pipe output through tee to save a timestamped log file in the logs directory. Run in background with ampersand.
+The command pattern is:
 
-Example log filename format: api_YYYYMMDD_HHMMSS.log
+    setsid context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 > logs/api_TIMESTAMP.log 2>&1 &
+
+Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`. Do NOT use `nohup` or `tee` — use `setsid` with output redirection.
 
 ### Frontend Server
 
-Start the Vite dev server from the frontend directory. Pipe output through tee to save a timestamped log in the logs directory (use parent path since you change directory). Run in background.
+Start the Vite dev server from the frontend directory. Same `setsid` pattern:
 
-Example log filename format: frontend_YYYYMMDD_HHMMSS.log
+    cd frontend && setsid npm run dev > ../logs/frontend_TIMESTAMP.log 2>&1 &
+
+Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`.
 
 ### Verify Startup
 
