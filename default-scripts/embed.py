@@ -69,7 +69,7 @@ def chunk_file(filepath, chunk_size=10, overlap=3):
     filepath = Path(filepath)
     try:
         text = filepath.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, PermissionError) as e:
+    except (UnicodeDecodeError, PermissionError, FileNotFoundError) as e:
         print(f"  Skipping {filepath}: {e}", file=sys.stderr)
         return []
 

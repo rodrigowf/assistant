@@ -139,7 +139,8 @@ def index_history(reset: bool = False) -> None:
         # Clean up temp files
         for f in temp_dir.glob("*"):
             f.unlink()
-        temp_dir.rmdir()
+        if temp_dir.exists():
+            temp_dir.rmdir()
 
 
 def main():

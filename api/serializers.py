@@ -63,6 +63,9 @@ def serialize_orchestrator_event(event: object) -> dict[str, Any]:
         TextComplete as OTextComplete,
         ToolUseStart,
         ToolResultEvent,
+        ToolExecutingEvent,
+        ToolProgressEvent,
+        NestedSessionEvent,
         TurnComplete as OTurnComplete,
         ErrorEvent,
     )
@@ -77,6 +80,27 @@ def serialize_orchestrator_event(event: object) -> dict[str, Any]:
             "tool_use_id": event.tool_call_id,
             "tool_name": event.tool_name,
             "tool_input": event.tool_input,
+        }
+    if isinstance(event, ToolExecutingEvent):
+        return {
+            "type": "tool_executing",
+            "tool_use_id": event.tool_call_id,
+            "tool_name": event.tool_name,
+        }
+    if isinstance(event, ToolProgressEvent):
+        return {
+            "type": "tool_progress",
+            "tool_use_id": event.tool_call_id,
+            "tool_name": event.tool_name,
+            "elapsed_seconds": event.elapsed_seconds,
+            "message": event.message,
+        }
+    if isinstance(event, NestedSessionEvent):
+        return {
+            "type": "nested_session_event",
+            "session_id": event.session_id,
+            "event_type": event.event_type,
+            "event_data": event.event_data,
         }
     if isinstance(event, ToolResultEvent):
         return {

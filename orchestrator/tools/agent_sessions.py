@@ -168,7 +168,8 @@ async def read_agent_session(
     name="send_to_agent_session",
     description=(
         "Send a message to an active Claude Code agent session and wait for the response. "
-        "Returns the agent's text response."
+        "Returns the agent's text response. Progress events are streamed to the orchestrator "
+        "so the frontend stays updated during long-running agent tasks."
     ),
     input_schema={
         "type": "object",
@@ -189,7 +190,8 @@ async def send_to_agent_session(
     context: dict[str, Any], session_id: str, message: str
 ) -> str:
     import asyncio
-    from manager.types import TextComplete, TurnComplete
+    from api.serializers import serialize_event
+    from manager.types import TextComplete, TurnComplete, TextDelta, ToolUse, ToolResult
 
     pool = context["pool"]
 
@@ -203,6 +205,20 @@ async def send_to_agent_session(
     async def _collect() -> None:
         nonlocal cost, turns
         async for event in pool.send(session_id, message):
+            # Forward significant events to the orchestrator WebSocket as nested events
+            # This ensures the frontend sees progress during long-running agent tasks
+            if isinstance(event, (TextDelta, TextComplete, ToolUse, ToolResult)):
+                try:
+                    serialized = serialize_event(event)
+                    await pool.broadcast_orchestrator({
+                        "type": "nested_session_event",
+                        "session_id": session_id,
+                        "event_type": serialized.get("type", "unknown"),
+                        "event_data": serialized,
+                    })
+                except Exception as e:
+                    logger.debug("Failed to broadcast nested event: %s", e)
+
             if isinstance(event, TextComplete):
                 texts.append(event.text)
             elif isinstance(event, TurnComplete):
@@ -212,6 +228,8 @@ async def send_to_agent_session(
     try:
         # pool.send() acquires the per-session lock and broadcasts events
         # to all WebSocket subscribers (e.g., the frontend agent tab).
+        # We also forward events to the orchestrator WebSocket as nested events
+        # so the frontend can show progress during agent execution.
         # Timeout prevents the orchestrator from hanging indefinitely if
         # the SDK subprocess dies or the lock is held too long.
         await asyncio.wait_for(_collect(), timeout=300.0)
