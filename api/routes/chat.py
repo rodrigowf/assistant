@@ -110,7 +110,21 @@ async def _handle_start(
 
     # Create a new session via the pool
     from manager.config import ManagerConfig
+    from api.routes.config import _load_config as _load_assistant_config
     config = ManagerConfig.load()
+    # Apply global assistant config overrides (working directory, MCPs)
+    assistant_cfg = _load_assistant_config()
+    from dataclasses import replace
+    config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
+    # If no per-session MCPs provided, use the globally-enabled MCPs from the config.
+    # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".
+    if mcp_servers is None:
+        enabled_mcps: list[str] = assistant_cfg.get("enabled_mcps", [])
+        if enabled_mcps:
+            # Load full MCP configs from .claude.json and filter to enabled ones
+            from api.routes.mcp import _load_mcp_servers
+            all_mcps = _load_mcp_servers()
+            mcp_servers = {k: v for k, v in all_mcps.items() if k in enabled_mcps} or None
     try:
         await ws.send_bytes(orjson.dumps({
             "type": "status", "status": "connecting",

@@ -4,6 +4,7 @@ import { AuthGate } from "./components/AuthGate";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { ChatPanelContainer } from "./components/ChatPanelContainer";
+import { ConfigPage } from "./components/ConfigPage";
 import { OrchestratorModal } from "./components/OrchestratorModal";
 import { TabsProvider, useTabsContext } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
@@ -86,6 +87,9 @@ function AppContent() {
     setPendingOrchestrator(null);
   }, []);
 
+  // Config page visibility — toggled without unmounting chat instances
+  const [showConfig, setShowConfig] = useState(false);
+
   // Mobile sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false);
   useEffect(() => {
@@ -102,6 +106,7 @@ function AppContent() {
         onNew={handleNewSession}
         onNewOrchestrator={handleNewOrchestrator}
         onSelectOrchestrator={handleSelectOrchestrator}
+        onOpenConfig={() => { setShowConfig(true); setSidebarOpen(false); }}
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
       />
@@ -112,9 +117,26 @@ function AppContent() {
               <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
             </svg>
           </button>
-          <TabBar />
+          {showConfig ? (
+            <div className="config-topbar">
+              <span className="config-topbar-title">Configuration</span>
+              <button className="config-close-btn" onClick={() => setShowConfig(false)} title="Back to sessions">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+                Close
+              </button>
+            </div>
+          ) : (
+            <TabBar />
+          )}
         </div>
-        <ChatPanelContainer onSessionChange={refresh} />
+        {/* Config page is always mounted, shown/hidden via CSS to avoid unmounting chat instances */}
+        <ConfigPage isActive={showConfig} />
+        {/* Chat panels hidden (not unmounted) while config is showing */}
+        <div style={{ display: showConfig ? "none" : "contents" }}>
+          <ChatPanelContainer onSessionChange={refresh} />
+        </div>
       </main>
       {showOrchestratorModal && (
         <OrchestratorModal

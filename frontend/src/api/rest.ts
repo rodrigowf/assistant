@@ -92,3 +92,46 @@ export interface McpServersResponse {
 export function listMcpServers(): Promise<McpServersResponse> {
   return json(`${BASE}/mcp/servers`);
 }
+
+// Global config
+
+export interface AssistantConfig {
+  working_directory: string;
+  working_directory_history: string[];
+  enabled_mcps: string[];
+  disabled_skills: string[];
+}
+
+export interface ConfigUpdate {
+  working_directory?: string;
+  enabled_mcps?: string[];
+  disabled_skills?: string[];
+}
+
+export function getConfig(): Promise<AssistantConfig> {
+  return json(`${BASE}/config`);
+}
+
+export function updateConfig(update: ConfigUpdate): Promise<AssistantConfig> {
+  return json(`${BASE}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+}
+
+// Skills
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  dir: string;
+}
+
+export interface SkillsResponse {
+  skills: SkillInfo[];
+}
+
+export function listSkills(): Promise<SkillsResponse> {
+  return json(`${BASE}/skills`);
+}

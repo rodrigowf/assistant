@@ -1924,3 +1924,298 @@ pre.field-value {
 
   pre.field-value { max-height: 120px; }
 }
+
+/* ============================================================
+   Sidebar – config button
+   ============================================================ */
+
+.sidebar-config-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: calc(100% - 12px);
+  margin: 0 6px 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.79rem;
+  text-align: left;
+  transition: background var(--transition), color var(--transition);
+  flex-shrink: 0;
+}
+
+.sidebar-config-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+/* ============================================================
+   Config topbar row
+   ============================================================ */
+
+.config-topbar {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  padding: 0 8px 0 4px;
+  gap: 8px;
+  height: 100%;
+}
+
+.config-topbar-title {
+  flex: 1;
+  font-size: 0.83rem;
+  font-weight: 500;
+  color: var(--text-bright);
+}
+
+.config-close-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  transition: background var(--transition), color var(--transition);
+}
+
+.config-close-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text-bright);
+}
+
+/* ============================================================
+   Config page
+   ============================================================ */
+
+.config-page {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 28px 64px;
+}
+
+.config-content {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.config-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 32px;
+}
+
+.config-title {
+  font-size: 1.4rem;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.config-saving {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.config-saved {
+  font-size: 0.78rem;
+  color: var(--success);
+}
+
+.config-loading,
+.config-error,
+.config-empty {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  padding: 12px 0;
+}
+
+.config-error { color: var(--error); }
+
+.config-section {
+  margin-bottom: 40px;
+  padding-bottom: 40px;
+  border-bottom: 1px solid var(--border);
+}
+
+.config-section:last-child {
+  border-bottom: none;
+}
+
+.config-section-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 6px;
+}
+
+.config-section-desc {
+  font-size: 0.83rem;
+  color: var(--text-muted);
+  margin-bottom: 16px;
+  line-height: 1.55;
+}
+
+/* Working directory form */
+.wd-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.wd-input {
+  flex: 1;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-bright);
+  font-size: 0.84rem;
+  padding: 7px 11px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  outline: none;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.wd-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+.wd-apply-btn {
+  padding: 7px 16px;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 500;
+  transition: opacity var(--transition);
+}
+
+.wd-apply-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.config-field-error {
+  font-size: 0.78rem;
+  color: var(--error);
+  margin-top: 4px;
+}
+
+/* Working directory history */
+.wd-history {
+  margin-top: 12px;
+}
+
+.wd-history-label {
+  font-size: 0.71rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.wd-history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  text-align: left;
+  transition: background var(--transition), color var(--transition);
+}
+
+.wd-history-item:hover {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+.wd-history-item.active {
+  background: var(--bg-elevated);
+  color: var(--text-bright);
+}
+
+.wd-history-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wd-history-current {
+  font-family: inherit;
+  font-size: 0.70rem;
+  font-weight: 600;
+  color: var(--success);
+  background: rgba(var(--success-rgb, 100, 200, 120), 0.1);
+  border-radius: 3px;
+  padding: 1px 6px;
+  flex-shrink: 0;
+}
+
+/* Config item list (MCPs, Skills) */
+.config-item-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.config-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.config-item:hover {
+  background: var(--bg-elevated);
+  border-color: var(--border);
+}
+
+.config-item.enabled {
+  border-color: var(--border);
+}
+
+.config-item input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.config-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.config-item-name {
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-bright);
+}
+
+.config-item-detail {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: "SF Mono", "Fira Code", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
