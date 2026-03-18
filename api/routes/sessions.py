@@ -184,6 +184,11 @@ async def close_pool_session(
     files from accumulating on disk. Resumed sessions are never deleted
     here — they have existing history that must be preserved.
     """
+    # Handle orchestrator session close
+    if pool.has_orchestrator() and pool.orchestrator_id == local_id:
+        await pool.stop_orchestrator()
+        return
+
     sm = pool.get(local_id)
     sdk_id = sm.sdk_session_id if sm else None
     is_new_unused = (
