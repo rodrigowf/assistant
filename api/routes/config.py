@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/config", tags=["config"])
@@ -19,8 +20,7 @@ _CONFIG_FILE_NAME = "assistant_config.json"
 
 def _get_config_path() -> Path:
     """Return path to the global config JSON."""
-    project_root = Path(__file__).resolve().parent.parent.parent
-    return project_root / _CONFIG_FILE_NAME
+    return PROJECT_ROOT / _CONFIG_FILE_NAME
 
 
 def _load_config() -> dict[str, Any]:
@@ -47,12 +47,12 @@ def _save_config(data: dict[str, Any]) -> None:
 
 
 def _default_config() -> dict[str, Any]:
-    project_root = Path(__file__).resolve().parent.parent.parent
     return {
-        "working_directory": str(project_root),
-        "working_directory_history": [str(project_root)],
+        "working_directory": str(PROJECT_ROOT),
+        "working_directory_history": [str(PROJECT_ROOT)],
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
         "disabled_skills": [],  # list of skill names to hide
+        "disabled_agents": [],  # list of agent names to hide
     }
 
 
@@ -62,8 +62,10 @@ def _default_config() -> dict[str, Any]:
 
 class ConfigUpdate(BaseModel):
     working_directory: str | None = None
+    working_directory_history: list[str] | None = None  # full replacement of the list
     enabled_mcps: list[str] | None = None
     disabled_skills: list[str] | None = None
+    disabled_agents: list[str] | None = None
 
 
 # -----------------------------------------------------------------------
@@ -83,22 +85,35 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
 
     if body.working_directory is not None:
         new_dir = body.working_directory
-        # Validate the path exists
         if not Path(new_dir).is_dir():
             raise HTTPException(status_code=400, detail=f"Directory does not exist: {new_dir}")
         config["working_directory"] = new_dir
-        # Keep history, deduplicate, most-recent-first
+        # Ensure selected dir is in history
         history: list[str] = config.get("working_directory_history", [])
-        if new_dir in history:
-            history.remove(new_dir)
-        history.insert(0, new_dir)
-        config["working_directory_history"] = history[:20]  # cap at 20
+        if new_dir not in history:
+            history.append(new_dir)
+        config["working_directory_history"] = history[:20]
+
+    if body.working_directory_history is not None:
+        # Validate all paths exist; also ensure current selected dir stays consistent
+        validated: list[str] = []
+        for p in body.working_directory_history:
+            if not Path(p).is_dir():
+                raise HTTPException(status_code=400, detail=f"Directory does not exist: {p}")
+            validated.append(p)
+        config["working_directory_history"] = validated[:20]
+        # If current working_directory was removed from history, reset to first entry
+        if config["working_directory"] not in config["working_directory_history"]:
+            config["working_directory"] = config["working_directory_history"][0] if config["working_directory_history"] else ""
 
     if body.enabled_mcps is not None:
         config["enabled_mcps"] = body.enabled_mcps
 
     if body.disabled_skills is not None:
         config["disabled_skills"] = body.disabled_skills
+
+    if body.disabled_agents is not None:
+        config["disabled_agents"] = body.disabled_agents
 
     _save_config(config)
     return config

@@ -67,9 +67,19 @@ async def _do_search_subprocess(
             )
             return [{"error": f"Search crashed (signal {-proc.returncode})"}]
         else:
-            # Non-zero exit could mean empty collection or missing index
+            # Non-zero exit means index issue - return clear error
             logger.warning("Search returned exit %d: %s", proc.returncode, stderr_text)
-            return []
+            # Parse common error cases for better user feedback
+            if "No index found" in stderr_text:
+                return [{"error": "Index not found. Run index-memory.py to rebuild."}]
+            elif "Collection" in stderr_text and "not found" in stderr_text:
+                return [{"error": f"Collection '{collection_name}' not found. Run index-memory.py --reset to rebuild."}]
+            elif "empty" in stderr_text.lower():
+                return [{"error": f"Collection '{collection_name}' is empty. Run index-memory.py to populate."}]
+            elif "Error loading hnsw index" in stderr_text or "hnsw" in stderr_text.lower():
+                return [{"error": f"Index corrupted. Delete index/chroma/ and run index-memory.py --reset to rebuild."}]
+            else:
+                return [{"error": f"Search failed: {stderr_text[:200]}"}]
 
     # Parse JSON output
     stdout_text = stdout.decode().strip()

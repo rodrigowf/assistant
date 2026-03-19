@@ -18,7 +18,7 @@ from manager.store import SessionStore
 from .connections import ConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
 from .pool import SessionPool
-from .routes import auth, chat, config, mcp, orchestrator, sessions, skills, voice
+from .routes import agents, auth, chat, config, mcp, orchestrator, sessions, skills, voice
 
 logger = logging.getLogger(__name__)
 
@@ -84,5 +84,6 @@ def create_app() -> FastAPI:
     app.include_router(mcp.router)
     app.include_router(config.router)
     app.include_router(skills.router)
+    app.include_router(agents.router)
 
     return app

@@ -1951,129 +1951,294 @@ pre.field-value {
 }
 
 /* ============================================================
-   Config topbar row
+   Config floating panel
    ============================================================ */
 
-.config-topbar {
-  flex: 1;
+/* Backdrop — semi-transparent blur layer over the whole app */
+.config-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   display: flex;
-  align-items: center;
-  padding: 0 8px 0 4px;
-  gap: 8px;
-  height: 100%;
-}
-
-.config-topbar-title {
-  flex: 1;
-  font-size: 0.83rem;
-  font-weight: 500;
-  color: var(--text-bright);
-}
-
-.config-close-btn {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 4px 10px;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-  transition: background var(--transition), color var(--transition);
-}
-
-.config-close-btn:hover {
-  background: var(--bg-elevated);
-  color: var(--text-bright);
-}
-
-/* ============================================================
-   Config page
-   ============================================================ */
-
-.config-page {
-  flex: 1;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 20px 32px;
   overflow-y: auto;
-  padding: 32px 28px 64px;
 }
 
-.config-content {
-  max-width: 720px;
-  margin: 0 auto;
+/* The panel itself */
+.config-panel {
+  width: 100%;
+  max-width: 680px;
+  background: rgba(28, 28, 32, 0.92);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  box-shadow:
+    0 4px 6px rgba(0, 0, 0, 0.12),
+    0 16px 48px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+  flex-shrink: 0;
+  animation: config-panel-in 0.18s ease;
 }
 
-.config-header {
+@keyframes config-panel-in {
+  from { opacity: 0; transform: translateY(-10px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Sticky header inside the panel */
+.config-panel-header {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
-  margin-bottom: 32px;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
-.config-title {
-  font-size: 1.4rem;
+.config-panel-title-row {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.config-panel-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.config-panel-title {
+  font-size: 0.95rem;
   font-weight: 600;
   color: var(--text-bright);
 }
 
+.config-panel-status {
+  margin-left: 4px;
+}
+
 .config-saving {
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   color: var(--text-muted);
 }
 
 .config-saved {
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   color: var(--success);
+}
+
+.config-panel-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background var(--transition), color var(--transition);
+}
+
+.config-panel-close:hover {
+  background: var(--bg-elevated);
+  color: var(--text-bright);
+}
+
+/* Scrollable body */
+.config-panel-body {
+  padding: 24px 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
 }
 
 .config-loading,
 .config-error,
 .config-empty {
-  font-size: 0.85rem;
+  font-size: 0.83rem;
   color: var(--text-muted);
-  padding: 12px 0;
+  padding: 8px 0;
 }
 
 .config-error { color: var(--error); }
 
 .config-section {
-  margin-bottom: 40px;
-  padding-bottom: 40px;
-  border-bottom: 1px solid var(--border);
+  padding: 24px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.config-section:last-child {
-  border-bottom: none;
-}
+.config-section:first-child { padding-top: 0; }
+.config-section:last-child { border-bottom: none; padding-bottom: 0; }
 
 .config-section-title {
-  font-size: 1rem;
+  font-size: 0.84rem;
   font-weight: 600;
   color: var(--text-bright);
-  margin-bottom: 6px;
+  margin-bottom: 5px;
+  letter-spacing: 0.01em;
 }
 
 .config-section-desc {
-  font-size: 0.83rem;
+  font-size: 0.78rem;
   color: var(--text-muted);
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   line-height: 1.55;
 }
 
-/* Working directory form */
-.wd-form {
+/* Working directory list */
+.wd-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+
+.wd-list-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.03);
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.wd-list-item:hover {
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.wd-list-item.active {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.07);
+}
+
+/* Radio button */
+.wd-list-radio {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.wd-radio-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.2);
+  background: transparent;
+  transition: border-color var(--transition), background var(--transition);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wd-list-radio:hover .wd-radio-dot:not(.checked) {
+  border-color: rgba(255, 255, 255, 0.4);
+}
+
+.wd-radio-dot.checked {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+.wd-radio-dot.checked::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+/* Path text */
+.wd-list-path {
+  flex: 1;
+  font-size: 0.80rem;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.wd-list-item.active .wd-list-path {
+  color: var(--text-bright);
+}
+
+/* Active badge */
+.wd-active-badge {
+  font-size: 0.67rem;
+  font-weight: 600;
+  color: var(--success);
+  background: rgba(74, 170, 122, 0.12);
+  border-radius: 3px;
+  padding: 1px 6px;
+  flex-shrink: 0;
+  letter-spacing: 0.02em;
+}
+
+/* Delete button */
+.wd-list-delete {
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity var(--transition), background var(--transition), color var(--transition);
+}
+
+.wd-list-item:hover .wd-list-delete {
+  opacity: 1;
+}
+
+.wd-list-delete:hover {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.wd-list-delete:disabled {
+  opacity: 0 !important;
+  cursor: default;
+}
+
+/* Add new directory form */
+.wd-add-form {
   display: flex;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-top: 4px;
 }
 
 .wd-input {
   flex: 1;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: var(--radius);
   color: var(--text-bright);
-  font-size: 0.84rem;
-  padding: 7px 11px;
+  font-size: 0.81rem;
+  padding: 6px 11px;
   font-family: "SF Mono", "Fira Code", monospace;
   outline: none;
   transition: border-color var(--transition), box-shadow var(--transition);
@@ -2084,115 +2249,70 @@ pre.field-value {
   box-shadow: 0 0 0 3px var(--accent-subtle);
 }
 
-.wd-apply-btn {
-  padding: 7px 16px;
-  border-radius: var(--radius);
-  background: var(--accent);
-  color: #fff;
-  font-size: 0.82rem;
-  font-weight: 500;
-  transition: opacity var(--transition);
+.wd-input::placeholder {
+  color: var(--text-dim);
 }
 
-.wd-apply-btn:disabled {
-  opacity: 0.4;
+.wd-add-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+  font-size: 0.80rem;
+  font-weight: 500;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  transition: background var(--transition), color var(--transition);
+  white-space: nowrap;
+}
+
+.wd-add-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+  color: var(--text-bright);
+}
+
+.wd-add-btn:disabled {
+  opacity: 0.35;
   cursor: default;
 }
 
 .config-field-error {
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   color: var(--error);
-  margin-top: 4px;
+  margin-top: 5px;
 }
 
-/* Working directory history */
-.wd-history {
-  margin-top: 12px;
-}
-
-.wd-history-label {
-  font-size: 0.71rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-  margin-bottom: 6px;
-}
-
-.wd-history-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 6px 10px;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 0.82rem;
-  font-family: "SF Mono", "Fira Code", monospace;
-  text-align: left;
-  transition: background var(--transition), color var(--transition);
-}
-
-.wd-history-item:hover {
-  background: var(--bg-elevated);
-  color: var(--text);
-}
-
-.wd-history-item.active {
-  background: var(--bg-elevated);
-  color: var(--text-bright);
-}
-
-.wd-history-path {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.wd-history-current {
-  font-family: inherit;
-  font-size: 0.70rem;
-  font-weight: 600;
-  color: var(--success);
-  background: rgba(var(--success-rgb, 100, 200, 120), 0.1);
-  border-radius: 3px;
-  padding: 1px 6px;
-  flex-shrink: 0;
-}
-
-/* Config item list (MCPs, Skills) */
+/* Config item list (MCPs, Skills, Agents) */
 .config-item-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .config-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 9px 12px;
+  gap: 11px;
+  padding: 8px 11px;
   border-radius: var(--radius);
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.03);
   cursor: pointer;
   transition: background var(--transition), border-color var(--transition);
 }
 
 .config-item:hover {
-  background: var(--bg-elevated);
-  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.07);
 }
 
 .config-item.enabled {
-  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.06);
 }
 
 .config-item input[type="checkbox"] {
-  width: 15px;
-  height: 15px;
+  width: 14px;
+  height: 14px;
   accent-color: var(--accent);
   flex-shrink: 0;
   cursor: pointer;
@@ -2206,13 +2326,13 @@ pre.field-value {
 }
 
 .config-item-name {
-  font-size: 0.85rem;
+  font-size: 0.83rem;
   font-weight: 500;
   color: var(--text-bright);
 }
 
 .config-item-detail {
-  font-size: 0.75rem;
+  font-size: 0.73rem;
   color: var(--text-muted);
   font-family: "SF Mono", "Fira Code", monospace;
   overflow: hidden;

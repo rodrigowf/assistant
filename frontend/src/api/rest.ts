@@ -100,12 +100,15 @@ export interface AssistantConfig {
   working_directory_history: string[];
   enabled_mcps: string[];
   disabled_skills: string[];
+  disabled_agents: string[];
 }
 
 export interface ConfigUpdate {
   working_directory?: string;
+  working_directory_history?: string[];
   enabled_mcps?: string[];
   disabled_skills?: string[];
+  disabled_agents?: string[];
 }
 
 export function getConfig(): Promise<AssistantConfig> {
@@ -134,4 +137,20 @@ export interface SkillsResponse {
 
 export function listSkills(): Promise<SkillsResponse> {
   return json(`${BASE}/skills`);
+}
+
+// Agents
+
+export interface AgentInfo {
+  name: string;
+  description: string;
+  file: string;
+}
+
+export interface AgentsResponse {
+  agents: AgentInfo[];
+}
+
+export function listAgents(): Promise<AgentsResponse> {
+  return json(`${BASE}/agents`);
 }
