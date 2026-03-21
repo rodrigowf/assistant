@@ -13,12 +13,14 @@ export default defineConfig({
   base: process.env.NODE_ENV === 'production' ? '/assistant/' : '/',
   server: {
     host: '0.0.0.0', // Listen on all network interfaces
+    port: 5432,
+    strictPort: true,
     https: hasLocalCerts
       ? { key: fs.readFileSync(path.join(certsDir, 'key.pem')), cert: fs.readFileSync(path.join(certsDir, 'cert.pem')) }
       : undefined,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8765',
         ws: true,
       },
     },

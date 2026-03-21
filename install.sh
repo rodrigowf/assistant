@@ -216,7 +216,7 @@ important context across sessions.
 
 1. Start the backend:
    ```bash
-   context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000
+   context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765
    ```
 
 2. Start the frontend (new terminal):
@@ -224,7 +224,7 @@ important context across sessions.
    cd frontend && npm run dev
    ```
 
-3. Open https://localhost:5173
+3. Open https://localhost:5432
 
 ### Useful Commands
 
@@ -550,14 +550,14 @@ if [ ! -f "context/.env" ] || ! grep -q "^OPENAI_API_KEY=.\+" context/.env 2>/de
 fi
 
 echo "  ${GREEN}${STEP}.${NC} Start the backend:"
-echo "     ${BLUE}context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000${NC}"
+echo "     ${BLUE}context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765${NC}"
 echo ""
 
 echo "  ${GREEN}$((STEP + 1)).${NC} Start the frontend (new terminal):"
 echo "     ${BLUE}cd frontend && npm run dev${NC}"
 echo ""
 
-echo "  ${GREEN}$((STEP + 2)).${NC} Open ${BLUE}https://localhost:5173${NC} in your browser"
+echo "  ${GREEN}$((STEP + 2)).${NC} Open ${BLUE}https://localhost:5432${NC} in your browser"
 echo ""
 
 echo -e "${CYAN}Tip:${NC} Use ${BOLD}/help${NC} in the assistant to see available commands."

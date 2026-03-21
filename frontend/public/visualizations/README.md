@@ -14,8 +14,8 @@ frontend/public/visualizations/
 
 Files placed in this directory are automatically served by Vite at:
 
-- **Local access:** `https://localhost:5173/visualizations/<filename>.html`
-- **Network access:** `https://192.168.0.28:5173/visualizations/<filename>.html`
+- **Local access:** `https://localhost:5432/visualizations/<filename>.html`
+- **Network access:** `https://192.168.0.28:5432/visualizations/<filename>.html`
 
 ## 🚀 Quick Start
 
@@ -54,7 +54,7 @@ EOF
 ### 3. Access it immediately
 
 No build step needed! Access at:
-- `https://localhost:5173/visualizations/my-viz.html`
+- `https://localhost:5432/visualizations/my-viz.html`
 
 ### 4. Display on Fire TV
 
@@ -63,7 +63,7 @@ Using the `/tv-remote` skill or ADB commands:
 ```bash
 # Open visualization on Fire TV
 adb shell am start -a android.intent.action.VIEW \
-    -d "https://192.168.0.28:5173/visualizations/example.html"
+    -d "https://192.168.0.28:5432/visualizations/example.html"
 ```
 
 ## 📊 Example Visualization
@@ -137,7 +137,7 @@ context/scripts/run.sh context/scripts/get_visualization_url.py <filename> [--ne
 # Examples
 context/scripts/run.sh context/scripts/get_visualization_url.py example
 context/scripts/run.sh context/scripts/get_visualization_url.py example --network
-context/scripts/run.sh context/scripts/get_visualization_url.py example --network --port 5173
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network --port 5432
 ```
 
 ## 🔌 Integration with Assistant
@@ -193,7 +193,7 @@ Use WebSockets or Server-Sent Events to push updates:
 
 ```javascript
 // Example: Connect to assistant API for real-time data
-const ws = new WebSocket('ws://192.168.0.28:8000/api/ws');
+const ws = new WebSocket('ws://192.168.0.28:8765/api/ws');
 ws.onmessage = (event) => {
     const data = JSON.parse(event.data);
     updateVisualization(data);
@@ -219,7 +219,7 @@ document.addEventListener('keydown', (e) => {
 
 ### File not accessible
 
-1. Check frontend is running: `lsof -ti:5173`
+1. Check frontend is running: `lsof -ti:5432`
 2. Verify file exists: `ls frontend/public/visualizations/`
 3. Check permissions: `ls -la frontend/public/visualizations/`
 
@@ -227,7 +227,7 @@ document.addEventListener('keydown', (e) => {
 
 1. Ensure both devices on same network
 2. Test URL in browser first
-3. Check firewall isn't blocking port 5173
+3. Check firewall isn't blocking port 5432
 4. Use network URL (192.168.0.28), not localhost
 
 ### Visualization not updating
