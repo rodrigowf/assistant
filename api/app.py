@@ -71,7 +71,7 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5432", "https://localhost:5432", "https://192.168.0.200:5432"],
+        allow_origins=["*"],  # Allow all origins for Android app and local dev
         allow_methods=["*"],
         allow_headers=["*"],
     )

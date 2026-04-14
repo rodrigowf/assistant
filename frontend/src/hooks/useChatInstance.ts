@@ -15,6 +15,9 @@ import { getSession } from "../api/rest";
 // State
 // -------------------------------------------------------------------
 
+// Context window sizes (tokens) — used to compute usage percentage
+const CONTEXT_WINDOW = 200_000; // Claude models (conservative default)
+
 interface ChatState {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -22,6 +25,7 @@ interface ChatState {
   cost: number;
   turns: number;
   error: string | null;
+  contextTokens: number; // latest input_tokens count
 }
 
 const INITIAL_STATE: ChatState = {
@@ -31,6 +35,7 @@ const INITIAL_STATE: ChatState = {
   cost: 0,
   turns: 0,
   error: null,
+  contextTokens: 0,
 };
 
 // -------------------------------------------------------------------
@@ -48,7 +53,8 @@ type Action =
   | { type: "THINKING_COMPLETE"; text: string }
   | { type: "TOOL_USE"; toolUseId: string; toolName: string; toolInput: Record<string, unknown> }
   | { type: "TOOL_RESULT"; toolUseId: string; output: string; isError: boolean }
-  | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string }
+  | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string; inputTokens?: number }
+  | { type: "COMPACT_COMPLETE"; summary: string }
   | { type: "STATUS"; status: SessionStatus }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
@@ -251,6 +257,21 @@ function reducer(state: ChatState, action: Action): ChatState {
         cost: state.cost + (action.cost ?? 0),
         turns: state.turns + action.turns,
         sessionId: action.sessionId || state.sessionId,
+        contextTokens: action.inputTokens ?? state.contextTokens,
+      };
+
+    case "COMPACT_COMPLETE":
+      return {
+        ...state,
+        // Don't reset contextTokens here — the next TurnComplete will have the accurate post-compact count
+        messages: [
+          ...state.messages,
+          {
+            id: nextId(),
+            role: "assistant" as const,
+            blocks: [{ type: "compact" as const, content: action.summary, streaming: false }],
+          },
+        ],
       };
 
     case "STATUS":
@@ -316,11 +337,17 @@ export interface ChatInstance {
   cost: number;
   turns: number;
   error: string | null;
+  /** Context usage as a percentage of the context window (0–100). */
+  contextUsage: number;
   /** Currently selected MCP server names */
   selectedMcps: string[];
   send: (text: string) => void;
+  /** Send an audio message (base64-encoded). */
+  sendAudio: (audioBase64: string, format: string, textPrompt?: string) => void;
   command: (text: string) => void;
   interrupt: () => void;
+  /** Trigger conversation compaction (summarize history to free context). */
+  compact: () => void;
   /** Stop the current session (releases orchestrator lock). */
   stop: () => void;
   /** Restart the session (send start again after a stop). */
@@ -439,8 +466,12 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
           cost: event.cost ?? null,
           turns: event.num_turns ?? 1,
           sessionId: "",  // Don't update sessionId — local_id is stable
+          inputTokens: (event.input_tokens as number | undefined) ?? (event.usage as Record<string, number> | undefined)?.input_tokens,
         });
         onSessionChangeRef.current?.();
+        break;
+      case "compact_complete":
+        dispatch({ type: "COMPACT_COMPLETE", summary: (event.summary as string) || "" });
         break;
       case "status":
         dispatch({ type: "STATUS", status: event.status as SessionStatus });
@@ -537,6 +568,15 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     (text: string) => {
       dispatch({ type: "USER_MESSAGE", text });
       wsSend({ type: "send", text });
+    },
+    [wsSend]
+  );
+
+  const sendAudio = useCallback(
+    (audioBase64: string, format: string, textPrompt?: string) => {
+      // Display a user message indicating voice input
+      dispatch({ type: "USER_MESSAGE", text: "[voice message]" });
+      wsSend({ type: "send_audio", audio: audioBase64, format, text: textPrompt });
     },
     [wsSend]
   );
@@ -656,6 +696,13 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     []
   );
 
+  const compact = useCallback(() => {
+    dispatch({ type: "STATUS", status: "streaming" });
+    wsSend({ type: "compact" });
+  }, [wsSend]);
+
+  const contextUsage = Math.min(100, Math.round((state.contextTokens / CONTEXT_WINDOW) * 100));
+
   return {
     messages: state.messages,
     status: state.status,
@@ -664,10 +711,13 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     cost: state.cost,
     turns: state.turns,
     error: state.error,
+    contextUsage,
     selectedMcps,
     send,
+    sendAudio,
     command,
     interrupt,
+    compact,
     stop,
     restart,
     restartWithMcps,

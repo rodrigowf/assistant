@@ -95,6 +95,7 @@ class CompactComplete(Event):
     """Compaction completed — conversation was summarized."""
 
     trigger: str = "manual"  # "manual" or "auto"
+    summary: str = ""  # The summary text generated during compaction
 
 
 # ---------------------------------------------------------------------------

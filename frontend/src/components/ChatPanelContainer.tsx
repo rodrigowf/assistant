@@ -3,7 +3,7 @@ import { useTabsContext } from "../context/TabsContext";
 import { useChatInstance, type ChatInstance } from "../hooks/useChatInstance";
 import { useVoiceOrchestrator } from "../hooks/useVoiceOrchestrator";
 import { ChatPanel } from "./ChatPanel";
-import { McpSelectionModal } from "./McpSelectionModal";
+import { listModels, type ModelsResponse } from "../api/rest";
 import type { SessionStatus, ConnectionState } from "../types";
 
 /**
@@ -79,14 +79,14 @@ function OrchestratorChatPanel({
   instance,
   onSessionChange,
   isActive,
-  onMcpSettings,
+  supportsAudio,
 }: {
   sessionId: string;
   resumeSdkId?: string | null;
   instance: ChatInstance;
   onSessionChange: () => void;
   isActive?: boolean;
-  onMcpSettings?: () => void;
+  supportsAudio?: boolean;
 }) {
   const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel, voiceError } = useVoiceOrchestrator({
     localId: sessionId,
@@ -123,7 +123,10 @@ function OrchestratorChatPanel({
       turns={instance.turns}
       error={instance.error}
       onSend={instance.send}
+      onSendAudio={instance.sendAudio}
       onInterrupt={instance.interrupt}
+      onCompact={instance.compact}
+      contextUsage={instance.contextUsage}
       isActive={isActive}
       isOrchestrator={true}
       voiceStatus={voiceStatus}
@@ -136,8 +139,7 @@ function OrchestratorChatPanel({
       micLevel={micLevel}
       speakerLevel={speakerLevel}
       voiceError={voiceError}
-      activeMcpCount={instance.selectedMcps.length}
-      onMcpSettings={onMcpSettings}
+      supportsAudio={supportsAudio}
     />
   );
 }
@@ -152,8 +154,14 @@ export function ChatPanelContainer({
 }) {
   const { tabs, activeTabId, openTab, closeTab } = useTabsContext();
   const instancesRef = useRef<Map<string, ChatInstance>>(new Map());
-  const [showMcpModal, setShowMcpModal] = useState(false);
-  const [mcpModalSessionId, setMcpModalSessionId] = useState<string | null>(null);
+
+  // Track which models support audio
+  const [modelsInfo, setModelsInfo] = useState<ModelsResponse | null>(null);
+
+  // Fetch models info on mount
+  useEffect(() => {
+    listModels().then(setModelsInfo).catch(console.error);
+  }, []);
 
   const handleAgentSessionOpened = useCallback(
     (agentSessionId: string, sdkSessionId?: string) => {
@@ -176,27 +184,10 @@ export function ChatPanelContainer({
     [closeTab]
   );
 
-  const handleOpenMcpModal = useCallback((sessionId: string) => {
-    setMcpModalSessionId(sessionId);
-    setShowMcpModal(true);
-  }, []);
-
-  const handleCloseMcpModal = useCallback(() => {
-    setShowMcpModal(false);
-    setMcpModalSessionId(null);
-  }, []);
-
-  const handleMcpConfirm = useCallback((selectedMcps: string[]) => {
-    if (mcpModalSessionId) {
-      const inst = instancesRef.current.get(mcpModalSessionId);
-      if (inst) {
-        inst.restartWithMcps(selectedMcps);
-      }
-    }
-    handleCloseMcpModal();
-  }, [mcpModalSessionId, handleCloseMcpModal]);
-
   const activeInstance = activeTabId ? instancesRef.current.get(activeTabId) : undefined;
+
+  // Check if any model supports audio (show button if audio is available)
+  const supportsAudio = (modelsInfo?.audio_capable_models?.length ?? 0) > 0;
 
   return (
     <>
@@ -234,7 +225,7 @@ export function ChatPanelContainer({
                 instance={inst}
                 onSessionChange={onSessionChange}
                 isActive={isActive}
-                onMcpSettings={() => handleOpenMcpModal(tab.sessionId)}
+                supportsAudio={supportsAudio}
               />
             ) : (
               <ChatPanel
@@ -246,9 +237,9 @@ export function ChatPanelContainer({
                 error={inst.error}
                 onSend={inst.send}
                 onInterrupt={inst.interrupt}
+                onCompact={inst.compact}
+                contextUsage={inst.contextUsage}
                 isActive={isActive}
-                activeMcpCount={inst.selectedMcps.length}
-                onMcpSettings={() => handleOpenMcpModal(tab.sessionId)}
               />
             )}
           </div>
@@ -267,15 +258,6 @@ export function ChatPanelContainer({
             </div>
           </div>
         </main>
-      )}
-
-      {/* MCP Selection Modal */}
-      {showMcpModal && mcpModalSessionId && (
-        <McpSelectionModal
-          selectedMcps={instancesRef.current.get(mcpModalSessionId)?.selectedMcps ?? []}
-          onConfirm={handleMcpConfirm}
-          onCancel={handleCloseMcpModal}
-        />
       )}
     </>
   );

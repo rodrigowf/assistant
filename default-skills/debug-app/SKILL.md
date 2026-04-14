@@ -31,7 +31,7 @@ Start the FastAPI backend with uvicorn, using the factory pattern. **IMPORTANT**
 
 The command pattern is:
 
-    setsid context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765 > logs/api_TIMESTAMP.log 2>&1 &
+    setsid context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765 > logs/api_TIMESTAMP.log 2>&1 &
 
 Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`. Do NOT use `nohup` or `tee` — use `setsid` with output redirection.
 

@@ -81,6 +81,7 @@ export interface ChatMessage {
 export type MessageBlock =
   | { type: "text"; content: string; streaming: boolean }
   | { type: "thinking"; content: string; streaming: boolean }
+  | { type: "compact"; content: string; streaming: boolean }
   | {
       type: "tool_use";
       toolUseId: string;

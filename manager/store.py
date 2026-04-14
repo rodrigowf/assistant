@@ -179,6 +179,47 @@ class SessionStore:
             return []
         return detail.messages[-max_messages:]
 
+    def get_messages_paginated(
+        self,
+        session_id: str,
+        limit: int = 50,
+        before_index: int | None = None,
+    ) -> tuple[list[MessagePreview], int, bool]:
+        """Get paginated messages from a session.
+
+        Args:
+            session_id: The session ID to load messages from.
+            limit: Maximum number of messages to return.
+            before_index: Return messages before this index (for reverse scrolling).
+                         If None, returns the most recent messages.
+
+        Returns:
+            A tuple of (messages, total_count, has_more).
+            Messages are returned in chronological order (oldest first).
+        """
+        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            return [], 0, False
+
+        messages_raw = self._read_messages(jsonl_path)
+        if not messages_raw:
+            return [], 0, False
+
+        previews = self._to_previews(messages_raw)
+        total_count = len(previews)
+
+        if before_index is None:
+            # Return the most recent messages (from the bottom)
+            start_idx = max(0, total_count - limit)
+            end_idx = total_count
+        else:
+            # Return messages before the given index
+            end_idx = min(before_index, total_count)
+            start_idx = max(0, end_idx - limit)
+
+        has_more = start_idx > 0
+        return previews[start_idx:end_idx], total_count, has_more
+
     def get_session_info(self, session_id: str) -> SessionInfo | None:
         """Get lightweight summary info for a single session (no full parse)."""
         jsonl_path = self._sessions_dir / f"{session_id}.jsonl"

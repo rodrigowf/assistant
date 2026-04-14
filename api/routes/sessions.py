@@ -8,6 +8,7 @@ from api.deps import get_pool, get_store
 from api.models import (
     ContentBlockResponse,
     MessagePreviewResponse,
+    PaginatedMessagesResponse,
     PoolSessionResponse,
     SessionDetailResponse,
     SessionInfoResponse,
@@ -133,6 +134,42 @@ def get_session(session_id: str, store: SessionStore = Depends(get_store)):
             )
             for m in detail.messages
         ],
+    )
+
+
+@router.get("/{session_id}/messages", response_model=PaginatedMessagesResponse)
+def get_messages_paginated(
+    session_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    before: int | None = Query(None, description="Load messages before this index (for infinite scroll up)"),
+    store: SessionStore = Depends(get_store),
+):
+    """Get paginated messages from a session.
+
+    For initial load (most recent messages): call without `before` parameter.
+    For loading older messages (scroll up): pass `before=<start_index>` from previous response.
+    """
+    messages, total_count, has_more = store.get_messages_paginated(
+        session_id, limit=limit, before_index=before
+    )
+    if total_count == 0 and store.get_session_info(session_id) is None:
+        raise HTTPException(404, detail=f"Session {session_id!r} not found")
+
+    start_index = 0 if not messages else (before - len(messages) if before else total_count - len(messages))
+
+    return PaginatedMessagesResponse(
+        messages=[
+            MessagePreviewResponse(
+                role=m.role,
+                text=m.text,
+                blocks=_convert_blocks(m.blocks),
+                timestamp=m.timestamp.isoformat() if m.timestamp else None,
+            )
+            for m in messages
+        ],
+        total_count=total_count,
+        has_more=has_more,
+        start_index=max(0, start_index),
     )
 
 

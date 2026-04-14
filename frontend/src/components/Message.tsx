@@ -3,6 +3,7 @@ import type { ChatMessage } from "../types";
 import { Markdown } from "./Markdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolUseBlock } from "./ToolUseBlock";
+import { CompactDivider } from "./CompactDivider";
 
 interface Props {
   message: ChatMessage;
@@ -31,6 +32,12 @@ function UserTextBlock({ content }: { content: string }) {
 
 export function Message({ message }: Props) {
   const isUser = message.role === "user";
+
+  // Compact divider — rendered full-width outside the bubble
+  const compactBlock = message.blocks.find(b => b.type === "compact");
+  if (compactBlock && compactBlock.type === "compact") {
+    return <CompactDivider summary={compactBlock.content} />;
+  }
 
   return (
     <div className={`message ${isUser ? "message-user" : "message-assistant"}`}>

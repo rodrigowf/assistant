@@ -5,10 +5,12 @@ import {
   listMcpServers,
   listSkills,
   listAgents,
+  listModels,
   type AssistantConfig,
   type SkillInfo,
   type AgentInfo,
   type McpServerConfig,
+  type ModelInfo,
 } from "../api/rest";
 
 interface Props {
@@ -21,6 +23,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -40,16 +43,18 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, skillsRes, agentsRes] = await Promise.all([
+      const [cfg, mcpRes, skillsRes, agentsRes, modelsRes] = await Promise.all([
         getConfig(),
         listMcpServers(),
         listSkills(),
         listAgents(),
+        listModels(),
       ]);
       setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setSkills(skillsRes.skills);
       setAgents(agentsRes.agents);
+      setModels(modelsRes.models);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -240,6 +245,78 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                   </button>
                 </form>
                 {addWdError && <div className="config-field-error">{addWdError}</div>}
+              </section>
+
+              {/* ── Session Flags ─────────────────────────────── */}
+              <section className="config-section">
+                <h3 className="config-section-title">Session Flags</h3>
+                <p className="config-section-desc">
+                  Extra flags applied when initializing new Claude Code sessions.
+                </p>
+                <div className="config-item-list">
+                  <label className={`config-item${config.chrome_extension ? " enabled" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={config.chrome_extension}
+                      onChange={() => save({ chrome_extension: !config.chrome_extension })}
+                    />
+                    <div className="config-item-info">
+                      <span className="config-item-name">Chrome Extension</span>
+                      <span className="config-item-detail">Launch sessions with --chrome flag to control Google Chrome tabs</span>
+                    </div>
+                  </label>
+                </div>
+              </section>
+
+              {/* ── Model Selection ───────────────────────────── */}
+              <section className="config-section">
+                <h3 className="config-section-title">Orchestrator Model</h3>
+                <p className="config-section-desc">
+                  Default model for new orchestrator sessions. Can be changed mid-conversation.
+                </p>
+                {models.length === 0 ? (
+                  <div className="config-empty">No models available</div>
+                ) : (
+                  <div className="model-selector">
+                    {/* Group by provider */}
+                    {["anthropic", "openai"].map((provider) => {
+                      const providerModels = models.filter(m => m.provider === provider);
+                      if (providerModels.length === 0) return null;
+                      return (
+                        <div key={provider} className="model-provider-group">
+                          <div className="model-provider-label">
+                            {provider === "anthropic" ? "Anthropic" : "OpenAI"}
+                          </div>
+                          <div className="model-list">
+                            {providerModels.map((model) => {
+                              const isSelected = model.model_id === config.default_model;
+                              return (
+                                <button
+                                  key={model.model_id}
+                                  className={`model-option${isSelected ? " selected" : ""}`}
+                                  onClick={() => !isSelected && save({ default_model: model.model_id })}
+                                  disabled={saving}
+                                  title={`${model.display_name}${model.supports_audio ? " (audio)" : ""}${model.supports_vision ? " (vision)" : ""}`}
+                                >
+                                  <span className={`model-radio${isSelected ? " checked" : ""}`} />
+                                  <span className="model-name">{model.display_name}</span>
+                                  <span className="model-badges">
+                                    {model.supports_audio && (
+                                      <span className="model-badge audio" title="Supports audio input">🎤</span>
+                                    )}
+                                    {model.supports_vision && (
+                                      <span className="model-badge vision" title="Supports vision">👁</span>
+                                    )}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </section>
 
               {/* ── MCP Servers ───────────────────────────────── */}

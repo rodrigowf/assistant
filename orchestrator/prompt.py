@@ -167,14 +167,24 @@ The user interacts with you through a multi-tab web interface. Each agent sessio
 
 
 def _active_sessions_section(context: dict[str, Any]) -> str:
-    """Build the active sessions status section."""
-    orch_sessions = context.get("orchestrator_sessions", {})
-    if not orch_sessions:
+    """Build the active sessions status section from the live pool."""
+    pool = context.get("pool")
+    if pool is None:
+        return "## Active Agent Sessions\nNo agent sessions are currently active."
+
+    sessions = pool.list_sessions()
+    if not sessions:
         return "## Active Agent Sessions\nNo agent sessions are currently active."
 
     lines = ["## Active Agent Sessions"]
-    for sid, sm in orch_sessions.items():
-        lines.append(f"- `{sid}`: status={sm.status.value}, turns={sm.turns}, cost=${sm.cost:.4f}")
+    for s in sessions:
+        sid = s["session_id"]
+        status = s.get("status", "unknown")
+        turns = s.get("turns", 0)
+        cost = s.get("cost", 0.0)
+        sdk_id = s.get("sdk_session_id", "")
+        sdk_note = f", sdk_id={sdk_id}" if sdk_id else ""
+        lines.append(f"- `{sid}`: status={status}, turns={turns}, cost=${cost:.4f}{sdk_note}")
     return "\n".join(lines)
 
 

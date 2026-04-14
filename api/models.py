@@ -41,6 +41,15 @@ class SessionDetailResponse(SessionInfoResponse):
     messages: list[MessagePreviewResponse] = []
 
 
+class PaginatedMessagesResponse(BaseModel):
+    """Paginated messages for a session."""
+    messages: list[MessagePreviewResponse]
+    total_count: int
+    has_more: bool
+    # The index of the first message in this batch (for cursor-based pagination)
+    start_index: int
+
+
 class PoolSessionResponse(BaseModel):
     """A session that is currently live in the pool (not just in JSONL history)."""
     local_id: str

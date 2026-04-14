@@ -288,6 +288,20 @@ class SessionPool:
                 await self._broadcast_session(session_id, payload)
                 yield event
 
+    async def compact(self, session_id: str) -> AsyncIterator[Event]:
+        """Trigger compaction with per-session lock, broadcasting to all subscribers."""
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            raise ValueError(f"No session with ID {session_id}")
+
+        lock = self._locks[session_id]
+
+        async with lock:
+            async for event in sm.compact():
+                payload = serialize_event(event)
+                await self._broadcast_session(session_id, payload)
+                yield event
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

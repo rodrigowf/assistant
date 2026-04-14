@@ -101,6 +101,8 @@ export interface AssistantConfig {
   enabled_mcps: string[];
   disabled_skills: string[];
   disabled_agents: string[];
+  chrome_extension: boolean;
+  default_model: string;
 }
 
 export interface ConfigUpdate {
@@ -109,6 +111,8 @@ export interface ConfigUpdate {
   enabled_mcps?: string[];
   disabled_skills?: string[];
   disabled_agents?: string[];
+  chrome_extension?: boolean;
+  default_model?: string;
 }
 
 export function getConfig(): Promise<AssistantConfig> {
@@ -121,6 +125,28 @@ export function updateConfig(update: ConfigUpdate): Promise<AssistantConfig> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(update),
   });
+}
+
+// Model Configuration
+
+export interface ModelInfo {
+  provider: string;
+  model_id: string;
+  display_name: string;
+  supports_audio: boolean;
+  supports_vision: boolean;
+  supports_tools: boolean;
+  max_tokens: number;
+}
+
+export interface ModelsResponse {
+  models: ModelInfo[];
+  audio_capable_models: string[];
+  default_model: string;
+}
+
+export function listModels(): Promise<ModelsResponse> {
+  return json(`${BASE}/orchestrator/models`);
 }
 
 // Skills

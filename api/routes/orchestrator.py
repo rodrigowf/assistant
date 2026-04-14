@@ -1,8 +1,24 @@
-"""WebSocket orchestrator endpoint — streams orchestrator agent events."""
+"""WebSocket orchestrator endpoint — streams orchestrator agent events.
+
+Supports text, audio, and voice modes with runtime model switching.
+
+Message types (client → server):
+- start: Initialize text mode
+- voice_start: Initialize voice mode (WebRTC)
+- send: Send text message
+- send_audio: Send audio message (base64 encoded)
+- set_model: Switch model mid-conversation
+- voice_event: Mirrored OpenAI Realtime event (voice mode)
+- interrupt: Stop current response
+- stop: Close session
+- get_model: Get current model info
+- get_models: List available models
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from pathlib import Path
 
@@ -11,7 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.pool import SessionPool
 from api.serializers import serialize_orchestrator_event
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, get_available_models
 from orchestrator.session import OrchestratorSession
 
 logger = logging.getLogger(__name__)
@@ -57,6 +73,43 @@ async def orchestrator_ws(ws: WebSocket):
                     continue
                 await _handle_send(pool, session, msg.get("text", ""))
 
+            elif msg_type == "send_audio":
+                if session is None:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_started",
+                        "detail": "Send a 'start' message first",
+                    }))
+                    continue
+                await _handle_send_audio(
+                    pool,
+                    session,
+                    msg.get("audio", ""),
+                    msg.get("format", "webm"),
+                    msg.get("text"),
+                )
+
+            elif msg_type == "set_model":
+                if session is None:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_started",
+                        "detail": "Send a 'start' message first",
+                    }))
+                    continue
+                await _handle_set_model(pool, session, msg.get("model", ""))
+
+            elif msg_type == "get_model":
+                if session is None:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_started",
+                        "detail": "Send a 'start' message first",
+                    }))
+                    continue
+                await _handle_get_model(ws, session)
+
+            elif msg_type == "get_models":
+                # List available models (doesn't require session)
+                await _handle_get_models(ws)
+
             elif msg_type == "voice_event":
                 if session is None or not session.is_voice:
                     await ws.send_bytes(orjson.dumps({
@@ -65,6 +118,15 @@ async def orchestrator_ws(ws: WebSocket):
                     }))
                     continue
                 await _handle_voice_event(pool, session, msg.get("event", {}))
+
+            elif msg_type == "compact":
+                if session is None:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_started",
+                        "detail": "Send a 'start' message first",
+                    }))
+                    continue
+                await _handle_compact(pool, session)
 
             elif msg_type == "interrupt":
                 if session is not None:
@@ -131,6 +193,7 @@ async def _handle_start(
                 "type": "session_started",
                 "session_id": local_id,
                 "voice": current_voice,
+                "model_info": session.get_model_info(),
             }))
             return session, True
         else:
@@ -140,6 +203,7 @@ async def _handle_start(
                 "type": "session_started",
                 "session_id": local_id,
                 "voice": current_voice,
+                "model_info": session.get_model_info(),
             }))
             return session, True
 
@@ -188,6 +252,7 @@ async def _handle_start(
         "type": "session_started",
         "session_id": session_id,
         "voice": voice,
+        "model_info": session.get_model_info(),
     }
     if voice:
         session_update = session.get_session_update()
@@ -211,6 +276,107 @@ async def _handle_send(
     except Exception as e:
         logger.exception("Orchestrator send failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "send_failed", "detail": str(e)})
+
+
+async def _handle_send_audio(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    audio_base64: str,
+    audio_format: str,
+    text_prompt: str | None,
+) -> None:
+    """Process audio input through the multimodal model."""
+    try:
+        # Decode base64 audio
+        try:
+            audio_bytes = base64.b64decode(audio_base64)
+        except Exception as e:
+            await pool.broadcast_orchestrator({
+                "type": "error",
+                "error": "invalid_audio",
+                "detail": f"Invalid base64 audio data: {e}",
+            })
+            return
+
+        await pool.broadcast_orchestrator({"type": "status", "status": "streaming"})
+
+        async for event in session.send_audio(audio_bytes, audio_format, text_prompt):
+            payload = serialize_orchestrator_event(event)
+            await pool.broadcast_orchestrator(payload)
+
+        await pool.broadcast_orchestrator({"type": "status", "status": "idle"})
+    except Exception as e:
+        logger.exception("Orchestrator send_audio failed")
+        await pool.broadcast_orchestrator({
+            "type": "error",
+            "error": "send_audio_failed",
+            "detail": str(e),
+        })
+
+
+async def _handle_set_model(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    model_id: str,
+) -> None:
+    """Switch the model for the current session."""
+    if session.is_voice:
+        await pool.broadcast_orchestrator({
+            "type": "error",
+            "error": "cannot_switch_voice",
+            "detail": "Cannot switch models during voice session",
+        })
+        return
+
+    if session.set_model(model_id):
+        await pool.broadcast_orchestrator({
+            "type": "model_changed",
+            "model_info": session.get_model_info(),
+        })
+    else:
+        await pool.broadcast_orchestrator({
+            "type": "error",
+            "error": "unknown_model",
+            "detail": f"Unknown model: {model_id}",
+        })
+
+
+async def _handle_get_model(ws: WebSocket, session: OrchestratorSession) -> None:
+    """Get the current model info."""
+    await ws.send_bytes(orjson.dumps({
+        "type": "model_info",
+        "model_info": session.get_model_info(),
+    }))
+
+
+async def _handle_get_models(ws: WebSocket) -> None:
+    """Get list of all available models."""
+    models = get_available_models()
+    await ws.send_bytes(orjson.dumps({
+        "type": "models_list",
+        "models": [m.to_dict() for m in models],
+    }))
+
+
+async def _handle_compact(
+    pool: SessionPool, session: OrchestratorSession,
+) -> None:
+    """Compact the orchestrator conversation history."""
+    try:
+        await pool.broadcast_orchestrator({"type": "status", "status": "streaming"})
+        result = await session.compact()
+        await pool.broadcast_orchestrator({
+            "type": "compact_complete",
+            "trigger": "manual",
+            "tokens_before": result["tokens_before"],
+            "tokens_after": result["tokens_after"],
+        })
+        await pool.broadcast_orchestrator({"type": "status", "status": "idle"})
+    except Exception as e:
+        logger.exception("Orchestrator compact failed")
+        await pool.broadcast_orchestrator({
+            "type": "error", "error": "compact_failed", "detail": str(e),
+        })
 
 
 async def _handle_voice_event(
@@ -251,8 +417,18 @@ async def _handle_voice_tool_call(
         import json as _json
         call_id = event.get("call_id", "")
         name = event.get("name", "")
+
+        # Fall back to pending_calls if name not in event
+        # (OpenAI sends the name in response.output_item.added, not always in the done event)
+        if not name and hasattr(session, "_voice_provider") and session._voice_provider:
+            name = session._voice_provider.pending_calls.get(call_id, "")
+
+        # Prefer accumulated streaming args over the event's arguments field
+        pending_args = ""
+        if hasattr(session, "_voice_provider") and session._voice_provider:
+            pending_args = session._voice_provider._pending_args.get(call_id, "")
         try:
-            tool_input = _json.loads(event.get("arguments", "{}"))
+            tool_input = _json.loads(pending_args or event.get("arguments", "") or "{}")
         except Exception:
             tool_input = {}
 

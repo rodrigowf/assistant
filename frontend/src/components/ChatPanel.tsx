@@ -13,7 +13,10 @@ interface Props {
   turns: number;
   error: string | null;
   onSend: (text: string) => void;
+  onSendAudio?: (audioBase64: string, format: string) => void;
   onInterrupt: () => void;
+  onCompact?: () => void;
+  contextUsage?: number;
   isActive?: boolean;
   // Voice mode props (orchestrator only)
   isOrchestrator?: boolean;
@@ -28,9 +31,8 @@ interface Props {
   speakerLevel?: number;
   /** Voice error message (e.g. session expired). */
   voiceError?: string | null;
-  // MCP settings
-  activeMcpCount?: number;
-  onMcpSettings?: () => void;
+  /** Whether the current model supports audio input */
+  supportsAudio?: boolean;
 }
 
 export function ChatPanel({
@@ -41,7 +43,10 @@ export function ChatPanel({
   turns,
   error,
   onSend,
+  onSendAudio,
   onInterrupt,
+  onCompact,
+  contextUsage,
   isActive,
   isOrchestrator,
   voiceStatus,
@@ -54,8 +59,7 @@ export function ChatPanel({
   micLevel,
   speakerLevel,
   voiceError,
-  activeMcpCount,
-  onMcpSettings,
+  supportsAudio,
 }: Props) {
   const isStreaming = status === "streaming" || status === "thinking" || status === "tool_use";
   const voiceActive = voiceStatus && voiceStatus !== "off" && voiceStatus !== "error";
@@ -71,11 +75,13 @@ export function ChatPanel({
         <div className="chat-input-bar">
           <ChatInput
             onSend={onSend}
+            onSendAudio={onSendAudio}
             onInterrupt={onInterrupt}
+            onCompact={onCompact}
+            contextUsage={contextUsage}
             disabled={status === "disconnected" || status === "connecting"}
             streaming={isStreaming}
-            activeMcpCount={activeMcpCount}
-            onMcpSettings={onMcpSettings}
+            supportsAudio={supportsAudio}
           />
         </div>
       )}
@@ -138,4 +144,3 @@ export function ChatPanel({
     </main>
   );
 }
-

@@ -53,6 +53,8 @@ def _default_config() -> dict[str, Any]:
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
         "disabled_skills": [],  # list of skill names to hide
         "disabled_agents": [],  # list of agent names to hide
+        "chrome_extension": False,  # launch sessions with --chrome flag
+        "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
     }
 
 
@@ -66,6 +68,8 @@ class ConfigUpdate(BaseModel):
     enabled_mcps: list[str] | None = None
     disabled_skills: list[str] | None = None
     disabled_agents: list[str] | None = None
+    chrome_extension: bool | None = None
+    default_model: str | None = None  # default model for new orchestrator sessions
 
 
 # -----------------------------------------------------------------------
@@ -114,6 +118,16 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
 
     if body.disabled_agents is not None:
         config["disabled_agents"] = body.disabled_agents
+
+    if body.chrome_extension is not None:
+        config["chrome_extension"] = body.chrome_extension
+
+    if body.default_model is not None:
+        # Validate model exists
+        from orchestrator.config import AVAILABLE_MODELS
+        if body.default_model not in AVAILABLE_MODELS:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {body.default_model}")
+        config["default_model"] = body.default_model
 
     _save_config(config)
     return config

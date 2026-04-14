@@ -70,8 +70,22 @@ class OrchestratorAgent:
     def history(self, value: list[dict[str, Any]]) -> None:
         self._history = value
 
-    async def run(self, prompt: str) -> AsyncIterator[OrchestratorEvent]:
+    @property
+    def provider(self) -> ModelProvider:
+        return self._provider
+
+    @provider.setter
+    def provider(self, value: ModelProvider) -> None:
+        """Switch the model provider (for runtime model switching)."""
+        self._provider = value
+
+    async def run(self, prompt: str | dict[str, Any]) -> AsyncIterator[OrchestratorEvent]:
         """Run one user turn through the agent loop.
+
+        Args:
+            prompt: Either a text string or a message dict with content
+                   (for multimodal input like audio). If a dict, it should
+                   have "role" and "content" keys.
 
         Yields events as the model streams its response. If the model
         requests tool calls, executes them NON-BLOCKING and yields
@@ -81,7 +95,14 @@ class OrchestratorAgent:
         self._interrupted = False
 
         # Add user message to history
-        self._history.append({"role": "user", "content": prompt})
+        # Handle both string prompts and multimodal message dicts
+        if isinstance(prompt, str):
+            self._history.append({"role": "user", "content": prompt})
+        elif isinstance(prompt, dict):
+            # Multimodal message (e.g., audio input)
+            self._history.append(prompt)
+        else:
+            raise TypeError(f"prompt must be str or dict, got {type(prompt)}")
 
         # Build system prompt with conversation history for context continuity
         system = build_system_prompt(

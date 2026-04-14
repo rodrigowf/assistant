@@ -65,6 +65,14 @@ async def chat_ws(ws: WebSocket):
                         "type": "status", "status": "interrupted",
                     }))
 
+            elif msg_type == "compact":
+                if sm is None or session_id is None:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_started",
+                    }))
+                    continue
+                await _handle_compact(ws, pool, session_id)
+
             elif msg_type == "stop":
                 if session_id:
                     pool.unsubscribe(session_id, ws)
@@ -125,6 +133,9 @@ async def _handle_start(
             from api.routes.mcp import _load_mcp_servers
             all_mcps = _load_mcp_servers()
             mcp_servers = {k: v for k, v in all_mcps.items() if k in enabled_mcps} or None
+    # Apply chrome extension flag if enabled
+    if assistant_cfg.get("chrome_extension", False):
+        config = replace(config, extra_args={"chrome": None})
     try:
         await ws.send_bytes(orjson.dumps({
             "type": "status", "status": "connecting",
@@ -182,6 +193,18 @@ async def _handle_send(
             "detail": str(e),
         }))
     return session_id
+
+
+async def _handle_compact(ws: WebSocket, pool: SessionPool, session_id: str) -> None:
+    """Trigger conversation compaction, broadcasting events to all subscribers."""
+    try:
+        async for event in pool.compact(session_id):
+            pass  # Events already broadcast by pool
+    except Exception as e:
+        await ws.send_bytes(orjson.dumps({
+            "type": "error", "error": "compact_failed",
+            "detail": str(e),
+        }))
 
 
 async def _handle_command(ws: WebSocket, sm: SessionManager, text: str) -> None:

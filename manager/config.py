@@ -25,6 +25,7 @@ class ManagerConfig:
     max_budget_usd: float | None = None
     max_turns: int | None = None
     mcp_servers: dict[str, McpServerConfig] | None = None
+    extra_args: dict[str, str | None] | None = None
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> ManagerConfig:

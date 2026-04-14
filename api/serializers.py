@@ -42,17 +42,26 @@ def serialize_event(event: Event) -> dict[str, Any]:
             "is_error": event.is_error,
         }
     if isinstance(event, TurnComplete):
+        usage = event.usage or {}
+        # Total context size = new tokens + cached tokens read
+        total_input = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+        )
         return {
             "type": "turn_complete",
             "cost": event.cost,
-            "usage": event.usage,
+            "usage": usage,
+            "input_tokens": total_input,
+            "output_tokens": usage.get("output_tokens", 0),
             "num_turns": event.num_turns,
             "session_id": event.session_id,
             "is_error": event.is_error,
             "result": event.result,
         }
     if isinstance(event, CompactComplete):
-        return {"type": "compact_complete", "trigger": event.trigger}
+        return {"type": "compact_complete", "trigger": event.trigger, "summary": event.summary}
     return {"type": "unknown"}
 
 
