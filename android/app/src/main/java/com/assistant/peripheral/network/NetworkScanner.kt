@@ -7,9 +7,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
-import java.net.InetAddress
-import java.net.URL
+import java.net.InetSocketAddress
+import java.net.Socket
 
 data class DiscoveredServer(
     val ip: String,
@@ -19,25 +18,25 @@ data class DiscoveredServer(
 
 object NetworkScanner {
     private const val TAG = "NetworkScanner"
-    private const val BACKEND_PORT = 8765
-    private const val PROBE_PATH = "/api/sessions"
+    private val PROBE_PORTS = listOf(80, 8765)
     private const val CONNECT_TIMEOUT_MS = 400
 
     /**
      * Scans the local subnet for running assistant backends.
-     * Uses the device's WiFi IP to determine the subnet (e.g. 192.168.0.x).
-     * Returns all discovered servers sorted by IP.
+     * Probes ports 80 (nginx) and 8765 (direct uvicorn), preferring 80.
+     * Returns at most one entry per IP, sorted by IP.
      */
     suspend fun scan(context: Context): List<DiscoveredServer> = withContext(Dispatchers.IO) {
         val subnet = getSubnet(context) ?: return@withContext emptyList()
-        Log.d(TAG, "Scanning subnet $subnet.0/24 on port $BACKEND_PORT")
+        Log.d(TAG, "Scanning subnet $subnet.0/24 on ports $PROBE_PORTS")
 
-        val found = (1..254).map { i ->
+        val found = (2..254).map { i ->  // skip .1 (default gateway)
             async {
                 val ip = "$subnet.$i"
-                if (probe(ip, BACKEND_PORT)) {
-                    Log.d(TAG, "Found backend at $ip:$BACKEND_PORT")
-                    DiscoveredServer(ip = ip, port = BACKEND_PORT)
+                val port = PROBE_PORTS.firstOrNull { probe(ip, it) }
+                if (port != null) {
+                    Log.d(TAG, "Found backend at $ip:$port")
+                    DiscoveredServer(ip = ip, port = port)
                 } else null
             }
         }.awaitAll().filterNotNull()
@@ -59,21 +58,13 @@ object NetworkScanner {
         return "$a.$b.$c"
     }
 
-    /** Returns true if the assistant backend is reachable at the given IP:port. */
+    /** Returns true if a TCP connection can be established to the given IP:port. */
     private fun probe(ip: String, port: Int): Boolean {
         return try {
-            // First a fast TCP reachability check
-            val addr = InetAddress.getByName(ip)
-            if (!addr.isReachable(CONNECT_TIMEOUT_MS)) return false
-            // Then an HTTP check to confirm it's our backend
-            val url = URL("http://$ip:$port$PROBE_PATH")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.connectTimeout = CONNECT_TIMEOUT_MS
-            conn.readTimeout = CONNECT_TIMEOUT_MS
-            conn.requestMethod = "GET"
-            val code = conn.responseCode
-            conn.disconnect()
-            code in 200..299 || code == 404  // 404 means server is up but path may differ
+            Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress(ip, port), CONNECT_TIMEOUT_MS)
+                true
+            }
         } catch (e: Exception) {
             false
         }

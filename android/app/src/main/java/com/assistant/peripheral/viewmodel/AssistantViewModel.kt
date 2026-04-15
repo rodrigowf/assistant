@@ -164,9 +164,14 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         // Load settings from DataStore
         viewModelScope.launch {
+            var previousServerUrl: String? = null
             dataStore.data.collect { preferences ->
+                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: "ws://192.168.0.28:8765"
+                val serverUrlChanged = previousServerUrl != null && previousServerUrl != newServerUrl
+                previousServerUrl = newServerUrl
+
                 _settings.value = AppSettings(
-                    serverUrl = preferences[PreferenceKeys.SERVER_URL] ?: "ws://192.168.0.28:8765",
+                    serverUrl = newServerUrl,
                     autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: true,
                     enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: false,
                     wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: "hey assistant",
@@ -188,6 +193,21 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     it.setMicGain(_settings.value.micGainLevel)
                 }
                 setupVoiceManagerCallbacks()
+
+                // Clear all session state when switching servers
+                if (serverUrlChanged) {
+                    webSocketManager.disconnect()
+                    _sessions.value = emptyList()
+                    _messages.value = emptyList()
+                    _liveSessionIds.value = emptySet()
+                    _currentSessionId.value = null
+                    _currentLocalId.value = UUID.randomUUID().toString()
+                    _pendingResumeSessionId.value = null
+                    _jsonlSessionId = null
+                    _isOrchestratorSession.value = false
+                    _hasMoreMessages.value = false
+                    sessionCache.clear()
+                }
             }
         }
 
