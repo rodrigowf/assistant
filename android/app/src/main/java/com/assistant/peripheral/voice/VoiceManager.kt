@@ -65,6 +65,9 @@ class VoiceManager(
     // Microphone gain (0.0 to 2.0, default 1.0)
     private var micGainLevel: Float = 1.0f
 
+    // Audio output routing: false = loudspeaker (default), true = earpiece
+    private var useEarpiece: Boolean = false
+
     // Gain saved before agent speech — restored when speech ends or user interrupts
     private var gainBeforeSpeaking: Float? = null
     private var micRestoreJob: kotlinx.coroutines.Job? = null
@@ -180,10 +183,26 @@ class VoiceManager(
             )
         }
 
-        // Set speaker mode for voice chat
+        // Always use MODE_IN_COMMUNICATION — WebRTC's JavaAudioDeviceModule forces this mode
+        // internally when it starts recording, overriding MODE_NORMAL. Setting it here first
+        // avoids a transient mode mismatch. Speaker routing is applied after WebRTC connects.
         audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
-        @Suppress("DEPRECATION")
-        audioManager?.isSpeakerphoneOn = true
+        applySpeakerRouting()
+
+        // Ensure STREAM_VOICE_CALL is audible — WebRTC routes output through this stream
+        // on Lollipop. If the user has phone volume at 0 or the stream is muted, voice
+        // output will be silent. Raise to at least 50% of max if currently at 0.
+        val am = audioManager
+        if (am != null) {
+            val maxVoice = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            val curVoice = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+            if (curVoice == 0) {
+                val target = (maxVoice * 0.75).toInt().coerceAtLeast(1)
+                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, target, 0)
+                Log.d(TAG, "STREAM_VOICE_CALL was 0, raised to $target/$maxVoice")
+            }
+        }
+        Log.d(TAG, "Audio routed to ${if (useEarpiece) "earpiece" else "loudspeaker"}")
     }
 
     private fun releaseAudioFocus() {
@@ -196,6 +215,7 @@ class VoiceManager(
         audioManager?.mode = AudioManager.MODE_NORMAL
         @Suppress("DEPRECATION")
         audioManager?.isSpeakerphoneOn = false
+        audioFocusRequest = null
     }
 
     private suspend fun initializeWebRTC(token: String): Boolean {
@@ -415,6 +435,9 @@ class VoiceManager(
                     dcReady = true
                     _state.value = VoiceState.Active
                     _events.tryEmit(VoiceEvent.SessionCreated)
+                    // Re-apply speaker routing: WebRTC may have reset MODE_IN_COMMUNICATION
+                    // which reverts isSpeakerphoneOn to false (earpiece) on some devices.
+                    applySpeakerRouting()
 
                     // Drain pending commands
                     // Web frontend: const pending = pendingCommandsRef.current.splice(0); for (const cmd of pending) { ... }
@@ -713,6 +736,29 @@ class VoiceManager(
             micGainLevel = saved
             gainBeforeSpeaking = null
             Log.d(TAG, "User interrupted — mic restored to $micGainLevel immediately")
+        }
+    }
+
+    /**
+     * Set audio output routing. Must be called before starting a voice session to take effect.
+     * @param earpiece true = route to earpiece, false = route to loudspeaker (default)
+     */
+    fun setUseEarpiece(earpiece: Boolean) {
+        useEarpiece = earpiece
+        Log.d(TAG, "Audio output: ${if (earpiece) "earpiece" else "loudspeaker"}")
+    }
+
+    /**
+     * Apply speakerphone routing based on [useEarpiece].
+     * Called both at session start and after data channel opens (WebRTC may reset the mode).
+     */
+    private fun applySpeakerRouting() {
+        val am = audioManager ?: return
+        @Suppress("DEPRECATION")
+        if (useEarpiece) {
+            am.isSpeakerphoneOn = false
+        } else {
+            am.isSpeakerphoneOn = true
         }
     }
 
