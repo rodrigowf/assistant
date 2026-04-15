@@ -20,6 +20,7 @@ frontend/node_modules/
 
 # Local logs
 logs/
+remote_console.log
 
 # Context is now a submodule (assistant-context repo)
 # context/
