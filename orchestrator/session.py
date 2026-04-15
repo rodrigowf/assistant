@@ -150,6 +150,7 @@ class OrchestratorSession:
         import orchestrator.tools.agent_sessions  # noqa: F401
         import orchestrator.tools.search  # noqa: F401
         import orchestrator.tools.files  # noqa: F401
+        import orchestrator.tools.voice_control  # noqa: F401
 
         if self._voice:
             from orchestrator.providers.openai_voice import OpenAIVoiceProvider
