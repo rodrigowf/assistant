@@ -172,24 +172,34 @@ class WakeWordDetector(
             .coerceAtLeast(3200)  // at least 100ms of audio at 16kHz 16-bit mono
 
         silenceMonitorJob = scope.launch(Dispatchers.IO) {
-            val recorder = try {
-                AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    SAMPLE_RATE,
-                    CHANNEL_CONFIG,
-                    AUDIO_FORMAT,
-                    bufferSize
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to create AudioRecord: ${e.message}")
-                return@launch
-            }
+            // Retry loop: mic may be held by AudioRecorder (turn-based recording) for a few seconds.
+            // Keep trying until the mic is free or we're no longer active.
+            var recorder: AudioRecord? = null
+            while (isActive && recorder == null) {
+                val candidate = try {
+                    AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        SAMPLE_RATE,
+                        CHANNEL_CONFIG,
+                        AUDIO_FORMAT,
+                        bufferSize
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to create AudioRecord (will retry): ${e.message}")
+                    kotlinx.coroutines.delay(500L)
+                    continue
+                }
 
-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord not initialized")
-                recorder.release()
-                return@launch
+                if (candidate.state != AudioRecord.STATE_INITIALIZED) {
+                    Log.w(TAG, "AudioRecord not initialized (mic busy, will retry)")
+                    candidate.release()
+                    kotlinx.coroutines.delay(500L)
+                    continue
+                }
+
+                recorder = candidate
             }
+            if (recorder == null || !isActive) return@launch
 
             audioRecord = recorder
             recorder.startRecording()
