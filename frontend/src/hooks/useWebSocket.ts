@@ -108,16 +108,18 @@ export function useWebSocket(
     reconnectAttemptsRef.current = 0;
     connectSocket(handler, endpoint);
 
-    // Reconnect when the page becomes visible again (mobile resume).
+    // Reconnect (or re-subscribe) when the page becomes visible again (mobile resume).
     const onVisibilityChange = () => {
-      if (
-        !document.hidden &&
-        activeRef.current &&
-        !intentionalCloseRef.current &&
-        socketRef.current?.readyState !== WebSocket.OPEN
-      ) {
-        reconnectAttemptsRef.current = 0; // reset attempts on visibility
-        connectSocket(handler, endpoint);
+      if (!document.hidden && activeRef.current && !intentionalCloseRef.current) {
+        if (socketRef.current?.readyState === WebSocket.OPEN) {
+          // Socket is still connected but may have lost its backend subscription
+          // (e.g. backend restarted or timed out the subscription while tab was hidden).
+          // Re-send the start message to re-subscribe without a full reconnect.
+          onOpenRef.current?.();
+        } else {
+          reconnectAttemptsRef.current = 0; // reset attempts on visibility
+          connectSocket(handler, endpoint);
+        }
       }
     };
     document.addEventListener("visibilitychange", onVisibilityChange);

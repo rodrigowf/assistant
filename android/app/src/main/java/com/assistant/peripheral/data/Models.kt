@@ -194,7 +194,7 @@ enum class ThemeMode {
  * App settings stored in DataStore.
  */
 data class AppSettings(
-    val serverUrl: String = "ws://192.168.0.28:8765",
+    val serverUrl: String = "ws://192.168.0.200:80",
     val autoConnect: Boolean = true,
     val enableWakeWord: Boolean = false,
     val wakeWord: String = "hey assistant, assistant",   // comma-separated, triggers turn-based voice input

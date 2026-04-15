@@ -516,21 +516,25 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   }, []);
 
   const handleOpen = useCallback(() => {
+    // Always re-send start on every (re)connect so the backend re-subscribes this
+    // WebSocket to the session. Without this, reconnects after screen-lock or
+    // tab-switch leave the socket open but not subscribed to any events.
+    const startMsg: Record<string, unknown> = {
+      type: "start",
+      local_id: localIdRef.current,
+    };
+    // Use pending mcpServers if this is an MCP restart
     const pending = pendingStartRef.current;
-    if (pending) {
-      pendingStartRef.current = null;
-      const startMsg: Record<string, unknown> = {
-        type: "start",
-        local_id: localIdRef.current,
-      };
-      if (pending.resumeSdkId) {
-        startMsg.resume_sdk_id = pending.resumeSdkId;
-      }
-      if (pending.mcpServers) {
-        startMsg.mcp_servers = pending.mcpServers;
-      }
-      wsSendRef.current?.(startMsg);
+    if (pending?.mcpServers) {
+      startMsg.mcp_servers = pending.mcpServers;
     }
+    // Always include the SDK session ID if we have one (pending overrides stable ref)
+    const sdkId = (pending?.resumeSdkId !== undefined) ? pending.resumeSdkId : resumeSdkIdRef.current;
+    if (sdkId) {
+      startMsg.resume_sdk_id = sdkId;
+    }
+    pendingStartRef.current = null;
+    wsSendRef.current?.(startMsg);
   }, []);
 
   const { send: wsSend, close: wsClose, connectionState } = useWebSocket(wsActive, handleEvent, handleOpen, wsEndpoint);
