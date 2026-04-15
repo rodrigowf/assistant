@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import legacy from '@vitejs/plugin-legacy'
 import fs from 'fs'
 import path from 'path'
 
@@ -11,12 +10,6 @@ const hasLocalCerts = fs.existsSync(path.join(certsDir, 'key.pem'))
 export default defineConfig({
   plugins: [
     react(),
-    legacy({
-      targets: ['defaults', 'safari >= 12', 'ios >= 12'],
-      modernPolyfills: true,
-      renderLegacyChunks: true,
-      additionalLegacyPolyfills: ['regenerator-runtime/runtime'],
-    }),
   ],
   base: '/',
   server: {
