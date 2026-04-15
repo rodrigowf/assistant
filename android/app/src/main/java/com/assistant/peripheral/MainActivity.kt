@@ -341,6 +341,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                     onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
                     onUpdateWakeWord = viewModel::updateWakeWord,
                     onUpdateVoiceWord = viewModel::updateVoiceWord,
+                    onUpdateEnableButtonTrigger = viewModel::updateEnableButtonTrigger,
                     onConnect = viewModel::connect,
                     onDisconnect = viewModel::disconnect,
                     onScanForServers = viewModel::scanForServers,

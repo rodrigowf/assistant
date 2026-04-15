@@ -203,5 +203,6 @@ data class AppSettings(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,        // 0.0 to 2.0, where 1.0 is normal
     val speakerVolumeLevel: Float = 1.0f,  // 0.0 to 1.5, where 1.0 is 100%
-    val useEarpiece: Boolean = false       // false = loudspeaker (default), true = earpiece
+    val useEarpiece: Boolean = false,      // false = loudspeaker (default), true = earpiece
+    val enableButtonTrigger: Boolean = false  // long-press recents button starts voice session
 )

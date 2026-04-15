@@ -36,11 +36,55 @@
             </intent-filter>
         </activity>
 
+        <!-- Assist activity: handles long-press home → starts realtime voice session -->
+        <activity
+            android:name=".VoiceShortcutActivity"
+            android:exported="true"
+            android:label="@string/voice_shortcut_label"
+            android:theme="@style/Theme.AssistantPeripheral.Transparent"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity="">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".service.AssistantService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- AccessibilityService: intercepts recents long-press to start voice session -->
+        <service
+            android:name=".service.ButtonAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service" />
+        </service>
+
+        <!-- VoiceInteractionService: makes long-press home trigger our voice session -->
+        <service
+            android:name=".service.AssistantVoiceInteractionService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.voice_interaction"
+                android:resource="@xml/voice_interaction_service" />
+        </service>
 
     </application>
 

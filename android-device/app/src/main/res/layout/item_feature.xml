@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    item_feature.xml — Reusable feature row layout template.
+
+    This file is provided as a reference template; the feature rows in
+    activity_main.xml are inlined for simplicity (no adapter/RecyclerView needed
+    for a fixed 5-item list). This template can be used if the feature list
+    grows to need dynamic population.
+
+    Views:
+      - tv_feature_name: feature title (bold, white)
+      - tv_feature_desc: one-line description (secondary text colour)
+      - switch_feature: on/off toggle (right-aligned)
+      - tv_feature_status: live status line below the row (monospace, small)
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="@color/surface"
+    android:padding="16dp">
+
+    <!-- Top row: name + switch -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <!-- Left: name + description -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/tv_feature_name"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Feature Name"
+                android:textColor="@color/text_primary"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_feature_desc"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Short description"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+        </LinearLayout>
+
+        <!-- Right: toggle -->
+        <Switch
+            android:id="@+id/switch_feature"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+
+    </LinearLayout>
+
+    <!-- Status line below: e.g. "192.168.1.100:5555" or "Running" -->
+    <TextView
+        android:id="@+id/tv_feature_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="@color/status_active"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:paddingTop="6dp" />
+
+</LinearLayout>

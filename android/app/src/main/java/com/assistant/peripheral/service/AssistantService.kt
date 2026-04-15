@@ -13,9 +13,14 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.assistant.peripheral.MainActivity
 import com.assistant.peripheral.R
 import com.assistant.peripheral.voice.WakeWordDetector
+import java.io.DataInputStream
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * Foreground service that keeps the assistant running in the background.
@@ -109,6 +114,10 @@ class AssistantService : Service() {
     private var wakeWordDetector: WakeWordDetector? = null
     private lateinit var prefs: SharedPreferences
 
+    // Recents long-press monitor (reads /dev/input/event2 directly)
+    private var recentsMonitorThread: Thread? = null
+    @Volatile private var recentsMonitorRunning = false
+
     // Set to true while a voice session is active (between pauseWakeWord and resumeWakeWord).
     // Prevents ACTION_SCREEN_ON from restarting the detector and stealing the mic from WebRTC.
     private var voiceSessionActive: Boolean = false
@@ -192,6 +201,8 @@ class AssistantService : Service() {
             addAction(Intent.ACTION_USER_PRESENT)
         }
         registerReceiver(screenReceiver, filter)
+
+        startRecentsMonitor()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -254,6 +265,7 @@ class AssistantService : Service() {
         rearmHandler.removeCallbacks(rearmRunnable)
         unregisterReceiver(screenReceiver)
         wakeWordDetector?.release()
+        stopRecentsMonitor()
         Log.d(TAG, "Service destroyed")
     }
 
@@ -268,6 +280,75 @@ class AssistantService : Service() {
         wakeWordDetector?.stop()
         wakeWordDetector = null
         Log.d(TAG, "Wake word detection stopped")
+    }
+
+    // -------------------------------------------------------------------------
+    // Recents button long-press monitor
+    // Reads /dev/input/event2 (sec_touchkey) directly. KEY_APPSWITCH (0x00fe)
+    // held for >= LONG_PRESS_MS triggers the realtime voice session.
+    // -------------------------------------------------------------------------
+
+    private fun startRecentsMonitor() {
+        stopRecentsMonitor()
+        recentsMonitorRunning = true
+        recentsMonitorThread = Thread({
+            // input_event struct: timeval (8 bytes) + type (2) + code (2) + value (4) = 16 bytes
+            val STRUCT_SIZE = 16
+            val KEY_APPSWITCH = 0x00fe.toShort()
+            val EV_KEY = 0x01.toShort()
+            val LONG_PRESS_MS = 600L
+
+            Log.d(TAG, "Recents monitor started")
+            try {
+                DataInputStream(FileInputStream("/dev/input/event2")).use { dis ->
+                    val buf = ByteArray(STRUCT_SIZE)
+                    var pressedAt = 0L
+                    while (recentsMonitorRunning) {
+                        var offset = 0
+                        while (offset < STRUCT_SIZE) {
+                            val n = dis.read(buf, offset, STRUCT_SIZE - offset)
+                            if (n < 0) { recentsMonitorRunning = false; break }
+                            offset += n
+                        }
+                        if (!recentsMonitorRunning) break
+
+                        val bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN)
+                        bb.getLong() // skip timeval (8 bytes)
+                        val type = bb.short
+                        val code = bb.short
+                        val value = bb.int  // 1=down, 0=up, 2=repeat
+
+                        if (type == EV_KEY && code == KEY_APPSWITCH) {
+                            when (value) {
+                                1 -> pressedAt = System.currentTimeMillis()
+                                0 -> {
+                                    val held = System.currentTimeMillis() - pressedAt
+                                    Log.d(TAG, "KEY_APPSWITCH released after ${held}ms")
+                                    if (pressedAt > 0 && held >= LONG_PRESS_MS) {
+                                        Log.d(TAG, "Recents long-press → starting voice session")
+                                        bringToForeground(this)
+                                        LocalBroadcastManager.getInstance(this)
+                                            .sendBroadcast(Intent(WakeWordDetector.ACTION_VOICE_WORD_DETECTED))
+                                    }
+                                    pressedAt = 0L
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Recents monitor error: ${e.message}")
+            }
+            Log.d(TAG, "Recents monitor stopped")
+        }, "recents-monitor")
+        recentsMonitorThread?.isDaemon = true
+        recentsMonitorThread?.start()
+    }
+
+    private fun stopRecentsMonitor() {
+        recentsMonitorRunning = false
+        recentsMonitorThread?.interrupt()
+        recentsMonitorThread = null
     }
 
     private fun createNotificationChannel() {

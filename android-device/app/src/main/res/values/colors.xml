@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ── Background layers ──────────────────────────────────────────────
+         background: page / window background (near-black)
+         surface:    card / row background (slightly lighter)
+    -->
+    <color name="background">#FF1A1A1A</color>
+    <color name="surface">#FF2A2A2A</color>
+
+    <!-- ── Accent ──────────────────────────────────────────────────────────
+         primary: teal — used for the app title, ADB address, and button fill
+    -->
+    <color name="primary">#FF00BCD4</color>
+
+    <!-- ── Text ───────────────────────────────────────────────────────────
+         text_primary:   body text, feature titles
+         text_secondary: descriptions, timestamps, section labels
+    -->
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#FFAAAAAA</color>
+
+    <!-- ── Status indicators ──────────────────────────────────────────────
+         status_active:   feature is running / value is good (green)
+         status_inactive: feature exists but is off or unknown (grey)
+         status_error:    permission missing / something failed (red)
+    -->
+    <color name="status_active">#FF4CAF50</color>
+    <color name="status_inactive">#FF666666</color>
+    <color name="status_error">#FFF44336</color>
+</resources>

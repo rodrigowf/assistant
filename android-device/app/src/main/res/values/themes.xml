@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Theme.AssistantDevice
+        ─────────────────────
+        Parent: Theme.Material — the native Material Design theme introduced in
+        Android 5.0 (API 21). We use this rather than Theme.AppCompat.* to avoid
+        the AppCompat dependency entirely. The Samsung Galaxy A300M runs Android
+        5.0.2, so Theme.Material is always available.
+
+        Key overrides:
+          colorPrimary        → teal (#00bcd4) — action bar, button fill
+          colorPrimaryDark    → darker teal — status bar colour
+          colorAccent         → teal — Switch track, active state
+          android:background  → near-black (#1a1a1a)
+          android:windowBackground → same near-black
+
+        Note: Theme.Material gives us Material Design widgets (Switch, Button,
+        etc.) without requiring any external libraries.
+    -->
+    <style name="Theme.AssistantDevice" parent="@android:style/Theme.Material">
+        <!-- Primary brand colour: action bar background and primary tint -->
+        <item name="android:colorPrimary">@color/primary</item>
+
+        <!-- Darker shade used for the status bar on API 21+ -->
+        <item name="android:colorPrimaryDark">#FF0097A7</item>
+
+        <!-- Accent: controls Switch, CheckBox, and other active-state tints -->
+        <item name="android:colorAccent">@color/primary</item>
+
+        <!-- Window and default view background colour -->
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:background">@color/background</item>
+
+        <!-- Text colours for the default theme -->
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+
+        <!-- Navigation and status bar: keep them dark for the dark theme -->
+        <item name="android:navigationBarColor">@color/background</item>
+        <item name="android:statusBarColor">@color/background</item>
+
+        <!-- Action bar: use surface colour so it blends with the dark background -->
+        <item name="android:actionBarStyle">@style/ActionBar.AssistantDevice</item>
+    </style>
+
+    <!--
+        ActionBar.AssistantDevice
+        ─────────────────────────
+        Overrides the action bar background to use the surface colour (#2a2a2a)
+        rather than the primary teal, keeping the app feeling minimal.
+    -->
+    <style name="ActionBar.AssistantDevice" parent="@android:style/Widget.Material.ActionBar">
+        <item name="android:background">@color/surface</item>
+        <item name="android:titleTextStyle">@style/ActionBarTitle.AssistantDevice</item>
+    </style>
+
+    <style name="ActionBarTitle.AssistantDevice" parent="@android:style/TextAppearance.Material.Widget.ActionBar.Title">
+        <item name="android:textColor">@color/primary</item>
+    </style>
+</resources>

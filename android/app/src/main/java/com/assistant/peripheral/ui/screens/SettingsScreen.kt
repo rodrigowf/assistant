@@ -36,6 +36,7 @@ fun SettingsScreen(
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
     onUpdateVoiceWord: (String) -> Unit,
+    onUpdateEnableButtonTrigger: (Boolean) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onScanForServers: () -> Unit,
@@ -601,6 +602,35 @@ fun SettingsScreen(
                             text = "Each phrase also matches common mishearings automatically",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Divider()
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Recents button long-press trigger
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Recents Button Trigger",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = "Long-press recents button to start voice session (screen must be on)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = settings.enableButtonTrigger,
+                            onCheckedChange = onUpdateEnableButtonTrigger
                         )
                     }
                 }

@@ -53,3 +53,11 @@ android/build/
 android/local.properties
 android/**/*.apk
 android/**/*.aab
+
+# Android Device companion app
+android-device/.gradle/
+android-device/app/build/
+android-device/build/
+android-device/local.properties
+android-device/**/*.apk
+android-device/**/*.aab

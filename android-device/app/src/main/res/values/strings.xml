@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App identity -->
+    <string name="app_name">AssistantDevice</string>
+    <string name="subtitle">Samsung Galaxy A300M — Terminal Configuration</string>
+
+    <!-- Setup warning banner -->
+    <string name="warning_title">Setup required: WRITE_SECURE_SETTINGS not granted</string>
+    <string name="warning_body">Run once via USB (survives updates, not reinstalls):\nadb shell pm grant com.assistant.device android.permission.WRITE_SECURE_SETTINGS</string>
+
+    <!-- Section headers -->
+    <string name="section_features">Boot configuration features</string>
+
+    <!-- Feature: WiFi ADB -->
+    <string name="feature_wifi_adb">WiFi ADB</string>
+    <string name="feature_wifi_adb_desc">Re-enable TCP ADB on port 5555 after every boot</string>
+
+    <!-- Feature: Auto-launch -->
+    <string name="feature_auto_launch">Auto-launch Assistant</string>
+    <string name="feature_auto_launch_desc">Start com.assistant.peripheral 3 s after boot</string>
+
+    <!-- Feature: CPU Governor -->
+    <string name="feature_cpu_governor">Performance CPU Governor</string>
+    <string name="feature_cpu_governor_desc">Set Snapdragon 410 cores to max frequency (root required to write)</string>
+
+    <!-- Feature: DND -->
+    <string name="feature_dnd">Do Not Disturb</string>
+    <string name="feature_dnd_desc">Total silence — suppress all notifications and alerts</string>
+
+    <!-- Feature: Watchdog -->
+    <string name="feature_watchdog">App Watchdog</string>
+    <string name="feature_watchdog_desc">Foreground service: revive assistant app if it dies (every 30 s)</string>
+
+    <!-- Action buttons -->
+    <string name="btn_apply_all">Apply All Features Now</string>
+    <string name="btn_set_home">Set Assistant as Home App…</string>
+</resources>

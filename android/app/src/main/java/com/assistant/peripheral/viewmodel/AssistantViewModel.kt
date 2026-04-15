@@ -160,6 +160,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
         val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
         val USE_EARPIECE = booleanPreferencesKey("use_earpiece")
+        val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
     }
 
     init {
@@ -184,8 +185,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     },
                     micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
                     speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
-                    useEarpiece = preferences[PreferenceKeys.USE_EARPIECE] ?: false
+                    useEarpiece = preferences[PreferenceKeys.USE_EARPIECE] ?: false,
+                    enableButtonTrigger = preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] ?: false
                 )
+                // Sync button trigger setting to SharedPreferences so ButtonAccessibilityService can read it
+                getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
+                    .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
                 // Update API client when server URL changes
                 apiClient = ApiClient(_settings.value.serverUrl)
                 // Update VoiceManager with new API client
@@ -973,6 +978,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             val newVolume = (clamped * maxVolume).toInt().coerceIn(0, maxVolume)
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
+        }
+    }
+
+    fun updateEnableButtonTrigger(enabled: Boolean) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] = enabled
+            }
+            // Write to shared prefs so ButtonAccessibilityService can read it without a Context ref
+            getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
+                .edit().putBoolean("button_trigger_enabled", enabled).apply()
         }
     }
 

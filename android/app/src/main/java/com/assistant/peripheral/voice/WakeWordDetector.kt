@@ -437,27 +437,36 @@ class WakeWordDetector(
     // Helpers
     // -------------------------------------------------------------------------
 
+    @Suppress("DEPRECATION")
     private fun muteBeep() {
-        // Only mute on API 23+ (Marshmallow) where ADJUST_MUTE is available and safe.
-        // On pre-M (Lollipop and below), setStreamVolume(stream, 0) is NOT used because
-        // if the service dies or restarts the saved volumes are lost, leaving streams
-        // permanently muted. The SpeechRecognizer beep is minor on Lollipop devices
-        // compared to the risk of corrupting the user's volume settings.
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         try {
-            for (stream in BEEP_STREAMS) {
-                audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                // API 23+: ADJUST_MUTE is reference-counted and safe
+                for (stream in BEEP_STREAMS) {
+                    audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0)
+                }
+            } else {
+                // API 21-22 (Lollipop): setStreamMute is reference-counted (safe — unmute reverses it)
+                for (stream in BEEP_STREAMS) {
+                    audioManager.setStreamMute(stream, true)
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to mute beep streams: ${e.message}")
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun unmuteBeep() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         try {
-            for (stream in BEEP_STREAMS) {
-                audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                for (stream in BEEP_STREAMS) {
+                    audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
+                }
+            } else {
+                for (stream in BEEP_STREAMS) {
+                    audioManager.setStreamMute(stream, false)
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to unmute beep streams: ${e.message}")

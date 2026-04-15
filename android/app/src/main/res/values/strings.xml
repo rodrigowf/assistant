@@ -8,6 +8,8 @@
     <string name="notification_channel_description">Keeps the assistant running in background</string>
     <string name="notification_title">Assistant Active</string>
     <string name="notification_text">Listening for commands</string>
+    <string name="voice_shortcut_label">Voice</string>
+    <string name="accessibility_service_description">Allows long-pressing the recents button to start a voice session</string>
     <string name="send_message">Send message</string>
     <string name="type_message">Type a message...</string>
     <string name="record_audio">Record audio</string>
