@@ -511,7 +511,20 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             is WebSocketEvent.VoiceStopped -> {
-                // AI-initiated clean end (end_voice_session tool) — mirror web frontend behaviour
+                // AI-initiated clean end (end_voice_session tool) — mirror web frontend behaviour.
+                // Finalize any in-progress streaming message (TurnComplete never arrives in voice mode).
+                streamingMessageId?.let { messageId ->
+                    _messages.update { messages ->
+                        messages.map { msg ->
+                            if (msg.id == messageId) msg.copy(isStreaming = false) else msg
+                        }
+                    }
+                }
+                streamingMessageId = null
+                _streamingContent.value = ""
+                currentThinkingContent = ""
+                currentToolBlocks.clear()
+                _sessionStatus.value = "idle"
                 stopVoiceSession()
             }
 
