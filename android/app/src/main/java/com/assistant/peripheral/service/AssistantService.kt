@@ -24,6 +24,8 @@ class AssistantService : Service() {
         private const val EXTRA_ENABLE_WAKE_WORD = "enable_wake_word"
         private const val EXTRA_WAKE_WORD = "wake_word"
         private const val EXTRA_VOICE_WORD = "voice_word"
+        private const val EXTRA_PAUSE_WAKE_WORD = "pause_wake_word"
+        private const val EXTRA_RESUME_WAKE_WORD = "resume_wake_word"
 
         fun start(context: Context) {
             val intent = Intent(context, AssistantService::class.java)
@@ -37,6 +39,22 @@ class AssistantService : Service() {
         fun stop(context: Context) {
             val intent = Intent(context, AssistantService::class.java)
             context.stopService(intent)
+        }
+
+        fun pauseWakeWord(context: Context) {
+            val intent = Intent(context, AssistantService::class.java).apply {
+                putExtra(EXTRA_PAUSE_WAKE_WORD, true)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
+        }
+
+        fun resumeWakeWord(context: Context) {
+            val intent = Intent(context, AssistantService::class.java).apply {
+                putExtra(EXTRA_RESUME_WAKE_WORD, true)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
         }
 
         fun updateWakeWord(context: Context, enabled: Boolean, wakeWord: String, voiceWord: String = "") {
@@ -65,12 +83,17 @@ class AssistantService : Service() {
         Log.d(TAG, "Service started")
         startForeground(NOTIFICATION_ID, createNotification())
 
-        // Handle wake word enable/disable
-        intent?.let {
-            if (it.hasExtra(EXTRA_ENABLE_WAKE_WORD)) {
-                val enableWakeWord = it.getBooleanExtra(EXTRA_ENABLE_WAKE_WORD, false)
-                val wakeWord = it.getStringExtra(EXTRA_WAKE_WORD) ?: "hey assistant"
-                val voiceWord = it.getStringExtra(EXTRA_VOICE_WORD) ?: ""
+        if (intent != null) {
+            if (intent.getBooleanExtra(EXTRA_PAUSE_WAKE_WORD, false)) {
+                Log.d(TAG, "Pausing wake word detection for voice session")
+                wakeWordDetector?.pause()
+            } else if (intent.getBooleanExtra(EXTRA_RESUME_WAKE_WORD, false)) {
+                Log.d(TAG, "Resuming wake word detection after voice session")
+                wakeWordDetector?.resume()
+            } else if (intent.hasExtra(EXTRA_ENABLE_WAKE_WORD)) {
+                val enableWakeWord = intent.getBooleanExtra(EXTRA_ENABLE_WAKE_WORD, false)
+                val wakeWord = intent.getStringExtra(EXTRA_WAKE_WORD) ?: "hey assistant"
+                val voiceWord = intent.getStringExtra(EXTRA_VOICE_WORD) ?: ""
                 if (enableWakeWord) {
                     startWakeWord(wakeWord, voiceWord)
                 } else {

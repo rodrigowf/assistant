@@ -798,6 +798,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
 
+        // Pause wake word detection while voice session is active — the mic is owned
+        // by WebRTC and we don't want keywords triggering extra recordings or new sessions.
+        AssistantService.pauseWakeWord(getApplication())
+
         viewModelScope.launch {
             // Send voice_start to backend — passes local_id AND the true JSONL session id
             // so the orchestrator resumes from the correct history file.
@@ -817,6 +821,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off
             _isMuted.value = false
+            // Re-arm wake word detection now that the mic is free
+            AssistantService.resumeWakeWord(getApplication())
         }
     }
 

@@ -97,6 +97,7 @@ class WakeWordDetector(
     }
 
     private var isActive = false
+    private var isPaused = false
     private var isRecognizing = false
     private var consecutiveMisses = 0  // exponential backoff counter
 
@@ -139,11 +140,42 @@ class WakeWordDetector(
         Log.d(TAG, "Starting — wake variants: $wakeVariants")
         if (voiceVariants.isNotEmpty()) Log.d(TAG, "Voice variants: $voiceVariants")
         isActive = true
+        isPaused = false
+        startSilenceMonitor()
+    }
+
+    /**
+     * Temporarily suspend detection without fully stopping. Call resume() to re-arm.
+     * Safe to call from any thread.
+     */
+    fun pause() {
+        if (!isActive || isPaused) return
+        Log.d(TAG, "Pausing wake word detection")
+        isPaused = true
+        // Stop mic + recognizer so they don't compete with voice session
+        silenceMonitorJob?.cancel()
+        silenceMonitorJob = null
+        stopAudioRecord()
+        if (isRecognizing) {
+            isRecognizing = false
+            scope.launch { destroyRecognizer(); unmuteBeep() }
+        }
+    }
+
+    /**
+     * Resume after pause(). Re-arms the silence monitor.
+     */
+    fun resume() {
+        if (!isActive || !isPaused) return
+        Log.d(TAG, "Resuming wake word detection")
+        isPaused = false
+        consecutiveMisses = 0
         startSilenceMonitor()
     }
 
     fun stop() {
         isActive = false
+        isPaused = false
         isRecognizing = false
         consecutiveMisses = 0
         try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
@@ -165,7 +197,7 @@ class WakeWordDetector(
     // -------------------------------------------------------------------------
 
     private fun startSilenceMonitor() {
-        if (!isActive) return
+        if (!isActive || isPaused) return
         stopAudioRecord()
 
         val bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
@@ -351,7 +383,8 @@ class WakeWordDetector(
     private fun finishRecognition(wakeWordDetected: Boolean, delay: Long = -1L) {
         isRecognizing = false
         destroyRecognizer()
-        try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
+        // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership
+        if (!wakeWordDetected) try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
         unmuteBeep()
         val restartDelay = when {
             delay >= 0 -> delay
@@ -370,7 +403,7 @@ class WakeWordDetector(
         }
         scope.launch {
             delay(restartDelay)
-            if (isActive) startSilenceMonitor()
+            if (isActive && !isPaused) startSilenceMonitor()
         }
     }
 

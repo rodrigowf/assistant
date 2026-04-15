@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
@@ -49,6 +50,9 @@ class VoiceManager(
         private const val OPENAI_REALTIME_URL = "https://api.openai.com/v1/realtime"
         private const val VOICE_MODEL = "gpt-realtime"
         private const val CONNECTION_TIMEOUT_MS = 15_000L
+
+        // PeerConnectionFactory.initialize() is process-wide — must only be called once.
+        @Volatile private var peerConnectionFactoryInitialized = false
     }
 
     private var peerConnection: PeerConnection? = null
@@ -60,6 +64,10 @@ class VoiceManager(
 
     // Microphone gain (0.0 to 2.0, default 1.0)
     private var micGainLevel: Float = 1.0f
+
+    // Gain saved before agent speech — restored when speech ends or user interrupts
+    private var gainBeforeSpeaking: Float? = null
+    private var micRestoreJob: kotlinx.coroutines.Job? = null
 
     // Audio effects for echo cancellation
     private var acousticEchoCanceler: AcousticEchoCanceler? = null
@@ -201,22 +209,35 @@ class VoiceManager(
         WebRtcAudioUtils.setWebRtcBasedAutomaticGainControl(true)
         Log.d(TAG, ">>> Enabled WebRTC SOFTWARE AEC, NS, and AGC")
 
-        // Initialize PeerConnectionFactory
-        val initOptions = PeerConnectionFactory.InitializationOptions.builder(context)
-            .setEnableInternalTracer(false)
-            .createInitializationOptions()
-        PeerConnectionFactory.initialize(initOptions)
+        // Initialize PeerConnectionFactory (process-wide singleton — only initialize once)
+        if (!peerConnectionFactoryInitialized) {
+            val initOptions = PeerConnectionFactory.InitializationOptions.builder(context)
+                .setEnableInternalTracer(false)
+                .createInitializationOptions()
+            PeerConnectionFactory.initialize(initOptions)
+            peerConnectionFactoryInitialized = true
+        }
 
         // Disable hardware AEC - only use software
         val hwAecAvailable = AcousticEchoCanceler.isAvailable()
         val hwNsAvailable = NoiseSuppressor.isAvailable()
         Log.d(TAG, "Hardware AEC available: $hwAecAvailable (DISABLED), NS available: $hwNsAvailable (DISABLED)")
 
+        // Use VOICE_RECOGNITION on Lollipop (API < 24): Samsung's HAL routes VOICE_COMMUNICATION
+        // through aggressive noise processing that silences audio when MODE_NORMAL is active.
+        // VOICE_RECOGNITION bypasses that processing pipeline and reliably captures mic audio.
+        val micAudioSource = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N)
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        else
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+
         val audioDeviceModule = JavaAudioDeviceModule.builder(context)
             .setUseHardwareAcousticEchoCanceler(false)  // Disabled - can interfere with software AEC
             .setUseHardwareNoiseSuppressor(false)       // Disabled - using software instead
             .setAudioRecordDataCallback(audioRecordDataCallback)  // Apply mic gain before WebRTC
+            .setAudioSource(micAudioSource)
             .createAudioDeviceModule()
+        Log.d(TAG, "Audio source: ${if (micAudioSource == MediaRecorder.AudioSource.VOICE_RECOGNITION) "VOICE_RECOGNITION" else "VOICE_COMMUNICATION"}")
 
         Log.d(TAG, ">>> Using SOFTWARE-ONLY AEC (hardware disabled)")
 
@@ -266,7 +287,6 @@ class VoiceManager(
                 // Web frontend: pc.onconnectionstatechange
                 when (state) {
                     PeerConnection.IceConnectionState.CONNECTED -> {
-                        // Connection established, but wait for data channel open
                         Log.d(TAG, "ICE connected")
                     }
                     PeerConnection.IceConnectionState.DISCONNECTED -> {
@@ -452,9 +472,11 @@ class VoiceManager(
             when (eventType) {
                 "response.created" -> {
                     _state.value = VoiceState.Speaking
+                    duckMicForAgentSpeech()
                 }
                 "response.done" -> {
                     _state.value = VoiceState.Active
+                    restoreMicAfterAgentSpeech()
                     _events.tryEmit(VoiceEvent.TurnComplete)
                 }
                 "response.output_item.added" -> {
@@ -477,6 +499,7 @@ class VoiceManager(
                 }
                 "input_audio_buffer.speech_started" -> {
                     _state.value = VoiceState.Active
+                    restoreMicImmediately()  // User interrupted — restore mic immediately
                     _events.tryEmit(VoiceEvent.SpeechStarted)
                 }
                 "input_audio_buffer.speech_stopped" -> {
@@ -506,10 +529,12 @@ class VoiceManager(
                     if (_state.value != VoiceState.Speaking) {
                         _state.value = VoiceState.Speaking
                     }
+                    duckMicForAgentSpeech()
                 }
                 "output_audio_buffer.cleared", "response.audio.done" -> {
                     // Audio finished or cleared
                     _state.value = VoiceState.Active
+                    restoreMicAfterAgentSpeech()
                 }
             }
 
@@ -649,6 +674,49 @@ class VoiceManager(
     fun isMuted(): Boolean = !(localAudioTrack?.enabled() ?: true)
 
     /**
+     * Duck mic to 2% while agent is speaking to prevent echo/self-interruption.
+     * Saves the current gain so it can be restored when speaking ends.
+     * No-op if mic is already ducked.
+     */
+    private fun duckMicForAgentSpeech() {
+        if (gainBeforeSpeaking == null) {
+            gainBeforeSpeaking = micGainLevel
+            micGainLevel = 0.02f
+            Log.d(TAG, "Agent speaking — mic ducked from $gainBeforeSpeaking to 0.02")
+        }
+    }
+
+    /**
+     * Restore mic gain after agent speech ends — with a 1s delay so any speaker
+     * echo has time to die out before the mic opens up again.
+     */
+    private fun restoreMicAfterAgentSpeech(delayMs: Long = 1000L) {
+        if (gainBeforeSpeaking == null) return
+        micRestoreJob?.cancel()
+        micRestoreJob = scope.launch {
+            delay(delayMs)
+            gainBeforeSpeaking?.let { saved ->
+                micGainLevel = saved
+                gainBeforeSpeaking = null
+                Log.d(TAG, "Agent done — mic restored to $micGainLevel (after ${delayMs}ms delay)")
+            }
+        }
+    }
+
+    /**
+     * Restore mic gain immediately (user interrupted — we want the interruption heard).
+     */
+    private fun restoreMicImmediately() {
+        micRestoreJob?.cancel()
+        micRestoreJob = null
+        gainBeforeSpeaking?.let { saved ->
+            micGainLevel = saved
+            gainBeforeSpeaking = null
+            Log.d(TAG, "User interrupted — mic restored to $micGainLevel immediately")
+        }
+    }
+
+    /**
      * Set microphone gain level.
      * @param gain Gain level from 0.0 (silent) to 2.0 (double volume). Default is 1.0.
      */
@@ -715,6 +783,12 @@ class VoiceManager(
 
     private fun cleanup() {
         Log.d(TAG, "Cleaning up voice resources")
+
+        // Restore mic gain if session ends while agent was speaking
+        micRestoreJob?.cancel()
+        micRestoreJob = null
+        gainBeforeSpeaking?.let { micGainLevel = it }
+        gainBeforeSpeaking = null
 
         dcReady = false
         pendingCommands.clear()

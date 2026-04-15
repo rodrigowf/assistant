@@ -461,8 +461,25 @@ class OrchestratorSession:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-        async for event in self._run_agent(audio_message):
-            yield event
+        # If the session is in voice (WebRTC) mode, the agent's provider is
+        # OpenAIVoiceProvider which waits on a WebRTC event queue — sending audio
+        # clips through it would time out. Temporarily swap in an audio-capable
+        # text provider for this turn only.
+        if self._voice:
+            audio_provider = OpenAITextProvider(
+                model=self._config.model,
+                max_tokens=self._config.max_tokens,
+            )
+            saved_provider = self._agent._provider
+            self._agent._provider = audio_provider
+            try:
+                async for event in self._run_agent(audio_message):
+                    yield event
+            finally:
+                self._agent._provider = saved_provider
+        else:
+            async for event in self._run_agent(audio_message):
+                yield event
 
     async def _run_agent(
         self,
