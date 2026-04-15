@@ -2,6 +2,7 @@ package com.assistant.peripheral.viewmodel
 
 import android.app.Application
 import android.content.Context
+import android.media.AudioManager
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
@@ -11,8 +12,11 @@ import android.util.Log
 import com.assistant.peripheral.audio.AudioRecorder
 import com.assistant.peripheral.data.*
 import com.assistant.peripheral.network.ApiClient
+import com.assistant.peripheral.network.DiscoveredServer
+import com.assistant.peripheral.network.NetworkScanner
 import com.assistant.peripheral.network.WebSocketEndpoint
 import com.assistant.peripheral.network.WebSocketManager
+import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
 import com.assistant.peripheral.voice.VoiceManager
 import kotlinx.coroutines.flow.*
@@ -87,6 +91,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _isLoadingMoreMessages = MutableStateFlow(false)
     val isLoadingMoreMessages: StateFlow<Boolean> = _isLoadingMoreMessages.asStateFlow()
 
+    // Tracks the sdk session id we're reconnecting to, so SessionStarted can load history
+    private val _pendingResumeSessionId = MutableStateFlow<String?>(null)
+
+    // The true JSONL/SDK session ID (distinct from local_id on reconnect).
+    // Used as resume_sdk_id when starting voice so history is always found.
+    private var _jsonlSessionId: String? = null
+
     // Streaming message being built
     private var streamingMessageId: String? = null
     private val _streamingContent = MutableStateFlow("")
@@ -131,13 +142,23 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _settings = MutableStateFlow(AppSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
+    // Network scan
+    private val _discoveredServers = MutableStateFlow<List<DiscoveredServer>>(emptyList())
+    val discoveredServers: StateFlow<List<DiscoveredServer>> = _discoveredServers.asStateFlow()
+
+    private val _isScanning = MutableStateFlow(false)
+    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+
     // Preference keys
     private object PreferenceKeys {
         val SERVER_URL = stringPreferencesKey("server_url")
         val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
         val ENABLE_WAKE_WORD = booleanPreferencesKey("enable_wake_word")
         val WAKE_WORD = stringPreferencesKey("wake_word")
+        val VOICE_WORD = stringPreferencesKey("voice_word")
         val THEME_MODE = stringPreferencesKey("theme_mode")
+        val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
+        val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
     }
 
     init {
@@ -149,17 +170,23 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: true,
                     enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: false,
                     wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: "hey assistant",
+                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: "hey realtime",
                     themeMode = try {
                         ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
                     } catch (e: Exception) {
                         ThemeMode.SYSTEM
-                    }
+                    },
+                    micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
+                    speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f
                 )
                 // Update API client when server URL changes
                 apiClient = ApiClient(_settings.value.serverUrl)
                 // Update VoiceManager with new API client
                 voiceManager?.release()
-                voiceManager = VoiceManager(getApplication(), apiClient!!)
+                voiceManager = VoiceManager(getApplication(), apiClient!!).also {
+                    // Apply saved mic gain level
+                    it.setMicGain(_settings.value.micGainLevel)
+                }
                 setupVoiceManagerCallbacks()
             }
         }
@@ -262,19 +289,23 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private fun handleWebSocketEvent(event: WebSocketEvent) {
         when (event) {
             is WebSocketEvent.Connected -> {
-                // Check for existing orchestrator and connect to it, or start a new one
+                // Check for existing orchestrator and reconnect to it, or start a new one
                 viewModelScope.launch {
                     val livePool = apiClient?.getLivePool() ?: emptyList()
                     val existingOrchestrator = livePool.find { it.isOrchestrator }
 
                     if (existingOrchestrator != null) {
-                        // Connect to existing orchestrator using its local_id
+                        // Reuse the existing orchestrator's local_id so the backend
+                        // recognises this as a reconnect (not a new/conflicting session)
                         _currentLocalId.value = existingOrchestrator.localId
+                        // Also track the sdk session id so we can load history
+                        _pendingResumeSessionId.value = existingOrchestrator.sdkSessionId
                         webSocketManager.send(WebSocketMessage.Start(
-                            localId = existingOrchestrator.localId
+                            localId = existingOrchestrator.localId,
+                            resumeSdkId = existingOrchestrator.sdkSessionId
                         ))
                     } else {
-                        // No orchestrator exists, start a new one
+                        _pendingResumeSessionId.value = null
                         webSocketManager.send(WebSocketMessage.Start(
                             localId = _currentLocalId.value
                         ))
@@ -285,8 +316,35 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             is WebSocketEvent.SessionStarted -> {
                 _currentSessionId.value = event.sessionId
                 _sessionStatus.value = "idle"
-                _isOrchestratorSession.value = event.voice || true // Orchestrator sessions only via this endpoint
-                // Refresh sessions list
+                _isOrchestratorSession.value = true // Orchestrator sessions only via this endpoint
+
+                // Track the true JSONL session ID for voice resume.
+                // On reconnect the backend returns local_id as session_id — use
+                // pendingResumeSessionId (the actual SDK/JSONL id) instead.
+                _jsonlSessionId = _pendingResumeSessionId.value ?: event.sessionId
+
+                // If this is a voice session, forward the session.update payload to OpenAI
+                // This sends the system prompt + tool definitions so the voice session
+                // has full context (matches web frontend's useVoiceOrchestrator)
+                event.voiceSessionUpdate?.let { update ->
+                    voiceManager?.handleBackendCommand(update)
+                }
+
+                // Load existing messages if reconnecting to an existing session
+                val resumeId = _pendingResumeSessionId.value
+                if (resumeId != null && _messages.value.isEmpty()) {
+                    viewModelScope.launch {
+                        val paginated = apiClient?.getMessagesPaginated(resumeId, limit = 50)
+                            ?: com.assistant.peripheral.network.PaginatedMessages(emptyList(), 0, false, 0)
+                        if (paginated.messages.isNotEmpty()) {
+                            currentSessionIdForPagination = resumeId
+                            paginationStartIndex = paginated.startIndex
+                            _hasMoreMessages.value = paginated.hasMore
+                            _messages.value = paginated.messages
+                        }
+                    }
+                }
+                _pendingResumeSessionId.value = null
                 refreshSessions()
             }
 
@@ -741,8 +799,14 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         viewModelScope.launch {
-            // First send voice_start to backend to initialize voice mode
-            webSocketManager.send(WebSocketMessage.VoiceStart(localId = _currentLocalId.value))
+            // Send voice_start to backend — passes local_id AND the true JSONL session id
+            // so the orchestrator resumes from the correct history file.
+            // NOTE: _currentSessionId may be local_id on reconnect; _jsonlSessionId is always
+            // the real SDK/JSONL id (matches web frontend's resumeSdkId behaviour).
+            webSocketManager.send(WebSocketMessage.VoiceStart(
+                localId = _currentLocalId.value,
+                resumeSdkId = _jsonlSessionId ?: _currentSessionId.value
+            ))
             // Then start the actual WebRTC connection
             vm.start()
         }
@@ -759,6 +823,34 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun toggleMute() {
         val newMuteState = voiceManager?.toggleMute() ?: !_isMuted.value
         _isMuted.value = newMuteState
+    }
+
+    // Network discovery
+    fun scanForServers() {
+        if (_isScanning.value) return
+        viewModelScope.launch {
+            _isScanning.value = true
+            _discoveredServers.value = emptyList()
+            try {
+                val servers = NetworkScanner.scan(getApplication())
+                _discoveredServers.value = servers
+                // Auto-connect to first discovered server if not already connected
+                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected) {
+                    connectToDiscoveredServer(servers.first())
+                }
+            } finally {
+                _isScanning.value = false
+            }
+        }
+    }
+
+    fun connectToDiscoveredServer(server: DiscoveredServer) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.SERVER_URL] = server.wsUrl
+            }
+            // connect() will be triggered by settings update via DataStore flow
+        }
     }
 
     // Settings
@@ -782,6 +874,64 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.AUTO_CONNECT] = enabled
+            }
+        }
+    }
+
+    fun updateMicGainLevel(level: Float) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 2.0f)
+            }
+            // Apply gain to active voice session
+            voiceManager?.setMicGain(level)
+        }
+    }
+
+    fun updateSpeakerVolumeLevel(level: Float) {
+        viewModelScope.launch {
+            val clamped = level.coerceIn(0.0f, 1.5f)
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] = clamped
+            }
+            // Apply to system audio
+            val audioManager = getApplication<Application>().getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val newVolume = (clamped * maxVolume).toInt().coerceIn(0, maxVolume)
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
+        }
+    }
+
+    fun updateEnableWakeWord(enabled: Boolean) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.ENABLE_WAKE_WORD] = enabled
+            }
+            val s = _settings.value
+            AssistantService.updateWakeWord(getApplication(), enabled, s.wakeWord, s.voiceWord)
+        }
+    }
+
+    fun updateWakeWord(word: String) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.WAKE_WORD] = word
+            }
+            val s = _settings.value
+            if (s.enableWakeWord) {
+                AssistantService.updateWakeWord(getApplication(), true, word, s.voiceWord)
+            }
+        }
+    }
+
+    fun updateVoiceWord(word: String) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.VOICE_WORD] = word
+            }
+            val s = _settings.value
+            if (s.enableWakeWord) {
+                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, word)
             }
         }
     }

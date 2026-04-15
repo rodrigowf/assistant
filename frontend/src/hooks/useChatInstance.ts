@@ -9,7 +9,7 @@ import type {
   ConnectionState,
 } from "../types";
 import { useWebSocket } from "./useWebSocket";
-import { getSession } from "../api/rest";
+import { getMessagesPaginated } from "../api/rest";
 
 // -------------------------------------------------------------------
 // State
@@ -45,6 +45,7 @@ const INITIAL_STATE: ChatState = {
 type Action =
   | { type: "RESET" }
   | { type: "LOAD_HISTORY"; messages: MessagePreview[] }
+  | { type: "PREPEND_HISTORY"; messages: MessagePreview[] }
   | { type: "SESSION_STARTED"; sessionId: string }
   | { type: "USER_MESSAGE"; text: string }
   | { type: "TEXT_DELTA"; text: string }
@@ -86,69 +87,73 @@ function updateLastAssistantBlock(
   return [...msgs.slice(0, -1), last];
 }
 
+function convertPreviews(previews: MessagePreview[]): ChatMessage[] {
+  const toolResults = new Map<string, { output: string; isError: boolean }>();
+  for (const m of previews) {
+    for (const b of m.blocks) {
+      if (b.type === "tool_result" && b.tool_use_id) {
+        toolResults.set(b.tool_use_id, {
+          output: b.output || "",
+          isError: b.is_error || false,
+        });
+      }
+    }
+  }
+
+  const messages: ChatMessage[] = [];
+  for (const m of previews) {
+    const hasNonToolResult = m.blocks.some(b => b.type !== "tool_result");
+    if (m.role === "user" && !hasNonToolResult && m.blocks.length > 0) {
+      continue;
+    }
+
+    const blocks: MessageBlock[] = [];
+    for (const b of m.blocks) {
+      if (b.type === "text") {
+        if (b.text) {
+          blocks.push({ type: "text", content: b.text, streaming: false });
+        }
+      } else if (b.type === "tool_use") {
+        const result = b.tool_use_id ? toolResults.get(b.tool_use_id) : undefined;
+        const resultOutput = result?.output ?? b.output ?? undefined;
+        const resultIsError = result?.isError ?? false;
+        blocks.push({
+          type: "tool_use",
+          toolUseId: b.tool_use_id || "",
+          toolName: b.tool_name || "",
+          toolInput: (b.tool_input as Record<string, unknown>) || {},
+          result: resultOutput,
+          isError: resultIsError,
+          complete: true,
+        });
+      }
+    }
+
+    if (blocks.length === 0 && m.text) {
+      blocks.push({ type: "text", content: m.text, streaming: false });
+    }
+
+    if (blocks.length > 0) {
+      messages.push({
+        id: nextId(),
+        role: m.role as "user" | "assistant",
+        blocks,
+      });
+    }
+  }
+  return messages;
+}
+
 function reducer(state: ChatState, action: Action): ChatState {
   switch (action.type) {
     case "RESET":
       return INITIAL_STATE;
 
-    case "LOAD_HISTORY": {
-      const toolResults = new Map<string, { output: string; isError: boolean }>();
-      for (const m of action.messages) {
-        for (const b of m.blocks) {
-          if (b.type === "tool_result" && b.tool_use_id) {
-            toolResults.set(b.tool_use_id, {
-              output: b.output || "",
-              isError: b.is_error || false,
-            });
-          }
-        }
-      }
+    case "LOAD_HISTORY":
+      return { ...state, messages: convertPreviews(action.messages) };
 
-      const messages: ChatMessage[] = [];
-      for (const m of action.messages) {
-        const hasNonToolResult = m.blocks.some(b => b.type !== "tool_result");
-        if (m.role === "user" && !hasNonToolResult && m.blocks.length > 0) {
-          continue;
-        }
-
-        const blocks: MessageBlock[] = [];
-        for (const b of m.blocks) {
-          if (b.type === "text") {
-            if (b.text) {
-              blocks.push({ type: "text", content: b.text, streaming: false });
-            }
-          } else if (b.type === "tool_use") {
-            const result = b.tool_use_id ? toolResults.get(b.tool_use_id) : undefined;
-            // result may come from a separate tool_result block (SDK format)
-            // or directly on the tool_use block's output field (orchestrator format)
-            const resultOutput = result?.output ?? b.output ?? undefined;
-            const resultIsError = result?.isError ?? false;
-            blocks.push({
-              type: "tool_use",
-              toolUseId: b.tool_use_id || "",
-              toolName: b.tool_name || "",
-              toolInput: (b.tool_input as Record<string, unknown>) || {},
-              result: resultOutput,
-              isError: resultIsError,
-              complete: true,
-            });
-          }
-        }
-
-        if (blocks.length === 0 && m.text) {
-          blocks.push({ type: "text", content: m.text, streaming: false });
-        }
-
-        if (blocks.length > 0) {
-          messages.push({
-            id: nextId(),
-            role: m.role as "user" | "assistant",
-            blocks,
-          });
-        }
-      }
-      return { ...state, messages };
-    }
+    case "PREPEND_HISTORY":
+      return { ...state, messages: [...convertPreviews(action.messages), ...state.messages] };
 
     case "SESSION_STARTED":
       return { ...state, sessionId: action.sessionId, status: "idle", error: null };
@@ -341,6 +346,10 @@ export interface ChatInstance {
   contextUsage: number;
   /** Currently selected MCP server names */
   selectedMcps: string[];
+  /** Whether older messages exist that haven't been loaded yet. */
+  hasMoreMessages: boolean;
+  /** Load the next page of older messages (prepends to top). */
+  loadMoreMessages: () => Promise<void>;
   send: (text: string) => void;
   /** Send an audio message (base64-encoded). */
   sendAudio: (audioBase64: string, format: string, textPrompt?: string) => void;
@@ -401,6 +410,11 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   const pendingStartRef = useRef<{ resumeSdkId: string | null; mcpServers?: Record<string, unknown> } | null>(null);
   // Track when we're doing an internal MCP restart (don't close tab on session_stopped)
   const mcpRestartingRef = useRef(false);
+
+  // Pagination state
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const paginationStartIndexRef = useRef<number>(0);
+  const isLoadingMoreRef = useRef(false);
 
   // Stable refs for callbacks
   const onSessionChangeRef = useRef(onSessionChange);
@@ -538,13 +552,17 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
 
     async function init() {
       dispatch({ type: "RESET" });
+      setHasMoreMessages(false);
+      paginationStartIndexRef.current = 0;
 
       // Load history using the SDK session ID (JSONL filename)
       if (resumeSdkId && !skipHistory) {
         try {
-          const detail = await getSession(resumeSdkId);
+          const page = await getMessagesPaginated(resumeSdkId, 50);
           if (cancelled) return;
-          dispatch({ type: "LOAD_HISTORY", messages: detail.messages });
+          dispatch({ type: "LOAD_HISTORY", messages: page.messages });
+          setHasMoreMessages(page.has_more);
+          paginationStartIndexRef.current = page.start_index;
         } catch {
           // Session may not exist anymore
         }
@@ -696,6 +714,21 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     []
   );
 
+  const loadMoreMessages = useCallback(async () => {
+    if (!resumeSdkId || !hasMoreMessages || isLoadingMoreRef.current) return;
+    isLoadingMoreRef.current = true;
+    try {
+      const page = await getMessagesPaginated(resumeSdkId, 50, paginationStartIndexRef.current);
+      dispatch({ type: "PREPEND_HISTORY", messages: page.messages });
+      setHasMoreMessages(page.has_more);
+      paginationStartIndexRef.current = page.start_index;
+    } catch {
+      // Ignore errors — user can try scrolling again
+    } finally {
+      isLoadingMoreRef.current = false;
+    }
+  }, [resumeSdkId, hasMoreMessages]);
+
   const compact = useCallback(() => {
     dispatch({ type: "STATUS", status: "streaming" });
     wsSend({ type: "compact" });
@@ -713,6 +746,8 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     error: state.error,
     contextUsage,
     selectedMcps,
+    hasMoreMessages,
+    loadMoreMessages,
     send,
     sendAudio,
     command,

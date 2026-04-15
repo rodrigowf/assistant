@@ -431,9 +431,14 @@ class OrchestratorSession:
             raise RuntimeError("Session not started")
 
         if not self._config.supports_audio:
-            # Switch to audio-capable model automatically
-            # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview
-            if not self.set_model("gpt-4o-audio-preview"):
+            # Switch to audio-capable model automatically.
+            # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview.
+            # If _voice=True, set_model() normally refuses — force the config directly instead.
+            if self._voice:
+                self._config.set_model("gpt-4o-audio-preview")
+                if not self._config.supports_audio:
+                    raise RuntimeError("No audio-capable model available")
+            elif not self.set_model("gpt-4o-audio-preview"):
                 raise RuntimeError("No audio-capable model available")
 
         # Convert audio to OpenAI-supported format if needed (wav or mp3)

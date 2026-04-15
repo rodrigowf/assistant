@@ -22,6 +22,19 @@ async def chat_ws(ws: WebSocket):
 
     sm: SessionManager | None = None
     session_id: str | None = None
+    # Task currently streaming a response (send/compact/command), if any
+    stream_task: asyncio.Task | None = None
+
+    async def _cancel_stream() -> None:
+        """Cancel the active stream task and wait for it to finish."""
+        nonlocal stream_task
+        if stream_task is not None and not stream_task.done():
+            stream_task.cancel()
+            try:
+                await stream_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        stream_task = None
 
     try:
         while True:
@@ -48,7 +61,11 @@ async def chat_ws(ws: WebSocket):
                         "detail": "Send a 'start' message first",
                     }))
                     continue
-                session_id = await _handle_send(ws, sm, pool, session_id, msg.get("text", ""))
+                # Cancel any in-progress stream before starting a new one
+                await _cancel_stream()
+                stream_task = asyncio.create_task(
+                    _handle_send(ws, sm, pool, session_id, msg.get("text", ""))
+                )
 
             elif msg_type == "command":
                 if sm is None:
@@ -56,10 +73,15 @@ async def chat_ws(ws: WebSocket):
                         "type": "error", "error": "not_started",
                     }))
                     continue
-                await _handle_command(ws, sm, msg.get("text", ""))
+                await _cancel_stream()
+                stream_task = asyncio.create_task(
+                    _handle_command(ws, sm, msg.get("text", ""))
+                )
 
             elif msg_type == "interrupt":
                 if sm is not None and session_id:
+                    # Cancel the stream task first so the SDK interrupt is effective
+                    await _cancel_stream()
                     await pool.interrupt(session_id)
                     await ws.send_bytes(orjson.dumps({
                         "type": "status", "status": "interrupted",
@@ -71,9 +93,13 @@ async def chat_ws(ws: WebSocket):
                         "type": "error", "error": "not_started",
                     }))
                     continue
-                await _handle_compact(ws, pool, session_id)
+                await _cancel_stream()
+                stream_task = asyncio.create_task(
+                    _handle_compact(ws, pool, session_id)
+                )
 
             elif msg_type == "stop":
+                await _cancel_stream()
                 if session_id:
                     pool.unsubscribe(session_id, ws)
                 sm = None
@@ -89,6 +115,7 @@ async def chat_ws(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        await _cancel_stream()
         if session_id:
             pool.unsubscribe(session_id, ws)
 
@@ -187,6 +214,8 @@ async def _handle_send(
     try:
         async for event in pool.send(session_id, text, source_ws=ws):
             pass  # Events already broadcast by pool
+    except asyncio.CancelledError:
+        raise  # Let the task cancel propagate cleanly
     except Exception as e:
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "send_failed",
@@ -200,6 +229,8 @@ async def _handle_compact(ws: WebSocket, pool: SessionPool, session_id: str) -> 
     try:
         async for event in pool.compact(session_id):
             pass  # Events already broadcast by pool
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "compact_failed",
@@ -213,6 +244,8 @@ async def _handle_command(ws: WebSocket, sm: SessionManager, text: str) -> None:
         async for event in sm.command(text):
             payload = serialize_event(event)
             await ws.send_bytes(orjson.dumps(payload))
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "command_failed",

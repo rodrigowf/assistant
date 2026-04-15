@@ -98,9 +98,7 @@ fun ChatScreen(
     val isVoiceActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
 
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(horizontal = 8.dp)
+        modifier = modifier.fillMaxSize()
     ) {
         // Connection and status bar
         StatusBar(connectionState, sessionStatus, onInterrupt)
@@ -121,7 +119,7 @@ fun ChatScreen(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(vertical = 8.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 // Loading indicator at top when fetching older messages
@@ -320,7 +318,7 @@ private fun MessageItem(message: ChatMessage) {
                 else -> MaterialTheme.colorScheme.surfaceVariant
             },
             modifier = Modifier
-                .widthIn(max = 320.dp)
+                .widthIn(max = 340.dp)
                 .animateContentSize()
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
@@ -328,7 +326,7 @@ private fun MessageItem(message: ChatMessage) {
                 if (message.blocks.isNotEmpty()) {
                     message.blocks.forEachIndexed { index, block ->
                         if (index > 0) Spacer(modifier = Modifier.height(8.dp))
-                        MessageBlockView(block)
+                        MessageBlockView(block, isUser = isUser)
                     }
                 } else {
                     // Fallback to content
@@ -359,13 +357,14 @@ private fun MessageItem(message: ChatMessage) {
 }
 
 @Composable
-private fun MessageBlockView(block: MessageBlock) {
+private fun MessageBlockView(block: MessageBlock, isUser: Boolean = false) {
     when (block) {
         is MessageBlock.Text -> {
             Text(
                 text = block.text.ifEmpty { if (block.isStreaming) "..." else "" },
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface
+                color = if (isUser) MaterialTheme.colorScheme.onPrimaryContainer
+                        else MaterialTheme.colorScheme.onSurface
             )
         }
 
@@ -582,12 +581,13 @@ private fun ChatInputBar(
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        tonalElevation = 2.dp
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shadowElevation = 6.dp
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(8.dp),
+                .padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             // Voice conversation button (WebRTC realtime) - only for orchestrator

@@ -1,6 +1,10 @@
 package com.assistant.peripheral
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -16,6 +20,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -23,11 +29,13 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.assistant.peripheral.data.VoiceState
+import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.ui.screens.ChatScreen
 import com.assistant.peripheral.ui.screens.SessionsScreen
 import com.assistant.peripheral.ui.screens.SettingsScreen
 import com.assistant.peripheral.ui.theme.AssistantTheme
 import com.assistant.peripheral.viewmodel.AssistantViewModel
+import com.assistant.peripheral.voice.WakeWordDetector
 
 class MainActivity : ComponentActivity() {
 
@@ -41,10 +49,30 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Callbacks set from AssistantApp composable
+    var onWakeWordDetected: (() -> Unit)? = null   // turn-based recording
+    var onVoiceWordDetected: (() -> Unit)? = null  // realtime WebRTC session
+
+    private val wakeWordReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                WakeWordDetector.ACTION_WAKE_WORD_DETECTED -> onWakeWordDetected?.invoke()
+                WakeWordDetector.ACTION_VOICE_WORD_DETECTED -> onVoiceWordDetected?.invoke()
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         requestRequiredPermissions()
+
+        // Register both wake word broadcast actions on the same receiver
+        val filter = IntentFilter().apply {
+            addAction(WakeWordDetector.ACTION_WAKE_WORD_DETECTED)
+            addAction(WakeWordDetector.ACTION_VOICE_WORD_DETECTED)
+        }
+        LocalBroadcastManager.getInstance(this).registerReceiver(wakeWordReceiver, filter)
 
         setContent {
             val viewModel: AssistantViewModel = viewModel()
@@ -55,10 +83,15 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    AssistantApp(viewModel = viewModel)
+                    AssistantApp(viewModel = viewModel, activity = this@MainActivity)
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(wakeWordReceiver)
     }
 
     private fun requestRequiredPermissions() {
@@ -94,7 +127,7 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AssistantApp(viewModel: AssistantViewModel) {
+fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val navController = rememberNavController()
     val screens = listOf(Screen.Chat, Screen.Sessions, Screen.Settings)
 
@@ -113,11 +146,64 @@ fun AssistantApp(viewModel: AssistantViewModel) {
     val isOrchestratorSession by viewModel.isOrchestratorSession.collectAsState()
     val hasMoreMessages by viewModel.hasMoreMessages.collectAsState()
     val isLoadingMoreMessages by viewModel.isLoadingMoreMessages.collectAsState()
+    val discoveredServers by viewModel.discoveredServers.collectAsState()
+    val isScanning by viewModel.isScanning.collectAsState()
 
-    // Auto-connect on launch
+    // Wire wake word detection: start turn-based recording and navigate to chat
+    val coroutineScope = rememberCoroutineScope()
+    DisposableEffect(Unit) {
+        activity.onWakeWordDetected = {
+            // Navigate to chat so the user sees the recording UI
+            navController.navigate(Screen.Chat.route) {
+                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                launchSingleTop = true
+                restoreState = true
+            }
+            // Start recording — same as pressing the mic button
+            viewModel.startRecording()
+            // Auto-stop after 5 seconds (user speaks their request after the wake word)
+            coroutineScope.launch {
+                kotlinx.coroutines.delay(5000L)
+                if (viewModel.isRecording.value) {
+                    viewModel.stopRecording()
+                }
+            }
+        }
+        onDispose { activity.onWakeWordDetected = null }
+    }
+
+    // Wire realtime voice word detection: start WebRTC voice session
+    DisposableEffect(Unit) {
+        activity.onVoiceWordDetected = {
+            navController.navigate(Screen.Chat.route) {
+                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                launchSingleTop = true
+                restoreState = true
+            }
+            viewModel.startVoiceSession()
+        }
+        onDispose { activity.onVoiceWordDetected = null }
+    }
+
+    // Auto-connect or auto-scan on launch
     LaunchedEffect(Unit) {
         if (settings.autoConnect) {
             viewModel.connect()
+        } else {
+            // Scan for backends even when auto-connect is off
+            viewModel.scanForServers()
+        }
+        // Start foreground service and apply wake word setting
+        AssistantService.start(activity)
+        if (settings.enableWakeWord) {
+            AssistantService.updateWakeWord(activity, true, settings.wakeWord, settings.voiceWord)
+        }
+    }
+
+    // Also scan when auto-connect is on but we fail to connect after a moment
+    LaunchedEffect(settings.autoConnect) {
+        if (settings.autoConnect) {
+            viewModel.scanForServers()
         }
     }
 
@@ -204,11 +290,20 @@ fun AssistantApp(viewModel: AssistantViewModel) {
                 SettingsScreen(
                     settings = settings,
                     connectionState = connectionState,
+                    discoveredServers = discoveredServers,
+                    isScanning = isScanning,
                     onUpdateServerUrl = viewModel::updateServerUrl,
                     onUpdateThemeMode = viewModel::updateThemeMode,
                     onUpdateAutoConnect = viewModel::updateAutoConnect,
+                    onUpdateMicGainLevel = viewModel::updateMicGainLevel,
+                    onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
+                    onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
+                    onUpdateWakeWord = viewModel::updateWakeWord,
+                    onUpdateVoiceWord = viewModel::updateVoiceWord,
                     onConnect = viewModel::connect,
-                    onDisconnect = viewModel::disconnect
+                    onDisconnect = viewModel::disconnect,
+                    onScanForServers = viewModel::scanForServers,
+                    onConnectToServer = viewModel::connectToDiscoveredServer
                 )
             }
         }

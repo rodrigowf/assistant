@@ -207,7 +207,8 @@ class WebSocketManager {
                 "session_started" -> {
                     val sessionId = json.optString("session_id", "")
                     val voice = json.optBoolean("voice", false)
-                    _events.tryEmit(WebSocketEvent.SessionStarted(sessionId, voice))
+                    val voiceUpdate = json.optJSONObject("voice_session_update")?.let { jsonObjectToMap(it) }
+                    _events.tryEmit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
                 }
                 "session_stopped" -> {
                     _events.tryEmit(WebSocketEvent.SessionStopped)

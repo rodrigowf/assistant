@@ -1,7 +1,6 @@
 import { MessageList } from "./MessageList";
 import { ChatInput } from "./ChatInput";
 import { StatusBar } from "./StatusBar";
-import { VoiceButton } from "./VoiceButton";
 import { VoiceControls } from "./VoiceControls";
 import type { ChatMessage, SessionStatus, ConnectionState, VoiceStatus } from "../types";
 
@@ -18,6 +17,8 @@ interface Props {
   onCompact?: () => void;
   contextUsage?: number;
   isActive?: boolean;
+  hasMoreMessages?: boolean;
+  onLoadMore?: () => Promise<void>;
   // Voice mode props (orchestrator only)
   isOrchestrator?: boolean;
   voiceStatus?: VoiceStatus;
@@ -48,6 +49,8 @@ export function ChatPanel({
   onCompact,
   contextUsage,
   isActive,
+  hasMoreMessages,
+  onLoadMore,
   isOrchestrator,
   voiceStatus,
   onVoiceStart,
@@ -66,7 +69,7 @@ export function ChatPanel({
 
   return (
     <main className="chat-panel">
-      <MessageList messages={messages} isActive={isActive} />
+      <MessageList messages={messages} isActive={isActive} hasMoreMessages={hasMoreMessages} onLoadMore={onLoadMore} />
       {error && (
         <div className="error-banner">{error}</div>
       )}
@@ -82,27 +85,20 @@ export function ChatPanel({
             disabled={status === "disconnected" || status === "connecting"}
             streaming={isStreaming}
             supportsAudio={supportsAudio}
+            voiceStatus={isOrchestrator ? voiceStatus : undefined}
+            onVoiceStart={isOrchestrator ? onVoiceStart : undefined}
+            onVoiceStop={isOrchestrator ? onVoiceStop : undefined}
           />
+          {isOrchestrator && voiceStatus === "error" && voiceError && (
+            <span className="voice-error-message">{voiceError}</span>
+          )}
         </div>
       )}
-      {isOrchestrator && voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
+      {/* Voice active controls */}
+      {isOrchestrator && voiceActive && voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
         <div className="voice-bar-container">
           <div className="voice-bar">
-            {/* Show start button when voice is off */}
-            {!voiceActive && (
-              <>
-                <VoiceButton
-                  status={voiceStatus}
-                  onStart={onVoiceStart}
-                  onStop={onVoiceStop}
-                />
-                {voiceStatus === "error" && voiceError && (
-                  <span className="voice-error-message">{voiceError}</span>
-                )}
-              </>
-            )}
-            {/* Show new pill controls when voice is active */}
-            {voiceActive && onMicMuteToggle && onAssistantMuteToggle && (
+            {onMicMuteToggle && onAssistantMuteToggle && (
               <VoiceControls
                 status={voiceStatus}
                 onStop={onVoiceStop}
@@ -114,22 +110,20 @@ export function ChatPanel({
                 speakerLevel={speakerLevel ?? 0}
               />
             )}
-            {voiceActive && (
-              <span className="voice-status-label">
-                <span className={`voice-status-dot ${
-                  voiceStatus === "active" ? (isMicMuted ? "muted" : "listening") :
-                  voiceStatus === "speaking" ? "speaking" :
-                  voiceStatus === "thinking" ? "thinking" :
-                  voiceStatus === "tool_use" ? "tool-use" :
-                  "connecting"
-                }`} />
-                {voiceStatus === "active" && (isMicMuted ? "Muted" : "Listening…")}
-                {voiceStatus === "speaking" && "Speaking…"}
-                {voiceStatus === "thinking" && "Thinking…"}
-                {voiceStatus === "tool_use" && "Using tool…"}
-                {voiceStatus === "connecting" && "Connecting…"}
-              </span>
-            )}
+            <span className="voice-status-label">
+              <span className={`voice-status-dot ${
+                voiceStatus === "active" ? (isMicMuted ? "muted" : "listening") :
+                voiceStatus === "speaking" ? "speaking" :
+                voiceStatus === "thinking" ? "thinking" :
+                voiceStatus === "tool_use" ? "tool-use" :
+                "connecting"
+              }`} />
+              {voiceStatus === "active" && (isMicMuted ? "Muted" : "Listening…")}
+              {voiceStatus === "speaking" && "Speaking…"}
+              {voiceStatus === "thinking" && "Thinking…"}
+              {voiceStatus === "tool_use" && "Using tool…"}
+              {voiceStatus === "connecting" && "Connecting…"}
+            </span>
           </div>
         </div>
       )}

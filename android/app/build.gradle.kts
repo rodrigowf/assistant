@@ -86,6 +86,9 @@ dependencies {
     // DataStore for preferences
     implementation("androidx.datastore:datastore-preferences:1.0.0")
 
+    // LocalBroadcastManager for wake word detection
+    implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
+
     // WebRTC for voice mode
     implementation("io.getstream:stream-webrtc-android:1.1.1")
 

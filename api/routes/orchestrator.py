@@ -189,22 +189,31 @@ async def _handle_start(
             # Text WS reconnecting while voice is active — subscribe without
             # disrupting the voice session (the text WS auto-connects on mount).
             pool.subscribe_orchestrator(local_id, ws)
-            await ws.send_bytes(orjson.dumps({
+            reconnect_payload: dict = {
                 "type": "session_started",
                 "session_id": local_id,
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
-            }))
+            }
+            session_update = session.get_session_update()
+            if session_update:
+                reconnect_payload["voice_session_update"] = session_update
+            await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
         else:
             # Same mode — just reconnect
             pool.subscribe_orchestrator(local_id, ws)
-            await ws.send_bytes(orjson.dumps({
+            reconnect_payload = {
                 "type": "session_started",
                 "session_id": local_id,
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
-            }))
+            }
+            if current_voice:
+                session_update = session.get_session_update()
+                if session_update:
+                    reconnect_payload["voice_session_update"] = session_update
+            await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
 
     # --- A different orchestrator is already active ---

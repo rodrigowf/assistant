@@ -16,6 +16,7 @@ function TabInstance({
   resumeSdkId,
   onSessionChange,
   instancesRef,
+  notifyUpdate,
   wsEndpoint,
   isOrchestrator,
   onAgentSessionOpened,
@@ -26,6 +27,7 @@ function TabInstance({
   resumeSdkId: string | null;
   onSessionChange: () => void;
   instancesRef: React.RefObject<Map<string, ChatInstance>>;
+  notifyUpdate: () => void;
   wsEndpoint?: string;
   isOrchestrator?: boolean;
   onAgentSessionOpened?: (sessionId: string, sdkSessionId?: string) => void;
@@ -53,10 +55,15 @@ function TabInstance({
     onSessionClosed,
   });
 
-  // Keep instancesRef up to date with the latest instance on every render.
+  // Keep instancesRef up to date on every render.
   useEffect(() => {
     instancesRef.current?.set(sessionId, instance);
-  }, [instance, sessionId, instancesRef]);
+  });
+
+  // Notify the container when messages or pagination state change so it re-renders with fresh props.
+  useEffect(() => {
+    notifyUpdate();
+  }, [instance.messages, instance.hasMoreMessages, notifyUpdate]);
 
   // Clean up on unmount only.
   useEffect(() => {
@@ -128,6 +135,8 @@ function OrchestratorChatPanel({
       onCompact={instance.compact}
       contextUsage={instance.contextUsage}
       isActive={isActive}
+      hasMoreMessages={instance.hasMoreMessages}
+      onLoadMore={instance.loadMoreMessages}
       isOrchestrator={true}
       voiceStatus={voiceStatus}
       onVoiceStart={startVoice}
@@ -154,6 +163,8 @@ export function ChatPanelContainer({
 }) {
   const { tabs, activeTabId, openTab, closeTab } = useTabsContext();
   const instancesRef = useRef<Map<string, ChatInstance>>(new Map());
+  const [, setInstanceVersion] = useState(0);
+  const notifyUpdate = useCallback(() => setInstanceVersion(v => v + 1), []);
 
   // Track which models support audio
   const [modelsInfo, setModelsInfo] = useState<ModelsResponse | null>(null);
@@ -199,6 +210,7 @@ export function ChatPanelContainer({
           resumeSdkId={tab.resumeSdkId || null}
           onSessionChange={onSessionChange}
           instancesRef={instancesRef}
+          notifyUpdate={notifyUpdate}
           wsEndpoint={tab.isOrchestrator ? "/api/orchestrator/chat" : undefined}
           isOrchestrator={tab.isOrchestrator}
           onAgentSessionOpened={tab.isOrchestrator ? handleAgentSessionOpened : undefined}
@@ -216,7 +228,9 @@ export function ChatPanelContainer({
         return (
           <div
             key={tab.sessionId}
-            style={{ display: isActive ? "contents" : "none" }}
+            style={isActive
+              ? { flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0 }
+              : { display: "none" }}
           >
             {tab.isOrchestrator ? (
               <OrchestratorChatPanel
@@ -240,6 +254,8 @@ export function ChatPanelContainer({
                 onCompact={inst.compact}
                 contextUsage={inst.contextUsage}
                 isActive={isActive}
+                hasMoreMessages={inst.hasMoreMessages}
+                onLoadMore={inst.loadMoreMessages}
               />
             )}
           </div>

@@ -1,4 +1,4 @@
-import type { SessionInfo, SessionDetail, MessagePreview } from "../types";
+import type { SessionInfo, SessionDetail, MessagePreview, PaginatedMessages } from "../types";
 
 const BASE = "/api";
 
@@ -18,6 +18,12 @@ export function getSession(id: string): Promise<SessionDetail> {
 
 export function getPreview(id: string, max = 5): Promise<MessagePreview[]> {
   return json(`${BASE}/sessions/${id}/preview?max=${max}`);
+}
+
+export function getMessagesPaginated(id: string, limit = 50, before?: number): Promise<PaginatedMessages> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (before !== undefined) params.set("before", String(before));
+  return json(`${BASE}/sessions/${id}/messages?${params}`);
 }
 
 export async function renameSession(id: string, title: string): Promise<void> {

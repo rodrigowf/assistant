@@ -1,6 +1,8 @@
 import { useRef, useCallback, type KeyboardEvent, type ChangeEvent } from "react";
 import { VoiceRecordButton } from "./VoiceRecordButton";
+import { VoiceButton } from "./VoiceButton";
 import { useAudioRecorder } from "../hooks/useAudioRecorder";
+import type { VoiceStatus } from "../types";
 
 interface Props {
   onSend: (text: string) => void;
@@ -13,6 +15,10 @@ interface Props {
   contextUsage?: number;
   /** Whether audio recording is supported (model supports audio input) */
   supportsAudio?: boolean;
+  /** Orchestrator voice props */
+  voiceStatus?: VoiceStatus;
+  onVoiceStart?: () => void;
+  onVoiceStop?: () => void;
 }
 
 export function ChatInput({
@@ -24,6 +30,9 @@ export function ChatInput({
   streaming,
   contextUsage,
   supportsAudio,
+  voiceStatus,
+  onVoiceStart,
+  onVoiceStop,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -136,6 +145,13 @@ export function ChatInput({
           onStop={stopRecording}
           onCancel={cancelRecording}
           disabled={disabled || streaming}
+        />
+      )}
+      {voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
+        <VoiceButton
+          status={voiceStatus}
+          onStart={onVoiceStart}
+          onStop={onVoiceStop}
         />
       )}
     </div>

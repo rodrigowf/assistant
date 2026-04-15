@@ -116,7 +116,11 @@ sealed class WebSocketEvent {
     data class ToolResult(val toolUseId: String, val output: String, val isError: Boolean) : WebSocketEvent()
 
     // Session events
-    data class SessionStarted(val sessionId: String, val voice: Boolean = false) : WebSocketEvent()
+    data class SessionStarted(
+        val sessionId: String,
+        val voice: Boolean = false,
+        val voiceSessionUpdate: Map<String, Any?>? = null  // session.update payload for OpenAI
+    ) : WebSocketEvent()
     object SessionStopped : WebSocketEvent()
     data class TurnComplete(val inputTokens: Int, val outputTokens: Int) : WebSocketEvent()
 
@@ -193,6 +197,9 @@ data class AppSettings(
     val serverUrl: String = "ws://192.168.0.28:8765",
     val autoConnect: Boolean = true,
     val enableWakeWord: Boolean = false,
-    val wakeWord: String = "hey assistant",
-    val themeMode: ThemeMode = ThemeMode.SYSTEM
+    val wakeWord: String = "hey assistant, assistant",   // comma-separated, triggers turn-based voice input
+    val voiceWord: String = "hey realtime, realtime",   // comma-separated, triggers realtime WebRTC voice session
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val micGainLevel: Float = 1.0f,        // 0.0 to 2.0, where 1.0 is normal
+    val speakerVolumeLevel: Float = 1.0f   // 0.0 to 1.5, where 1.0 is 100%
 )

@@ -120,7 +120,7 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
 }
 
 # Default model
-DEFAULT_MODEL_ID = "claude-sonnet-4-5-20250929"
+DEFAULT_MODEL_ID = "gpt-4o-audio-preview"
 
 
 def get_available_models() -> list[ModelInfo]:

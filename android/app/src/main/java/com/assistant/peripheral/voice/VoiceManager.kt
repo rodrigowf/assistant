@@ -15,7 +15,11 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import org.json.JSONObject
 import org.webrtc.*
+import org.webrtc.audio.AudioRecordDataCallback
 import org.webrtc.audio.JavaAudioDeviceModule
+import org.webrtc.voiceengine.WebRtcAudioUtils
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
 
 /**
@@ -54,15 +58,13 @@ class VoiceManager(
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
 
+    // Microphone gain (0.0 to 2.0, default 1.0)
+    private var micGainLevel: Float = 1.0f
+
     // Audio effects for echo cancellation
     private var acousticEchoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
 
-    // Echo suppression: reduce mic volume while assistant speaks
-    // This helps prevent feedback loops when hardware AEC isn't sufficient
-    private var isAssistantSpeaking = false
-    private val MIC_VOLUME_WHILE_SPEAKING = 0.15f  // 15% volume while assistant speaks (allows loud interruptions)
-    private val MIC_VOLUME_NORMAL = 1.0f
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -189,23 +191,34 @@ class VoiceManager(
     }
 
     private suspend fun initializeWebRTC(token: String): Boolean {
-        // Initialize PeerConnectionFactory with hardware AEC enabled
-        // Web frontend: pc = new RTCPeerConnection()
+        // SOFTWARE-ONLY AEC: Disable hardware AEC, use only WebRTC software processing
+        // Hardware AEC can interfere or not work properly with Bluetooth speakers
+
+        // Enable WebRTC-based software AEC - this MUST be called before PeerConnectionFactory.initialize()
+        // Reference: https://getstream.github.io/webrtc-android/stream-webrtc-android/org.webrtc.voiceengine/-web-rtc-audio-utils/
+        WebRtcAudioUtils.setWebRtcBasedAcousticEchoCanceler(true)
+        WebRtcAudioUtils.setWebRtcBasedNoiseSuppressor(true)
+        WebRtcAudioUtils.setWebRtcBasedAutomaticGainControl(true)
+        Log.d(TAG, ">>> Enabled WebRTC SOFTWARE AEC, NS, and AGC")
+
+        // Initialize PeerConnectionFactory
         val initOptions = PeerConnectionFactory.InitializationOptions.builder(context)
             .setEnableInternalTracer(false)
             .createInitializationOptions()
         PeerConnectionFactory.initialize(initOptions)
 
-        // Create audio device module with hardware AEC/NS enabled
+        // Disable hardware AEC - only use software
+        val hwAecAvailable = AcousticEchoCanceler.isAvailable()
+        val hwNsAvailable = NoiseSuppressor.isAvailable()
+        Log.d(TAG, "Hardware AEC available: $hwAecAvailable (DISABLED), NS available: $hwNsAvailable (DISABLED)")
+
         val audioDeviceModule = JavaAudioDeviceModule.builder(context)
-            .setUseHardwareAcousticEchoCanceler(true)
-            .setUseHardwareNoiseSuppressor(true)
+            .setUseHardwareAcousticEchoCanceler(false)  // Disabled - can interfere with software AEC
+            .setUseHardwareNoiseSuppressor(false)       // Disabled - using software instead
+            .setAudioRecordDataCallback(audioRecordDataCallback)  // Apply mic gain before WebRTC
             .createAudioDeviceModule()
 
-        // Log AEC availability
-        val aecAvailable = AcousticEchoCanceler.isAvailable()
-        val nsAvailable = NoiseSuppressor.isAvailable()
-        Log.d(TAG, "Hardware AEC available: $aecAvailable, NS available: $nsAvailable")
+        Log.d(TAG, ">>> Using SOFTWARE-ONLY AEC (hardware disabled)")
 
         peerConnectionFactory = PeerConnectionFactory.builder()
             .setOptions(PeerConnectionFactory.Options())
@@ -214,12 +227,23 @@ class VoiceManager(
 
         val factory = peerConnectionFactory!!
 
-        // Create audio source and track for microphone
-        // Web frontend: micStream = await navigator.mediaDevices.getUserMedia({ audio: {...} })
+        // Create audio source with WebRTC software-based audio processing
+        // These constraints enable WebRTC's internal echo cancellation algorithms
         val audioConstraints = MediaConstraints().apply {
+            // Standard WebRTC constraints
             mandatory.add(MediaConstraints.KeyValuePair("echoCancellation", "true"))
             mandatory.add(MediaConstraints.KeyValuePair("noiseSuppression", "true"))
             mandatory.add(MediaConstraints.KeyValuePair("autoGainControl", "true"))
+            // Google-specific WebRTC AEC constraints for better echo cancellation
+            mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googEchoCancellation2", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googDAEchoCancellation", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googAutoGainControl2", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googNoiseSuppression2", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googHighpassFilter", "true"))
+            mandatory.add(MediaConstraints.KeyValuePair("googTypingNoiseDetection", "true"))
         }
 
         val audioSource = factory.createAudioSource(audioConstraints)
@@ -478,24 +502,14 @@ class VoiceManager(
                     _events.tryEmit(VoiceEvent.TextComplete(transcript))
                 }
                 "output_audio_buffer.started" -> {
-                    // Audio playback started - mute mic to prevent echo
+                    // Audio playback started
                     if (_state.value != VoiceState.Speaking) {
                         _state.value = VoiceState.Speaking
                     }
-                    if (!isAssistantSpeaking) {
-                        isAssistantSpeaking = true
-                        setMicVolume(MIC_VOLUME_WHILE_SPEAKING)
-                        Log.d(TAG, ">>> Assistant speaking - MUTING mic to prevent echo")
-                    }
                 }
                 "output_audio_buffer.cleared", "response.audio.done" -> {
-                    // Audio finished or cleared - unmute mic
+                    // Audio finished or cleared
                     _state.value = VoiceState.Active
-                    if (isAssistantSpeaking) {
-                        isAssistantSpeaking = false
-                        setMicVolume(MIC_VOLUME_NORMAL)
-                        Log.d(TAG, ">>> Assistant done speaking - UNMUTING mic")
-                    }
                 }
             }
 
@@ -635,28 +649,58 @@ class VoiceManager(
     fun isMuted(): Boolean = !(localAudioTrack?.enabled() ?: true)
 
     /**
-     * Set microphone volume (0.0 to 1.0).
-     * Used to reduce echo feedback when assistant is speaking.
-     *
-     * Since WebRTC doesn't expose direct volume control on AudioTrack,
-     * we mute the track when volume is very low (< 0.5) and unmute otherwise.
-     * This prevents the assistant from hearing its own voice through the mic.
+     * Set microphone gain level.
+     * @param gain Gain level from 0.0 (silent) to 2.0 (double volume). Default is 1.0.
      */
-    private fun setMicVolume(volume: Float) {
-        localAudioTrack?.let { track ->
-            try {
-                if (volume < 0.5f) {
-                    // Mute mic while assistant is speaking to prevent echo
-                    track.setEnabled(false)
-                } else {
-                    // Restore mic when assistant stops speaking
-                    track.setEnabled(true)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to adjust mic volume", e)
+    fun setMicGain(gain: Float) {
+        micGainLevel = gain.coerceIn(0.0f, 2.0f)
+        Log.d(TAG, "Mic gain set to: $micGainLevel")
+    }
+
+    /**
+     * Get current mic gain level.
+     */
+    fun getMicGain(): Float = micGainLevel
+
+    /**
+     * Audio data callback that applies gain to microphone input.
+     * Called by JavaAudioDeviceModule before audio is fed into WebRTC.
+     */
+    private val audioRecordDataCallback = object : AudioRecordDataCallback {
+        override fun onAudioDataRecorded(audioFormat: Int, channelCount: Int, sampleRate: Int, audioBuffer: ByteBuffer) {
+            // Apply gain to the audio samples
+            if (micGainLevel != 1.0f) {
+                applyGainToBuffer(audioBuffer, micGainLevel)
             }
         }
     }
+
+    /**
+     * Apply gain to audio samples in a ByteBuffer.
+     * Audio is in 16-bit PCM format (shorts).
+     * Gain is applied directly: 1.0 = normal, 0.5 = half volume, 0.05 = 5%, etc.
+     */
+    private fun applyGainToBuffer(buffer: ByteBuffer, gain: Float) {
+        // Audio samples are 16-bit signed PCM (shorts)
+        val originalOrder = buffer.order()
+        buffer.order(ByteOrder.LITTLE_ENDIAN)
+
+        val position = buffer.position()
+        val limit = buffer.limit()
+
+        // Process each 16-bit sample
+        var i = position
+        while (i < limit - 1) {
+            val sample = buffer.getShort(i).toInt()
+            // Apply gain directly and clamp to prevent clipping
+            val amplified = (sample * gain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            buffer.putShort(i, amplified.toShort())
+            i += 2
+        }
+
+        buffer.order(originalOrder)
+    }
+
 
     /**
      * Stop voice session and cleanup.

@@ -1,23 +1,21 @@
-import { useCallback, useEffect, useState, lazy, Suspense } from "react";
-import "./App.css";
-import { AuthGate } from "./components/AuthGate";
-import { Sidebar } from "./components/Sidebar";
-import { TabBar } from "./components/TabBar";
-import { ChatPanelContainer } from "./components/ChatPanelContainer";
-import { OrchestratorModal } from "./components/OrchestratorModal";
-
-const ConfigPage = lazy(() => import("./components/ConfigPage").then(m => ({ default: m.ConfigPage })));
-import { TabsProvider, useTabsContext } from "./context/TabsContext";
-import { useSessions } from "./hooks/useSessions";
-import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
-import { generateUUID } from "./utils/uuid";
+import { useCallback, useEffect, useState } from "react";
+import "@/App.css";
+import { AuthGate } from "@/components/AuthGate";
+import { Sidebar } from "@/components/Sidebar";
+import { TabBar } from "@/components/TabBar";
+import { ChatPanelContainer } from "@/components/ChatPanelContainer";
+import { ConfigPage } from "@/components/ConfigPage";
+import { OrchestratorModal } from "@/components/OrchestratorModal";
+import { TabsProvider, useTabsContext } from "@/context/TabsContext";
+import { useSessions } from "@/hooks/useSessions";
+import { useReconnectPoolSessions } from "@/hooks/useReconnectPoolSessions";
+import { generateUUID } from "@/utils/uuid";
 
 function AppContent() {
   const { sessions, refresh, deleteSession, renameSession } = useSessions();
   useReconnectPoolSessions();
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
-  // Pending orchestrator action: either open new or resume existing
   const [pendingOrchestrator, setPendingOrchestrator] = useState<
     { type: "new" } | { type: "resume"; id: string; title: string } | null
   >(null);
@@ -37,20 +35,15 @@ function AppContent() {
 
   const closeOrchestratorTabs = useCallback(() => {
     for (const tab of tabs) {
-      if (tab.isOrchestrator) {
-        closeTab(tab.sessionId);
-      }
+      if (tab.isOrchestrator) closeTab(tab.sessionId);
     }
   }, [tabs, closeTab]);
 
   const openOrchestrator = useCallback((action: { type: "new" } | { type: "resume"; id: string; title: string }) => {
     if (action.type === "new") {
-      const localId = generateUUID();
-      openTab(localId, "Orchestrator", true);
+      openTab(generateUUID(), "Orchestrator", true);
     } else {
-      // Resuming from history: generate a stable local_id, pass SDK ID as resumeSdkId
-      const localId = generateUUID();
-      openTab(localId, action.title, true, action.id);
+      openTab(generateUUID(), action.title, true, action.id);
     }
   }, [openTab]);
 
@@ -88,11 +81,9 @@ function AppContent() {
     setPendingOrchestrator(null);
   }, []);
 
-  // Config page visibility — toggled without unmounting chat instances
   const [showConfig, setShowConfig] = useState(false);
-
-  // Mobile sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
   useEffect(() => {
     document.body.style.overflow = sidebarOpen ? "hidden" : "";
     return () => { document.body.style.overflow = ""; };
@@ -121,10 +112,7 @@ function AppContent() {
           <TabBar />
         </div>
         <ChatPanelContainer onSessionChange={refresh} />
-        {/* Config floats over everything — chat instances stay mounted */}
-        <Suspense fallback={null}>
-          <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
-        </Suspense>
+        <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
       </main>
       {showOrchestratorModal && (
         <OrchestratorModal

@@ -10,6 +10,8 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from manager.auth import AuthManager
 from manager.config import ManagerConfig
@@ -18,7 +20,7 @@ from manager.store import SessionStore
 from .connections import ConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
 from .pool import SessionPool
-from .routes import agents, auth, chat, config, mcp, orchestrator, sessions, skills, voice
+from .routes import agents, auth, chat, config, debug, mcp, orchestrator, sessions, skills, voice
 
 logger = logging.getLogger(__name__)
 
@@ -85,5 +87,40 @@ def create_app() -> FastAPI:
     app.include_router(config.router)
     app.include_router(skills.router)
     app.include_router(agents.router)
+    app.include_router(debug.router)
+
+    # Serve the compat frontend (React 18, for older devices) at /compat/
+    compat_dist = Path(__file__).resolve().parent.parent / "frontend-compat" / "dist"
+    if compat_dist.exists():
+        app.mount("/compat/assets", StaticFiles(directory=compat_dist / "assets"), name="compat-assets")
+
+        @app.get("/compat")
+        @app.get("/compat/")
+        async def serve_compat_index():
+            return FileResponse(compat_dist / "index.html")
+
+        @app.get("/compat/{full_path:path}")
+        async def serve_compat_spa(full_path: str):
+            file_path = compat_dist / full_path
+            if file_path.exists() and file_path.is_file():
+                return FileResponse(file_path)
+            return FileResponse(compat_dist / "index.html")
+
+    # Serve the production frontend build if it exists
+    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    if frontend_dist.exists():
+        app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
+
+        @app.get("/")
+        async def serve_index():
+            return FileResponse(frontend_dist / "index.html")
+
+        @app.get("/{full_path:path}")
+        async def serve_spa(full_path: str):
+            # Serve index.html for all non-API routes (SPA client-side routing)
+            file_path = frontend_dist / full_path
+            if file_path.exists() and file_path.is_file():
+                return FileResponse(file_path)
+            return FileResponse(frontend_dist / "index.html")
 
     return app
