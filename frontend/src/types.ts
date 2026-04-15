@@ -60,7 +60,8 @@ export type ServerEvent =
   | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }
   | { type: "agent_session_closed"; session_id: string }
   | { type: "user_message"; text: string; source?: string }
-  | { type: "voice_command"; command: Record<string, unknown> };
+  | { type: "voice_command"; command: Record<string, unknown> }
+  | { type: "voice_stopped" };
 
 // OpenAI Realtime API event types (subset used by voice integration)
 export interface RealtimeEvent {
