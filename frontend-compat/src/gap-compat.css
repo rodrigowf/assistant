@@ -1,5 +1,5 @@
 /*
- * gap-compat.css — Safari 12 / iOS 12 compatibility shim
+ * gap-compat.css — Safari 12 / iOS 12 compatibility shims
  *
  * Safari 12 does not support the `gap` property in flexbox contexts
  * (support was added in Safari 14.1). This file neutralizes every
@@ -12,6 +12,26 @@
  * Injected only in the compat build (frontend-compat/src/main.tsx).
  * The main frontend is NOT affected.
  */
+
+/* ============================================================
+   Momentum scrolling — iOS / old Safari
+   -webkit-overflow-scrolling: touch enables inertial (momentum)
+   scroll on all overflow-y/x: auto containers. Supported since
+   iOS 5; has no effect on modern browsers (safe to apply).
+   ============================================================ */
+
+/* .message-list uses iosScrollTo() in the MessageList shim to stop momentum
+   before each programmatic scrollTop assignment, so it is safe to enable here. */
+.message-list,
+.session-list,
+.tab-bar,
+.result-output pre,
+.tool-params-content,
+.agent-session-content,
+.mcp-server-list,
+.config-panel-overlay {
+  -webkit-overflow-scrolling: touch;
+}
 
 /* ── Tab bar (row, gap: 3px) ────────────────────────────────────────────── */
 .tab-bar { gap: 0; }
