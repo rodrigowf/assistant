@@ -24,6 +24,8 @@ export default defineConfig({
       'react-syntax-highlighter': path.resolve(__dirname, 'src/shims/react-syntax-highlighter.tsx'),
       // Shim out remark-gfm (uses lookbehind regexes unsupported in Safari 12)
       'remark-gfm': path.resolve(__dirname, 'src/shims/remark-gfm.ts'),
+      // Compat MessageList: stops iOS momentum scroll before programmatic scrollTop assignments
+      '@/components/MessageList': path.resolve(__dirname, 'src/shims/MessageList.tsx'),
     },
   },
   server: {
