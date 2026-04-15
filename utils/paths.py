@@ -57,3 +57,24 @@ def ensure_context_dirs() -> None:
     get_context_dir().mkdir(parents=True, exist_ok=True)
     get_memory_dir().mkdir(parents=True, exist_ok=True)
     get_index_dir().mkdir(parents=True, exist_ok=True)
+
+
+def parse_md_frontmatter(content: str, default_name: str) -> tuple[str, str]:
+    """Parse YAML frontmatter from a markdown file.
+
+    Returns (name, description). Falls back to default_name if no name field found.
+    """
+    name = default_name
+    description = ""
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            for line in parts[1].splitlines():
+                line = line.strip()
+                if line.startswith("description:"):
+                    description = line[len("description:"):].strip()
+                    if description.startswith(("'", '"')) and description.endswith(("'", '"')):
+                        description = description[1:-1]
+                elif line.startswith("name:"):
+                    name = line[len("name:"):].strip()
+    return name, description

@@ -9,11 +9,14 @@ import type {
   ConnectionState,
 } from "../types";
 import { useWebSocket } from "./useWebSocket";
-import { getSession } from "../api/rest";
+import { getMessagesPaginated } from "../api/rest";
 
 // -------------------------------------------------------------------
 // State
 // -------------------------------------------------------------------
+
+// Context window sizes (tokens) — used to compute usage percentage
+const CONTEXT_WINDOW = 200_000; // Claude models (conservative default)
 
 interface ChatState {
   messages: ChatMessage[];
@@ -22,6 +25,7 @@ interface ChatState {
   cost: number;
   turns: number;
   error: string | null;
+  contextTokens: number; // latest input_tokens count
 }
 
 const INITIAL_STATE: ChatState = {
@@ -31,6 +35,7 @@ const INITIAL_STATE: ChatState = {
   cost: 0,
   turns: 0,
   error: null,
+  contextTokens: 0,
 };
 
 // -------------------------------------------------------------------
@@ -40,6 +45,7 @@ const INITIAL_STATE: ChatState = {
 type Action =
   | { type: "RESET" }
   | { type: "LOAD_HISTORY"; messages: MessagePreview[] }
+  | { type: "PREPEND_HISTORY"; messages: MessagePreview[] }
   | { type: "SESSION_STARTED"; sessionId: string }
   | { type: "USER_MESSAGE"; text: string }
   | { type: "TEXT_DELTA"; text: string }
@@ -48,7 +54,8 @@ type Action =
   | { type: "THINKING_COMPLETE"; text: string }
   | { type: "TOOL_USE"; toolUseId: string; toolName: string; toolInput: Record<string, unknown> }
   | { type: "TOOL_RESULT"; toolUseId: string; output: string; isError: boolean }
-  | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string }
+  | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string; inputTokens?: number }
+  | { type: "COMPACT_COMPLETE"; summary: string }
   | { type: "STATUS"; status: SessionStatus }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
@@ -80,69 +87,73 @@ function updateLastAssistantBlock(
   return [...msgs.slice(0, -1), last];
 }
 
+function convertPreviews(previews: MessagePreview[]): ChatMessage[] {
+  const toolResults = new Map<string, { output: string; isError: boolean }>();
+  for (const m of previews) {
+    for (const b of m.blocks) {
+      if (b.type === "tool_result" && b.tool_use_id) {
+        toolResults.set(b.tool_use_id, {
+          output: b.output || "",
+          isError: b.is_error || false,
+        });
+      }
+    }
+  }
+
+  const messages: ChatMessage[] = [];
+  for (const m of previews) {
+    const hasNonToolResult = m.blocks.some(b => b.type !== "tool_result");
+    if (m.role === "user" && !hasNonToolResult && m.blocks.length > 0) {
+      continue;
+    }
+
+    const blocks: MessageBlock[] = [];
+    for (const b of m.blocks) {
+      if (b.type === "text") {
+        if (b.text) {
+          blocks.push({ type: "text", content: b.text, streaming: false });
+        }
+      } else if (b.type === "tool_use") {
+        const result = b.tool_use_id ? toolResults.get(b.tool_use_id) : undefined;
+        const resultOutput = result?.output ?? b.output ?? undefined;
+        const resultIsError = result?.isError ?? false;
+        blocks.push({
+          type: "tool_use",
+          toolUseId: b.tool_use_id || "",
+          toolName: b.tool_name || "",
+          toolInput: (b.tool_input as Record<string, unknown>) || {},
+          result: resultOutput,
+          isError: resultIsError,
+          complete: true,
+        });
+      }
+    }
+
+    if (blocks.length === 0 && m.text) {
+      blocks.push({ type: "text", content: m.text, streaming: false });
+    }
+
+    if (blocks.length > 0) {
+      messages.push({
+        id: nextId(),
+        role: m.role as "user" | "assistant",
+        blocks,
+      });
+    }
+  }
+  return messages;
+}
+
 function reducer(state: ChatState, action: Action): ChatState {
   switch (action.type) {
     case "RESET":
       return INITIAL_STATE;
 
-    case "LOAD_HISTORY": {
-      const toolResults = new Map<string, { output: string; isError: boolean }>();
-      for (const m of action.messages) {
-        for (const b of m.blocks) {
-          if (b.type === "tool_result" && b.tool_use_id) {
-            toolResults.set(b.tool_use_id, {
-              output: b.output || "",
-              isError: b.is_error || false,
-            });
-          }
-        }
-      }
+    case "LOAD_HISTORY":
+      return { ...state, messages: convertPreviews(action.messages) };
 
-      const messages: ChatMessage[] = [];
-      for (const m of action.messages) {
-        const hasNonToolResult = m.blocks.some(b => b.type !== "tool_result");
-        if (m.role === "user" && !hasNonToolResult && m.blocks.length > 0) {
-          continue;
-        }
-
-        const blocks: MessageBlock[] = [];
-        for (const b of m.blocks) {
-          if (b.type === "text") {
-            if (b.text) {
-              blocks.push({ type: "text", content: b.text, streaming: false });
-            }
-          } else if (b.type === "tool_use") {
-            const result = b.tool_use_id ? toolResults.get(b.tool_use_id) : undefined;
-            // result may come from a separate tool_result block (SDK format)
-            // or directly on the tool_use block's output field (orchestrator format)
-            const resultOutput = result?.output ?? b.output ?? undefined;
-            const resultIsError = result?.isError ?? false;
-            blocks.push({
-              type: "tool_use",
-              toolUseId: b.tool_use_id || "",
-              toolName: b.tool_name || "",
-              toolInput: (b.tool_input as Record<string, unknown>) || {},
-              result: resultOutput,
-              isError: resultIsError,
-              complete: true,
-            });
-          }
-        }
-
-        if (blocks.length === 0 && m.text) {
-          blocks.push({ type: "text", content: m.text, streaming: false });
-        }
-
-        if (blocks.length > 0) {
-          messages.push({
-            id: nextId(),
-            role: m.role as "user" | "assistant",
-            blocks,
-          });
-        }
-      }
-      return { ...state, messages };
-    }
+    case "PREPEND_HISTORY":
+      return { ...state, messages: [...convertPreviews(action.messages), ...state.messages] };
 
     case "SESSION_STARTED":
       return { ...state, sessionId: action.sessionId, status: "idle", error: null };
@@ -251,6 +262,21 @@ function reducer(state: ChatState, action: Action): ChatState {
         cost: state.cost + (action.cost ?? 0),
         turns: state.turns + action.turns,
         sessionId: action.sessionId || state.sessionId,
+        contextTokens: action.inputTokens ?? state.contextTokens,
+      };
+
+    case "COMPACT_COMPLETE":
+      return {
+        ...state,
+        // Don't reset contextTokens here — the next TurnComplete will have the accurate post-compact count
+        messages: [
+          ...state.messages,
+          {
+            id: nextId(),
+            role: "assistant" as const,
+            blocks: [{ type: "compact" as const, content: action.summary, streaming: false }],
+          },
+        ],
       };
 
     case "STATUS":
@@ -316,11 +342,21 @@ export interface ChatInstance {
   cost: number;
   turns: number;
   error: string | null;
+  /** Context usage as a percentage of the context window (0–100). */
+  contextUsage: number;
   /** Currently selected MCP server names */
   selectedMcps: string[];
+  /** Whether older messages exist that haven't been loaded yet. */
+  hasMoreMessages: boolean;
+  /** Load the next page of older messages (prepends to top). */
+  loadMoreMessages: () => Promise<void>;
   send: (text: string) => void;
+  /** Send an audio message (base64-encoded). */
+  sendAudio: (audioBase64: string, format: string, textPrompt?: string) => void;
   command: (text: string) => void;
   interrupt: () => void;
+  /** Trigger conversation compaction (summarize history to free context). */
+  compact: () => void;
   /** Stop the current session (releases orchestrator lock). */
   stop: () => void;
   /** Restart the session (send start again after a stop). */
@@ -374,6 +410,11 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   const pendingStartRef = useRef<{ resumeSdkId: string | null; mcpServers?: Record<string, unknown> } | null>(null);
   // Track when we're doing an internal MCP restart (don't close tab on session_stopped)
   const mcpRestartingRef = useRef(false);
+
+  // Pagination state
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const paginationStartIndexRef = useRef<number>(0);
+  const isLoadingMoreRef = useRef(false);
 
   // Stable refs for callbacks
   const onSessionChangeRef = useRef(onSessionChange);
@@ -439,8 +480,12 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
           cost: event.cost ?? null,
           turns: event.num_turns ?? 1,
           sessionId: "",  // Don't update sessionId — local_id is stable
+          inputTokens: (event.input_tokens as number | undefined) ?? (event.usage as Record<string, number> | undefined)?.input_tokens,
         });
         onSessionChangeRef.current?.();
+        break;
+      case "compact_complete":
+        dispatch({ type: "COMPACT_COMPLETE", summary: (event.summary as string) || "" });
         break;
       case "status":
         dispatch({ type: "STATUS", status: event.status as SessionStatus });
@@ -507,13 +552,17 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
 
     async function init() {
       dispatch({ type: "RESET" });
+      setHasMoreMessages(false);
+      paginationStartIndexRef.current = 0;
 
       // Load history using the SDK session ID (JSONL filename)
       if (resumeSdkId && !skipHistory) {
         try {
-          const detail = await getSession(resumeSdkId);
+          const page = await getMessagesPaginated(resumeSdkId, 50);
           if (cancelled) return;
-          dispatch({ type: "LOAD_HISTORY", messages: detail.messages });
+          dispatch({ type: "LOAD_HISTORY", messages: page.messages });
+          setHasMoreMessages(page.has_more);
+          paginationStartIndexRef.current = page.start_index;
         } catch {
           // Session may not exist anymore
         }
@@ -537,6 +586,15 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     (text: string) => {
       dispatch({ type: "USER_MESSAGE", text });
       wsSend({ type: "send", text });
+    },
+    [wsSend]
+  );
+
+  const sendAudio = useCallback(
+    (audioBase64: string, format: string, textPrompt?: string) => {
+      // Display a user message indicating voice input
+      dispatch({ type: "USER_MESSAGE", text: "[voice message]" });
+      wsSend({ type: "send_audio", audio: audioBase64, format, text: textPrompt });
     },
     [wsSend]
   );
@@ -656,6 +714,28 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     []
   );
 
+  const loadMoreMessages = useCallback(async () => {
+    if (!resumeSdkId || !hasMoreMessages || isLoadingMoreRef.current) return;
+    isLoadingMoreRef.current = true;
+    try {
+      const page = await getMessagesPaginated(resumeSdkId, 50, paginationStartIndexRef.current);
+      dispatch({ type: "PREPEND_HISTORY", messages: page.messages });
+      setHasMoreMessages(page.has_more);
+      paginationStartIndexRef.current = page.start_index;
+    } catch {
+      // Ignore errors — user can try scrolling again
+    } finally {
+      isLoadingMoreRef.current = false;
+    }
+  }, [resumeSdkId, hasMoreMessages]);
+
+  const compact = useCallback(() => {
+    dispatch({ type: "STATUS", status: "streaming" });
+    wsSend({ type: "compact" });
+  }, [wsSend]);
+
+  const contextUsage = Math.min(100, Math.round((state.contextTokens / CONTEXT_WINDOW) * 100));
+
   return {
     messages: state.messages,
     status: state.status,
@@ -664,10 +744,15 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     cost: state.cost,
     turns: state.turns,
     error: state.error,
+    contextUsage,
     selectedMcps,
+    hasMoreMessages,
+    loadMoreMessages,
     send,
+    sendAudio,
     command,
     interrupt,
+    compact,
     stop,
     restart,
     restartWithMcps,

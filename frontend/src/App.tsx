@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, lazy, Suspense } from "react";
 import "./App.css";
 import { AuthGate } from "./components/AuthGate";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { ChatPanelContainer } from "./components/ChatPanelContainer";
 import { OrchestratorModal } from "./components/OrchestratorModal";
+
+const ConfigPage = lazy(() => import("./components/ConfigPage").then(m => ({ default: m.ConfigPage })));
 import { TabsProvider, useTabsContext } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
 import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
@@ -86,6 +88,9 @@ function AppContent() {
     setPendingOrchestrator(null);
   }, []);
 
+  // Config page visibility — toggled without unmounting chat instances
+  const [showConfig, setShowConfig] = useState(false);
+
   // Mobile sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false);
   useEffect(() => {
@@ -102,6 +107,7 @@ function AppContent() {
         onNew={handleNewSession}
         onNewOrchestrator={handleNewOrchestrator}
         onSelectOrchestrator={handleSelectOrchestrator}
+        onOpenConfig={() => { setShowConfig(true); setSidebarOpen(false); }}
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
       />
@@ -115,6 +121,10 @@ function AppContent() {
           <TabBar />
         </div>
         <ChatPanelContainer onSessionChange={refresh} />
+        {/* Config floats over everything — chat instances stay mounted */}
+        <Suspense fallback={null}>
+          <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
+        </Suspense>
       </main>
       {showOrchestratorModal && (
         <OrchestratorModal

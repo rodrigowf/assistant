@@ -73,7 +73,7 @@ class TestOrchestratorConfig:
 
         config = OrchestratorConfig.load()
         assert config.model == "claude-sonnet-4-5-20250929"
-        assert config.provider == "anthropic"
+        assert config.provider.value == "anthropic"
         assert config.max_tokens == 8192
         assert "ORCHESTRATOR_MEMORY.md" in config.memory_path
 
@@ -87,6 +87,38 @@ class TestOrchestratorConfig:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/my-config")
         config = OrchestratorConfig.load()
         assert "context/memory/ORCHESTRATOR_MEMORY.md" in config.memory_path
+
+    def test_set_model_switches_provider(self):
+        config = OrchestratorConfig()
+        assert config.provider.value == "anthropic"
+
+        # Switch to OpenAI model
+        success = config.set_model("gpt-4o")
+        assert success is True
+        assert config.model == "gpt-4o"
+        assert config.provider.value == "openai"
+        assert config.supports_audio is True
+
+        # Switch back to Anthropic
+        success = config.set_model("claude-sonnet-4-5-20250929")
+        assert success is True
+        assert config.provider.value == "anthropic"
+        assert config.supports_audio is False
+
+    def test_set_model_unknown_returns_false(self):
+        config = OrchestratorConfig()
+        success = config.set_model("unknown-model-xyz")
+        assert success is False
+        # Model should not change
+        assert config.model == "claude-sonnet-4-5-20250929"
+
+    def test_to_dict(self):
+        config = OrchestratorConfig()
+        d = config.to_dict()
+        assert "model" in d
+        assert "provider" in d
+        assert "supports_audio" in d
+        assert "model_info" in d
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +221,113 @@ class TestToolRegistry:
 
         result = await reg.execute("simple", {"x": "ok", "extra": "ignored"}, context={})
         assert result == "ok"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI text provider tests
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAITextProvider:
+    def test_tool_conversion(self):
+        """Test Anthropic to OpenAI tool format conversion."""
+        from orchestrator.providers.openai_text import anthropic_to_openai_tools
+
+        anthropic_tools = [
+            {
+                "name": "my_tool",
+                "description": "Does something",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"arg": {"type": "string"}},
+                    "required": ["arg"],
+                },
+            }
+        ]
+
+        openai_tools = anthropic_to_openai_tools(anthropic_tools)
+        assert len(openai_tools) == 1
+        assert openai_tools[0]["type"] == "function"
+        assert openai_tools[0]["function"]["name"] == "my_tool"
+        assert openai_tools[0]["function"]["description"] == "Does something"
+        assert openai_tools[0]["function"]["parameters"]["type"] == "object"
+
+    def test_message_conversion_simple_text(self):
+        """Test simple text message conversion."""
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
+
+        result = convert_messages_for_openai(messages, "You are helpful")
+        assert len(result) == 3  # system + user + assistant
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "You are helpful"
+        assert result[1]["role"] == "user"
+        assert result[1]["content"] == "Hello"
+        assert result[2]["role"] == "assistant"
+        assert result[2]["content"] == "Hi there!"
+
+    def test_message_conversion_with_tool_use(self):
+        """Test message conversion with tool calls."""
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": "Search for X"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me search"},
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "search",
+                        "input": {"query": "X"},
+                    },
+                ],
+            },
+        ]
+
+        result = convert_messages_for_openai(messages, "")
+        # Should have: user, assistant with tool_calls
+        assistant_msg = result[-1]
+        assert assistant_msg["role"] == "assistant"
+        assert "tool_calls" in assistant_msg
+        assert assistant_msg["tool_calls"][0]["function"]["name"] == "search"
+
+    def test_audio_content_creation(self):
+        """Test audio content block creation."""
+        from orchestrator.providers.openai_text import AudioContent
+
+        audio = AudioContent.from_bytes(b"fake audio data", "wav")
+        block = audio.to_openai_content_block()
+
+        assert block["type"] == "input_audio"
+        assert "input_audio" in block
+        assert block["input_audio"]["format"] == "wav"
+        # Base64 encoded
+        assert "ZmFrZSBhdWRpbyBkYXRh" in block["input_audio"]["data"]
+
+    def test_create_audio_message(self):
+        """Test audio message helper function."""
+        from orchestrator.providers.openai_text import create_audio_message
+
+        msg = create_audio_message(b"audio", "mp3", "What is this?")
+        assert msg["role"] == "user"
+        assert len(msg["content"]) == 2
+        assert msg["content"][0]["type"] == "text"
+        assert msg["content"][0]["text"] == "What is this?"
+        assert msg["content"][1]["type"] == "input_audio"
+
+    def test_model_supports_audio(self):
+        """Test audio capability detection."""
+        from orchestrator.providers.openai_text import OpenAIModel
+
+        assert OpenAIModel.GPT_4O.supports_audio is True
+        assert OpenAIModel.GPT_4O_MINI.supports_audio is True
+        assert OpenAIModel.GPT_4_TURBO.supports_audio is False
 
 
 # ---------------------------------------------------------------------------
@@ -779,3 +918,64 @@ class TestOrchestratorSerializer:
         result = serialize_orchestrator_event(ErrorEvent(error="oops", detail="bad"))
         assert result["type"] == "error"
         assert result["error"] == "oops"
+
+
+# ---------------------------------------------------------------------------
+# Audio conversion tests
+# ---------------------------------------------------------------------------
+
+
+class TestAudioConversion:
+    def test_wav_passthrough(self):
+        """WAV format should pass through unchanged."""
+        from orchestrator.audio_utils import convert_audio_to_wav
+
+        data = b"RIFF...WAV data"
+        result_data, result_format = convert_audio_to_wav(data, "wav")
+        assert result_data == data
+        assert result_format == "wav"
+
+    def test_mp3_passthrough(self):
+        """MP3 format should pass through unchanged."""
+        from orchestrator.audio_utils import convert_audio_to_wav
+
+        data = b"ID3...MP3 data"
+        result_data, result_format = convert_audio_to_wav(data, "mp3")
+        assert result_data == data
+        assert result_format == "mp3"
+
+    def test_base64_passthrough(self):
+        """Base64 input should remain base64 output for supported formats."""
+        import base64
+        from orchestrator.audio_utils import convert_audio_to_wav
+
+        original = b"WAV audio bytes"
+        b64_input = base64.b64encode(original).decode("utf-8")
+        result_data, result_format = convert_audio_to_wav(b64_input, "wav")
+        assert result_data == b64_input
+        assert result_format == "wav"
+
+    def test_format_normalization(self):
+        """Format strings should be normalized (lowercase, no dots)."""
+        from orchestrator.audio_utils import convert_audio_to_wav
+
+        data = b"audio"
+        result_data, result_format = convert_audio_to_wav(data, ".WAV")
+        assert result_format == "wav"
+
+    def test_audio_content_validates_format(self):
+        """AudioContent should reject unsupported formats."""
+        from orchestrator.providers.openai_text import AudioContent
+
+        # Valid formats work
+        audio = AudioContent(data="base64data", format="wav")
+        assert audio.format == "wav"
+
+        audio = AudioContent(data="base64data", format="mp3")
+        assert audio.format == "mp3"
+
+        # Invalid format raises
+        with pytest.raises(ValueError) as exc_info:
+            AudioContent(data="base64data", format="webm")
+        assert "webm" in str(exc_info.value)
+        assert "wav" in str(exc_info.value)

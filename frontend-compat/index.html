@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Assistant</title>
+    <meta name="theme-color" content="#0d0d0f" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="icon" type="image/svg+xml" href="/compat/icon.svg" />
+    <script>
+      (function() {
+        function send(level, args) {
+          try {
+            var msg = Array.prototype.map.call(args, function(a) {
+              try { return typeof a === 'object' ? JSON.stringify(a) : String(a); } catch(e) { return '[unserializable]'; }
+            }).join(' ');
+            navigator.sendBeacon('/api/debug/log', JSON.stringify({ level: level, msg: '[compat] ' + msg, ts: new Date().toISOString() }));
+          } catch(e) {}
+        }
+        ['log','warn','error','info'].forEach(function(m) {
+          var orig = console[m].bind(console);
+          console[m] = function() { orig.apply(console, arguments); send(m, arguments); };
+        });
+        window.addEventListener('error', function(e) {
+          send('uncaught', [e.message + ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno]);
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+          send('unhandledrejection', ['[compat] ' + String(e.reason)]);
+        });
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

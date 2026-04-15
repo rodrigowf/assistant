@@ -1,18 +1,58 @@
 import { useRef, useCallback, type KeyboardEvent, type ChangeEvent } from "react";
+import { VoiceRecordButton } from "./VoiceRecordButton";
+import { VoiceButton } from "./VoiceButton";
+import { useAudioRecorder } from "../hooks/useAudioRecorder";
+import type { VoiceStatus } from "../types";
 
 interface Props {
   onSend: (text: string) => void;
+  onSendAudio?: (audioBase64: string, format: string) => void;
   onInterrupt: () => void;
+  onCompact?: () => void;
   disabled: boolean;
   streaming: boolean;
-  /** Number of active MCPs (shows badge if > 0) */
-  activeMcpCount?: number;
-  /** Called when user clicks the MCP settings button */
-  onMcpSettings?: () => void;
+  /** Context usage percentage (0–100). Shows compact button when > 0. */
+  contextUsage?: number;
+  /** Whether audio recording is supported (model supports audio input) */
+  supportsAudio?: boolean;
+  /** Orchestrator voice props */
+  voiceStatus?: VoiceStatus;
+  onVoiceStart?: () => void;
+  onVoiceStop?: () => void;
 }
 
-export function ChatInput({ onSend, onInterrupt, disabled, streaming, activeMcpCount, onMcpSettings }: Props) {
+export function ChatInput({
+  onSend,
+  onSendAudio,
+  onInterrupt,
+  onCompact,
+  disabled,
+  streaming,
+  contextUsage,
+  supportsAudio,
+  voiceStatus,
+  onVoiceStart,
+  onVoiceStop,
+}: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const handleRecordingComplete = useCallback(
+    (audioBase64: string, format: string) => {
+      onSendAudio?.(audioBase64, format);
+    },
+    [onSendAudio]
+  );
+
+  const handleRecordingError = useCallback((error: string) => {
+    console.error("Recording error:", error);
+  }, []);
+
+  const { state: recordingState, duration, startRecording, stopRecording, cancelRecording } =
+    useAudioRecorder({
+      onRecordingComplete: handleRecordingComplete,
+      onError: handleRecordingError,
+      maxDuration: 60,
+    });
 
   const handleInput = useCallback((e: ChangeEvent<HTMLTextAreaElement>) => {
     const el = e.target;
@@ -37,16 +77,39 @@ export function ChatInput({ onSend, onInterrupt, disabled, streaming, activeMcpC
     [onSend]
   );
 
+  const isRecording = recordingState !== "idle";
+
+  const hasUsageData = contextUsage !== undefined && contextUsage > 0;
+  const usageLabel = hasUsageData ? `${contextUsage}%` : "?";
+  const usageClass = hasUsageData && contextUsage >= 80
+    ? " compact-btn--warning"
+    : hasUsageData && contextUsage >= 50
+      ? " compact-btn--caution"
+      : "";
+  const usageTitle = hasUsageData
+    ? `Compact conversation (${contextUsage}% context used)`
+    : "Compact conversation (context usage unknown)";
+
   return (
     <div className="chat-input">
       <textarea
         ref={textareaRef}
         placeholder={streaming ? "Waiting for response..." : "Send a message..."}
-        disabled={disabled && !streaming}
+        disabled={(disabled && !streaming) || isRecording}
         onChange={handleInput}
         onKeyDown={handleKeyDown}
         rows={1}
       />
+      {onCompact && (
+        <button
+          className={`compact-btn${usageClass}`}
+          onClick={onCompact}
+          title={usageTitle}
+          disabled={isRecording || streaming}
+        >
+          <span className="compact-btn-pct">{usageLabel}</span>
+        </button>
+      )}
       {streaming ? (
         <button className="interrupt-btn" onClick={onInterrupt} title="Interrupt">
           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
@@ -67,26 +130,29 @@ export function ChatInput({ onSend, onInterrupt, disabled, streaming, activeMcpC
             }
           }}
           title="Send"
+          disabled={isRecording}
         >
           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
             <path d="M1 1l14 7-14 7V9l10-1-10-1V1z" />
           </svg>
         </button>
       )}
-      {onMcpSettings && (
-        <button
-          className="send-btn mcp-btn"
-          onClick={onMcpSettings}
-          title="MCP Server Settings"
-        >
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="3" />
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-          </svg>
-          {activeMcpCount !== undefined && activeMcpCount > 0 && (
-            <span className="mcp-badge">{activeMcpCount}</span>
-          )}
-        </button>
+      {supportsAudio && onSendAudio && (
+        <VoiceRecordButton
+          state={recordingState}
+          duration={duration}
+          onStart={startRecording}
+          onStop={stopRecording}
+          onCancel={cancelRecording}
+          disabled={disabled || streaming}
+        />
+      )}
+      {voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
+        <VoiceButton
+          status={voiceStatus}
+          onStart={onVoiceStart}
+          onStop={onVoiceStop}
+        />
       )}
     </div>
   );

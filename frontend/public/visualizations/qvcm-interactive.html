@@ -1,0 +1,1163 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>QVCM - Modelo de Consciência Quantum Perspectiva</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #0a0a1a 0%, #1a1a3a 50%, #0a0a2a 100%);
+            color: #e0e0e0;
+        }
+
+        /* Navigation */
+        .nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(10, 10, 30, 0.95);
+            padding: 8px 20px;
+            display: flex;
+            gap: 12px;
+            z-index: 1000;
+            border-bottom: 1px solid rgba(100, 150, 255, 0.3);
+            flex-wrap: nowrap;
+            justify-content: center;
+        }
+
+        .nav-btn {
+            background: rgba(60, 100, 180, 0.3);
+            border: 1px solid rgba(100, 150, 255, 0.5);
+            color: #a0c0ff;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            white-space: nowrap;
+        }
+
+        .nav-btn:hover, .nav-btn.active {
+            background: rgba(80, 130, 220, 0.6);
+            color: #fff;
+            transform: scale(1.05);
+            box-shadow: 0 0 15px rgba(100, 150, 255, 0.4);
+        }
+
+        /* Sections */
+        .section {
+            display: none;
+            height: 100vh;
+            padding: 50px 30px 15px;
+            animation: fadeIn 0.5s ease;
+            overflow: hidden;
+        }
+
+        .section.active {
+            display: flex;
+            flex-direction: column;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 {
+            font-size: 32px;
+            text-align: center;
+            margin-bottom: 5px;
+            background: linear-gradient(90deg, #60a0ff, #a060ff, #60a0ff);
+            background-size: 200% auto;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: gradient 3s ease infinite;
+        }
+
+        @keyframes gradient {
+            0%, 100% { background-position: 0% center; }
+            50% { background-position: 100% center; }
+        }
+
+        h2 {
+            font-size: 24px;
+            color: #80b0ff;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+
+        .description {
+            font-size: 16px;
+            text-align: center;
+            max-width: 900px;
+            margin: 0 auto 10px;
+            color: #b0b0c0;
+            line-height: 1.4;
+        }
+
+        /* Canvas containers */
+        .canvas-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 10px auto;
+            flex-shrink: 0;
+        }
+
+        canvas {
+            border-radius: 15px;
+            background: rgba(0, 0, 0, 0.3);
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin: 10px 0;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+        }
+
+        .control-btn {
+            background: linear-gradient(135deg, #4060a0, #6080c0);
+            border: none;
+            color: white;
+            padding: 10px 25px;
+            border-radius: 25px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .control-btn:hover {
+            transform: scale(1.1);
+            box-shadow: 0 0 20px rgba(80, 120, 200, 0.6);
+        }
+
+        .control-btn.active {
+            background: linear-gradient(135deg, #60a060, #80c080);
+        }
+
+        /* Slider */
+        .slider-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            margin: 8px 0;
+            flex-shrink: 0;
+        }
+
+        .slider-label {
+            font-size: 16px;
+            color: #a0c0ff;
+        }
+
+        .slider {
+            width: 300px;
+            height: 8px;
+            -webkit-appearance: none;
+            background: linear-gradient(90deg, #ff6060, #ffff60, #60ff60);
+            border-radius: 4px;
+            outline: none;
+        }
+
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            background: white;
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+        }
+
+        .slider-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #fff;
+        }
+
+        /* Info boxes */
+        .info-box {
+            background: rgba(40, 60, 100, 0.3);
+            border: 1px solid rgba(100, 150, 255, 0.3);
+            border-radius: 10px;
+            padding: 12px 18px;
+            margin: 8px auto;
+            max-width: 800px;
+            flex-shrink: 0;
+        }
+
+        .info-box h3 {
+            color: #80c0ff;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+
+        .info-box p {
+            font-size: 14px;
+            line-height: 1.4;
+            color: #c0c0d0;
+        }
+
+        /* Double slit specific */
+        .observer-status {
+            font-size: 18px;
+            text-align: center;
+            margin: 8px 0;
+            padding: 10px;
+            border-radius: 8px;
+            flex-shrink: 0;
+        }
+
+        .observer-status.off {
+            background: rgba(60, 100, 60, 0.3);
+            color: #80ff80;
+        }
+
+        .observer-status.on {
+            background: rgba(100, 60, 60, 0.3);
+            color: #ff8080;
+        }
+
+        /* Perspectiva visualization */
+        .perspectiva-card {
+            background: rgba(30, 50, 80, 0.4);
+            border: 2px solid rgba(100, 150, 255, 0.4);
+            border-radius: 15px;
+            padding: 15px;
+            text-align: center;
+            width: 200px;
+            transition: all 0.5s ease;
+        }
+
+        .perspectiva-card.merged {
+            border-color: #80ff80;
+            box-shadow: 0 0 20px rgba(100, 255, 100, 0.3);
+        }
+
+        .perspectiva-icon {
+            font-size: 36px;
+            margin-bottom: 8px;
+        }
+
+        .perspectiva-name {
+            font-size: 16px;
+            color: #a0c0ff;
+            margin-bottom: 5px;
+        }
+
+        .perspectiva-thought {
+            font-size: 13px;
+            color: #c0c0d0;
+            font-style: italic;
+        }
+
+        /* Intro section */
+        .intro-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            max-width: 1000px;
+            margin: 15px auto;
+            flex: 1;
+        }
+
+        .intro-card {
+            background: rgba(30, 50, 80, 0.3);
+            border: 1px solid rgba(100, 150, 255, 0.3);
+            border-radius: 12px;
+            padding: 15px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .intro-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(80, 120, 200, 0.3);
+        }
+
+        .intro-card .icon {
+            font-size: 32px;
+            margin-bottom: 8px;
+        }
+
+        .intro-card h3 {
+            color: #80c0ff;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+
+        .intro-card p {
+            font-size: 13px;
+            color: #a0a0b0;
+        }
+
+        /* World-Mind diagram */
+        .diagram-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 30px;
+            margin: 10px 0;
+        }
+
+        .diagram-label {
+            font-size: 14px;
+            color: #a0c0ff;
+            text-align: center;
+        }
+
+        .arrow {
+            font-size: 24px;
+            color: #60a0ff;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="nav">
+        <button class="nav-btn active" onclick="showSection('intro')">Introdução</button>
+        <button class="nav-btn" onclick="showSection('perception')">Percepção</button>
+        <button class="nav-btn" onclick="showSection('decision')">Decisão</button>
+        <button class="nav-btn" onclick="showSection('perspectiva')">Perspectiva</button>
+        <button class="nav-btn" onclick="showSection('oneness')">Oneness</button>
+        <button class="nav-btn" onclick="showSection('double-slit')">Dupla Fenda</button>
+    </nav>
+
+    <!-- Introduction Section -->
+    <section id="intro" class="section active">
+        <h1>QVCM</h1>
+        <h2>Modelo de Consciência Quantum Perspectiva</h2>
+        <p class="description">
+            A consciência <strong>é</strong> um estado quântico físico do cérebro — um modelo interno unificado
+            que espelha a realidade externa. Não são múltiplas possibilidades, mas uma abstração coerente do mundo.
+        </p>
+
+        <div class="intro-grid">
+            <div class="intro-card">
+                <div class="icon">🌐</div>
+                <h3>Percepção</h3>
+                <p>Superposição quântica <strong>é</strong> o modelo interno unificado do mundo</p>
+            </div>
+            <div class="intro-card">
+                <div class="icon">⚡</div>
+                <h3>Decisão</h3>
+                <p>Colapso <strong>é</strong> a reconfiguração desse modelo em direção à ação</p>
+            </div>
+            <div class="intro-card">
+                <div class="icon">👁️</div>
+                <h3>Perspectiva</h3>
+                <p>Componente conectado do grafo <strong>é</strong> um ponto de vista consciente</p>
+            </div>
+            <div class="intro-card">
+                <div class="icon">🔗</div>
+                <h3>Oneness</h3>
+                <p>Grau de acoplamento <strong>é</strong> a unidade sentida da experiência</p>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <h3>Superposição = Espelho Interno do Mundo</h3>
+            <p>
+                A superposição não é "múltiplas escolhas". É uma <strong>representação quântica única e coerente</strong>
+                da realidade externa — um holograma interno que modela o mundo real em sua totalidade.
+            </p>
+        </div>
+    </section>
+
+    <!-- Perception Section -->
+    <section id="perception" class="section">
+        <h2>Percepção = Modelo Quântico Unificado</h2>
+        <p class="description">
+            A superposição quântica do substrato neural <strong>é</strong> uma abstração única e coerente do mundo externo.
+            Não são possibilidades competindo — é um espelho interno da realidade.
+        </p>
+
+        <div class="diagram-container">
+            <div>
+                <canvas id="worldCanvas" width="300" height="200"></canvas>
+                <div class="diagram-label">Mundo Externo</div>
+            </div>
+            <div class="arrow">➜</div>
+            <div>
+                <canvas id="perceptionCanvas" width="300" height="200"></canvas>
+                <div class="diagram-label">Modelo Interno (Superposição)</div>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <h3>Holograma Quântico</h3>
+            <p>
+                A superposição não representa escolhas a fazer. Ela <strong>é</strong> a abstração consciente do mundo —
+                um padrão quântico complexo que codifica a totalidade da realidade percebida como uma estrutura unificada.
+            </p>
+        </div>
+    </section>
+
+    <!-- Decision Section -->
+    <section id="decision" class="section">
+        <h2>Decisão = Reconfiguração do Modelo</h2>
+        <p class="description">
+            O colapso não é escolher entre opções. É a <strong>reconfiguração</strong> do modelo interno unificado
+            em uma direção específica de ação. O estado se transforma, não se "seleciona".
+        </p>
+
+        <div class="canvas-container">
+            <canvas id="decisionCanvas" width="800" height="220"></canvas>
+        </div>
+
+        <div class="controls">
+            <button class="control-btn" onclick="triggerCollapse()">⚡ Reconfigurar / Decidir</button>
+            <button class="control-btn" onclick="resetDecision()">🔄 Restaurar</button>
+        </div>
+
+        <div class="info-box">
+            <h3>Transformação, não Seleção</h3>
+            <p>
+                O modelo interno não "escolhe um caminho entre muitos". Ele <strong>se transforma</strong> —
+                a estrutura quântica se reconfigura de um estado holístico para um estado direcionado à ação.
+            </p>
+        </div>
+    </section>
+
+    <!-- Perspectiva Section -->
+    <section id="perspectiva" class="section">
+        <h2>Perspectiva = Componente Conectado</h2>
+        <p class="description">
+            Uma perspectiva <strong>é</strong> uma componente conectada do grafo de acoplamento neural.
+            Múltiplas componentes = múltiplas perspectivas simultâneas (literalmente).
+        </p>
+
+        <div style="display: flex; justify-content: center; align-items: center; gap: 20px; flex-wrap: wrap;">
+            <div class="perspectiva-card" id="perspectivaA">
+                <div class="perspectiva-icon">🍔</div>
+                <div class="perspectiva-name">Perspectiva A</div>
+                <div class="perspectiva-thought">"Estou com fome!"</div>
+            </div>
+
+            <div class="canvas-container" style="margin: 0;">
+                <canvas id="perspectivaCanvas" width="400" height="150"></canvas>
+            </div>
+
+            <div class="perspectiva-card" id="perspectivaB">
+                <div class="perspectiva-icon">💻</div>
+                <div class="perspectiva-name">Perspectiva B</div>
+                <div class="perspectiva-thought">"Preciso trabalhar!"</div>
+            </div>
+        </div>
+
+        <div class="slider-container">
+            <span class="slider-label">Acoplamento (força da conexão)</span>
+            <input type="range" class="slider" id="couplingSlider" min="0" max="100" value="30" oninput="updateCoupling(this.value)">
+            <span class="slider-value" id="couplingValue">30%</span>
+        </div>
+
+        <div class="info-box" id="perspectivaInfo">
+            <p id="perspectivaInfoText">
+                <strong>Conflito:</strong> Baixo acoplamento = perspectivas separadas. Aumente para ver a <strong>fusão</strong>.
+            </p>
+        </div>
+    </section>
+
+    <!-- Oneness Section -->
+    <section id="oneness" class="section">
+        <h2>Oneness = Grau de Acoplamento</h2>
+        <p class="description">
+            <strong>O</strong> é a fração de integração do grafo neural. O valor físico do acoplamento
+            <strong>é</strong> a unidade sentida — não uma correlação, uma identidade.
+        </p>
+
+        <div class="canvas-container">
+            <canvas id="onenessCanvas" width="700" height="220"></canvas>
+        </div>
+
+        <div class="slider-container">
+            <span class="slider-label">Oneness (O)</span>
+            <input type="range" class="slider" id="onenessSlider" min="0" max="100" value="50" oninput="updateOneness(this.value)">
+            <span class="slider-value" id="onenessValue">O = 0.50</span>
+        </div>
+
+        <div class="info-box" id="onenessInfo">
+            <h3>Estado: Integração Parcial</h3>
+            <p id="onenessDescription">
+                O valor de O reflete a estrutura física do grafo. Múltiplas componentes = múltiplas perspectivas literais.
+            </p>
+        </div>
+    </section>
+
+    <!-- Double Slit Section -->
+    <section id="double-slit" class="section">
+        <h2>Experimento da Dupla Fenda</h2>
+        <p class="description">
+            Este experimento demonstra a superposição quântica e o colapso — os mesmos fenômenos
+            que <strong>são</strong> percepção e decisão no QVCM.
+        </p>
+
+        <div class="canvas-container">
+            <canvas id="slitCanvas" width="700" height="200"></canvas>
+        </div>
+
+        <div class="observer-status" id="observerStatus" class="off">
+            👁️ Observador: DESLIGADO - Superposição intacta (padrão de interferência)
+        </div>
+
+        <div class="controls">
+            <button class="control-btn" id="observerBtn" onclick="toggleObserver()">👁️ Ligar Observador</button>
+            <button class="control-btn" onclick="resetDoubleSlit()">🔄 Reiniciar</button>
+        </div>
+
+        <div class="info-box">
+            <h3>Superposição e Colapso</h3>
+            <p>
+                <strong>Sem observador:</strong> A partícula existe em superposição (modelo unificado).
+                <strong>Com observador:</strong> O estado colapsa/reconfigura para um caminho definido.
+            </p>
+        </div>
+    </section>
+
+    <script>
+        // ==================== NAVIGATION ====================
+        function showSection(sectionId) {
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+
+            document.getElementById(sectionId).classList.add('active');
+            event.target.classList.add('active');
+
+            if (sectionId === 'perception') startPerceptionAnimation();
+            if (sectionId === 'decision') startDecisionAnimation();
+            if (sectionId === 'perspectiva') startPerspectivaAnimation();
+            if (sectionId === 'oneness') startOnenessAnimation();
+            if (sectionId === 'double-slit') startDoubleSlitAnimation();
+        }
+
+        // ==================== PERCEPTION ====================
+        let perceptionAnimId;
+        let worldAnimId;
+
+        function startPerceptionAnimation() {
+            cancelAnimationFrame(perceptionAnimId);
+            cancelAnimationFrame(worldAnimId);
+
+            // World canvas - external reality representation
+            const worldCanvas = document.getElementById('worldCanvas');
+            const worldCtx = worldCanvas.getContext('2d');
+
+            // Perception canvas - quantum model (hologram)
+            const percCanvas = document.getElementById('perceptionCanvas');
+            const percCtx = percCanvas.getContext('2d');
+
+            let time = 0;
+
+            function animateWorld() {
+                worldCtx.fillStyle = 'rgba(10, 20, 40, 0.1)';
+                worldCtx.fillRect(0, 0, worldCanvas.width, worldCanvas.height);
+
+                // Draw "world" as geometric shapes (reality)
+                const cx = worldCanvas.width / 2;
+                const cy = worldCanvas.height / 2;
+
+                // Sun
+                worldCtx.beginPath();
+                const sunGrad = worldCtx.createRadialGradient(cx - 60, cy - 40, 0, cx - 60, cy - 40, 30);
+                sunGrad.addColorStop(0, '#ffdd44');
+                sunGrad.addColorStop(1, 'rgba(255, 200, 50, 0)');
+                worldCtx.fillStyle = sunGrad;
+                worldCtx.arc(cx - 60, cy - 40, 30 + Math.sin(time * 0.02) * 3, 0, Math.PI * 2);
+                worldCtx.fill();
+
+                // Mountain
+                worldCtx.beginPath();
+                worldCtx.fillStyle = '#4a6a4a';
+                worldCtx.moveTo(cx - 80, cy + 60);
+                worldCtx.lineTo(cx, cy - 20);
+                worldCtx.lineTo(cx + 80, cy + 60);
+                worldCtx.closePath();
+                worldCtx.fill();
+
+                // Tree
+                worldCtx.beginPath();
+                worldCtx.fillStyle = '#2a4a2a';
+                worldCtx.arc(cx + 60, cy + 20, 20, 0, Math.PI * 2);
+                worldCtx.fill();
+                worldCtx.fillStyle = '#5a3a2a';
+                worldCtx.fillRect(cx + 57, cy + 35, 6, 25);
+
+                // Ground
+                worldCtx.fillStyle = '#3a5a3a';
+                worldCtx.fillRect(0, cy + 55, worldCanvas.width, 50);
+
+                time++;
+                worldAnimId = requestAnimationFrame(animateWorld);
+            }
+
+            function animatePerception() {
+                percCtx.fillStyle = 'rgba(5, 10, 25, 0.08)';
+                percCtx.fillRect(0, 0, percCanvas.width, percCanvas.height);
+
+                const cx = percCanvas.width / 2;
+                const cy = percCanvas.height / 2;
+
+                // Draw quantum hologram - unified field pattern
+                for (let i = 0; i < 8; i++) {
+                    const angle = (i / 8) * Math.PI * 2 + time * 0.01;
+                    const radius = 60 + Math.sin(time * 0.02 + i) * 15;
+
+                    percCtx.beginPath();
+                    percCtx.strokeStyle = `hsla(${200 + i * 20}, 80%, 60%, 0.4)`;
+                    percCtx.lineWidth = 2;
+
+                    // Draw interference-like ripples
+                    for (let r = 10; r < radius; r += 15) {
+                        percCtx.beginPath();
+                        percCtx.arc(cx, cy, r, angle, angle + Math.PI * 0.5);
+                        percCtx.stroke();
+                    }
+                }
+
+                // Central unified core
+                const coreGrad = percCtx.createRadialGradient(cx, cy, 0, cx, cy, 40);
+                coreGrad.addColorStop(0, 'rgba(100, 180, 255, 0.8)');
+                coreGrad.addColorStop(0.5, 'rgba(150, 100, 255, 0.4)');
+                coreGrad.addColorStop(1, 'rgba(100, 150, 255, 0)');
+                percCtx.beginPath();
+                percCtx.fillStyle = coreGrad;
+                percCtx.arc(cx, cy, 40 + Math.sin(time * 0.03) * 5, 0, Math.PI * 2);
+                percCtx.fill();
+
+                // Quantum field lines - unified pattern
+                percCtx.strokeStyle = 'rgba(150, 200, 255, 0.3)';
+                percCtx.lineWidth = 1;
+                for (let i = 0; i < 12; i++) {
+                    const a = (i / 12) * Math.PI * 2 + time * 0.005;
+                    const x1 = cx + Math.cos(a) * 30;
+                    const y1 = cy + Math.sin(a) * 30;
+                    const x2 = cx + Math.cos(a) * (70 + Math.sin(time * 0.02 + i) * 10);
+                    const y2 = cy + Math.sin(a) * (70 + Math.sin(time * 0.02 + i) * 10);
+
+                    percCtx.beginPath();
+                    percCtx.moveTo(x1, y1);
+                    percCtx.lineTo(x2, y2);
+                    percCtx.stroke();
+                }
+
+                perceptionAnimId = requestAnimationFrame(animatePerception);
+            }
+
+            worldCtx.fillStyle = 'rgba(10, 20, 40, 1)';
+            worldCtx.fillRect(0, 0, worldCanvas.width, worldCanvas.height);
+            percCtx.fillStyle = 'rgba(5, 10, 25, 1)';
+            percCtx.fillRect(0, 0, percCanvas.width, percCanvas.height);
+
+            animateWorld();
+            animatePerception();
+        }
+
+        // ==================== DECISION ====================
+        let decisionAnimId;
+        let collapsed = false;
+        let collapseProgress = 0;
+
+        function startDecisionAnimation() {
+            cancelAnimationFrame(decisionAnimId);
+            const canvas = document.getElementById('decisionCanvas');
+            const ctx = canvas.getContext('2d');
+            let time = 0;
+
+            function animate() {
+                ctx.fillStyle = 'rgba(5, 10, 25, 0.1)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                const cx = canvas.width / 2;
+                const cy = canvas.height / 2;
+
+                if (!collapsed) {
+                    // Unified holographic state - complex but coherent
+                    for (let layer = 0; layer < 5; layer++) {
+                        const baseRadius = 30 + layer * 25;
+                        ctx.strokeStyle = `hsla(${220 + layer * 15}, 70%, ${50 + layer * 5}%, ${0.4 - layer * 0.05})`;
+                        ctx.lineWidth = 3 - layer * 0.4;
+
+                        ctx.beginPath();
+                        for (let i = 0; i < 60; i++) {
+                            const angle = (i / 60) * Math.PI * 2;
+                            const wobble = Math.sin(angle * 6 + time * 0.03 + layer) * 8;
+                            const r = baseRadius + wobble;
+                            const x = cx + Math.cos(angle) * r;
+                            const y = cy + Math.sin(angle) * r;
+                            if (i === 0) ctx.moveTo(x, y);
+                            else ctx.lineTo(x, y);
+                        }
+                        ctx.closePath();
+                        ctx.stroke();
+                    }
+
+                    // Core glow
+                    const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 60);
+                    coreGrad.addColorStop(0, 'rgba(100, 150, 255, 0.6)');
+                    coreGrad.addColorStop(0.5, 'rgba(150, 100, 255, 0.3)');
+                    coreGrad.addColorStop(1, 'transparent');
+                    ctx.fillStyle = coreGrad;
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, 60, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Label
+                    ctx.fillStyle = 'rgba(150, 200, 255, 0.8)';
+                    ctx.font = '14px Segoe UI';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Modelo Interno Unificado', cx, cy + 100);
+
+                } else {
+                    // Collapsed/reconfigured state - directed toward action
+                    collapseProgress = Math.min(collapseProgress + 0.02, 1);
+
+                    // Contracted core
+                    const contractedRadius = 60 - collapseProgress * 35;
+
+                    // Direction arrow forming
+                    const arrowLength = collapseProgress * 150;
+
+                    // Core transforms
+                    const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, contractedRadius);
+                    coreGrad.addColorStop(0, `rgba(100, 255, 150, ${0.8 * collapseProgress + 0.2})`);
+                    coreGrad.addColorStop(1, 'transparent');
+                    ctx.fillStyle = coreGrad;
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, contractedRadius, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Action direction arrow
+                    if (collapseProgress > 0.3) {
+                        const arrowOpacity = (collapseProgress - 0.3) / 0.7;
+                        ctx.strokeStyle = `rgba(100, 255, 150, ${arrowOpacity})`;
+                        ctx.lineWidth = 4;
+                        ctx.beginPath();
+                        ctx.moveTo(cx, cy);
+                        ctx.lineTo(cx + arrowLength, cy);
+                        ctx.stroke();
+
+                        // Arrow head
+                        ctx.beginPath();
+                        ctx.moveTo(cx + arrowLength, cy);
+                        ctx.lineTo(cx + arrowLength - 15, cy - 10);
+                        ctx.lineTo(cx + arrowLength - 15, cy + 10);
+                        ctx.closePath();
+                        ctx.fillStyle = `rgba(100, 255, 150, ${arrowOpacity})`;
+                        ctx.fill();
+                    }
+
+                    // Labels
+                    ctx.fillStyle = 'rgba(100, 255, 150, 0.9)';
+                    ctx.font = '14px Segoe UI';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Reconfigurado → Direção de Ação', cx, cy + 100);
+                }
+
+                time++;
+                decisionAnimId = requestAnimationFrame(animate);
+            }
+
+            ctx.fillStyle = 'rgba(5, 10, 25, 1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            animate();
+        }
+
+        function triggerCollapse() {
+            collapsed = true;
+            collapseProgress = 0;
+        }
+
+        function resetDecision() {
+            collapsed = false;
+            collapseProgress = 0;
+        }
+
+        // ==================== PERSPECTIVA ====================
+        let perspectivaAnimId;
+        let coupling = 30;
+        let nodeA = { x: 100, y: 75 };
+        let nodeB = { x: 300, y: 75 };
+
+        function startPerspectivaAnimation() {
+            cancelAnimationFrame(perspectivaAnimId);
+            const canvas = document.getElementById('perspectivaCanvas');
+            const ctx = canvas.getContext('2d');
+            let time = 0;
+
+            function animate() {
+                ctx.fillStyle = 'rgba(10, 10, 30, 0.2)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                const mergeProgress = coupling / 100;
+                const centerX = 200;
+                const separation = 200 * (1 - mergeProgress * 0.8);
+
+                nodeA.x = centerX - separation / 2;
+                nodeB.x = centerX + separation / 2;
+
+                // Connection line
+                ctx.beginPath();
+                ctx.strokeStyle = `rgba(100, 200, 255, ${mergeProgress})`;
+                ctx.lineWidth = 2 + mergeProgress * 6;
+                ctx.setLineDash([10, 10 - mergeProgress * 10]);
+                ctx.moveTo(nodeA.x, nodeA.y);
+                ctx.lineTo(nodeB.x, nodeB.y);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Coupling particles
+                if (coupling > 20) {
+                    for (let i = 0; i < coupling / 10; i++) {
+                        const t = (time * 0.02 + i / 10) % 1;
+                        const px = nodeA.x + (nodeB.x - nodeA.x) * t;
+                        const py = nodeA.y + Math.sin(t * Math.PI) * -20;
+                        ctx.beginPath();
+                        ctx.fillStyle = `rgba(100, 200, 255, ${0.5 + Math.sin(time * 0.1 + i) * 0.3})`;
+                        ctx.arc(px, py, 3, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+
+                // Nodes
+                const pulse = Math.sin(time * 0.05) * 3;
+
+                // Node A
+                const gradA = ctx.createRadialGradient(nodeA.x, nodeA.y, 0, nodeA.x, nodeA.y, 40 + pulse);
+                gradA.addColorStop(0, mergeProgress > 0.7 ? '#80ff80' : '#ff8060');
+                gradA.addColorStop(1, 'transparent');
+                ctx.beginPath();
+                ctx.fillStyle = gradA;
+                ctx.arc(nodeA.x, nodeA.y, 40 + pulse, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Node B
+                const gradB = ctx.createRadialGradient(nodeB.x, nodeB.y, 0, nodeB.x, nodeB.y, 40 + pulse);
+                gradB.addColorStop(0, mergeProgress > 0.7 ? '#80ff80' : '#6080ff');
+                gradB.addColorStop(1, 'transparent');
+                ctx.beginPath();
+                ctx.fillStyle = gradB;
+                ctx.arc(nodeB.x, nodeB.y, 40 + pulse, 0, Math.PI * 2);
+                ctx.fill();
+
+                time++;
+                perspectivaAnimId = requestAnimationFrame(animate);
+            }
+
+            ctx.fillStyle = 'rgba(10, 10, 30, 1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            animate();
+        }
+
+        function updateCoupling(value) {
+            coupling = parseInt(value);
+            document.getElementById('couplingValue').textContent = value + '%';
+
+            const perspectivaA = document.getElementById('perspectivaA');
+            const perspectivaB = document.getElementById('perspectivaB');
+            const infoText = document.getElementById('perspectivaInfoText');
+
+            if (coupling >= 70) {
+                perspectivaA.classList.add('merged');
+                perspectivaB.classList.add('merged');
+                perspectivaA.querySelector('.perspectiva-thought').textContent = '"Lanche rápido e volto!"';
+                perspectivaB.querySelector('.perspectiva-thought').textContent = '"Energia renovada!"';
+                infoText.innerHTML = '<strong>Fusão:</strong> Alto acoplamento integrou as perspectivas em uma só.';
+            } else {
+                perspectivaA.classList.remove('merged');
+                perspectivaB.classList.remove('merged');
+                perspectivaA.querySelector('.perspectiva-thought').textContent = '"Estou com fome!"';
+                perspectivaB.querySelector('.perspectiva-thought').textContent = '"Preciso trabalhar!"';
+                infoText.innerHTML = '<strong>Conflito:</strong> Baixo acoplamento = perspectivas separadas. Aumente para ver a <strong>fusão</strong>.';
+            }
+        }
+
+        // ==================== ONENESS ====================
+        let onenessAnimId;
+        let onenessValue = 0.5;
+
+        function startOnenessAnimation() {
+            cancelAnimationFrame(onenessAnimId);
+            const canvas = document.getElementById('onenessCanvas');
+            const ctx = canvas.getContext('2d');
+            let time = 0;
+
+            function animate() {
+                ctx.fillStyle = 'rgba(10, 10, 30, 0.15)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                const cx = canvas.width / 2;
+                const cy = canvas.height / 2;
+
+                const numNodes = Math.max(1, Math.floor((1 - onenessValue) * 8) + 1);
+                const nodeSize = 25 + onenessValue * 35;
+
+                if (onenessValue >= 0.8) {
+                    // Unified
+                    const pulse = Math.sin(time * 0.05) * 8;
+                    const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 100 + pulse);
+                    grad.addColorStop(0, '#80ff80');
+                    grad.addColorStop(0.4, 'rgba(100, 255, 100, 0.4)');
+                    grad.addColorStop(1, 'transparent');
+                    ctx.beginPath();
+                    ctx.fillStyle = grad;
+                    ctx.arc(cx, cy, 100 + pulse, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.fillStyle = '#fff';
+                    ctx.font = 'bold 18px Segoe UI';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('UNIFICADO', cx, cy + 80);
+                } else {
+                    // Multiple nodes
+                    for (let i = 0; i < numNodes; i++) {
+                        const angle = (i / numNodes) * Math.PI * 2 + time * 0.01;
+                        const radius = 80 + Math.sin(time * 0.03 + i) * 20;
+                        const x = cx + Math.cos(angle) * radius;
+                        const y = cy + Math.sin(angle) * radius * 0.6;
+
+                        if (onenessValue > 0.2) {
+                            ctx.beginPath();
+                            ctx.strokeStyle = `rgba(100, 150, 255, ${onenessValue * 0.5})`;
+                            ctx.lineWidth = onenessValue * 2;
+                            ctx.moveTo(cx, cy);
+                            ctx.lineTo(x, y);
+                            ctx.stroke();
+                        }
+
+                        const colors = ['#ff6080', '#60ff80', '#6080ff', '#ffff60', '#ff60ff', '#60ffff'];
+                        const grad = ctx.createRadialGradient(x, y, 0, x, y, nodeSize);
+                        grad.addColorStop(0, colors[i % colors.length]);
+                        grad.addColorStop(1, 'transparent');
+                        ctx.beginPath();
+                        ctx.fillStyle = grad;
+                        ctx.arc(x, y, nodeSize, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    const centerSize = 15 + onenessValue * 25;
+                    ctx.beginPath();
+                    ctx.fillStyle = `rgba(255, 255, 255, ${0.3 + onenessValue * 0.5})`;
+                    ctx.arc(cx, cy, centerSize, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 28px Segoe UI';
+                ctx.textAlign = 'center';
+                ctx.fillText(`O = ${onenessValue.toFixed(2)}`, cx, 40);
+
+                time++;
+                onenessAnimId = requestAnimationFrame(animate);
+            }
+
+            ctx.fillStyle = 'rgba(10, 10, 30, 1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            animate();
+        }
+
+        function updateOneness(value) {
+            onenessValue = value / 100;
+            document.getElementById('onenessValue').textContent = `O = ${onenessValue.toFixed(2)}`;
+
+            const info = document.getElementById('onenessInfo');
+            const desc = document.getElementById('onenessDescription');
+
+            if (onenessValue >= 0.8) {
+                info.querySelector('h3').textContent = 'Estado: Grafo Conectado';
+                desc.textContent = 'Uma única componente dominante. Perspectiva unificada.';
+            } else if (onenessValue >= 0.5) {
+                info.querySelector('h3').textContent = 'Estado: Integração Parcial';
+                desc.textContent = 'Componentes parcialmente conectadas. Múltiplas perspectivas com comunicação.';
+            } else if (onenessValue >= 0.2) {
+                info.querySelector('h3').textContent = 'Estado: Múltiplas Componentes';
+                desc.textContent = 'Grafo fragmentado = múltiplas perspectivas separadas.';
+            } else {
+                info.querySelector('h3').textContent = 'Estado: Alta Fragmentação';
+                desc.textContent = 'Muitas componentes desconectadas. Perspectivas independentes.';
+            }
+        }
+
+        // ==================== DOUBLE SLIT ====================
+        let slitAnimId;
+        let observerOn = false;
+        let slitParticles = [];
+        let detectionPattern = [];
+
+        function initDoubleSlit() {
+            slitParticles = [];
+            detectionPattern = new Array(80).fill(0);
+        }
+
+        function startDoubleSlitAnimation() {
+            cancelAnimationFrame(slitAnimId);
+            const canvas = document.getElementById('slitCanvas');
+            const ctx = canvas.getContext('2d');
+
+            if (slitParticles.length === 0) initDoubleSlit();
+
+            const slitX = 250;
+            const slit1Y = 75;
+            const slit2Y = 125;
+            const screenX = 600;
+
+            function animate() {
+                ctx.fillStyle = 'rgba(10, 10, 30, 0.1)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                // Barrier
+                ctx.fillStyle = '#304060';
+                ctx.fillRect(slitX - 8, 0, 16, slit1Y - 20);
+                ctx.fillRect(slitX - 8, slit1Y + 20, 16, slit2Y - slit1Y - 40);
+                ctx.fillRect(slitX - 8, slit2Y + 20, 16, canvas.height - slit2Y - 20);
+
+                // Slits
+                ctx.fillStyle = '#60a0ff';
+                ctx.fillRect(slitX - 8, slit1Y - 20, 16, 40);
+                ctx.fillRect(slitX - 8, slit2Y - 20, 16, 40);
+
+                // Screen
+                ctx.fillStyle = '#203040';
+                ctx.fillRect(screenX, 0, 8, canvas.height);
+
+                // Detection pattern
+                for (let i = 0; i < detectionPattern.length; i++) {
+                    const intensity = Math.min(detectionPattern[i] / 5, 1);
+                    if (intensity > 0) {
+                        ctx.fillStyle = `rgba(100, 200, 255, ${intensity})`;
+                        ctx.fillRect(screenX + 12, i * 2.5, intensity * 50, 2.5);
+                    }
+                }
+
+                // Emit particles
+                if (Math.random() < 0.1) {
+                    const particle = {
+                        x: 40,
+                        y: 100,
+                        phase: Math.random() * Math.PI * 2,
+                        path: observerOn ? (Math.random() < 0.5 ? 1 : 2) : null,
+                        reached: false
+                    };
+                    slitParticles.push(particle);
+                }
+
+                // Update particles
+                slitParticles = slitParticles.filter(p => {
+                    p.x += 3;
+
+                    if (p.x < slitX) {
+                        ctx.beginPath();
+                        ctx.fillStyle = '#60c0ff';
+                        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                        ctx.fill();
+                    } else if (p.x < screenX) {
+                        if (observerOn) {
+                            const targetY = p.path === 1 ? slit1Y : slit2Y;
+                            const spread = (p.x - slitX) * 0.25;
+                            const y = targetY + (Math.random() - 0.5) * spread;
+                            ctx.beginPath();
+                            ctx.fillStyle = p.path === 1 ? '#ff8080' : '#80ff80';
+                            ctx.arc(p.x, y, 3, 0, Math.PI * 2);
+                            ctx.fill();
+                            p.detY = y;
+                        } else {
+                            const progress = (p.x - slitX) / (screenX - slitX);
+                            ctx.beginPath();
+                            ctx.strokeStyle = 'rgba(255, 100, 100, 0.3)';
+                            const y1 = slit1Y + Math.sin(p.phase + p.x * 0.04) * (15 + progress * 60);
+                            ctx.arc(p.x, y1, 2, 0, Math.PI * 2);
+                            ctx.stroke();
+
+                            ctx.beginPath();
+                            ctx.strokeStyle = 'rgba(100, 255, 100, 0.3)';
+                            const y2 = slit2Y + Math.sin(p.phase + p.x * 0.04 + Math.PI) * (15 + progress * 60);
+                            ctx.arc(p.x, y2, 2, 0, Math.PI * 2);
+                            ctx.stroke();
+
+                            const interference = Math.sin(p.phase * 3 + p.x * 0.015) * (40 + progress * 60);
+                            p.detY = 100 + interference;
+                        }
+                    } else if (!p.reached) {
+                        p.reached = true;
+                        const idx = Math.floor((p.detY / canvas.height) * detectionPattern.length);
+                        if (idx >= 0 && idx < detectionPattern.length) {
+                            detectionPattern[idx]++;
+                        }
+                    }
+
+                    return p.x < screenX + 40;
+                });
+
+                // Labels
+                ctx.fillStyle = '#a0c0ff';
+                ctx.font = '12px Segoe UI';
+                ctx.textAlign = 'center';
+                ctx.fillText('Fonte', 40, 25);
+                ctx.fillText('Detector', screenX + 35, 25);
+
+                slitAnimId = requestAnimationFrame(animate);
+            }
+
+            ctx.fillStyle = 'rgba(10, 10, 30, 1)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            animate();
+        }
+
+        function toggleObserver() {
+            observerOn = !observerOn;
+            const status = document.getElementById('observerStatus');
+            const btn = document.getElementById('observerBtn');
+
+            if (observerOn) {
+                status.className = 'observer-status on';
+                status.innerHTML = '👁️ Observador: LIGADO - Estado colapsado (caminho definido)';
+                btn.textContent = '👁️ Desligar Observador';
+                btn.classList.add('active');
+            } else {
+                status.className = 'observer-status off';
+                status.innerHTML = '👁️ Observador: DESLIGADO - Superposição intacta (padrão de interferência)';
+                btn.textContent = '👁️ Ligar Observador';
+                btn.classList.remove('active');
+            }
+            initDoubleSlit();
+        }
+
+        function resetDoubleSlit() {
+            initDoubleSlit();
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            const navBtns = document.querySelectorAll('.nav-btn');
+            const currentIndex = Array.from(navBtns).findIndex(btn => btn.classList.contains('active'));
+
+            if (e.key === 'ArrowRight' && currentIndex < navBtns.length - 1) {
+                navBtns[currentIndex + 1].click();
+            } else if (e.key === 'ArrowLeft' && currentIndex > 0) {
+                navBtns[currentIndex - 1].click();
+            }
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            initDoubleSlit();
+        });
+    </script>
+</body>
+</html>

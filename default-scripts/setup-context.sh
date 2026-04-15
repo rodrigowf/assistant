@@ -188,7 +188,7 @@ important context across sessions.
 
 1. Start the backend:
    ```bash
-   context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000
+   context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765
    ```
 
 2. Start the frontend (new terminal):
@@ -196,7 +196,7 @@ important context across sessions.
    cd frontend && npm run dev
    ```
 
-3. Open https://localhost:5173
+3. Open https://localhost:5432
 EOF
     info "Created context/memory/MEMORY.md"
 fi

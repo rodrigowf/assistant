@@ -1,0 +1,1518 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>O Início do Mundo - Mitologia Japonesa</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@400;600;700&family=Playfair+Display:wght@400;600;700&display=swap" rel="stylesheet">
+
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- Anime.js for advanced animations -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+
+    <style>
+        :root {
+            /* Paleta inspirada em arte japonesa tradicional */
+            --vermillion: #D03D33;
+            --indigo-deep: #1a1a2e;
+            --gold-accent: #C9A227;
+            --cream: #F5F0E1;
+            --charcoal: #2D2D2D;
+            --ocean-blue: #264653;
+            --mist: rgba(245, 240, 225, 0.9);
+            --shadow-purple: #3D3759;
+            --fire-orange: #E76F51;
+            --moon-silver: #B8C4CE;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Noto Serif JP', serif;
+            background: var(--indigo-deep);
+            color: var(--cream);
+            line-height: 1.8;
+            overflow-x: hidden;
+        }
+
+        /* Animated Background */
+        .bg-particles {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .particle {
+            position: absolute;
+            background: var(--gold-accent);
+            border-radius: 50%;
+            opacity: 0.3;
+            animation: float 15s infinite ease-in-out;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0) translateX(0) rotate(0deg); }
+            25% { transform: translateY(-30px) translateX(20px) rotate(90deg); }
+            50% { transform: translateY(-10px) translateX(-15px) rotate(180deg); }
+            75% { transform: translateY(-40px) translateX(10px) rotate(270deg); }
+        }
+
+        /* Navigation */
+        nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            background: rgba(26, 26, 46, 0.95);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            padding: 1rem 2rem;
+            border-bottom: 1px solid var(--gold-accent);
+        }
+
+        nav ul {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            list-style: none;
+            flex-wrap: wrap;
+        }
+
+        nav a {
+            color: var(--cream);
+            text-decoration: none;
+            font-size: 0.9rem;
+            letter-spacing: 1px;
+            transition: all 0.3s;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+        }
+
+        nav a:hover, nav a.active {
+            color: var(--indigo-deep);
+            background: var(--gold-accent);
+        }
+
+        /* Hero Section */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 2rem;
+            background:
+                linear-gradient(180deg,
+                    rgba(26, 26, 46, 0.3) 0%,
+                    rgba(26, 26, 46, 0.8) 50%,
+                    var(--indigo-deep) 100%),
+                url('https://images.unsplash.com/photo-1528360983277-13d401cdc186?w=1920&q=80') center/cover;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(ellipse at center, transparent 0%, var(--indigo-deep) 70%);
+        }
+
+        .hero-content {
+            position: relative;
+            z-index: 1;
+        }
+
+        .hero h1 {
+            font-family: 'Playfair Display', serif;
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 700;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, var(--cream) 0%, var(--gold-accent) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero .subtitle {
+            font-size: 1.3rem;
+            color: var(--moon-silver);
+            margin-bottom: 2rem;
+            letter-spacing: 3px;
+        }
+
+        .hero .kanji {
+            font-size: 4rem;
+            color: var(--vermillion);
+            margin-bottom: 2rem;
+            text-shadow: 0 0 30px rgba(208, 61, 51, 0.5);
+        }
+
+        .scroll-indicator {
+            position: absolute;
+            bottom: 2rem;
+            animation: bounce 2s infinite;
+        }
+
+        .scroll-indicator i {
+            font-size: 2rem;
+            color: var(--gold-accent);
+        }
+
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(10px); }
+        }
+
+        /* Sections */
+        section {
+            padding: 6rem 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+            position: relative;
+            z-index: 1;
+        }
+
+        .section-title {
+            font-family: 'Playfair Display', serif;
+            font-size: 2.5rem;
+            text-align: center;
+            margin-bottom: 1rem;
+            color: var(--gold-accent);
+        }
+
+        .section-subtitle {
+            text-align: center;
+            color: var(--moon-silver);
+            margin-bottom: 4rem;
+            font-size: 1.1rem;
+        }
+
+        /* Interactive Timeline */
+        .interactive-timeline {
+            position: relative;
+            padding: 2rem 0;
+        }
+
+        .timeline-track {
+            position: absolute;
+            left: 50%;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: linear-gradient(180deg, var(--gold-accent), var(--vermillion), var(--ocean-blue));
+            transform: translateX(-50%);
+        }
+
+        .timeline-event {
+            display: flex;
+            align-items: center;
+            margin: 3rem 0;
+            position: relative;
+            opacity: 0;
+            transform: translateY(30px);
+            transition: all 0.6s ease-out;
+        }
+
+        .timeline-event.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .timeline-event:nth-child(odd) {
+            flex-direction: row;
+        }
+
+        .timeline-event:nth-child(even) {
+            flex-direction: row-reverse;
+        }
+
+        .timeline-content {
+            width: 45%;
+            padding: 2rem;
+            background: linear-gradient(135deg, rgba(45, 45, 45, 0.9) 0%, rgba(61, 55, 89, 0.7) 100%);
+            border-radius: 15px;
+            border: 1px solid rgba(201, 162, 39, 0.3);
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .timeline-content:hover {
+            transform: scale(1.02);
+            box-shadow: 0 10px 40px rgba(201, 162, 39, 0.2);
+            border-color: var(--gold-accent);
+        }
+
+        .timeline-marker {
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 50px;
+            height: 50px;
+            background: var(--indigo-deep);
+            border: 3px solid var(--gold-accent);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            color: var(--gold-accent);
+            z-index: 10;
+            transition: all 0.3s;
+        }
+
+        .timeline-event:hover .timeline-marker {
+            background: var(--gold-accent);
+            color: var(--indigo-deep);
+            transform: translateX(-50%) scale(1.2);
+        }
+
+        .timeline-content h4 {
+            color: var(--gold-accent);
+            margin-bottom: 0.5rem;
+            font-size: 1.2rem;
+        }
+
+        .timeline-content p {
+            color: var(--cream);
+            opacity: 0.9;
+            font-size: 0.95rem;
+        }
+
+        /* Character Relationship Chart */
+        .relationship-chart {
+            background: linear-gradient(135deg, rgba(45, 45, 45, 0.8) 0%, rgba(61, 55, 89, 0.6) 100%);
+            border-radius: 20px;
+            padding: 2rem;
+            margin: 3rem 0;
+            border: 1px solid rgba(201, 162, 39, 0.3);
+        }
+
+        .chart-container {
+            position: relative;
+            height: 400px;
+            margin: 2rem 0;
+        }
+
+        /* Character Cards with Animation */
+        .characters-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 2rem;
+            margin: 3rem 0;
+        }
+
+        .character-card {
+            background: rgba(38, 70, 83, 0.4);
+            border-radius: 15px;
+            padding: 2rem;
+            text-align: center;
+            border: 1px solid rgba(184, 196, 206, 0.2);
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .character-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(201, 162, 39, 0.1), transparent);
+            transition: left 0.5s;
+        }
+
+        .character-card:hover::before {
+            left: 100%;
+        }
+
+        .character-card:hover {
+            transform: translateY(-10px) rotateX(5deg);
+            box-shadow: 0 20px 60px rgba(201, 162, 39, 0.3);
+            border-color: var(--gold-accent);
+        }
+
+        .character-icon {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--vermillion), var(--gold-accent));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1.5rem;
+            font-size: 2.5rem;
+            color: var(--cream);
+            position: relative;
+            transition: all 0.3s;
+        }
+
+        .character-card:hover .character-icon {
+            transform: scale(1.1) rotate(10deg);
+        }
+
+        .character-icon::after {
+            content: '';
+            position: absolute;
+            width: 120%;
+            height: 120%;
+            border: 2px dashed var(--gold-accent);
+            border-radius: 50%;
+            opacity: 0;
+            transition: all 0.3s;
+        }
+
+        .character-card:hover .character-icon::after {
+            opacity: 1;
+            animation: spin 10s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .character-card h4 {
+            color: var(--gold-accent);
+            margin-bottom: 0.5rem;
+            font-size: 1.3rem;
+        }
+
+        .character-card .role {
+            color: var(--vermillion);
+            font-size: 0.85rem;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .character-card p {
+            color: var(--moon-silver);
+            font-size: 0.9rem;
+        }
+
+        /* Power Meter */
+        .power-meter {
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(201, 162, 39, 0.2);
+        }
+
+        .power-bar {
+            height: 6px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+
+        .power-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--vermillion), var(--gold-accent));
+            border-radius: 3px;
+            width: 0;
+            transition: width 1s ease-out;
+        }
+
+        /* Artifacts Interactive */
+        .artifacts-showcase {
+            display: flex;
+            justify-content: center;
+            gap: 3rem;
+            flex-wrap: wrap;
+            margin: 4rem 0;
+            perspective: 1000px;
+        }
+
+        .artifact-3d {
+            width: 200px;
+            height: 280px;
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.8s;
+            cursor: pointer;
+        }
+
+        .artifact-3d:hover {
+            transform: rotateY(180deg);
+        }
+
+        .artifact-front, .artifact-back {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            backface-visibility: hidden;
+            border-radius: 15px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+            text-align: center;
+        }
+
+        .artifact-front {
+            background: linear-gradient(135deg, var(--shadow-purple), var(--indigo-deep));
+            border: 2px solid var(--gold-accent);
+        }
+
+        .artifact-back {
+            background: linear-gradient(135deg, var(--gold-accent), var(--vermillion));
+            transform: rotateY(180deg);
+            color: var(--indigo-deep);
+        }
+
+        .artifact-icon-large {
+            font-size: 4rem;
+            color: var(--gold-accent);
+            margin-bottom: 1rem;
+        }
+
+        .artifact-front h4 {
+            color: var(--cream);
+            font-size: 1.1rem;
+        }
+
+        .artifact-back h4 {
+            color: var(--indigo-deep);
+            margin-bottom: 0.5rem;
+        }
+
+        .artifact-back p {
+            color: var(--indigo-deep);
+            font-size: 0.85rem;
+            opacity: 0.9;
+        }
+
+        /* Stats Dashboard */
+        .stats-dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin: 3rem 0;
+        }
+
+        .stat-card {
+            background: rgba(38, 70, 83, 0.4);
+            border-radius: 15px;
+            padding: 1.5rem;
+            text-align: center;
+            border: 1px solid rgba(201, 162, 39, 0.2);
+            transition: all 0.3s;
+        }
+
+        .stat-card:hover {
+            transform: scale(1.05);
+            border-color: var(--gold-accent);
+        }
+
+        .stat-number {
+            font-size: 3rem;
+            font-weight: bold;
+            color: var(--gold-accent);
+            font-family: 'Playfair Display', serif;
+        }
+
+        .stat-label {
+            color: var(--moon-silver);
+            font-size: 0.9rem;
+            margin-top: 0.5rem;
+        }
+
+        /* Image Gallery with Lightbox */
+        .gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin: 4rem 0;
+        }
+
+        .gallery-item {
+            position: relative;
+            border-radius: 15px;
+            overflow: hidden;
+            aspect-ratio: 4/3;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+            cursor: pointer;
+        }
+
+        .gallery-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: transform 0.5s;
+        }
+
+        .gallery-item:hover img {
+            transform: scale(1.1);
+        }
+
+        .gallery-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(26, 26, 46, 0);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+
+        .gallery-item:hover .gallery-overlay {
+            background: rgba(26, 26, 46, 0.7);
+        }
+
+        .gallery-overlay i {
+            font-size: 3rem;
+            color: var(--gold-accent);
+            opacity: 0;
+            transform: scale(0.5);
+            transition: all 0.3s;
+        }
+
+        .gallery-item:hover .gallery-overlay i {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        .gallery-caption {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 2rem 1.5rem 1.5rem;
+            background: linear-gradient(transparent, rgba(26, 26, 46, 0.95));
+        }
+
+        .gallery-caption h4 {
+            color: var(--gold-accent);
+            margin-bottom: 0.3rem;
+        }
+
+        .gallery-caption p {
+            color: var(--cream);
+            font-size: 0.85rem;
+            opacity: 0.9;
+        }
+
+        /* Lightbox */
+        .lightbox {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.95);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+            padding: 2rem;
+        }
+
+        .lightbox.active {
+            display: flex;
+        }
+
+        .lightbox img {
+            max-width: 90%;
+            max-height: 90%;
+            border-radius: 10px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+        }
+
+        .lightbox-close {
+            position: absolute;
+            top: 2rem;
+            right: 2rem;
+            font-size: 2rem;
+            color: var(--cream);
+            cursor: pointer;
+            transition: color 0.3s;
+        }
+
+        .lightbox-close:hover {
+            color: var(--gold-accent);
+        }
+
+        /* Themes Section */
+        .themes-wheel {
+            position: relative;
+            width: 400px;
+            height: 400px;
+            margin: 4rem auto;
+        }
+
+        .theme-node {
+            position: absolute;
+            width: 100px;
+            height: 100px;
+            background: rgba(208, 61, 51, 0.2);
+            border: 2px solid var(--vermillion);
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .theme-node:hover {
+            background: var(--vermillion);
+            transform: scale(1.2);
+        }
+
+        .theme-node i {
+            font-size: 1.5rem;
+            color: var(--cream);
+            margin-bottom: 0.3rem;
+        }
+
+        .theme-node span {
+            font-size: 0.7rem;
+            color: var(--cream);
+            text-align: center;
+        }
+
+        /* Quote Section */
+        .quote-section {
+            background: linear-gradient(135deg, var(--shadow-purple) 0%, var(--indigo-deep) 100%);
+            padding: 4rem;
+            border-radius: 20px;
+            text-align: center;
+            margin: 4rem 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .quote-section::before {
+            content: '"';
+            position: absolute;
+            top: 1rem;
+            left: 2rem;
+            font-size: 8rem;
+            color: rgba(201, 162, 39, 0.2);
+            font-family: 'Playfair Display', serif;
+        }
+
+        .quote-section blockquote {
+            font-size: 1.4rem;
+            font-style: italic;
+            color: var(--cream);
+            max-width: 800px;
+            margin: 0 auto;
+            line-height: 2;
+        }
+
+        .quote-section cite {
+            display: block;
+            margin-top: 1.5rem;
+            color: var(--gold-accent);
+        }
+
+        /* Progress Indicator */
+        .progress-bar {
+            position: fixed;
+            top: 60px;
+            left: 0;
+            height: 3px;
+            background: var(--gold-accent);
+            z-index: 999;
+            width: 0%;
+            transition: width 0.1s;
+        }
+
+        /* Footer */
+        footer {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 3rem 2rem;
+            text-align: center;
+            border-top: 1px solid rgba(201, 162, 39, 0.3);
+            position: relative;
+            z-index: 1;
+        }
+
+        footer p {
+            color: var(--moon-silver);
+            font-size: 0.9rem;
+        }
+
+        footer .sources {
+            margin-top: 1.5rem;
+        }
+
+        footer .sources a {
+            color: var(--gold-accent);
+            text-decoration: none;
+            margin: 0 1rem;
+            font-size: 0.85rem;
+            transition: all 0.3s;
+        }
+
+        footer .sources a:hover {
+            text-decoration: underline;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            nav ul {
+                gap: 0.5rem;
+            }
+
+            .timeline-track {
+                left: 20px;
+            }
+
+            .timeline-event {
+                flex-direction: column !important;
+                padding-left: 50px;
+            }
+
+            .timeline-content {
+                width: 100%;
+            }
+
+            .timeline-marker {
+                left: 20px;
+                transform: translateX(-50%);
+            }
+
+            .themes-wheel {
+                width: 300px;
+                height: 300px;
+            }
+
+            .artifacts-showcase {
+                gap: 1.5rem;
+            }
+        }
+
+        /* Loading Animation */
+        .loading-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: var(--indigo-deep);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 3000;
+            transition: opacity 0.5s, visibility 0.5s;
+        }
+
+        .loading-screen.hidden {
+            opacity: 0;
+            visibility: hidden;
+        }
+
+        .loading-kanji {
+            font-size: 5rem;
+            color: var(--vermillion);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.95); }
+        }
+
+        .loading-text {
+            color: var(--moon-silver);
+            margin-top: 1rem;
+            letter-spacing: 3px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Loading Screen -->
+    <div class="loading-screen" id="loadingScreen">
+        <div class="loading-kanji">神</div>
+        <p class="loading-text">Carregando...</p>
+    </div>
+
+    <!-- Progress Bar -->
+    <div class="progress-bar" id="progressBar"></div>
+
+    <!-- Animated Background Particles -->
+    <div class="bg-particles" id="particles"></div>
+
+    <!-- Navigation -->
+    <nav>
+        <ul>
+            <li><a href="#intro" class="active"><i class="fas fa-torii-gate"></i> Início</a></li>
+            <li><a href="#chapter1"><i class="fas fa-sun"></i> Capítulo 1</a></li>
+            <li><a href="#chapter2"><i class="fas fa-moon"></i> Capítulo 2</a></li>
+            <li><a href="#characters"><i class="fas fa-users"></i> Personagens</a></li>
+            <li><a href="#artifacts"><i class="fas fa-gem"></i> Artefatos</a></li>
+            <li><a href="#gallery"><i class="fas fa-image"></i> Galeria</a></li>
+        </ul>
+    </nav>
+
+    <!-- Hero Section -->
+    <header class="hero" id="intro">
+        <div class="hero-content">
+            <div class="kanji">天地開闢</div>
+            <h1>O Início do Mundo</h1>
+            <p class="subtitle">Uma jornada pela mitologia japonesa</p>
+            <p style="max-width: 600px; margin: 0 auto; opacity: 0.8;">
+                Dos deuses criadores ao submundo de Yomi, uma narrativa épica sobre
+                amor, perda, criação e o nascimento do sol, da lua e das tempestades.
+            </p>
+        </div>
+        <div class="scroll-indicator">
+            <i class="fas fa-chevron-down"></i>
+        </div>
+    </header>
+
+    <!-- Stats Overview -->
+    <section>
+        <div class="stats-dashboard">
+            <div class="stat-card">
+                <div class="stat-number" data-count="2">0</div>
+                <div class="stat-label">Capítulos</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" data-count="8">0</div>
+                <div class="stat-label">Divindades</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" data-count="3">0</div>
+                <div class="stat-label">Artefatos Sagrados</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" data-count="2">0</div>
+                <div class="stat-label">Reinos (Céu e Yomi)</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Chapter 1: Interactive Timeline -->
+    <section id="chapter1">
+        <h2 class="section-title">
+            <i class="fas fa-sparkles"></i> Capítulo 1
+        </h2>
+        <p class="section-subtitle">O Início do Mundo e os Primeiros Deuses</p>
+
+        <div class="interactive-timeline">
+            <div class="timeline-track"></div>
+
+            <div class="timeline-event">
+                <div class="timeline-content">
+                    <h4><i class="fas fa-infinity"></i> O Vazio Primordial</h4>
+                    <p>Do caos sem forma, seres divinos começam a emergir. Izanagi e Izanami são o casal mais jovem entre os deuses primordiais.</p>
+                </div>
+                <div class="timeline-marker"><i class="fas fa-circle"></i></div>
+            </div>
+
+            <div class="timeline-event">
+                <div class="timeline-content">
+                    <h4><i class="fas fa-gem"></i> A Lança Celestial</h4>
+                    <p>Usando a Ame-no-Nuboko (lança ornada de joias), os deuses agitam o oceano primordial, criando as ilhas do Japão a partir das gotas de salmoura.</p>
+                </div>
+                <div class="timeline-marker"><i class="fas fa-water"></i></div>
+            </div>
+
+            <div class="timeline-event">
+                <div class="timeline-content">
+                    <h4><i class="fas fa-heart"></i> União Divina</h4>
+                    <p>Da paixão de Izanagi e Izanami nascem forças naturais e inúmeras divindades, povoando o mundo recém-criado.</p>
+                </div>
+                <div class="timeline-marker"><i class="fas fa-star"></i></div>
+            </div>
+
+            <div class="timeline-event">
+                <div class="timeline-content">
+                    <h4><i class="fas fa-fire"></i> O Fogo Fatal</h4>
+                    <p>Izanami dá à luz Kagutsuchi, o deus do fogo. Suas chamas a queimam fatalmente — a primeira morte entre os deuses.</p>
+                </div>
+                <div class="timeline-marker"><i class="fas fa-fire-flame-curved"></i></div>
+            </div>
+
+            <div class="timeline-event">
+                <div class="timeline-content">
+                    <h4><i class="fas fa-sword"></i> A Espada do Luto</h4>
+                    <p>Consumido pela dor, Izanagi mata seu filho com fúria, forjando a Espada Totsuka a partir de sua própria aflição transformada em poder.</p>
+                </div>
+                <div class="timeline-marker"><i class="fas fa-khanda"></i></div>
+            </div>
+
+            <div class="timeline-event">
+                <div class="timeline-content">
+                    <h4><i class="fas fa-dragon"></i> O Nascimento dos Dragões</h4>
+                    <p>Do sangue de Kagutsuchi nasce o oceano. Das lágrimas de Izanagi surgem dois dragões: Watatsumi (mar) e Kuraokami (chuva).</p>
+                </div>
+                <div class="timeline-marker"><i class="fas fa-water"></i></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Chapter 2 -->
+    <section id="chapter2" style="background: linear-gradient(180deg, transparent, rgba(61, 55, 89, 0.3), transparent); max-width: none; padding: 6rem 2rem;">
+        <div style="max-width: 1200px; margin: 0 auto;">
+            <h2 class="section-title">
+                <i class="fas fa-skull"></i> Capítulo 2
+            </h2>
+            <p class="section-subtitle">A Descida a Yomi — O Submundo</p>
+
+            <div class="interactive-timeline">
+                <div class="timeline-track"></div>
+
+                <div class="timeline-event">
+                    <div class="timeline-content">
+                        <h4><i class="fas fa-stairs"></i> A Descida</h4>
+                        <p>Incapaz de aceitar a perda, Izanagi desce ao Yomi-no-kuni através de túneis de escuridão absoluta até encontrar Izanami.</p>
+                    </div>
+                    <div class="timeline-marker"><i class="fas fa-door-open"></i></div>
+                </div>
+
+                <div class="timeline-event">
+                    <div class="timeline-content">
+                        <h4><i class="fas fa-comments"></i> O Pedido Proibido</h4>
+                        <p>Izanami adverte que já comeu a comida dos mortos. Promete pedir permissão aos senhores da morte, mas implora: "Não olhe para mim."</p>
+                    </div>
+                    <div class="timeline-marker"><i class="fas fa-eye-slash"></i></div>
+                </div>
+
+                <div class="timeline-event">
+                    <div class="timeline-content">
+                        <h4><i class="fas fa-fire"></i> A Revelação Horrenda</h4>
+                        <p>Impaciente, Izanagi acende uma chama. A luz revela o corpo de Izanami em decomposição — infestado de vermes e criaturas.</p>
+                    </div>
+                    <div class="timeline-marker"><i class="fas fa-skull-crossbones"></i></div>
+                </div>
+
+                <div class="timeline-event">
+                    <div class="timeline-content">
+                        <h4><i class="fas fa-running"></i> A Fuga Desesperada</h4>
+                        <p>Horrorizado, Izanagi foge. Izanami, envergonhada e furiosa, envia feiticeiras, oni e espíritos famintos em sua perseguição.</p>
+                    </div>
+                    <div class="timeline-marker"><i class="fas fa-ghost"></i></div>
+                </div>
+
+                <div class="timeline-event">
+                    <div class="timeline-content">
+                        <h4><i class="fas fa-mountain"></i> O Selo Eterno</h4>
+                        <p>Usando pêssegos sagrados para repelir os mortos, Izanagi escapa e sela a passagem com uma pedra gigantesca. Os mundos estão separados para sempre.</p>
+                    </div>
+                    <div class="timeline-marker"><i class="fas fa-lock"></i></div>
+                </div>
+
+                <div class="timeline-event">
+                    <div class="timeline-content">
+                        <h4><i class="fas fa-scale-balanced"></i> A Maldição e o Equilíbrio</h4>
+                        <p>Izanami jura: "Mil vidas tomarei diariamente." Izanagi responde: "Mil e quinhentas darei à vida." Assim nasce a mortalidade humana.</p>
+                    </div>
+                    <div class="timeline-marker"><i class="fas fa-yin-yang"></i></div>
+                </div>
+            </div>
+
+            <!-- Quote -->
+            <div class="quote-section">
+                <blockquote>
+                    "Ao banhar-se nas águas do rio, Izanagi purificou-se das impurezas do submundo.
+                    De seus olhos e nariz nasceram três das mais poderosas divindades:
+                    Amaterasu, Tsukuyomi e Susano-o."
+                </blockquote>
+                <cite>— O Ritual de Purificação (Harai)</cite>
+            </div>
+        </div>
+    </section>
+
+    <!-- Characters Section -->
+    <section id="characters">
+        <h2 class="section-title">
+            <i class="fas fa-users"></i> Panteão Divino
+        </h2>
+        <p class="section-subtitle">Os deuses e suas histórias</p>
+
+        <!-- Power Chart -->
+        <div class="relationship-chart">
+            <h3 style="color: var(--gold-accent); text-align: center; margin-bottom: 1rem;">
+                <i class="fas fa-chart-bar"></i> Domínios Divinos
+            </h3>
+            <div class="chart-container">
+                <canvas id="powerChart"></canvas>
+            </div>
+        </div>
+
+        <div class="characters-grid">
+            <div class="character-card" data-power="95">
+                <div class="character-icon" style="background: linear-gradient(135deg, #FFD700, #FFA500);">
+                    <i class="fas fa-sun"></i>
+                </div>
+                <h4>Amaterasu</h4>
+                <div class="role">Deusa do Sol</div>
+                <p>Nascida do olho esquerdo de Izanagi. Governa os céus e é a ancestral divina da família imperial japonesa.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="75">
+                <div class="character-icon" style="background: linear-gradient(135deg, #B8C4CE, #6B7280);">
+                    <i class="fas fa-moon"></i>
+                </div>
+                <h4>Tsukuyomi</h4>
+                <div class="role">Deus da Lua</div>
+                <p>Nascido do olho direito de Izanagi. Governa a noite e está eternamente separado de sua irmã Amaterasu.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="85">
+                <div class="character-icon" style="background: linear-gradient(135deg, #264653, #1a1a2e);">
+                    <i class="fas fa-bolt"></i>
+                </div>
+                <h4>Susano-o</h4>
+                <div class="role">Deus das Tempestades</div>
+                <p>Nascido do nariz de Izanagi. Impetuoso e violento, será banido dos céus e enfrentará Yamata-no-Orochi.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="100">
+                <div class="character-icon">
+                    <i class="fas fa-crown"></i>
+                </div>
+                <h4>Izanagi</h4>
+                <div class="role">Deus Criador</div>
+                <p>Pai dos deuses. Seu amor por Izanami o levou a desafiar a própria morte, mas o custo foi a separação eterna.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="90">
+                <div class="character-icon" style="background: linear-gradient(135deg, #E76F51, #C9A227);">
+                    <i class="fas fa-star"></i>
+                </div>
+                <h4>Izanami</h4>
+                <div class="role">Deusa Criadora / Rainha de Yomi</div>
+                <p>Mãe dos deuses. Após sua morte, tornou-se a governante do submundo, selando o destino da mortalidade.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="60">
+                <div class="character-icon" style="background: linear-gradient(135deg, #E76F51, #D03D33);">
+                    <i class="fas fa-fire-flame-curved"></i>
+                </div>
+                <h4>Kagutsuchi</h4>
+                <div class="role">Deus do Fogo</div>
+                <p>Seu nascimento violento matou Izanami e desencadeou a primeira tragédia divina, dando origem a novos seres.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="80">
+                <div class="character-icon" style="background: linear-gradient(135deg, #264653, #1a1a2e);">
+                    <i class="fas fa-water"></i>
+                </div>
+                <h4>Watatsumi</h4>
+                <div class="role">Dragão do Mar</div>
+                <p>Senhor dos oceanos. Habita o magnífico palácio submarino Ryūgū-jō e controla as marés e criaturas marinhas.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+
+            <div class="character-card" data-power="70">
+                <div class="character-icon" style="background: linear-gradient(135deg, #B8C4CE, #3D3759);">
+                    <i class="fas fa-cloud-rain"></i>
+                </div>
+                <h4>Kuraokami</h4>
+                <div class="role">Dragão da Chuva</div>
+                <p>Dragão branco das tempestades. Guarda ressentimento pelo domínio menor e deseja ardentemente a Espada Totsuka.</p>
+                <div class="power-meter">
+                    <small style="color: var(--gold-accent);">Poder Cósmico</small>
+                    <div class="power-bar"><div class="power-fill" style="width: 0%"></div></div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Artifacts Section -->
+    <section id="artifacts">
+        <h2 class="section-title">
+            <i class="fas fa-gem"></i> Artefatos Sagrados
+        </h2>
+        <p class="section-subtitle">Clique para revelar os poderes</p>
+
+        <div class="artifacts-showcase">
+            <div class="artifact-3d">
+                <div class="artifact-front">
+                    <div class="artifact-icon-large"><i class="fas fa-khanda"></i></div>
+                    <h4>Ame-no-Nuboko</h4>
+                </div>
+                <div class="artifact-back">
+                    <h4>Lança Celestial</h4>
+                    <p>Ornada de joias divinas. Ao mexer o oceano primordial, criou as ilhas do Japão a partir das gotas de salmoura que caíram de sua ponta.</p>
+                </div>
+            </div>
+
+            <div class="artifact-3d">
+                <div class="artifact-front">
+                    <div class="artifact-icon-large"><i class="fas fa-sword"></i></div>
+                    <h4>Espada Totsuka</h4>
+                </div>
+                <div class="artifact-back">
+                    <h4>Lâmina do Luto</h4>
+                    <p>Forjada da dor de Izanagi ao matar seu filho. Simboliza a transformação do sofrimento em poder. Kuraokami a deseja ardentemente.</p>
+                </div>
+            </div>
+
+            <div class="artifact-3d">
+                <div class="artifact-front">
+                    <div class="artifact-icon-large"><i class="fas fa-apple-whole"></i></div>
+                    <h4>Pessegueiro Sagrado</h4>
+                </div>
+                <div class="artifact-back">
+                    <h4>Protetor contra a Morte</h4>
+                    <p>Árvore mística capaz de repelir espíritos e mortos. Foi crucial na fuga de Izanagi do submundo, salvando-o da perseguição de Izanami.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Gallery -->
+    <section id="gallery">
+        <h2 class="section-title">
+            <i class="fas fa-palette"></i> Galeria Visual
+        </h2>
+        <p class="section-subtitle">Arte tradicional japonesa representando os mitos</p>
+
+        <div class="gallery">
+            <div class="gallery-item" onclick="openLightbox(this)">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/8c/Kobayashi_Izanami_and_Izanagi.jpg/800px-Kobayashi_Izanami_and_Izanagi.jpg"
+                     alt="Izanagi e Izanami criando as ilhas do Japão"
+                     onerror="this.src='https://images.unsplash.com/photo-1545569341-9eb8b30979d9?w=800'">
+                <div class="gallery-overlay"><i class="fas fa-search-plus"></i></div>
+                <div class="gallery-caption">
+                    <h4>A Criação das Ilhas</h4>
+                    <p>Kobayashi Eitaku, c. 1885 — MFA Boston</p>
+                </div>
+            </div>
+
+            <div class="gallery-item" onclick="openLightbox(this)">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Kuniyoshi_Dragon.jpg/800px-Kuniyoshi_Dragon.jpg"
+                     alt="Dragão emergindo das ondas"
+                     onerror="this.src='https://images.unsplash.com/photo-1528164344705-47542687000d?w=800'">
+                <div class="gallery-overlay"><i class="fas fa-search-plus"></i></div>
+                <div class="gallery-caption">
+                    <h4>Dragão e Ondas</h4>
+                    <p>Utagawa Kuniyoshi, c. 1827-31</p>
+                </div>
+            </div>
+
+            <div class="gallery-item" onclick="openLightbox(this)">
+                <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/Amaterasu_cave.JPG/800px-Amaterasu_cave.JPG"
+                     alt="Amaterasu emergindo da caverna"
+                     onerror="this.src='https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?w=800'">
+                <div class="gallery-overlay"><i class="fas fa-search-plus"></i></div>
+                <div class="gallery-caption">
+                    <h4>Amaterasu na Caverna</h4>
+                    <p>Shunsai Toshimasa, 1887</p>
+                </div>
+            </div>
+
+            <div class="gallery-item" onclick="openLightbox(this)">
+                <img src="https://images.unsplash.com/photo-1478436127897-769e1b3f0f36?w=800"
+                     alt="Torii gate ao pôr do sol">
+                <div class="gallery-overlay"><i class="fas fa-search-plus"></i></div>
+                <div class="gallery-caption">
+                    <h4>Portal Torii</h4>
+                    <p>Símbolo do limiar entre mundos</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Lightbox -->
+    <div class="lightbox" id="lightbox" onclick="closeLightbox()">
+        <span class="lightbox-close"><i class="fas fa-times"></i></span>
+        <img src="" alt="Imagem ampliada" id="lightboxImage">
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <p><i class="fas fa-torii-gate"></i> O Início do Mundo — Mitologia Japonesa</p>
+        <p style="margin-top: 0.5rem; opacity: 0.7;">Capítulos 1 e 2 — Apresentação Interativa</p>
+
+        <div class="sources">
+            <p style="margin-bottom: 0.5rem;"><strong>Fontes e Referências:</strong></p>
+            <a href="https://collections.mfa.org/objects/26669" target="_blank">MFA Boston</a>
+            <a href="https://www.worldhistory.org/Izanami_and_Izanagi/" target="_blank">World History Encyclopedia</a>
+            <a href="https://artsandculture.google.com/asset/dragon-and-waves-artist-utagawa-kuniyoshi/xAGeYhXMRYqbrw" target="_blank">Google Arts & Culture</a>
+            <a href="https://asia.si.edu/explore-art-culture/collections/search/edanmdm:fsg_S2004.3.149/" target="_blank">Smithsonian</a>
+        </div>
+    </footer>
+
+    <script>
+        // Initialize when DOM is loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            // Hide loading screen
+            setTimeout(() => {
+                document.getElementById('loadingScreen').classList.add('hidden');
+            }, 1500);
+
+            // Create background particles
+            createParticles();
+
+            // Initialize animations
+            initScrollAnimations();
+            initNavHighlight();
+            initCounters();
+            initPowerBars();
+            initProgressBar();
+            initChart();
+        });
+
+        // Create floating particles
+        function createParticles() {
+            const container = document.getElementById('particles');
+            for (let i = 0; i < 30; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.style.width = Math.random() * 10 + 5 + 'px';
+                particle.style.height = particle.style.width;
+                particle.style.left = Math.random() * 100 + '%';
+                particle.style.top = Math.random() * 100 + '%';
+                particle.style.animationDelay = Math.random() * 10 + 's';
+                particle.style.animationDuration = 10 + Math.random() * 20 + 's';
+                container.appendChild(particle);
+            }
+        }
+
+        // Scroll animations for timeline events
+        function initScrollAnimations() {
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        entry.target.classList.add('visible');
+                    }
+                });
+            }, { threshold: 0.2 });
+
+            document.querySelectorAll('.timeline-event, .character-card, .stat-card').forEach(el => {
+                observer.observe(el);
+            });
+        }
+
+        // Navigation highlight
+        function initNavHighlight() {
+            const sections = document.querySelectorAll('section, header');
+            const navLinks = document.querySelectorAll('nav a');
+
+            window.addEventListener('scroll', () => {
+                let current = '';
+                sections.forEach(section => {
+                    const sectionTop = section.offsetTop;
+                    if (scrollY >= sectionTop - 200) {
+                        current = section.getAttribute('id');
+                    }
+                });
+
+                navLinks.forEach(link => {
+                    link.classList.remove('active');
+                    if (link.getAttribute('href') === '#' + current) {
+                        link.classList.add('active');
+                    }
+                });
+            });
+        }
+
+        // Animated counters
+        function initCounters() {
+            const counters = document.querySelectorAll('.stat-number');
+
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const target = parseInt(entry.target.dataset.count);
+                        animateCounter(entry.target, target);
+                        observer.unobserve(entry.target);
+                    }
+                });
+            }, { threshold: 0.5 });
+
+            counters.forEach(counter => observer.observe(counter));
+        }
+
+        function animateCounter(element, target) {
+            let current = 0;
+            const increment = target / 30;
+            const timer = setInterval(() => {
+                current += increment;
+                if (current >= target) {
+                    element.textContent = target;
+                    clearInterval(timer);
+                } else {
+                    element.textContent = Math.floor(current);
+                }
+            }, 50);
+        }
+
+        // Power bars animation
+        function initPowerBars() {
+            const cards = document.querySelectorAll('.character-card');
+
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const power = entry.target.dataset.power;
+                        const fill = entry.target.querySelector('.power-fill');
+                        if (fill) {
+                            setTimeout(() => {
+                                fill.style.width = power + '%';
+                            }, 300);
+                        }
+                    }
+                });
+            }, { threshold: 0.5 });
+
+            cards.forEach(card => observer.observe(card));
+        }
+
+        // Progress bar
+        function initProgressBar() {
+            const progressBar = document.getElementById('progressBar');
+
+            window.addEventListener('scroll', () => {
+                const scrollTop = window.scrollY;
+                const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+                const progress = (scrollTop / docHeight) * 100;
+                progressBar.style.width = progress + '%';
+            });
+        }
+
+        // Chart.js initialization
+        function initChart() {
+            const ctx = document.getElementById('powerChart');
+            if (!ctx) return;
+
+            new Chart(ctx.getContext('2d'), {
+                type: 'radar',
+                data: {
+                    labels: ['Criação', 'Destruição', 'Domínio Celestial', 'Domínio Terrestre', 'Domínio Aquático', 'Domínio do Submundo'],
+                    datasets: [
+                        {
+                            label: 'Izanagi',
+                            data: [100, 60, 90, 80, 40, 30],
+                            backgroundColor: 'rgba(201, 162, 39, 0.2)',
+                            borderColor: '#C9A227',
+                            pointBackgroundColor: '#C9A227'
+                        },
+                        {
+                            label: 'Izanami',
+                            data: [95, 50, 70, 75, 35, 100],
+                            backgroundColor: 'rgba(208, 61, 51, 0.2)',
+                            borderColor: '#D03D33',
+                            pointBackgroundColor: '#D03D33'
+                        },
+                        {
+                            label: 'Amaterasu',
+                            data: [70, 30, 100, 60, 20, 10],
+                            backgroundColor: 'rgba(255, 215, 0, 0.2)',
+                            borderColor: '#FFD700',
+                            pointBackgroundColor: '#FFD700'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            angleLines: { color: 'rgba(245, 240, 225, 0.1)' },
+                            grid: { color: 'rgba(245, 240, 225, 0.1)' },
+                            pointLabels: { color: '#F5F0E1', font: { size: 11 } },
+                            ticks: { display: false }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            labels: { color: '#F5F0E1' }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Lightbox functions
+        function openLightbox(element) {
+            const img = element.querySelector('img');
+            const lightbox = document.getElementById('lightbox');
+            const lightboxImage = document.getElementById('lightboxImage');
+
+            lightboxImage.src = img.src;
+            lightbox.classList.add('active');
+        }
+
+        function closeLightbox() {
+            document.getElementById('lightbox').classList.remove('active');
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeLightbox();
+            }
+        });
+
+        // Smooth scroll for navigation
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function(e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({ behavior: 'smooth' });
+                }
+            });
+        });
+    </script>
+</body>
+</html>

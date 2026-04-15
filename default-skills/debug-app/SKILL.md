@@ -31,7 +31,7 @@ Start the FastAPI backend with uvicorn, using the factory pattern. **IMPORTANT**
 
 The command pattern is:
 
-    setsid context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 > logs/api_TIMESTAMP.log 2>&1 &
+    setsid context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765 > logs/api_TIMESTAMP.log 2>&1 &
 
 Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`. Do NOT use `nohup` or `tee` — use `setsid` with output redirection.
 
@@ -48,7 +48,7 @@ Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`.
 After starting both servers:
 1. Wait a few seconds for servers to initialize
 2. Check that processes are running with ps aux filtered for uvicorn and vite
-3. Backend should be on port 8000, frontend on port 5173
+3. Backend should be on port 8765, frontend on port 5432
 
 ---
 
@@ -58,7 +58,7 @@ Use these MCP tools to automate browser interaction with the frontend.
 
 ### Opening the Application
 
-Use the new_page tool to open a browser tab at the frontend URL. If SSL certs exist in context/certs/, the URL is https://localhost:5173; otherwise it's http://localhost:5173. Check the frontend log output to confirm which protocol is being served.
+Use the new_page tool to open a browser tab at the frontend URL. If SSL certs exist in context/certs/, the URL is https://localhost:5432; otherwise it's http://localhost:5432. Check the frontend log output to confirm which protocol is being served.
 
 ### Taking Snapshots
 
@@ -188,6 +188,6 @@ For real-time output, use tail with the follow flag on the log file. Run in back
 
 **Kill servers**: Use pkill or kill with the process IDs found above.
 
-**Check port usage**: Use lsof or ss to verify ports 8000 and 5173.
+**Check port usage**: Use lsof or ss to verify ports 8765 and 5432.
 
 **Restart cleanly**: Kill existing processes, then start fresh with new log files.

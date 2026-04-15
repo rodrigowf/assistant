@@ -1,4 +1,13 @@
-"""Orchestrator session — wraps OrchestratorAgent with JSONL persistence."""
+"""Orchestrator session — wraps OrchestratorAgent with JSONL persistence.
+
+Supports three modes:
+- Text mode (default): Uses configurable provider (Anthropic/OpenAI)
+- Audio mode: Uses OpenAI for multimodal audio input
+- Voice mode: Uses OpenAI Realtime for WebRTC streaming
+
+Text and audio modes support runtime model switching. Voice mode uses a
+fixed model for the session duration (WebRTC constraint).
+"""
 
 from __future__ import annotations
 
@@ -13,9 +22,16 @@ from typing import Any
 from utils.paths import get_sessions_dir
 
 from orchestrator.agent import OrchestratorAgent
-from orchestrator.config import OrchestratorConfig
+from orchestrator.audio_utils import convert_audio_to_wav
+from orchestrator.config import (
+    AVAILABLE_MODELS,
+    OrchestratorConfig,
+    Provider,
+    get_model_info,
+)
 from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.providers.anthropic import AnthropicProvider
+from orchestrator.providers.openai_text import OpenAITextProvider, create_audio_message
 from orchestrator.tools import registry
 from orchestrator.types import (
     OrchestratorEvent,
@@ -35,9 +51,12 @@ MAX_VOICE_HISTORY_MESSAGES = 20
 class OrchestratorSession:
     """Manage a single orchestrator conversation with JSONL persistence.
 
-    Supports two modes:
-    - Text mode (default): Uses AnthropicProvider, driven by session.send(text)
-    - Voice mode: Uses OpenAIVoiceProvider, driven by session.process_voice_event(event)
+    Supports three modes:
+    - Text mode (default): Uses AnthropicProvider or OpenAITextProvider
+    - Audio mode: Uses OpenAITextProvider with audio content
+    - Voice mode: Uses OpenAIVoiceProvider for WebRTC streaming
+
+    The text provider can be switched mid-conversation via set_model().
 
     Usage (text)::
 
@@ -46,6 +65,18 @@ class OrchestratorSession:
         async for event in session.send("Hello"):
             ...
         await session.stop()
+
+    Usage (audio)::
+
+        session = OrchestratorSession(config=config, context=context)
+        session_id = await session.start()
+        async for event in session.send_audio(audio_bytes, "wav"):
+            ...
+
+    Usage (model switching)::
+
+        success = session.set_model("gpt-4o")
+        # Next send() will use the new model
 
     Usage (voice)::
 
@@ -76,6 +107,9 @@ class OrchestratorSession:
         self._voice_provider = None  # Set in start() if voice=True
         self._history_summary: str | None = None
 
+        # Track current provider for model switching
+        self._current_provider = None
+
     @property
     def local_id(self) -> str:
         """The pool key — stable frontend tab UUID used for reconnection."""
@@ -89,6 +123,21 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def current_model(self) -> str:
+        """Get the current model ID."""
+        return self._config.model
+
+    @property
+    def current_provider(self) -> str:
+        """Get the current provider name."""
+        return self._config.provider.value
+
+    @property
+    def supports_audio(self) -> bool:
+        """Whether the current model supports audio input."""
+        return self._config.supports_audio
 
     async def start(self) -> str:
         """Initialize the session.
@@ -107,10 +156,9 @@ class OrchestratorSession:
             self._voice_provider = OpenAIVoiceProvider()
             provider = self._voice_provider
         else:
-            provider = AnthropicProvider(
-                model=self._config.model,
-                max_tokens=self._config.max_tokens,
-            )
+            provider = self._create_provider()
+
+        self._current_provider = provider
 
         self._agent = OrchestratorAgent(
             config=self._config,
@@ -138,6 +186,8 @@ class OrchestratorSession:
                 "type": "orchestrator_meta",
                 "orchestrator": True,
                 "session_id": self.jsonl_id,
+                "model": self._config.model,
+                "provider": self._config.provider.value,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             if self._voice:
@@ -148,6 +198,63 @@ class OrchestratorSession:
             self._writer.append(meta)
 
         return self._local_id
+
+    def _create_provider(self):
+        """Create a provider instance based on current config."""
+        if self._config.provider == Provider.OPENAI:
+            return OpenAITextProvider(
+                model=self._config.model,
+                max_tokens=self._config.max_tokens,
+            )
+        else:
+            return AnthropicProvider(
+                model=self._config.model,
+                max_tokens=self._config.max_tokens,
+            )
+
+    def set_model(self, model_id: str) -> bool:
+        """Switch to a different model mid-conversation.
+
+        The change takes effect on the next send() call. Cannot switch
+        models during an active voice session.
+
+        Args:
+            model_id: The model identifier to switch to
+
+        Returns:
+            True if model was found and set, False otherwise
+        """
+        if self._voice:
+            logger.warning("Cannot switch models during voice session")
+            return False
+
+        if not self._config.set_model(model_id):
+            logger.warning("Unknown model: %s", model_id)
+            return False
+
+        # Create new provider
+        new_provider = self._create_provider()
+        self._current_provider = new_provider
+
+        # Update the agent's provider
+        if self._agent:
+            self._agent.provider = new_provider
+
+        # Log the model switch
+        if self._writer:
+            self._writer.append({
+                "type": "model_switch",
+                "model": model_id,
+                "provider": self._config.provider.value,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        logger.info("Switched to model: %s (%s)", model_id, self._config.provider.value)
+        return True
+
+    def get_model_info(self) -> dict[str, Any]:
+        """Get current model information."""
+        return self._config.to_dict()
 
     def get_session_update(self) -> dict[str, Any] | None:
         """Return the OpenAI session.update payload for voice mode.
@@ -217,12 +324,20 @@ class OrchestratorSession:
         # Tool call ready — execute and send result back
         elif event_type == "response.function_call_arguments.done":
             call_id = event.get("call_id", "")
-            args_str = event.get("arguments", "{}")
             name = event.get("name", "")
 
             # Get name from pending_calls if not in event
             if not name and call_id in self._voice_provider.pending_calls:
                 name = self._voice_provider.pending_calls[call_id]
+
+            # Prefer accumulated streaming args over the done event's arguments field
+            # (OpenAI may send an empty/missing arguments in the done event when
+            # the args were streamed incrementally via delta events)
+            args_str = (
+                self._voice_provider._pending_args.get(call_id)
+                or event.get("arguments", "")
+                or "{}"
+            )
 
             try:
                 tool_input = json.loads(args_str) if args_str else {}
@@ -279,7 +394,7 @@ class OrchestratorSession:
         return commands
 
     async def send(self, prompt: str) -> AsyncIterator[OrchestratorEvent]:
-        """Send a message and yield events. Persists to JSONL. (Text mode only)"""
+        """Send a text message and yield events. Persists to JSONL. (Text mode only)"""
         if self._agent is None:
             raise RuntimeError("Session not started")
 
@@ -290,6 +405,70 @@ class OrchestratorSession:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
+        async for event in self._run_agent(prompt):
+            yield event
+
+    async def send_audio(
+        self,
+        audio_data: bytes | str,
+        audio_format: str,
+        text_prompt: str | None = None,
+    ) -> AsyncIterator[OrchestratorEvent]:
+        """Send an audio message and yield events. (Audio mode)
+
+        The audio is sent directly to the model (GPT-4o) for transcription
+        and understanding in a single pass.
+
+        Args:
+            audio_data: Raw audio bytes or base64-encoded string
+            audio_format: Audio format ("wav", "mp3", "webm", "ogg")
+            text_prompt: Optional accompanying text
+
+        Yields:
+            OrchestratorEvent instances
+        """
+        if self._agent is None:
+            raise RuntimeError("Session not started")
+
+        if not self._config.supports_audio:
+            # Switch to audio-capable model automatically.
+            # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview.
+            # If _voice=True, set_model() normally refuses — force the config directly instead.
+            if self._voice:
+                self._config.set_model("gpt-4o-audio-preview")
+                if not self._config.supports_audio:
+                    raise RuntimeError("No audio-capable model available")
+            elif not self.set_model("gpt-4o-audio-preview"):
+                raise RuntimeError("No audio-capable model available")
+
+        # Convert audio to OpenAI-supported format if needed (wav or mp3)
+        # Browser MediaRecorder typically outputs webm, which OpenAI doesn't accept
+        converted_data, converted_format = convert_audio_to_wav(audio_data, audio_format)
+        logger.debug(f"Audio conversion: {audio_format} -> {converted_format}")
+
+        # Create audio message
+        audio_message = create_audio_message(converted_data, converted_format, text_prompt)
+
+        # Persist user message (log that it was audio)
+        self._writer.append({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": f"[audio:{audio_format}] {text_prompt or '(audio message)'}",
+            },
+            "source": "audio_input",
+            "audio_format": audio_format,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        async for event in self._run_agent(audio_message):
+            yield event
+
+    async def _run_agent(
+        self,
+        prompt: str | dict[str, Any],
+    ) -> AsyncIterator[OrchestratorEvent]:
+        """Run the agent with text or audio input and persist events."""
         # Collect assistant text for persistence; persist tool events as they arrive
         assistant_text_parts: list[str] = []
 
@@ -325,10 +504,60 @@ class OrchestratorSession:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
 
+    async def compact(self) -> dict[str, int]:
+        """Summarize and compress the conversation history.
+
+        Replaces the full history with a single summary message, freeing
+        context window space. Returns token counts before/after.
+
+        Returns:
+            dict with "tokens_before" and "tokens_after" (estimated)
+        """
+        if self._agent is None:
+            raise RuntimeError("Session not started")
+
+        history = self._agent.history
+        if not history:
+            return {"tokens_before": 0, "tokens_after": 0}
+
+        # Rough token estimate: ~0.75 tokens per character
+        def estimate_tokens(h: list) -> int:
+            import json as _json
+            try:
+                return int(len(_json.dumps(h)) * 0.75)
+            except Exception:
+                return 0
+
+        tokens_before = estimate_tokens(history)
+
+        summary = await self._summarize_history(history)
+
+        if summary:
+            # Replace history with a single summary message
+            self._agent.history = [{
+                "role": "user",
+                "content": f"[Previous conversation summary]\n{summary}",
+            }, {
+                "role": "assistant",
+                "content": "Understood. I have the context from our previous conversation.",
+            }]
+            # Persist the compact event
+            if self._writer:
+                self._writer.append({
+                    "type": "compact",
+                    "trigger": "manual",
+                    "summary": summary,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+        tokens_after = estimate_tokens(self._agent.history)
+        return {"tokens_before": tokens_before, "tokens_after": tokens_after}
+
     async def stop(self) -> None:
         """Clean up the session."""
         self._agent = None
         self._voice_provider = None
+        self._current_provider = None
 
     async def interrupt(self) -> None:
         """Interrupt the current agent run."""

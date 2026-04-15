@@ -1,0 +1,13 @@
+{
+  "working_directory": "/home/rodrigo/Projects/assistant",
+  "working_directory_history": [
+    "/home/rodrigo/Projects/assistant"
+  ],
+  "enabled_mcps": [],
+  "disabled_skills": [
+    "youtube"
+  ],
+  "disabled_agents": [],
+  "chrome_extension": false,
+  "default_model": "gpt-4o-audio-preview"
+}

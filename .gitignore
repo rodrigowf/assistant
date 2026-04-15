@@ -44,3 +44,11 @@ certs/
 *.egg-info/
 .ruff_cache/
 .mypy_cache/
+
+# Android
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/**/*.apk
+android/**/*.aab

@@ -28,8 +28,8 @@ manager/ (claude-agent-sdk wrapper)
 ```
 
 Key entry points:
-- API: `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000`
-- Frontend: `cd frontend && npm run dev` (Vite dev server on port 5173)
+- API: `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765`
+- Frontend: `cd frontend && npm run dev` (Vite dev server on port 5432)
 - Tests: `context/scripts/run.sh -m pytest tests/ -v`
 
 ## Debugging Workflow
@@ -39,8 +39,8 @@ Key entry points:
 When debugging, start servers with verbose output to capture logs:
 
 **API Server** (run in background, capture logs):
-- Use `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 --log-level debug`
-- Or redirect output: `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000 2>&1 | tee /tmp/api-debug.log &`
+- Use `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765 --log-level debug`
+- Or redirect output: `context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765 2>&1 | tee /tmp/api-debug.log &`
 
 **Frontend** (separate terminal):
 - Run `npm run dev` from the frontend directory
@@ -51,7 +51,7 @@ When debugging, start servers with verbose output to capture logs:
 Use Chrome DevTools MCP tools to interact with the running application:
 
 **Navigation and Snapshots:**
-- `navigate_page` to load the app (typically https://localhost:5173)
+- `navigate_page` to load the app (typically https://localhost:5432)
 - `take_snapshot` to get the current page structure and element UIDs
 - `take_screenshot` to capture visual state
 

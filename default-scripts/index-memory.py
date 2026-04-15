@@ -122,7 +122,12 @@ def index_history(reset: bool = False) -> None:
 
     # Convert JSONL files to temporary markdown for embedding
     temp_dir = PROJECT_DIR / ".index-temp"
-    temp_dir.mkdir(exist_ok=True)
+    # Ensure temp dir exists and is clean
+    if temp_dir.exists():
+        for f in temp_dir.glob("*"):
+            f.unlink()
+    else:
+        temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         for jsonl_path in jsonl_files:

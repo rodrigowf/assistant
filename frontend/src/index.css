@@ -66,16 +66,17 @@
   --tool-search-bg:   hsla(260, 40%, 52%, 0.07);
 
   /* Layout tokens */
-  --radius:        7px;
-  --radius-lg:     12px;
-  --radius-xl:     18px;
-  --sidebar-width: 256px;
-  --topbar-height: 44px;
+  --radius:        8px;
+  --radius-lg:     14px;
+  --radius-xl:     20px;
+  --sidebar-width: 280px;
+  --topbar-height: 52px;
   --transition:      130ms ease;
   --transition-slow: 220ms ease;
 
   font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
-  line-height: 1.5;
+  font-size: 15px;
+  line-height: 1.55;
   color: var(--text);
   background-color: var(--bg);
   font-synthesis: none;
@@ -99,3 +100,21 @@ input, textarea { font-family: inherit; color: inherit; background: none; border
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+/* ── Graceful degradation ────────────────────────────────────── */
+
+/* Disable all animations/transitions on low-end devices */
+.low-end *,
+.low-end *::before,
+.low-end *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* Same for users who prefer reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

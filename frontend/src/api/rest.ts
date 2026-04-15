@@ -1,4 +1,4 @@
-import type { SessionInfo, SessionDetail, MessagePreview } from "../types";
+import type { SessionInfo, SessionDetail, MessagePreview, PaginatedMessages } from "../types";
 
 const BASE = "/api";
 
@@ -18,6 +18,12 @@ export function getSession(id: string): Promise<SessionDetail> {
 
 export function getPreview(id: string, max = 5): Promise<MessagePreview[]> {
   return json(`${BASE}/sessions/${id}/preview?max=${max}`);
+}
+
+export function getMessagesPaginated(id: string, limit = 50, before?: number): Promise<PaginatedMessages> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (before !== undefined) params.set("before", String(before));
+  return json(`${BASE}/sessions/${id}/messages?${params}`);
 }
 
 export async function renameSession(id: string, title: string): Promise<void> {
@@ -91,4 +97,92 @@ export interface McpServersResponse {
 
 export function listMcpServers(): Promise<McpServersResponse> {
   return json(`${BASE}/mcp/servers`);
+}
+
+// Global config
+
+export interface AssistantConfig {
+  working_directory: string;
+  working_directory_history: string[];
+  enabled_mcps: string[];
+  disabled_skills: string[];
+  disabled_agents: string[];
+  chrome_extension: boolean;
+  default_model: string;
+}
+
+export interface ConfigUpdate {
+  working_directory?: string;
+  working_directory_history?: string[];
+  enabled_mcps?: string[];
+  disabled_skills?: string[];
+  disabled_agents?: string[];
+  chrome_extension?: boolean;
+  default_model?: string;
+}
+
+export function getConfig(): Promise<AssistantConfig> {
+  return json(`${BASE}/config`);
+}
+
+export function updateConfig(update: ConfigUpdate): Promise<AssistantConfig> {
+  return json(`${BASE}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+}
+
+// Model Configuration
+
+export interface ModelInfo {
+  provider: string;
+  model_id: string;
+  display_name: string;
+  supports_audio: boolean;
+  supports_vision: boolean;
+  supports_tools: boolean;
+  max_tokens: number;
+}
+
+export interface ModelsResponse {
+  models: ModelInfo[];
+  audio_capable_models: string[];
+  default_model: string;
+}
+
+export function listModels(): Promise<ModelsResponse> {
+  return json(`${BASE}/orchestrator/models`);
+}
+
+// Skills
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  dir: string;
+}
+
+export interface SkillsResponse {
+  skills: SkillInfo[];
+}
+
+export function listSkills(): Promise<SkillsResponse> {
+  return json(`${BASE}/skills`);
+}
+
+// Agents
+
+export interface AgentInfo {
+  name: string;
+  description: string;
+  file: string;
+}
+
+export interface AgentsResponse {
+  agents: AgentInfo[];
+}
+
+export function listAgents(): Promise<AgentsResponse> {
+  return json(`${BASE}/agents`);
 }

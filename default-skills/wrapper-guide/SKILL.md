@@ -173,7 +173,7 @@ The `lifespan` context manager initializes:
 5. `MemoryWatcher` → Watches memory folder, indexes on change
 6. `HistoryIndexer` → Periodic (120s) history indexing
 
-**CORS:** Allows `http://localhost:5173` and `https://localhost:5173` (frontend dev server)
+**CORS:** Allows `http://localhost:5432` and `https://localhost:5432` (frontend dev server)
 
 ### SessionPool (`pool.py`)
 
@@ -419,9 +419,9 @@ interface ChatState {
 
 **Debug steps:**
 1. Check browser console for WS errors
-2. Verify backend is running on port 8000
+2. Verify backend is running on port 8765
 3. Check backend logs for connection events
-4. Look for CORS issues (should allow localhost:5173)
+4. Look for CORS issues (should allow localhost:5432)
 
 **Key breakpoints:**
 - `api/routes/chat.py:20` → `chat_ws()` function
