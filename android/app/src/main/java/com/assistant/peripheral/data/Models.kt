@@ -143,6 +143,7 @@ sealed class WebSocketEvent {
     // Voice events (for WebRTC integration)
     data class VoiceCommand(val command: Map<String, Any?>) : WebSocketEvent()
     data class VoiceTranscript(val text: String, val isFinal: Boolean) : WebSocketEvent()
+    object VoiceStopped : WebSocketEvent()  // AI-initiated clean session end
 
     // Compaction
     data class CompactComplete(val summary: String) : WebSocketEvent()

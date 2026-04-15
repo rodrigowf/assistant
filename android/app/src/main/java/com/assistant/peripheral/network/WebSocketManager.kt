@@ -277,6 +277,9 @@ class WebSocketManager {
                     val command = jsonObjectToMap(json.optJSONObject("command"))
                     _events.tryEmit(WebSocketEvent.VoiceCommand(command))
                 }
+                "voice_stopped" -> {
+                    _events.tryEmit(WebSocketEvent.VoiceStopped)
+                }
 
                 // Compact
                 "compact_complete" -> {

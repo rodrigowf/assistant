@@ -510,6 +510,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 voiceManager?.handleBackendCommand(command)
             }
 
+            is WebSocketEvent.VoiceStopped -> {
+                // AI-initiated clean end (end_voice_session tool) — mirror web frontend behaviour
+                stopVoiceSession()
+            }
+
             is WebSocketEvent.VoiceTranscript -> {
                 // Handle voice transcripts (not used with realtime API)
             }
