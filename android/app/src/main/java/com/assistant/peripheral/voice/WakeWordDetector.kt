@@ -13,6 +13,8 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.assistant.peripheral.MainActivity
+import com.assistant.peripheral.service.AssistantService
 import kotlinx.coroutines.*
 import kotlin.math.sqrt
 
@@ -435,20 +437,16 @@ class WakeWordDetector(
     // Helpers
     // -------------------------------------------------------------------------
 
-    // Saved volumes for pre-M devices
-    private var savedVolumes: List<Int>? = null
-
     private fun muteBeep() {
+        // Only mute on API 23+ (Marshmallow) where ADJUST_MUTE is available and safe.
+        // On pre-M (Lollipop and below), setStreamVolume(stream, 0) is NOT used because
+        // if the service dies or restarts the saved volumes are lost, leaving streams
+        // permanently muted. The SpeechRecognizer beep is minor on Lollipop devices
+        // compared to the risk of corrupting the user's volume settings.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                for (stream in BEEP_STREAMS) {
-                    audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0)
-                }
-            } else {
-                savedVolumes = BEEP_STREAMS.map { audioManager.getStreamVolume(it) }
-                for (stream in BEEP_STREAMS) {
-                    audioManager.setStreamVolume(stream, 0, 0)
-                }
+            for (stream in BEEP_STREAMS) {
+                audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to mute beep streams: ${e.message}")
@@ -456,18 +454,10 @@ class WakeWordDetector(
     }
 
     private fun unmuteBeep() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                for (stream in BEEP_STREAMS) {
-                    audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
-                }
-            } else {
-                savedVolumes?.let { saved ->
-                    BEEP_STREAMS.forEachIndexed { i, stream ->
-                        audioManager.setStreamVolume(stream, saved[i], 0)
-                    }
-                }
-                savedVolumes = null
+            for (stream in BEEP_STREAMS) {
+                audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to unmute beep streams: ${e.message}")
@@ -480,12 +470,16 @@ class WakeWordDetector(
             // Check voice word first (more specific / longer phrase wins if both match)
             if (voiceVariants.isNotEmpty() && voiceVariants.any { lower.contains(it) }) {
                 Log.d(TAG, "Voice word detected in: \"$result\"")
+                // Bring app to foreground and unlock screen before broadcasting
+                AssistantService.bringToForeground(context)
                 LocalBroadcastManager.getInstance(context)
                     .sendBroadcast(Intent(ACTION_VOICE_WORD_DETECTED))
                 return true
             }
             if (wakeVariants.any { lower.contains(it) }) {
                 Log.d(TAG, "Wake word detected in: \"$result\"")
+                // Bring app to foreground and unlock screen before broadcasting
+                AssistantService.bringToForeground(context)
                 LocalBroadcastManager.getInstance(context)
                     .sendBroadcast(Intent(ACTION_WAKE_WORD_DETECTED))
                 return true

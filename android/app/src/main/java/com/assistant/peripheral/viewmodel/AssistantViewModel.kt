@@ -159,6 +159,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
         val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
+        val USE_EARPIECE = booleanPreferencesKey("use_earpiece")
     }
 
     init {
@@ -182,15 +183,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         ThemeMode.SYSTEM
                     },
                     micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
-                    speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f
+                    speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
+                    useEarpiece = preferences[PreferenceKeys.USE_EARPIECE] ?: false
                 )
                 // Update API client when server URL changes
                 apiClient = ApiClient(_settings.value.serverUrl)
                 // Update VoiceManager with new API client
                 voiceManager?.release()
                 voiceManager = VoiceManager(getApplication(), apiClient!!).also {
-                    // Apply saved mic gain level
                     it.setMicGain(_settings.value.micGainLevel)
+                    it.setUseEarpiece(_settings.value.useEarpiece)
                 }
                 setupVoiceManagerCallbacks()
 
@@ -929,6 +931,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             }
             // Apply gain to active voice session
             voiceManager?.setMicGain(level)
+        }
+    }
+
+    fun updateEarpieceMode(enabled: Boolean) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.USE_EARPIECE] = enabled
+            }
+            // Apply immediately to VoiceManager so next session picks it up
+            voiceManager?.setUseEarpiece(enabled)
         }
     }
 

@@ -201,5 +201,6 @@ data class AppSettings(
     val voiceWord: String = "hey realtime, realtime",   // comma-separated, triggers realtime WebRTC voice session
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,        // 0.0 to 2.0, where 1.0 is normal
-    val speakerVolumeLevel: Float = 1.0f   // 0.0 to 1.5, where 1.0 is 100%
+    val speakerVolumeLevel: Float = 1.0f,  // 0.0 to 1.5, where 1.0 is 100%
+    val useEarpiece: Boolean = false       // false = loudspeaker (default), true = earpiece
 )

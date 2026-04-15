@@ -7,7 +7,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.assistant.peripheral.MainActivity
@@ -29,6 +32,7 @@ class AssistantService : Service() {
         private const val EXTRA_VOICE_WORD = "voice_word"
         private const val EXTRA_PAUSE_WAKE_WORD = "pause_wake_word"
         private const val EXTRA_RESUME_WAKE_WORD = "resume_wake_word"
+        const val EXTRA_WAKE_WORD_TRIGGERED = "wake_word_triggered"
 
         // SharedPreferences keys — survive process death
         private const val PREFS_NAME = "assistant_service_prefs"
@@ -66,6 +70,28 @@ class AssistantService : Service() {
             else context.startService(intent)
         }
 
+        fun bringToForeground(context: Context) {
+            // Acquire a wake lock to turn the screen on before starting the activity.
+            // ACQUIRE_CAUSES_WAKEUP forces the screen on even when it's off — this is the
+            // reliable path on Android 5 (Lollipop) where window flags alone don't work
+            // when the activity is already running in the background.
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            @Suppress("DEPRECATION")
+            val wl = pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "assistant:wakeword"
+            )
+            wl.acquire(3000L) // hold for 3 s — enough for the activity to apply its own flags
+
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(EXTRA_WAKE_WORD_TRIGGERED, true)
+            }
+            context.startActivity(intent)
+        }
+
         fun updateWakeWord(context: Context, enabled: Boolean, wakeWord: String, voiceWord: String = "") {
             val intent = Intent(context, AssistantService::class.java).apply {
                 putExtra(EXTRA_ENABLE_WAKE_WORD, enabled)
@@ -83,6 +109,15 @@ class AssistantService : Service() {
     private var wakeWordDetector: WakeWordDetector? = null
     private lateinit var prefs: SharedPreferences
 
+    // Set to true while a voice session is active (between pauseWakeWord and resumeWakeWord).
+    // Prevents ACTION_SCREEN_ON from restarting the detector and stealing the mic from WebRTC.
+    private var voiceSessionActive: Boolean = false
+
+    // Debounce handler: ACTION_SCREEN_ON and ACTION_USER_PRESENT often fire within ms of each
+    // other — collapse them into a single rearmWakeWord() call after a short delay.
+    private val rearmHandler = Handler(Looper.getMainLooper())
+    private val rearmRunnable = Runnable { rearmWakeWord() }
+
     // In-memory cache of last-known config (authoritative copy is in SharedPreferences)
     private var lastWakeWord: String = "hey assistant"
     private var lastVoiceWord: String = ""
@@ -98,13 +133,23 @@ class AssistantService : Service() {
                 Intent.ACTION_SCREEN_ON,
                 Intent.ACTION_USER_PRESENT -> {
                     Log.d(TAG, "Screen on / unlocked (${intent.action}) — re-arming wake word")
-                    rearmWakeWord()
+                    // Debounce: SCREEN_ON and USER_PRESENT often fire within ms of each other.
+                    // Cancel any pending rearm and schedule one 300ms from now.
+                    rearmHandler.removeCallbacks(rearmRunnable)
+                    rearmHandler.postDelayed(rearmRunnable, 300)
                 }
             }
         }
     }
 
     private fun rearmWakeWord() {
+        // Don't touch the mic if a voice session is active — WebRTC owns it.
+        // The session will call resumeWakeWord() when it ends.
+        if (voiceSessionActive) {
+            Log.d(TAG, "Screen on during voice session — skipping wake word rearm")
+            return
+        }
+
         // Reload from SharedPreferences in case in-memory fields are stale (fresh process)
         val enabled = prefs.getBoolean(PREF_ENABLED, false)
         val wakeWord = prefs.getString(PREF_WAKE_WORD, "hey assistant") ?: "hey assistant"
@@ -156,9 +201,11 @@ class AssistantService : Service() {
         if (intent != null) {
             if (intent.getBooleanExtra(EXTRA_PAUSE_WAKE_WORD, false)) {
                 Log.d(TAG, "Pausing wake word detection for voice session")
+                voiceSessionActive = true
                 wakeWordDetector?.pause()
             } else if (intent.getBooleanExtra(EXTRA_RESUME_WAKE_WORD, false)) {
                 Log.d(TAG, "Resuming wake word detection after voice session")
+                voiceSessionActive = false
                 // Always do a full restart here — the silence monitor may be in a broken
                 // state if the mic was held by WebRTC when resume() was last called
                 // (e.g. screen-unlock fired while the voice session was still active).
@@ -204,6 +251,7 @@ class AssistantService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        rearmHandler.removeCallbacks(rearmRunnable)
         unregisterReceiver(screenReceiver)
         wakeWordDetector?.release()
         Log.d(TAG, "Service destroyed")

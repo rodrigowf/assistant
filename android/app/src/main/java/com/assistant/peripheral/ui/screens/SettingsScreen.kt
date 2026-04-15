@@ -32,6 +32,7 @@ fun SettingsScreen(
     onUpdateAutoConnect: (Boolean) -> Unit,
     onUpdateMicGainLevel: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
+    onUpdateEarpieceMode: (Boolean) -> Unit,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
     onUpdateVoiceWord: (String) -> Unit,
@@ -489,6 +490,31 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Reset to 100%")
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Earpiece mode toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Earpiece Mode",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = if (settings.useEarpiece) "Audio routed to earpiece" else "Audio routed to loudspeaker",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = settings.useEarpiece,
+                            onCheckedChange = { onUpdateEarpieceMode(it) }
+                        )
                     }
 
                     Spacer(modifier = Modifier.height(16.dp))
