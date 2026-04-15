@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
+import androidx.lifecycle.ViewModelProvider
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
@@ -87,6 +88,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Re-connect WebSocket if the app was in the background (screen lock, app switch, etc.)
+        // The ViewModel is retained across activity recreation, so this is the right place.
+        val viewModel = androidx.lifecycle.ViewModelProvider(this)[AssistantViewModel::class.java]
+        viewModel.reconnectIfNeeded()
     }
 
     override fun onDestroy() {
@@ -193,11 +202,19 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             // Scan for backends even when auto-connect is off
             viewModel.scanForServers()
         }
-        // Start foreground service and apply wake word setting
+        // Start foreground service (wake word config applied separately below)
         AssistantService.start(activity)
-        if (settings.enableWakeWord) {
-            AssistantService.updateWakeWord(activity, true, settings.wakeWord, settings.voiceWord)
-        }
+    }
+
+    // Apply wake word setting whenever it changes (also fires when DataStore finishes
+    // loading on first launch — LaunchedEffect(Unit) runs before DataStore is ready).
+    LaunchedEffect(settings.enableWakeWord, settings.wakeWord, settings.voiceWord) {
+        AssistantService.updateWakeWord(
+            activity,
+            settings.enableWakeWord,
+            settings.wakeWord,
+            settings.voiceWord
+        )
     }
 
     // Also scan when auto-connect is on but we fail to connect after a moment

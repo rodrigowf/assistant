@@ -96,8 +96,10 @@ class WakeWordDetector(
         }
     }
 
-    private var isActive = false
-    private var isPaused = false
+    var isActive = false
+        private set
+    var isPaused = false
+        private set
     private var isRecognizing = false
     private var consecutiveMisses = 0  // exponential backoff counter
 
@@ -235,6 +237,18 @@ class WakeWordDetector(
 
             audioRecord = recorder
             recorder.startRecording()
+            if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                // startRecording() failed (mic still held by another process, e.g. WebRTC)
+                Log.w(TAG, "AudioRecord.startRecording() failed — mic busy, will retry")
+                recorder.release()
+                audioRecord = null
+                kotlinx.coroutines.delay(500L)
+                // Restart the whole monitor so we retry mic acquisition from scratch
+                withContext(Dispatchers.Main) {
+                    if (isActive && !isPaused) startSilenceMonitor()
+                }
+                return@launch
+            }
             Log.d(TAG, "Silence monitor started (threshold=$RMS_THRESHOLD)")
 
             val buffer = ShortArray(bufferSize / 2)

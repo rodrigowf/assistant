@@ -350,17 +350,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     voiceManager?.handleBackendCommand(update)
                 }
 
-                // Load existing messages if reconnecting to an existing session
+                // Load/refresh messages when reconnecting to an existing session.
+                // Always re-fetch from server so any messages that arrived while the
+                // WebSocket was disconnected are not lost.
                 val resumeId = _pendingResumeSessionId.value
-                if (resumeId != null && _messages.value.isEmpty()) {
+                if (resumeId != null) {
                     viewModelScope.launch {
-                        val paginated = apiClient?.getMessagesPaginated(resumeId, limit = 50)
-                            ?: com.assistant.peripheral.network.PaginatedMessages(emptyList(), 0, false, 0)
-                        if (paginated.messages.isNotEmpty()) {
+                        try {
+                            val paginated = apiClient?.getMessagesPaginated(resumeId, limit = 50)
+                                ?: com.assistant.peripheral.network.PaginatedMessages(emptyList(), 0, false, 0)
+                            // Always update — server is the source of truth
                             currentSessionIdForPagination = resumeId
                             paginationStartIndex = paginated.startIndex
                             _hasMoreMessages.value = paginated.hasMore
                             _messages.value = paginated.messages
+                        } catch (_: Exception) {
+                            // Best-effort — keep existing messages if fetch fails
                         }
                     }
                 }
@@ -553,6 +558,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun disconnect() {
         webSocketManager.disconnect()
+    }
+
+    /**
+     * Re-establish the WebSocket connection if currently disconnected.
+     * Call from MainActivity.onResume() so the app reconnects after screen lock/unlock
+     * or switching back from another app.
+     */
+    fun reconnectIfNeeded() {
+        val state = connectionState.value
+        if (state is ConnectionState.Disconnected || state is ConnectionState.Error) {
+            Log.d(TAG, "Reconnecting WebSocket on foreground (was $state)")
+            connect()
+        }
     }
 
     fun sendMessage(text: String) {
