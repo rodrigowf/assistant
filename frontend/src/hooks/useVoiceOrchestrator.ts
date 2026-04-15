@@ -145,6 +145,13 @@ export function useVoiceOrchestrator(
         sendToOpenAI(event.command as RealtimeEvent);
         break;
 
+      case "voice_stopped":
+        // AI-initiated clean end (end_voice_session tool)
+        cleanup();
+        updateStatus("off");
+        optsRef.current.onAfterStop?.();
+        break;
+
       case "error": {
         const detail = (event as { detail?: string }).detail;
         console.error("[voice-orchestrator] Server error:", event.error, detail);
