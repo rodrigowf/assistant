@@ -46,6 +46,8 @@ type Action =
   | { type: "THINKING_DELTA"; text: string }
   | { type: "THINKING_COMPLETE"; text: string }
   | { type: "TOOL_USE"; toolUseId: string; toolName: string; toolInput: Record<string, unknown> }
+  | { type: "TOOL_EXECUTING"; toolUseId: string; toolName: string }
+  | { type: "TOOL_PROGRESS"; toolUseId: string; toolName: string; elapsedSeconds: number; message?: string }
   | { type: "TOOL_RESULT"; toolUseId: string; output: string; isError: boolean }
   | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string }
   | { type: "STATUS"; status: SessionStatus }
@@ -232,6 +234,29 @@ function reducer(state: ChatState, action: Action): ChatState {
         ]),
       };
 
+    case "TOOL_EXECUTING":
+      // Tool has started executing - update status to show activity
+      return {
+        ...state,
+        status: "tool_use",
+        messages: updateLastAssistantBlock(state.messages, (blocks) =>
+          blocks.map((b) =>
+            b.type === "tool_use" && b.toolUseId === action.toolUseId
+              ? { ...b, executing: true }
+              : b
+          )
+        ),
+      };
+
+    case "TOOL_PROGRESS":
+      // Progress update for long-running tool - keeps connection alive
+      // We don't change the message state, just acknowledge the heartbeat
+      // The status stays as "tool_use" to indicate work is happening
+      return {
+        ...state,
+        status: "tool_use",
+      };
+
     case "TOOL_RESULT":
       return {
         ...state,
@@ -320,6 +345,29 @@ export function useChat(options: UseChatOptions = {}): UseChatResult {
           toolName: event.tool_name,
           toolInput: event.tool_input,
         });
+        break;
+      case "tool_executing":
+        dispatch({
+          type: "TOOL_EXECUTING",
+          toolUseId: event.tool_use_id,
+          toolName: event.tool_name,
+        });
+        break;
+      case "tool_progress":
+        dispatch({
+          type: "TOOL_PROGRESS",
+          toolUseId: event.tool_use_id,
+          toolName: event.tool_name,
+          elapsedSeconds: event.elapsed_seconds,
+          message: event.message,
+        });
+        break;
+      case "nested_session_event":
+        // Nested session events are informational - they show activity from
+        // agent sessions that the orchestrator is controlling. We log them
+        // for debugging but don't need to update UI state since the agent
+        // session tab will show those events directly.
+        console.debug("[nested_session_event]", event.session_id, event.event_type);
         break;
       case "tool_result":
         dispatch({

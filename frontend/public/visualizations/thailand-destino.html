@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tailândia - Seu Próximo Destino</title>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Poppins', sans-serif;
+            background: #0a0a0a;
+            color: white;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        /* TV Safe Area - 8% margins for better overscan handling */
+        .tv-safe-area {
+            position: absolute;
+            top: 8%;
+            left: 6%;
+            width: 88%;
+            height: 84%;
+            overflow: hidden;
+        }
+
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            transition: opacity 1s ease-in-out;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .slide.active {
+            opacity: 1;
+        }
+
+        .slide-background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background-size: cover;
+            background-position: center;
+            filter: brightness(0.35) blur(2px);
+            z-index: -1;
+        }
+
+        .slide-content {
+            position: relative;
+            z-index: 10;
+            text-align: center;
+            padding: 20px;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .slide-icon {
+            font-size: 50px;
+            margin-bottom: 15px;
+        }
+
+        .slide-title {
+            font-size: 44px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            text-shadow: 2px 2px 20px rgba(0,0,0,0.8);
+            background: linear-gradient(135deg, #fff, #FFD700);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .slide-subtitle {
+            font-size: 20px;
+            font-weight: 300;
+            margin-bottom: 15px;
+            color: #FFD700;
+            text-shadow: 1px 1px 10px rgba(0,0,0,0.5);
+        }
+
+        .slide-description {
+            font-size: 20px;
+            line-height: 1.5;
+            font-weight: 300;
+            text-shadow: 1px 1px 10px rgba(0,0,0,0.8);
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+
+        .stat-card {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 25px 35px;
+            border: 2px solid rgba(255,255,255,0.2);
+            transition: all 0.3s;
+            min-width: 200px;
+        }
+
+        .stat-card.focused {
+            border-color: #FFD700;
+            transform: scale(1.05);
+            box-shadow: 0 0 30px rgba(255,215,0,0.4);
+        }
+
+        .stat-number {
+            font-size: 42px;
+            font-weight: 700;
+            color: #FFD700;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 16px;
+            font-weight: 300;
+            color: rgba(255,255,255,0.9);
+        }
+
+        /* Features */
+        .features-list {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 15px;
+            margin-top: 25px;
+        }
+
+        .feature-tag {
+            background: linear-gradient(135deg, rgba(255,215,0,0.3), rgba(255,140,0,0.3));
+            border: 2px solid rgba(255,215,0,0.5);
+            border-radius: 50px;
+            padding: 12px 25px;
+            font-size: 18px;
+            font-weight: 400;
+            transition: all 0.3s;
+        }
+
+        .feature-tag.focused {
+            border-color: #fff;
+            background: linear-gradient(135deg, rgba(255,215,0,0.6), rgba(255,140,0,0.6));
+            transform: scale(1.1);
+        }
+
+        /* Regions Grid - Horizontal Cards */
+        .regions-grid {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 25px;
+            width: 100%;
+            max-width: 1200px;
+        }
+
+        .region-card {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            overflow: hidden;
+            border: 3px solid rgba(255,255,255,0.2);
+            transition: all 0.3s;
+            flex: 1;
+            max-width: 260px;
+        }
+
+        .region-card.focused {
+            border-color: #FFD700;
+            transform: scale(1.03);
+            box-shadow: 0 0 40px rgba(255,215,0,0.5);
+        }
+
+        .region-image {
+            width: 100%;
+            height: 120px;
+            object-fit: cover;
+        }
+
+        .region-info {
+            padding: 12px;
+        }
+
+        .region-name {
+            font-size: 17px;
+            font-weight: 600;
+            margin-bottom: 5px;
+            color: #FFD700;
+        }
+
+        .region-desc {
+            font-size: 12px;
+            font-weight: 300;
+            line-height: 1.3;
+        }
+
+        /* Pride Colors */
+        .pride-colors {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin: 25px 0;
+        }
+
+        .pride-bar {
+            width: 60px;
+            height: 12px;
+            border-radius: 6px;
+        }
+
+        /* Gallery Grid for Interactive Slides */
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-top: 20px;
+            width: 100%;
+            max-width: 1100px;
+        }
+
+        .gallery-item {
+            border-radius: 15px;
+            overflow: hidden;
+            border: 3px solid transparent;
+            transition: all 0.3s;
+            aspect-ratio: 16/10;
+            position: relative;
+        }
+
+        .gallery-item.focused {
+            border-color: #FFD700;
+            transform: scale(1.08);
+            box-shadow: 0 0 30px rgba(255,215,0,0.5);
+            z-index: 10;
+        }
+
+        .gallery-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .gallery-item .caption {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(transparent, rgba(0,0,0,0.8));
+            padding: 10px;
+            font-size: 14px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        .gallery-item.focused .caption {
+            opacity: 1;
+        }
+
+        /* Progress Dots */
+        .progress-dots {
+            position: absolute;
+            bottom: 5px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            z-index: 100;
+        }
+
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.3);
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+
+        .dot.active {
+            background: #FFD700;
+            transform: scale(1.2);
+        }
+
+        .dot.nav-focused {
+            border-color: #fff;
+            transform: scale(1.3);
+        }
+
+        /* Logo */
+        .logo-corner {
+            position: absolute;
+            top: 15px;
+            left: 25px;
+            font-size: 22px;
+            font-weight: 600;
+            color: rgba(255,255,255,0.9);
+            z-index: 100;
+            text-shadow: 2px 2px 10px rgba(0,0,0,0.8);
+        }
+
+        /* Navigation Hint */
+        .nav-hint {
+            position: absolute;
+            bottom: 5px;
+            right: 15px;
+            font-size: 12px;
+            color: rgba(255,255,255,0.5);
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .nav-hint .key {
+            background: rgba(255,255,255,0.15);
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+        }
+
+        /* Image Viewer Modal */
+        .image-viewer {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0,0,0,0.95);
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+        }
+
+        .image-viewer.active {
+            display: flex;
+        }
+
+        .image-viewer img {
+            max-width: 90%;
+            max-height: 80%;
+            object-fit: contain;
+            border-radius: 10px;
+        }
+
+        .image-viewer .viewer-caption {
+            margin-top: 20px;
+            font-size: 24px;
+            color: #FFD700;
+        }
+
+        .image-viewer .viewer-hint {
+            position: absolute;
+            bottom: 30px;
+            color: rgba(255,255,255,0.6);
+            font-size: 16px;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.9; }
+            50% { opacity: 1; }
+        }
+
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+
+        /* Slide Counter */
+        .slide-counter {
+            position: absolute;
+            top: 15px;
+            right: 25px;
+            font-size: 18px;
+            color: rgba(255,255,255,0.7);
+            z-index: 100;
+        }
+
+        /* Thai Flag */
+        .thai-flag {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0;
+            margin: 20px 0;
+        }
+
+        .flag-stripe {
+            width: 120px;
+            height: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="tv-safe-area">
+        <div class="logo-corner pulse">🇹🇭 Thailand</div>
+        <div class="slide-counter"><span id="currentSlide">1</span> / <span id="totalSlides">7</span></div>
+
+        <!-- Slide 1: Intro -->
+        <div class="slide active" id="slide1">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1528181304800-259b08848526?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <div class="slide-icon">🙏</div>
+                <h1 class="slide-title">Land of Smiles</h1>
+                <p class="slide-subtitle">Tailândia · O Paraíso do Sudeste Asiático</p>
+                <p class="slide-description">
+                    Templos dourados, praias cristalinas, culinária incomparável<br>
+                    e o melhor custo-benefício para nômades digitais.
+                </p>
+                <div class="features-list" id="intro-features">
+                    <span class="feature-tag focused" data-idx="0">🏝️ Praias Paradisíacas</span>
+                    <span class="feature-tag" data-idx="1">💻 Digital Nomad Hub</span>
+                    <span class="feature-tag" data-idx="2">🏳️‍🌈 LGBTQ+ Friendly</span>
+                    <span class="feature-tag" data-idx="3">🍜 Gastronomia</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 2: Regiões -->
+        <div class="slide" id="slide2">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1552465011-b4e21bf6e79a?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <h1 class="slide-title">Regiões para Viver</h1>
+                <p class="slide-subtitle">De metrópoles vibrantes a ilhas tranquilas</p>
+                <div class="regions-grid" id="regions-grid">
+                    <div class="region-card focused" data-idx="0">
+                        <img src="https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=600&q=80" class="region-image" alt="Bangkok">
+                        <div class="region-info">
+                            <h3 class="region-name">🏙️ Bangkok</h3>
+                            <p class="region-desc">Metrópole vibrante, #2 para nômades digitais</p>
+                        </div>
+                    </div>
+                    <div class="region-card" data-idx="1">
+                        <img src="https://images.unsplash.com/photo-1598935898639-81586f7d2129?w=600&q=80" class="region-image" alt="Chiang Mai">
+                        <div class="region-info">
+                            <h3 class="region-name">🏔️ Chiang Mai</h3>
+                            <p class="region-desc">Capital dos nômades, templos e natureza</p>
+                        </div>
+                    </div>
+                    <div class="region-card" data-idx="2">
+                        <img src="https://images.unsplash.com/photo-1589394815804-964ed0be2eb5?w=600&q=80" class="region-image" alt="Phuket">
+                        <div class="region-info">
+                            <h3 class="region-name">🏖️ Phuket</h3>
+                            <p class="region-desc">Praias luxuosas, resorts e vida noturna</p>
+                        </div>
+                    </div>
+                    <div class="region-card" data-idx="3">
+                        <img src="https://images.unsplash.com/photo-1537956965359-7573183d1f57?w=600&q=80" class="region-image" alt="Koh Samui">
+                        <div class="region-info">
+                            <h3 class="region-name">🌴 Koh Samui</h3>
+                            <p class="region-desc">Ilha autêntica, wellness e comunidade</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 3: Galeria Templos & Landmarks -->
+        <div class="slide" id="slide3">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1563492065599-3520f775eeed?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <h1 class="slide-title">Templos & Maravilhas</h1>
+                <p class="slide-subtitle">Use as setas para explorar • Enter para ampliar</p>
+                <div class="gallery-grid" id="landmark-gallery">
+                    <div class="gallery-item focused" data-idx="0" data-caption="Grand Palace - Residência real desde 1782">
+                        <img src="https://images.unsplash.com/photo-1563492065599-3520f775eeed?w=400&q=80" alt="Grand Palace">
+                    </div>
+                    <div class="gallery-item" data-idx="1" data-caption="Wat Arun - Templo do Amanhecer">
+                        <img src="https://images.unsplash.com/photo-1596422846543-75c6fc197f07?w=400&q=80" alt="Wat Arun">
+                    </div>
+                    <div class="gallery-item" data-idx="2" data-caption="Wat Pho - Buda Reclinado de 46m">
+                        <img src="https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=400&q=80" alt="Wat Pho">
+                    </div>
+                    <div class="gallery-item" data-idx="3" data-caption="Phi Phi Islands - Maya Bay">
+                        <img src="https://images.unsplash.com/photo-1504214208698-ea1916a2195a?w=400&q=80" alt="Phi Phi">
+                    </div>
+                    <div class="gallery-item" data-idx="4" data-caption="Chiang Mai - Templos nas montanhas">
+                        <img src="https://images.unsplash.com/photo-1569154941061-e231b4725ef1?w=400&q=80" alt="Chiang Mai Temple">
+                    </div>
+                    <div class="gallery-item" data-idx="5" data-caption="Mercados flutuantes tradicionais">
+                        <img src="https://images.unsplash.com/photo-1506665531195-3566af2b4dfa?w=400&q=80" alt="Floating Market">
+                    </div>
+                    <div class="gallery-item" data-idx="6" data-caption="Praias de águas cristalinas">
+                        <img src="https://images.unsplash.com/photo-1483683804023-6ccdb62f86ef?w=400&q=80" alt="Beach">
+                    </div>
+                    <div class="gallery-item" data-idx="7" data-caption="Santuários de elefantes éticos">
+                        <img src="https://images.unsplash.com/photo-1549366021-9f761d450615?w=400&q=80" alt="Elephants">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 4: Digital Nomad Hub -->
+        <div class="slide" id="slide4">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1497366216548-37526070297c?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <h1 class="slide-title">Digital Nomad Paradise</h1>
+                <p class="slide-subtitle">O melhor custo-benefício do mundo</p>
+                <p class="slide-description">
+                    Internet 5G com 300+ Mbps, coworkings por toda parte,<br>
+                    e custo de vida que permite viver bem gastando pouco.
+                </p>
+                <div class="stats-grid" id="tech-stats">
+                    <div class="stat-card focused" data-idx="0">
+                        <div class="stat-number">$1.000</div>
+                        <div class="stat-label">custo mensal médio</div>
+                    </div>
+                    <div class="stat-card" data-idx="1">
+                        <div class="stat-number">300+</div>
+                        <div class="stat-label">Mbps velocidade média</div>
+                    </div>
+                    <div class="stat-card" data-idx="2">
+                        <div class="stat-number">#2</div>
+                        <div class="stat-label">melhor cidade p/ nomads</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5: Diversidade -->
+        <div class="slide" id="slide5">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1514933651103-005eec06c04b?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <h1 class="slide-title">Diversidade & Aceitação</h1>
+                <p class="slide-subtitle">Um dos países mais LGBTQ+ friendly da Ásia</p>
+                <div class="pride-colors">
+                    <div class="pride-bar" style="background: #E40303"></div>
+                    <div class="pride-bar" style="background: #FF8C00"></div>
+                    <div class="pride-bar" style="background: #FFED00"></div>
+                    <div class="pride-bar" style="background: #008026"></div>
+                    <div class="pride-bar" style="background: #24408E"></div>
+                    <div class="pride-bar" style="background: #732982"></div>
+                </div>
+                <div class="stats-grid" id="diversity-stats">
+                    <div class="stat-card focused" data-idx="0">
+                        <div class="stat-number">#2</div>
+                        <div class="stat-label">cidade gay-friendly na Ásia</div>
+                    </div>
+                    <div class="stat-card" data-idx="1">
+                        <div class="stat-number">Silom</div>
+                        <div class="stat-label">maior área LGBTQ+ da Ásia</div>
+                    </div>
+                    <div class="stat-card" data-idx="2">
+                        <div class="stat-number">Trans</div>
+                        <div class="stat-label">alta visibilidade e aceitação</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 6: Vida Social & Gastronomia -->
+        <div class="slide" id="slide6">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1559314809-0d155014e29e?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <h1 class="slide-title">Sabores & Experiências</h1>
+                <p class="slide-subtitle">Gastronomia de classe mundial a preços locais</p>
+                <div class="gallery-grid" id="social-gallery" style="grid-template-columns: repeat(3, 1fr); max-width: 900px;">
+                    <div class="gallery-item focused" data-idx="0" data-caption="Street Food - Pad Thai por $1">
+                        <img src="https://images.unsplash.com/photo-1559314809-0d155014e29e?w=400&q=80" alt="Thai Food">
+                    </div>
+                    <div class="gallery-item" data-idx="1" data-caption="Mercados noturnos vibrantes">
+                        <img src="https://images.unsplash.com/photo-1555529669-e69e7aa0ba9a?w=400&q=80" alt="Night Market">
+                    </div>
+                    <div class="gallery-item" data-idx="2" data-caption="Rooftop bars com vista">
+                        <img src="https://images.unsplash.com/photo-1514933651103-005eec06c04b?w=400&q=80" alt="Rooftop">
+                    </div>
+                    <div class="gallery-item" data-idx="3" data-caption="Retiros de yoga e meditação">
+                        <img src="https://images.unsplash.com/photo-1506665531195-3566af2b4dfa?w=400&q=80" alt="Wellness">
+                    </div>
+                    <div class="gallery-item" data-idx="4" data-caption="Thai massage tradicional">
+                        <img src="https://images.unsplash.com/photo-1519451241324-20b4ea2c4220?w=400&q=80" alt="Massage">
+                    </div>
+                    <div class="gallery-item" data-idx="5" data-caption="Full Moon Party em Koh Phangan">
+                        <img src="https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=400&q=80" alt="Beach Party">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 7: Call to Action -->
+        <div class="slide" id="slide7">
+            <div class="slide-background" style="background-image: url('https://images.unsplash.com/photo-1504214208698-ea1916a2195a?w=1920&q=80')"></div>
+            <div class="slide-content">
+                <div class="slide-icon">✨</div>
+                <h1 class="slide-title">Seu Próximo Capítulo</h1>
+                <p class="slide-subtitle">Sawadee krap! A Tailândia te espera</p>
+                <div class="thai-flag">
+                    <div class="flag-stripe" style="background: #A51931; border-radius: 6px 6px 0 0;"></div>
+                    <div class="flag-stripe" style="background: #F4F5F8;"></div>
+                    <div class="flag-stripe" style="background: #2D2A4A;"></div>
+                    <div class="flag-stripe" style="background: #2D2A4A;"></div>
+                    <div class="flag-stripe" style="background: #F4F5F8;"></div>
+                    <div class="flag-stripe" style="background: #A51931; border-radius: 0 0 6px 6px;"></div>
+                </div>
+                <p class="slide-description" style="font-size: 22px; margin-top: 20px;">
+                    Aventura · Tranquilidade · Cultura · Comunidade
+                </p>
+                <div class="features-list" style="margin-top: 30px;" id="cta-features">
+                    <span class="feature-tag focused" data-idx="0" style="font-size: 24px; padding: 18px 45px;">🙏 Sawasdee Thailand!</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="progress-dots" id="progress-dots">
+            <div class="dot active" data-slide="0"></div>
+            <div class="dot" data-slide="1"></div>
+            <div class="dot" data-slide="2"></div>
+            <div class="dot" data-slide="3"></div>
+            <div class="dot" data-slide="4"></div>
+            <div class="dot" data-slide="5"></div>
+            <div class="dot" data-slide="6"></div>
+        </div>
+
+        <div class="nav-hint">
+            <span class="key">◀ ▶</span> Navegar
+            <span class="key">▲ ▼</span> Explorar
+            <span class="key">OK</span> Selecionar
+        </div>
+    </div>
+
+    <!-- Image Viewer Modal -->
+    <div class="image-viewer" id="imageViewer">
+        <img id="viewerImage" src="" alt="Expanded view">
+        <div class="viewer-caption" id="viewerCaption"></div>
+        <div class="viewer-hint">Pressione qualquer botão para fechar</div>
+    </div>
+
+    <script>
+        // State
+        let currentSlide = 0;
+        let focusedElement = 0;
+        let navMode = 'slides';
+        let autoPlayInterval;
+        const slides = document.querySelectorAll('.slide');
+        const dots = document.querySelectorAll('.dot');
+        const totalSlides = slides.length;
+
+        document.getElementById('totalSlides').textContent = totalSlides;
+
+        function getInteractiveElements() {
+            const slideId = `slide${currentSlide + 1}`;
+            const slide = document.getElementById(slideId);
+            const selectors = '.feature-tag, .region-card, .stat-card, .gallery-item';
+            return slide.querySelectorAll(selectors);
+        }
+
+        function updateFocus() {
+            const elements = getInteractiveElements();
+            elements.forEach((el, i) => {
+                el.classList.toggle('focused', i === focusedElement);
+            });
+        }
+
+        function showSlide(index) {
+            currentSlide = ((index % totalSlides) + totalSlides) % totalSlides;
+            slides.forEach((slide, i) => {
+                slide.classList.toggle('active', i === currentSlide);
+            });
+            dots.forEach((dot, i) => {
+                dot.classList.toggle('active', i === currentSlide);
+                dot.classList.remove('nav-focused');
+            });
+            document.getElementById('currentSlide').textContent = currentSlide + 1;
+            focusedElement = 0;
+            navMode = 'slides';
+            updateFocus();
+        }
+
+        function nextSlide() { showSlide(currentSlide + 1); }
+        function prevSlide() { showSlide(currentSlide - 1); }
+
+        function navigateElements(direction) {
+            const elements = getInteractiveElements();
+            if (elements.length === 0) return;
+            navMode = 'elements';
+            if (direction === 'up' || direction === 'left') {
+                focusedElement = (focusedElement - 1 + elements.length) % elements.length;
+            } else {
+                focusedElement = (focusedElement + 1) % elements.length;
+            }
+            updateFocus();
+        }
+
+        function handleSelect() {
+            const elements = getInteractiveElements();
+            if (elements.length === 0) return;
+            const selected = elements[focusedElement];
+            if (selected.classList.contains('gallery-item')) {
+                const img = selected.querySelector('img');
+                const caption = selected.dataset.caption || '';
+                openImageViewer(img.src.replace('w=400', 'w=1200'), caption);
+            }
+        }
+
+        function openImageViewer(src, caption) {
+            const viewer = document.getElementById('imageViewer');
+            document.getElementById('viewerImage').src = src;
+            document.getElementById('viewerCaption').textContent = caption;
+            viewer.classList.add('active');
+            stopAutoPlay();
+        }
+
+        function closeImageViewer() {
+            document.getElementById('imageViewer').classList.remove('active');
+            startAutoPlay();
+        }
+
+        function startAutoPlay() {
+            stopAutoPlay();
+            autoPlayInterval = setInterval(nextSlide, 10000);
+        }
+
+        function stopAutoPlay() {
+            if (autoPlayInterval) clearInterval(autoPlayInterval);
+        }
+
+        document.addEventListener('keydown', (e) => {
+            const viewer = document.getElementById('imageViewer');
+            const isViewerOpen = viewer.classList.contains('active');
+
+            if (isViewerOpen) {
+                e.preventDefault();
+                e.stopPropagation();
+                closeImageViewer();
+                return false;
+            }
+
+            if (e.key === 'Escape' || e.key === 'Backspace' || e.key === 'GoBack') {
+                e.preventDefault();
+                e.stopPropagation();
+                navMode = 'slides';
+                updateFocus();
+                return false;
+            }
+
+            stopAutoPlay();
+
+            switch(e.key) {
+                case 'ArrowRight': nextSlide(); break;
+                case 'ArrowLeft': prevSlide(); break;
+                case 'ArrowUp': navigateElements('up'); break;
+                case 'ArrowDown': navigateElements('down'); break;
+                case 'Enter':
+                case ' ': handleSelect(); break;
+            }
+
+            startAutoPlay();
+        }, true);
+
+        dots.forEach((dot, index) => {
+            dot.addEventListener('click', () => showSlide(index));
+        });
+
+        showSlide(0);
+        startAutoPlay();
+    </script>
+</body>
+</html>

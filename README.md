@@ -201,13 +201,13 @@ The interactive installer will:
 
 ```bash
 # Terminal 1 — Backend
-context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8000
+context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765
 
 # Terminal 2 — Frontend
 cd frontend && npm run dev
 ```
 
-Open **https://localhost:5173** and start chatting.
+Open **https://localhost:5432** and start chatting.
 
 **Tip**: Use `/debug-app` to launch both backend and frontend with browser automation.
 

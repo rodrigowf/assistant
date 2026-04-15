@@ -104,3 +104,30 @@ class VoiceInterrupted(OrchestratorEvent):
     """The user interrupted the assistant's voice response (barge-in)."""
 
     partial_text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutingEvent(OrchestratorEvent):
+    """A tool has started executing (non-blocking status update)."""
+
+    tool_call_id: str
+    tool_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolProgressEvent(OrchestratorEvent):
+    """Progress update during long-running tool execution (heartbeat)."""
+
+    tool_call_id: str
+    tool_name: str
+    elapsed_seconds: float
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class NestedSessionEvent(OrchestratorEvent):
+    """Event from a nested agent session (forwarded from send_to_agent_session)."""
+
+    session_id: str
+    event_type: str
+    event_data: dict[str, Any] = field(default_factory=dict)

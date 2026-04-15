@@ -24,7 +24,8 @@ import sys
 from pathlib import Path
 
 # Add project root to path for utils import
-SCRIPT_DIR = Path(__file__).parent.resolve()
+# Resolve the file first (follows symlinks), then get parent directory
+SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
@@ -121,7 +122,12 @@ def index_history(reset: bool = False) -> None:
 
     # Convert JSONL files to temporary markdown for embedding
     temp_dir = PROJECT_DIR / ".index-temp"
-    temp_dir.mkdir(exist_ok=True)
+    # Ensure temp dir exists and is clean
+    if temp_dir.exists():
+        for f in temp_dir.glob("*"):
+            f.unlink()
+    else:
+        temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         for jsonl_path in jsonl_files:
@@ -138,7 +144,8 @@ def index_history(reset: bool = False) -> None:
         # Clean up temp files
         for f in temp_dir.glob("*"):
             f.unlink()
-        temp_dir.rmdir()
+        if temp_dir.exists():
+            temp_dir.rmdir()
 
 
 def main():

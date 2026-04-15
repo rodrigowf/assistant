@@ -20,6 +20,7 @@ frontend/node_modules/
 
 # Local logs
 logs/
+remote_console.log
 
 # Context is now a submodule (assistant-context repo)
 # context/
@@ -44,3 +45,11 @@ certs/
 *.egg-info/
 .ruff_cache/
 .mypy_cache/
+
+# Android
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/**/*.apk
+android/**/*.aab

@@ -27,24 +27,28 @@ Ensure the logs directory exists. Create it if missing by running mkdir for the 
 
 ### Backend Server
 
-Start the FastAPI backend with uvicorn, using the factory pattern. The command structure is:
+Start the FastAPI backend with uvicorn, using the factory pattern. **IMPORTANT**: Use `setsid` to fully detach the process from the shell's process group — otherwise the server dies when the Bash tool's shell exits.
 
-Run the uvicorn module through context/scripts/run.sh with the api.app:create_app factory on port 8000. Pipe output through tee to save a timestamped log file in the logs directory. Run in background with ampersand.
+The command pattern is:
 
-Example log filename format: api_YYYYMMDD_HHMMSS.log
+    setsid context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765 > logs/api_TIMESTAMP.log 2>&1 &
+
+Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`. Do NOT use `nohup` or `tee` — use `setsid` with output redirection.
 
 ### Frontend Server
 
-Start the Vite dev server from the frontend directory. Pipe output through tee to save a timestamped log in the logs directory (use parent path since you change directory). Run in background.
+Start the Vite dev server from the frontend directory. Same `setsid` pattern:
 
-Example log filename format: frontend_YYYYMMDD_HHMMSS.log
+    cd frontend && setsid npm run dev > ../logs/frontend_TIMESTAMP.log 2>&1 &
+
+Replace TIMESTAMP with `$(date +%Y%m%d_%H%M%S)`.
 
 ### Verify Startup
 
 After starting both servers:
 1. Wait a few seconds for servers to initialize
 2. Check that processes are running with ps aux filtered for uvicorn and vite
-3. Backend should be on port 8000, frontend on port 5173
+3. Backend should be on port 8765, frontend on port 5432
 
 ---
 
@@ -54,7 +58,7 @@ Use these MCP tools to automate browser interaction with the frontend.
 
 ### Opening the Application
 
-Use the new_page tool to open a browser tab at the frontend URL. If SSL certs exist in context/certs/, the URL is https://localhost:5173; otherwise it's http://localhost:5173. Check the frontend log output to confirm which protocol is being served.
+Use the new_page tool to open a browser tab at the frontend URL. If SSL certs exist in context/certs/, the URL is https://localhost:5432; otherwise it's http://localhost:5432. Check the frontend log output to confirm which protocol is being served.
 
 ### Taking Snapshots
 
@@ -184,6 +188,6 @@ For real-time output, use tail with the follow flag on the log file. Run in back
 
 **Kill servers**: Use pkill or kill with the process IDs found above.
 
-**Check port usage**: Use lsof or ss to verify ports 8000 and 5173.
+**Check port usage**: Use lsof or ss to verify ports 8765 and 5432.
 
 **Restart cleanly**: Kill existing processes, then start fresh with new log files.

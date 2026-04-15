@@ -54,16 +54,23 @@ export interface VoiceOrchestratorResult {
   isMuted: boolean;
   /** Toggle microphone mute on/off. */
   toggleMute: () => void;
+  /** Whether the assistant audio is muted. */
+  isAssistantMuted: boolean;
+  /** Toggle assistant audio mute on/off. */
+  toggleAssistantMute: () => void;
   /** Mic input audio level (0–1). */
   micLevel: number;
   /** Remote speaker audio level (0–1). */
   speakerLevel: number;
+  /** Error message for display (e.g. session expired). Null when no error. */
+  voiceError: string | null;
 }
 
 export function useVoiceOrchestrator(
   options: UseVoiceOrchestratorOptions = {}
 ): VoiceOrchestratorResult {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
+  const [voiceError, setVoiceError] = useState<string | null>(null);
   const voiceHandlesRef = useRef<VoiceSessionHandles | null>(null);
   const wsRef = useRef<ChatSocket | null>(null);
   // Queue commands that arrive before data channel opens
@@ -73,6 +80,7 @@ export function useVoiceOrchestrator(
 
   // Mute state
   const [isMuted, setIsMuted] = useState(false);
+  const [isAssistantMuted, setIsAssistantMuted] = useState(false);
 
   // Audio level analysis
   const [micLevel, setMicLevel] = useState(0);
@@ -98,6 +106,29 @@ export function useVoiceOrchestrator(
     }
   }, []);
 
+  const stopAudioAnalysis = useCallback(() => {
+    if (analyserIntervalRef.current) {
+      clearInterval(analyserIntervalRef.current);
+      analyserIntervalRef.current = null;
+    }
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
+    setMicLevel(0);
+    setSpeakerLevel(0);
+  }, []);
+
+  const cleanup = useCallback(() => {
+    stopAudioAnalysis();
+    voiceHandlesRef.current?.disconnect();
+    voiceHandlesRef.current = null;
+    wsRef.current?.close();
+    wsRef.current = null;
+    dcReadyRef.current = false;
+    pendingCommandsRef.current = [];
+    setIsMuted(false);
+    setIsAssistantMuted(false);
+  }, [stopAudioAnalysis]);
+
   // Handle server events from the orchestrator WebSocket
   const handleServerEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
@@ -114,12 +145,39 @@ export function useVoiceOrchestrator(
         sendToOpenAI(event.command as RealtimeEvent);
         break;
 
-      case "error":
-        console.error("[voice-orchestrator] Server error:", event.error, (event as { detail?: string }).detail);
+      case "error": {
+        const detail = (event as { detail?: string }).detail;
+        console.error("[voice-orchestrator] Server error:", event.error, detail);
+        setVoiceError(detail || `Server error: ${event.error}`);
+        cleanup();
         updateStatus("error");
+        optsRef.current.onAfterStop?.();
+        break;
+      }
+
+      case "status":
+        // WebSocket disconnected while voice was active
+        if ((event as { status?: string }).status === "disconnected" && voiceHandlesRef.current) {
+          setVoiceError((prev) => prev ?? "Server connection lost");
+          cleanup();
+          updateStatus("error");
+          optsRef.current.onAfterStop?.();
+        }
         break;
     }
-  }, [sendToOpenAI, updateStatus]);
+  }, [sendToOpenAI, updateStatus, cleanup]);
+
+  // Handle connection closed (e.g. session expired, network drop)
+  const handleConnectionClosed = useCallback(() => {
+    // Only act if voice is currently active (avoid double-firing)
+    if (voiceHandlesRef.current) {
+      // If we don't already have a specific error, set a generic one
+      setVoiceError((prev) => prev ?? "Voice connection lost");
+      cleanup();
+      updateStatus("error");
+      optsRef.current.onAfterStop?.();
+    }
+  }, [cleanup, updateStatus]);
 
   // Handle events from OpenAI data channel
   const handleOpenAIEvent = useCallback((event: RealtimeEvent) => {
@@ -127,6 +185,24 @@ export function useVoiceOrchestrator(
 
     // Mirror every event to the backend
     wsRef.current?.send({ type: "voice_event", event });
+
+    // Detect OpenAI error events (e.g. session_expired, rate_limit, etc.)
+    if (eventType === "error") {
+      const err = event.error as Record<string, unknown> | undefined;
+      const code = err?.code as string | undefined;
+      const message = err?.message as string | undefined;
+      if (code === "session_expired") {
+        console.warn("[voice-orchestrator] Session expired:", message);
+        setVoiceError(message || "Voice session expired — please restart");
+      } else {
+        console.error("[voice-orchestrator] OpenAI error:", code, message);
+        setVoiceError(message || `Voice error: ${code || "unknown"}`);
+      }
+      cleanup();
+      updateStatus("error");
+      optsRef.current.onAfterStop?.();
+      return; // Don't process further
+    }
 
     // Update status and dispatch UI callbacks
     if (eventType === "response.created") {
@@ -182,7 +258,7 @@ export function useVoiceOrchestrator(
     } else if (eventType === "response.audio_transcript.done") {
       optsRef.current.onAssistantComplete?.((event.transcript as string) || "");
     }
-  }, [updateStatus]);
+  }, [updateStatus, cleanup]);
 
   // Data channel connected → drain queue
   const handleVoiceConnected = useCallback(() => {
@@ -199,20 +275,11 @@ export function useVoiceOrchestrator(
     onConnected: handleVoiceConnected,
     onError: (err) => {
       console.error("[voice-orchestrator] WebRTC error:", err);
+      setVoiceError(err);
       updateStatus("error");
     },
+    onClose: handleConnectionClosed,
   });
-
-  const stopAudioAnalysis = useCallback(() => {
-    if (analyserIntervalRef.current) {
-      clearInterval(analyserIntervalRef.current);
-      analyserIntervalRef.current = null;
-    }
-    audioCtxRef.current?.close().catch(() => {});
-    audioCtxRef.current = null;
-    setMicLevel(0);
-    setSpeakerLevel(0);
-  }, []);
 
   const startAudioAnalysis = useCallback((handles: VoiceSessionHandles) => {
     const ctx = new AudioContext();
@@ -264,17 +331,6 @@ export function useVoiceOrchestrator(
     }, 66); // ~15fps
   }, []);
 
-  const cleanup = useCallback(() => {
-    stopAudioAnalysis();
-    voiceHandlesRef.current?.disconnect();
-    voiceHandlesRef.current = null;
-    wsRef.current?.close();
-    wsRef.current = null;
-    dcReadyRef.current = false;
-    pendingCommandsRef.current = [];
-    setIsMuted(false);
-  }, [stopAudioAnalysis]);
-
   const toggleMute = useCallback(() => {
     const handles = voiceHandlesRef.current;
     if (!handles) return;
@@ -285,9 +341,18 @@ export function useVoiceOrchestrator(
     setIsMuted(newMuted);
   }, [isMuted]);
 
+  const toggleAssistantMute = useCallback(() => {
+    const handles = voiceHandlesRef.current;
+    if (!handles) return;
+    const newMuted = !isAssistantMuted;
+    handles.audioElement.muted = newMuted;
+    setIsAssistantMuted(newMuted);
+  }, [isAssistantMuted]);
+
   const startVoice = useCallback(async () => {
     if (voiceStatus !== "off" && voiceStatus !== "error") return;
 
+    setVoiceError(null);
     updateStatus("connecting");
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
@@ -312,9 +377,24 @@ export function useVoiceOrchestrator(
       socket.send(payload);
     });
 
-    // 2. Establish WebRTC connection in parallel
-    const handles = await connect();
+    // 2. Establish WebRTC connection with timeout
+    const CONNECTION_TIMEOUT_MS = 15_000;
+    let handles: VoiceSessionHandles | null = null;
+    try {
+      handles = await Promise.race([
+        connect(),
+        new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error("Voice connection timed out")), CONNECTION_TIMEOUT_MS)
+        ),
+      ]);
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : "Voice connection timed out");
+      cleanup();
+      updateStatus("error");
+      return;
+    }
     if (!handles) {
+      // connect() returned null — onError already set voiceError
       cleanup();
       updateStatus("error");
       return;
@@ -355,7 +435,10 @@ export function useVoiceOrchestrator(
     isActive: voiceStatus !== "off" && voiceStatus !== "error",
     isMuted,
     toggleMute,
+    isAssistantMuted,
+    toggleAssistantMute,
     micLevel,
     speakerLevel,
+    voiceError,
   };
 }

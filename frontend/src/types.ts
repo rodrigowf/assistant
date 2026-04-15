@@ -32,6 +32,13 @@ export interface SessionDetail extends SessionInfo {
   messages: MessagePreview[];
 }
 
+export interface PaginatedMessages {
+  messages: MessagePreview[];
+  total_count: number;
+  has_more: boolean;
+  start_index: number;
+}
+
 // WebSocket event types (server → client)
 
 export type ServerEvent =
@@ -42,9 +49,12 @@ export type ServerEvent =
   | { type: "thinking_delta"; text: string }
   | { type: "thinking_complete"; text: string }
   | { type: "tool_use"; tool_use_id: string; tool_name: string; tool_input: Record<string, unknown> }
+  | { type: "tool_executing"; tool_use_id: string; tool_name: string }
+  | { type: "tool_progress"; tool_use_id: string; tool_name: string; elapsed_seconds: number; message?: string }
   | { type: "tool_result"; tool_use_id: string; output: string; is_error: boolean }
+  | { type: "nested_session_event"; session_id: string; event_type: string; event_data: Record<string, unknown> }
   | { type: "turn_complete"; cost?: number | null; usage?: Record<string, unknown>; num_turns?: number; session_id?: string; is_error?: boolean; result?: string | null; input_tokens?: number; output_tokens?: number }
-  | { type: "compact_complete"; trigger: string }
+  | { type: "compact_complete"; trigger: string; summary?: string }
   | { type: "status"; status: string }
   | { type: "error"; error: string; detail?: string }
   | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }
@@ -78,6 +88,7 @@ export interface ChatMessage {
 export type MessageBlock =
   | { type: "text"; content: string; streaming: boolean }
   | { type: "thinking"; content: string; streaming: boolean }
+  | { type: "compact"; content: string; streaming: boolean }
   | {
       type: "tool_use";
       toolUseId: string;
@@ -86,6 +97,8 @@ export type MessageBlock =
       result?: string;
       isError?: boolean;
       complete: boolean;
+      /** True when the tool has started executing (non-blocking status update) */
+      executing?: boolean;
     };
 
 export type SessionStatus =

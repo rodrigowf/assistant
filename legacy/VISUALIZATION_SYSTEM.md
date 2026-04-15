@@ -8,7 +8,7 @@ A complete system for creating and displaying HTML-based interactive visualizati
 
 - **Static File Serving:** ✅ Working (via Vite)
 - **Local IP:** `192.168.0.28`
-- **Frontend Port:** `5173`
+- **Frontend Port:** `5432`
 - **Visualizations Created:** 4 (index, example, system-stats, remote-demo)
 - **Fire TV Ready:** ✅ Yes
 
@@ -31,15 +31,15 @@ context/scripts/
 ## 🌐 Access URLs
 
 ### Gallery Index
-- **Local:** https://localhost:5173/visualizations/index.html
-- **Network:** https://192.168.0.28:5173/visualizations/index.html
+- **Local:** https://localhost:5432/visualizations/index.html
+- **Network:** https://192.168.0.28:5432/visualizations/index.html
 
 ### Individual Visualizations
 | Name | Description | URL |
 |------|-------------|-----|
-| Example | Animated interactive rectangle | https://192.168.0.28:5173/visualizations/example.html |
-| System Stats | Real-time monitoring dashboard | https://192.168.0.28:5173/visualizations/system-stats.html |
-| Remote Demo | Fire TV remote control demo | https://192.168.0.28:5173/visualizations/remote-demo.html |
+| Example | Animated interactive rectangle | https://192.168.0.28:5432/visualizations/example.html |
+| System Stats | Real-time monitoring dashboard | https://192.168.0.28:5432/visualizations/system-stats.html |
+| Remote Demo | Fire TV remote control demo | https://192.168.0.28:5432/visualizations/remote-demo.html |
 
 ## 🚀 Quick Start
 
@@ -49,7 +49,7 @@ Simply open any URL in your browser. No build step needed!
 
 ```bash
 # Local access
-xdg-open https://localhost:5173/visualizations/index.html
+xdg-open https://localhost:5432/visualizations/index.html
 
 # Or use the helper script
 context/scripts/run.sh context/scripts/get_visualization_url.py index
@@ -66,7 +66,7 @@ context/scripts/test_visualization_on_tv.sh
 **Option B: Direct ADB command**
 ```bash
 adb shell am start -a android.intent.action.VIEW \
-    -d "https://192.168.0.28:5173/visualizations/example.html"
+    -d "https://192.168.0.28:5432/visualizations/example.html"
 ```
 
 **Option C: Via /tv-remote skill** (if available)
@@ -84,7 +84,7 @@ touch frontend/public/visualizations/my-viz.html
 # (Use example.html as a template)
 
 # Access immediately - no build needed!
-https://localhost:5173/visualizations/my-viz.html
+https://localhost:5432/visualizations/my-viz.html
 ```
 
 ## 🛠️ Utilities
@@ -101,7 +101,7 @@ context/scripts/run.sh context/scripts/get_visualization_url.py example
 context/scripts/run.sh context/scripts/get_visualization_url.py example --network
 
 # Specify custom port
-context/scripts/run.sh context/scripts/get_visualization_url.py example --network --port 5173
+context/scripts/run.sh context/scripts/get_visualization_url.py example --network --port 5432
 ```
 
 ### test_visualization_on_tv.sh
@@ -265,9 +265,9 @@ Just ask Claude to:
 ```
 Browser/Fire TV
       ↓
-   HTTP GET https://192.168.0.28:5173/visualizations/example.html
+   HTTP GET https://192.168.0.28:5432/visualizations/example.html
       ↓
-  Vite Dev Server (port 5173)
+  Vite Dev Server (port 5432)
       ↓
   Serves from: frontend/public/visualizations/example.html
       ↓
@@ -278,10 +278,10 @@ Browser/Fire TV
 
 ### Requirements
 
-- **Frontend:** Running on port 5173 (check with `lsof -ti:5173`)
+- **Frontend:** Running on port 5432 (check with `lsof -ti:5432`)
 - **Network:** Device on same LAN as Fire TV
 - **ADB:** For Fire TV integration (install: `sudo apt install adb`)
-- **Firewall:** Port 5173 open for LAN access
+- **Firewall:** Port 5432 open for LAN access
 
 ## 🐛 Troubleshooting
 
@@ -289,13 +289,13 @@ Browser/Fire TV
 
 ```bash
 # 1. Check frontend is running
-lsof -ti:5173
+lsof -ti:5432
 
 # 2. Verify file exists
 ls -la frontend/public/visualizations/
 
 # 3. Test with curl
-curl -I https://localhost:5173/visualizations/example.html
+curl -I https://localhost:5432/visualizations/example.html
 # Should return: HTTP/1.1 200 OK
 ```
 
@@ -306,11 +306,11 @@ curl -I https://localhost:5173/visualizations/example.html
 adb devices
 
 # 2. Test URL in desktop browser first
-xdg-open https://192.168.0.28:5173/visualizations/example.html
+xdg-open https://192.168.0.28:5432/visualizations/example.html
 
 # 3. Check firewall
 sudo ufw status
-# Port 5173 should be open for LAN
+# Port 5432 should be open for LAN
 ```
 
 ### Visualization not updating
@@ -359,7 +359,7 @@ sudo ufw status
 
 - **Documentation:** `frontend/public/visualizations/README.md`
 - **Quick Reference:** `frontend/public/visualizations/QUICKSTART.md`
-- **Gallery:** https://localhost:5173/visualizations/index.html
+- **Gallery:** https://localhost:5432/visualizations/index.html
 - **Examples:** Use existing `.html` files as templates
 
 ## 🎉 Success Criteria
@@ -385,4 +385,4 @@ You now have a complete, working visualization system that:
 - Provides utilities for easy URL generation and testing
 - Has comprehensive documentation and quick-start guides
 
-**Start exploring:** https://localhost:5173/visualizations/index.html
+**Start exploring:** https://localhost:5432/visualizations/index.html

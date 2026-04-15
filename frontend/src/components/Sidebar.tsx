@@ -10,11 +10,12 @@ interface Props {
   onNew: () => void;
   onNewOrchestrator: () => void;
   onSelectOrchestrator: (id: string, title: string) => void;
+  onOpenConfig: () => void;
   isOpen?: boolean;
   onClose?: () => void;
 }
 
-export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator, isOpen, onClose }: Props) {
+export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
   const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
 
   const handleSelect = (sdkId: string, localId?: string) => {
@@ -100,6 +101,13 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
           </button>
         </div>
       </div>
+      <button className="sidebar-config-btn" onClick={onOpenConfig} title="Configuration">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+        Configuration
+      </button>
       <div className="session-list">
         {sessions.map((s) => {
           // A session item is active if the current tab matches by resumeSdkId or by local_id

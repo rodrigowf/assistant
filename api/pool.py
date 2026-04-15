@@ -67,12 +67,21 @@ class SessionPool:
         local_id: str | None = None,
         resume_sdk_id: str | None = None,
         fork: bool = False,
+        mcp_servers: dict[str, dict] | None = None,
     ) -> str:
         """Create, start, and register a SessionManager. Returns the stable local_id.
 
         If *resume_sdk_id* is given and a session with that SDK ID is already
         in the pool **and healthy**, return the existing local_id instead of
         creating a duplicate.
+
+        Args:
+            config: Manager configuration.
+            local_id: Stable frontend tab UUID.
+            resume_sdk_id: SDK session ID for resuming.
+            fork: Whether to fork from an existing session.
+            mcp_servers: Optional dict of MCP servers to load. If provided, overrides
+                         the mcp_servers in config.
         """
         # Deduplicate: reuse an existing pool session with the same SDK ID
         if resume_sdk_id and not fork:
@@ -89,6 +98,12 @@ class SessionPool:
                 self._locks.pop(existing, None)
 
         lid = local_id or str(_uuid.uuid4())
+
+        # If mcp_servers provided, create a new config with that override
+        if mcp_servers is not None:
+            from dataclasses import replace
+            config = replace(config, mcp_servers=mcp_servers)
+
         sm = SessionManager(
             session_id=resume_sdk_id,
             local_id=lid,
@@ -269,6 +284,20 @@ class SessionPool:
                 exclude=source_ws,
             )
             async for event in sm.send(text):
+                payload = serialize_event(event)
+                await self._broadcast_session(session_id, payload)
+                yield event
+
+    async def compact(self, session_id: str) -> AsyncIterator[Event]:
+        """Trigger compaction with per-session lock, broadcasting to all subscribers."""
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            raise ValueError(f"No session with ID {session_id}")
+
+        lock = self._locks[session_id]
+
+        async with lock:
+            async for event in sm.compact():
                 payload = serialize_event(event)
                 await self._broadcast_session(session_id, payload)
                 yield event

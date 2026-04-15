@@ -23,6 +23,8 @@ export interface VoiceSessionHandles {
   micStream: MediaStream;
   /** The remote audio MediaStream (for audio analysis). May be null until ontrack fires. */
   remoteStream: MediaStream | null;
+  /** The audio element playing assistant audio (for muting). */
+  audioElement: HTMLAudioElement;
 }
 
 interface UseVoiceSessionOptions {
@@ -32,12 +34,14 @@ interface UseVoiceSessionOptions {
   onConnected: () => void;
   /** Called on error. */
   onError: (error: string) => void;
+  /** Called when the connection is closed (e.g. session expired). */
+  onClose?: () => void;
 }
 
 export function useVoiceSession(options: UseVoiceSessionOptions): {
   connect: () => Promise<VoiceSessionHandles | null>;
 } {
-  const { onEvent, onConnected, onError } = options;
+  const { onEvent, onConnected, onError, onClose } = options;
 
   // Keep stable refs so connect() closure doesn't go stale
   const onEventRef = useRef(onEvent);
@@ -46,6 +50,8 @@ export function useVoiceSession(options: UseVoiceSessionOptions): {
   onConnectedRef.current = onConnected;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   const connect = useCallback(async (): Promise<VoiceSessionHandles | null> => {
     let pc: RTCPeerConnection | null = null;
@@ -108,6 +114,19 @@ export function useVoiceSession(options: UseVoiceSessionOptions): {
         onErrorRef.current(`Data channel error: ${e}`);
       };
 
+      dc.onclose = () => {
+        onCloseRef.current?.();
+      };
+
+      // Monitor peer connection state (catches ICE failures, network drops)
+      pc.onconnectionstatechange = () => {
+        if (pc!.connectionState === "failed") {
+          onErrorRef.current("Connection failed");
+        } else if (pc!.connectionState === "disconnected" || pc!.connectionState === "closed") {
+          onCloseRef.current?.();
+        }
+      };
+
       // 6. Create SDP offer
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -128,6 +147,7 @@ export function useVoiceSession(options: UseVoiceSessionOptions): {
         },
         micStream: micStream!,
         get remoteStream() { return remoteStream; },
+        audioElement: audioEl!,
       };
 
       return handles;

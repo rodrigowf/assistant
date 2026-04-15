@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Assistant</string>
+    <string name="nav_chat">Chat</string>
+    <string name="nav_tabs">Tabs</string>
+    <string name="nav_settings">Settings</string>
+    <string name="notification_channel_name">Assistant Service</string>
+    <string name="notification_channel_description">Keeps the assistant running in background</string>
+    <string name="notification_title">Assistant Active</string>
+    <string name="notification_text">Listening for commands</string>
+    <string name="send_message">Send message</string>
+    <string name="type_message">Type a message...</string>
+    <string name="record_audio">Record audio</string>
+    <string name="stop_recording">Stop recording</string>
+    <string name="new_tab">New Tab</string>
+    <string name="rename_tab">Rename</string>
+    <string name="close_tab">Close</string>
+    <string name="server_url">Server URL</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="connecting">Connecting...</string>
+</resources>

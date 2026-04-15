@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -160,12 +161,18 @@ class SessionManager:
     async def compact(self) -> AsyncIterator[Event]:
         """Trigger conversation compaction.
 
-        The PreCompact hook will auto-export before the compaction runs,
-        then this yields the normal response events (including a
-        ``CompactComplete`` when the SDK confirms it).
+        Sends /compact as a slash command. After all SDK events are yielded,
+        emits a ``CompactComplete`` so the frontend can display a divider.
+        The SDK only emits ``SystemMessage(subtype="compact")`` for auto-compact;
+        for manual compact we synthesize the event ourselves.
         """
+        got_compact_event = False
         async for event in self.command("/compact"):
+            if isinstance(event, CompactComplete):
+                got_compact_event = True
             yield event
+        if not got_compact_event:
+            yield CompactComplete(trigger="manual", summary="")
 
     async def command(self, slash_command: str) -> AsyncIterator[Event]:
         """Send an arbitrary slash command (e.g. ``/compact``, ``/help``).
@@ -262,6 +269,17 @@ class SessionManager:
             kwargs["resume"] = self._resume_id
         if self._fork:
             kwargs["fork_session"] = True
+        if self._config.mcp_servers is not None:
+            # Pass MCP servers directly to the SDK
+            # When mcp_servers is provided, it overrides settings from .claude.json
+            kwargs["mcp_servers"] = self._config.mcp_servers
+        if self._config.extra_args:
+            kwargs["extra_args"] = self._config.extra_args
+
+        # Strip CLAUDECODE to allow launching SDK sessions from within a
+        # Claude Code process (e.g. VSCode extension or the wrapper itself).
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        kwargs["env"] = env
 
         return ClaudeAgentOptions(**kwargs)
 
@@ -298,7 +316,8 @@ class SessionManager:
             if msg.subtype == "compact":
                 data = msg.data if isinstance(msg.data, dict) else {}
                 trigger = data.get("trigger", "manual")
-                yield CompactComplete(trigger=trigger)
+                summary = data.get("summary", "")
+                yield CompactComplete(trigger=trigger, summary=summary)
 
         elif isinstance(msg, AssistantMessage):
             for block in msg.content:

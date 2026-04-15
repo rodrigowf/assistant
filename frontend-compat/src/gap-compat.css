@@ -1,0 +1,250 @@
+/*
+ * gap-compat.css — Safari 12 / iOS 12 compatibility shims
+ *
+ * Safari 12 does not support the `gap` property in flexbox contexts
+ * (support was added in Safari 14.1). This file neutralizes every
+ * `gap:` rule in App.css and replaces it with margin-based equivalents.
+ *
+ * Pattern:
+ *   Row flex  → selector > * + * { margin-left: Xpx; }
+ *   Col flex  → selector > * + * { margin-top: Xpx; }
+ *
+ * Injected only in the compat build (frontend-compat/src/main.tsx).
+ * The main frontend is NOT affected.
+ */
+
+/* ============================================================
+   Momentum scrolling — iOS / old Safari
+   -webkit-overflow-scrolling: touch enables inertial (momentum)
+   scroll on all overflow-y/x: auto containers. Supported since
+   iOS 5; has no effect on modern browsers (safe to apply).
+   ============================================================ */
+
+/* .message-list uses iosScrollTo() in the MessageList shim to stop momentum
+   before each programmatic scrollTop assignment, so it is safe to enable here. */
+.message-list,
+.session-list,
+.tab-bar,
+.result-output pre,
+.tool-params-content,
+.agent-session-content,
+.mcp-server-list,
+.config-panel-overlay {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── Tab bar (row, gap: 3px) ────────────────────────────────────────────── */
+.tab-bar { gap: 0; }
+.tab-bar > * + * { margin-left: 3px; }
+
+/* ── Tab tile (row, gap: 7px) ───────────────────────────────────────────── */
+.tab { gap: 0; }
+.tab > * + * { margin-left: 7px; }
+
+/* ── Sidebar header actions (row, gap: 2px) ─────────────────────────────── */
+.sidebar-header-actions { gap: 0; }
+.sidebar-header-actions > * + * { margin-left: 2px; }
+
+/* ── Session meta (row, gap: 5px) ───────────────────────────────────────── */
+.session-meta { gap: 0; }
+.session-meta > * + * { margin-left: 5px; }
+
+/* ── Message list (column, gap: 4px) ───────────────────────────────────── */
+.message-list { gap: 0; }
+.message-list > * + * { margin-top: 4px; }
+
+/* ── Thinking toggle (row, gap: 8px) ───────────────────────────────────── */
+.thinking-toggle { gap: 0; }
+.thinking-toggle > * + * { margin-left: 8px; }
+
+/* ── Tool toggle / tool header (row, gap: 8px) ─────────────────────────── */
+.tool-toggle,
+.tool-header { gap: 0; }
+.tool-toggle > * + *,
+.tool-header > * + * { margin-left: 8px; }
+
+/* ── Bash header content (column, gap: 2px) ────────────────────────────── */
+.bash-header-content { gap: 0; }
+.bash-header-content > * + * { margin-top: 2px; }
+
+/* ── Tool status badge (row, gap: 4px) ─────────────────────────────────── */
+.tool-status { gap: 0; }
+.tool-status > * + * { margin-left: 4px; }
+
+/* ── Tool fields (column, gap: 5px) ────────────────────────────────────── */
+.tool-fields { gap: 0; }
+.tool-fields > * + * { margin-top: 5px; }
+
+/* ── Tool field row (row, gap: 8px) ─────────────────────────────────────── */
+.tool-field { gap: 0; }
+.tool-field > * + * { margin-left: 8px; }
+
+/* ── Tool field multiline (column, gap: 4px) ───────────────────────────── */
+.tool-field.multiline { gap: 0; }
+.tool-field.multiline > * + * { margin-top: 4px; }
+
+/* ── Tool code views (column, gap: 6px) ────────────────────────────────── */
+.tool-write-view,
+.tool-edit-view,
+.tool-bash-view { gap: 0; }
+.tool-write-view > * + *,
+.tool-edit-view > * + *,
+.tool-bash-view > * + * { margin-top: 6px; }
+
+/* ── Tool diff (column, gap: 6px) ──────────────────────────────────────── */
+.tool-diff { gap: 0; }
+.tool-diff > * + * { margin-top: 6px; }
+
+/* ── Tool task view (column, gap: 6px) ─────────────────────────────────── */
+.tool-task-view { gap: 0; }
+.tool-task-view > * + * { margin-top: 6px; }
+
+/* ── Todo list (column, gap: 3px) ──────────────────────────────────────── */
+.todo-list { gap: 0; }
+.todo-list > * + * { margin-top: 3px; }
+
+/* ── Todo item (row, gap: 9px) ─────────────────────────────────────────── */
+.todo-item { gap: 0; }
+.todo-item > * + * { margin-left: 9px; }
+
+/* ── Send-agent header content (column, gap: 2px) ──────────────────────── */
+.send-agent-header-content { gap: 0; }
+.send-agent-header-content > * + * { margin-top: 2px; }
+
+/* ── Agent session / search input views (column, gap: 6px) ─────────────── */
+.agent-session-view { gap: 0; }
+.agent-session-view > * + * { margin-top: 6px; }
+.search-input-view { gap: 0; }
+.search-input-view > * + * { margin-top: 6px; }
+
+/* ── Chat input bar (row, gap: 10px) ───────────────────────────────────── */
+.chat-input { gap: 0; }
+.chat-input > * + * { margin-left: 10px; }
+
+/* ── Compact divider (column, gap: 6px) ────────────────────────────────── */
+.compact-divider { gap: 0; }
+.compact-divider > * + * { margin-top: 6px; }
+
+/* ── Compact divider label (row, gap: 6px) ─────────────────────────────── */
+.compact-divider-label { gap: 0; }
+.compact-divider-label > * + * { margin-left: 6px; }
+
+/* ── Voice record active (row, gap: 8px) ───────────────────────────────── */
+.voice-record-active { gap: 0; }
+.voice-record-active > * + * { margin-left: 8px; }
+
+/* ── Voice bar (row, gap: 10px) ────────────────────────────────────────── */
+.voice-bar { gap: 0; }
+.voice-bar > * + * { margin-left: 10px; }
+
+/* ── Voice status label (row, gap: 6px) ────────────────────────────────── */
+.voice-status-label { gap: 0; }
+.voice-status-label > * + * { margin-left: 6px; }
+
+/* ── Voice start button (row, gap: 8px) ────────────────────────────────── */
+.voice-start-btn { gap: 0; }
+.voice-start-btn > * + * { margin-left: 8px; }
+
+/* ── Voice controls (row, gap: 8px) ────────────────────────────────────── */
+.voice-controls { gap: 0; }
+.voice-controls > * + * { margin-left: 8px; }
+
+/* ── Voice ctrl button interior (row, gap: 6px) ────────────────────────── */
+.voice-ctrl { gap: 0; }
+.voice-ctrl > * + * { margin-left: 6px; }
+
+/* ── Volume bars (row, gap: 2px) ───────────────────────────────────────── */
+.volume-bars { gap: 0; }
+.volume-bars > * + * { margin-left: 2px; }
+
+/* ── Status left/center/right (row, gap: 6px) ──────────────────────────── */
+.status-left,
+.status-center,
+.status-right { gap: 0; }
+.status-left > * + *,
+.status-center > * + *,
+.status-right > * + * { margin-left: 6px; }
+
+/* ── Auth buttons (row, gap: 10px) ─────────────────────────────────────── */
+.auth-buttons { gap: 0; }
+.auth-buttons > * + * { margin-left: 10px; }
+
+/* ── Modal actions (row, gap: 8px) ─────────────────────────────────────── */
+.modal-actions { gap: 0; }
+.modal-actions > * + * { margin-left: 8px; }
+
+/* ── MCP server list (column, gap: 8px) ────────────────────────────────── */
+.mcp-server-list { gap: 0; }
+.mcp-server-list > * + * { margin-top: 8px; }
+
+/* ── MCP server item (row, gap: 12px) ──────────────────────────────────── */
+.mcp-server-item { gap: 0; }
+.mcp-server-item > * + * { margin-left: 12px; }
+
+/* ── MCP server info (column, gap: 4px) ────────────────────────────────── */
+.mcp-server-info { gap: 0; }
+.mcp-server-info > * + * { margin-top: 4px; }
+
+/* ── Sidebar config button (row, gap: 7px) ─────────────────────────────── */
+.sidebar-config-btn { gap: 0; }
+.sidebar-config-btn > * + * { margin-left: 7px; }
+
+/* ── Config panel header (row, gap: 10px) ──────────────────────────────── */
+.config-panel-header { gap: 0; }
+.config-panel-header > * + * { margin-left: 10px; }
+
+/* ── Config panel title row (row, gap: 9px) ─────────────────────────────── */
+.config-panel-title-row { gap: 0; }
+.config-panel-title-row > * + * { margin-left: 9px; }
+
+/* ── Config panel body (column, gap: 0) — no-op but explicit ───────────── */
+/* .config-panel-body { gap: 0; } — already zero, nothing to override */
+
+/* ── WD list (column, gap: 2px) ────────────────────────────────────────── */
+.wd-list { gap: 0; }
+.wd-list > * + * { margin-top: 2px; }
+
+/* ── WD list item (row, gap: 8px) ──────────────────────────────────────── */
+.wd-list-item { gap: 0; }
+.wd-list-item > * + * { margin-left: 8px; }
+
+/* ── WD add form (row, gap: 8px) ───────────────────────────────────────── */
+.wd-add-form { gap: 0; }
+.wd-add-form > * + * { margin-left: 8px; }
+
+/* ── Config item list (column, gap: 3px) ───────────────────────────────── */
+.config-item-list { gap: 0; }
+.config-item-list > * + * { margin-top: 3px; }
+
+/* ── Config item (row, gap: 11px) ──────────────────────────────────────── */
+.config-item { gap: 0; }
+.config-item > * + * { margin-left: 11px; }
+
+/* ── Config item info (column, gap: 2px) ───────────────────────────────── */
+.config-item-info { gap: 0; }
+.config-item-info > * + * { margin-top: 2px; }
+
+/* ── Model selector (column, gap: 16px) ────────────────────────────────── */
+.model-selector { gap: 0; }
+.model-selector > * + * { margin-top: 16px; }
+
+/* ── Model provider group (column, gap: 6px) ───────────────────────────── */
+.model-provider-group { gap: 0; }
+.model-provider-group > * + * { margin-top: 6px; }
+
+/* ── Model list (column, gap: 3px) ─────────────────────────────────────── */
+.model-list { gap: 0; }
+.model-list > * + * { margin-top: 3px; }
+
+/* ── Model option (row, gap: 10px) ─────────────────────────────────────── */
+.model-option { gap: 0; }
+.model-option > * + * { margin-left: 10px; }
+
+/* ── Model badges (row, gap: 5px) ──────────────────────────────────────── */
+.model-badges { gap: 0; }
+.model-badges > * + * { margin-left: 5px; }
+
+/* ── Mobile: chat-input gap override (row, gap: 8px inside ≤640px) ─────── */
+@media (max-width: 640px) {
+  .chat-input > * + * { margin-left: 8px; }
+}
