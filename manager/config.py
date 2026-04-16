@@ -27,6 +27,11 @@ class ManagerConfig:
     mcp_servers: dict[str, McpServerConfig] | None = None
     extra_args: dict[str, str | None] | None = None
 
+    # SSH remote execution fields (all None = run locally)
+    ssh_host: str | None = None
+    ssh_user: str | None = None
+    ssh_key: str | None = None   # Path to private key file on the local machine
+
     @classmethod
     def load(cls, path: str | Path | None = None) -> ManagerConfig:
         """Load config from a JSON file, falling back to env vars and defaults.

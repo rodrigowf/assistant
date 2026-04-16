@@ -15,6 +15,9 @@ __pycache__/
 .manager.json
 assistant_config.json
 
+# Instance-specific assistant config (not shared)
+assistant_config.json
+
 # Frontend build output
 frontend/dist/
 frontend/node_modules/

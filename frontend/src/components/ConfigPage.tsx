@@ -7,6 +7,7 @@ import {
   listAgents,
   listModels,
   type AssistantConfig,
+  type WorkingDirectoryEntry,
   type SkillInfo,
   type AgentInfo,
   type McpServerConfig,
@@ -29,9 +30,15 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState(false);
 
-  // WD add-new input
-  const [addWdInput, setAddWdInput] = useState("");
+  // WD add-new form state
+  const [addWdType, setAddWdType] = useState<"local" | "ssh">("local");
+  const [addWdPath, setAddWdPath] = useState("");
+  const [addWdLabel, setAddWdLabel] = useState("");
+  const [addWdHost, setAddWdHost] = useState("");
+  const [addWdUser, setAddWdUser] = useState("");
+  const [addWdKey, setAddWdKey] = useState("");
   const [addWdError, setAddWdError] = useState<string | null>(null);
+  const [addWdOpen, setAddWdOpen] = useState(false);
 
   const savedMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasOpen = useRef(false);
@@ -99,35 +106,58 @@ export function ConfigPage({ isOpen, onClose }: Props) {
 
   // ── Working directory list ────────────────────────────────────────
 
-  const selectWd = useCallback(async (dir: string) => {
-    try { await save({ working_directory: dir }); }
+  const selectWd = useCallback(async (id: string) => {
+    try { await save({ working_directory: id }); }
     catch (e) { setError(String(e)); }
   }, [save]);
 
+  const resetAddWdForm = () => {
+    setAddWdPath(""); setAddWdLabel(""); setAddWdHost("");
+    setAddWdUser(""); setAddWdKey(""); setAddWdError(null);
+    setAddWdOpen(false);
+  };
+
   const addWd = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    const dir = addWdInput.trim();
-    if (!dir || !config) return;
-    if (config.working_directory_history.includes(dir)) {
-      // Just select it
-      setAddWdInput("");
-      await selectWd(dir);
+    if (!config) return;
+    const path = addWdPath.trim();
+    if (!path) return;
+
+    setAddWdError(null);
+
+    const isSSH = addWdType === "ssh";
+    const host = addWdHost.trim();
+    if (isSSH && !host) { setAddWdError("SSH host is required"); return; }
+
+    const id = isSSH ? `${host}:${path}` : path;
+    // If already in history, just select it
+    if (config.working_directory_history.some(e => e.id === id)) {
+      resetAddWdForm();
+      await selectWd(id);
       return;
     }
-    setAddWdError(null);
+
+    const entry: WorkingDirectoryEntry = {
+      id,
+      path,
+      label: addWdLabel.trim() || null,
+      ssh_host: isSSH ? host : null,
+      ssh_user: addWdUser.trim() || null,
+      ssh_key: addWdKey.trim() || null,
+    };
+
     try {
-      const newHistory = [...config.working_directory_history, dir];
-      // Add to history, then select it
-      await save({ working_directory_history: newHistory, working_directory: dir });
-      setAddWdInput("");
+      const newHistory = [...config.working_directory_history, entry];
+      await save({ working_directory_history: newHistory, working_directory: id });
+      resetAddWdForm();
     } catch (e) {
       setAddWdError(String(e));
     }
-  }, [addWdInput, config, save, selectWd]);
+  }, [addWdType, addWdPath, addWdLabel, addWdHost, addWdUser, addWdKey, config, save, selectWd]);
 
-  const deleteWd = useCallback(async (dir: string) => {
+  const deleteWd = useCallback(async (id: string) => {
     if (!config) return;
-    const newHistory = config.working_directory_history.filter(d => d !== dir);
+    const newHistory = config.working_directory_history.filter(e => e.id !== id);
     try { await save({ working_directory_history: newHistory }); }
     catch (e) { setError(String(e)); }
   }, [config, save]);
@@ -189,30 +219,46 @@ export function ConfigPage({ isOpen, onClose }: Props) {
               <section className="config-section">
                 <h3 className="config-section-title">Working Directories</h3>
                 <p className="config-section-desc">
-                  Saved directories for new sessions. Select one to make it active — it will be used for all new Claude Code sessions.
+                  Saved directories for new sessions. Select one to make it active.
+                  Local directories run Claude here; SSH directories run it on a remote machine.
                 </p>
 
                 {/* Saved directory list */}
                 {config.working_directory_history.length > 0 && (
                   <div className="wd-list">
-                    {config.working_directory_history.map((dir) => {
-                      const isActive = dir === config.working_directory;
+                    {config.working_directory_history.map((entry) => {
+                      const isActive = entry.id === config.working_directory;
                       const canDelete = config.working_directory_history.length > 1;
+                      const isSSH = !!entry.ssh_host;
+                      const displayName = entry.label || (isSSH ? `${entry.ssh_host}:${entry.path}` : entry.path);
+                      const subtitle = isSSH
+                        ? `${entry.ssh_user ? entry.ssh_user + "@" : ""}${entry.ssh_host} · ${entry.path}`
+                        : null;
                       return (
-                        <div key={dir} className={`wd-list-item${isActive ? " active" : ""}`}>
+                        <div key={entry.id} className={`wd-list-item${isActive ? " active" : ""}${isSSH ? " ssh" : ""}`}>
                           <button
                             className="wd-list-radio"
-                            onClick={() => !isActive && selectWd(dir)}
+                            onClick={() => !isActive && selectWd(entry.id)}
                             title={isActive ? "Currently active" : "Set as active"}
                             disabled={saving}
                           >
                             <span className={`wd-radio-dot${isActive ? " checked" : ""}`} />
                           </button>
-                          <span className="wd-list-path" title={dir}>{dir}</span>
+                          <div className="wd-list-info">
+                            <div className="wd-list-path-row">
+                              {isSSH && (
+                                <span className="wd-ssh-badge" title="Remote SSH session">SSH</span>
+                              )}
+                              <span className="wd-list-path" title={entry.id}>{displayName}</span>
+                            </div>
+                            {subtitle && (
+                              <span className="wd-list-subtitle">{subtitle}</span>
+                            )}
+                          </div>
                           {isActive && <span className="wd-active-badge">active</span>}
                           <button
                             className="wd-list-delete"
-                            onClick={() => deleteWd(dir)}
+                            onClick={() => deleteWd(entry.id)}
                             disabled={saving || !canDelete}
                             title={canDelete ? "Remove from list" : "Cannot remove the only directory"}
                           >
@@ -227,24 +273,113 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                 )}
 
                 {/* Add new directory */}
-                <form className="wd-add-form" onSubmit={addWd}>
-                  <input
-                    className="wd-input"
-                    type="text"
-                    value={addWdInput}
-                    onChange={(e) => { setAddWdInput(e.target.value); setAddWdError(null); }}
-                    placeholder="Add directory path…"
-                    spellCheck={false}
-                  />
-                  <button
-                    className="wd-add-btn"
-                    type="submit"
-                    disabled={saving || !addWdInput.trim()}
-                  >
-                    Add
+                {!addWdOpen ? (
+                  <button className="wd-add-toggle" onClick={() => setAddWdOpen(true)}>
+                    + Add directory
                   </button>
-                </form>
-                {addWdError && <div className="config-field-error">{addWdError}</div>}
+                ) : (
+                  <form className="wd-add-form" onSubmit={addWd}>
+                    {/* Local / SSH tabs */}
+                    <div className="wd-type-tabs">
+                      <button
+                        type="button"
+                        className={`wd-type-tab${addWdType === "local" ? " active" : ""}`}
+                        onClick={() => setAddWdType("local")}
+                      >Local</button>
+                      <button
+                        type="button"
+                        className={`wd-type-tab${addWdType === "ssh" ? " active" : ""}`}
+                        onClick={() => setAddWdType("ssh")}
+                      >SSH</button>
+                    </div>
+
+                    {addWdType === "ssh" && (
+                      <div className="wd-field-row">
+                        <div className="wd-field">
+                          <label className="wd-field-label">Host *</label>
+                          <input
+                            className="wd-input"
+                            type="text"
+                            value={addWdHost}
+                            onChange={(e) => { setAddWdHost(e.target.value); setAddWdError(null); }}
+                            placeholder="192.168.0.200"
+                            spellCheck={false}
+                          />
+                        </div>
+                        <div className="wd-field wd-field-sm">
+                          <label className="wd-field-label">User</label>
+                          <input
+                            className="wd-input"
+                            type="text"
+                            value={addWdUser}
+                            onChange={(e) => setAddWdUser(e.target.value)}
+                            placeholder="rodrigo"
+                            spellCheck={false}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="wd-field">
+                      <label className="wd-field-label">
+                        {addWdType === "ssh" ? "Remote path *" : "Path *"}
+                      </label>
+                      <input
+                        className="wd-input"
+                        type="text"
+                        value={addWdPath}
+                        onChange={(e) => { setAddWdPath(e.target.value); setAddWdError(null); }}
+                        placeholder={addWdType === "ssh" ? "/home/rodrigo/projects/myapp" : "/home/user/projects/myapp"}
+                        spellCheck={false}
+                      />
+                    </div>
+
+                    {addWdType === "ssh" && (
+                      <div className="wd-field">
+                        <label className="wd-field-label">SSH key (local path, optional)</label>
+                        <input
+                          className="wd-input"
+                          type="text"
+                          value={addWdKey}
+                          onChange={(e) => setAddWdKey(e.target.value)}
+                          placeholder="~/.ssh/id_rsa"
+                          spellCheck={false}
+                        />
+                      </div>
+                    )}
+
+                    <div className="wd-field">
+                      <label className="wd-field-label">Label (optional)</label>
+                      <input
+                        className="wd-input"
+                        type="text"
+                        value={addWdLabel}
+                        onChange={(e) => setAddWdLabel(e.target.value)}
+                        placeholder="Jetson Nano — assistant"
+                        spellCheck={false}
+                      />
+                    </div>
+
+                    {addWdError && <div className="config-field-error">{addWdError}</div>}
+
+                    <div className="wd-add-actions">
+                      <button
+                        className="wd-add-btn"
+                        type="submit"
+                        disabled={saving || !addWdPath.trim() || (addWdType === "ssh" && !addWdHost.trim())}
+                      >
+                        Add
+                      </button>
+                      <button
+                        className="wd-cancel-btn"
+                        type="button"
+                        onClick={resetAddWdForm}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
               </section>
 
               {/* ── Session Flags ─────────────────────────────── */}

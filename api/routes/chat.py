@@ -145,12 +145,22 @@ async def _handle_start(
 
     # Create a new session via the pool
     from manager.config import ManagerConfig
-    from api.routes.config import _load_config as _load_assistant_config
+    from api.routes.config import _load_config as _load_assistant_config, _find_active_entry
     config = ManagerConfig.load()
     # Apply global assistant config overrides (working directory, MCPs)
     assistant_cfg = _load_assistant_config()
     from dataclasses import replace
-    config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
+    active_entry = _find_active_entry(assistant_cfg)
+    if active_entry:
+        config = replace(
+            config,
+            project_dir=active_entry["path"],
+            ssh_host=active_entry.get("ssh_host") or None,
+            ssh_user=active_entry.get("ssh_user") or None,
+            ssh_key=active_entry.get("ssh_key") or None,
+        )
+    else:
+        config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
     # If no per-session MCPs provided, use the globally-enabled MCPs from the config.
     # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".
     if mcp_servers is None:
