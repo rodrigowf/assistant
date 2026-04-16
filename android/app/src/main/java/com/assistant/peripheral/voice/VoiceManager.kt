@@ -704,8 +704,8 @@ class VoiceManager(
     private fun duckMicForAgentSpeech() {
         if (gainBeforeSpeaking == null) {
             gainBeforeSpeaking = micGainLevel
-            micGainLevel = 0.02f
-            Log.d(TAG, "Agent speaking — mic ducked from $gainBeforeSpeaking to 0.02")
+            micGainLevel = 0.01f
+            Log.d(TAG, "Agent speaking — mic ducked from $gainBeforeSpeaking to 0.01")
         }
     }
 

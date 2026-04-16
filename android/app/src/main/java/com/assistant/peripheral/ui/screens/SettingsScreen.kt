@@ -31,6 +31,7 @@ fun SettingsScreen(
     onUpdateThemeMode: (ThemeMode) -> Unit,
     onUpdateAutoConnect: (Boolean) -> Unit,
     onUpdateMicGainLevel: (Float) -> Unit,
+    onUpdateWakeWordMicGainLevel: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEarpieceMode: (Boolean) -> Unit,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
@@ -593,6 +594,73 @@ fun SettingsScreen(
                                 Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("Save")
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Wake word mic sensitivity slider — independent of voice session gain.
+                        // Scales the RMS threshold: higher gain → more sensitive detection.
+                        val wakeGainSteps = listOf(0f, 1f, 2f, 3f, 5f, 8f, 13f, 21f, 34f, 55f, 100f, 150f, 200f)
+                        val currentWakeGainPercent = (settings.wakeWordMicGainLevel * 100).roundToInt().toFloat()
+                        var wakeSliderIndex by remember(settings.wakeWordMicGainLevel) {
+                            mutableFloatStateOf(wakeGainSteps.indexOfFirst { it >= currentWakeGainPercent }.coerceAtLeast(0).toFloat())
+                        }
+                        val wakeDisplayPercent = wakeGainSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f }.roundToInt()
+
+                        Text(
+                            text = "Wake Word Sensitivity: $wakeDisplayPercent%",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = "Higher = easier to trigger (independent of voice session gain)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.VolumeDown,
+                                contentDescription = "Low",
+                                modifier = Modifier.size(20.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Slider(
+                                value = wakeSliderIndex,
+                                onValueChange = { wakeSliderIndex = it },
+                                onValueChangeFinished = {
+                                    val gainPercent = wakeGainSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f }
+                                    onUpdateWakeWordMicGainLevel(gainPercent / 100f)
+                                },
+                                valueRange = 0f..(wakeGainSteps.size - 1).toFloat(),
+                                steps = wakeGainSteps.size - 2,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(horizontal = 8.dp)
+                            )
+                            Icon(
+                                imageVector = Icons.Default.VolumeUp,
+                                contentDescription = "High",
+                                modifier = Modifier.size(20.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        if (wakeDisplayPercent != 100) {
+                            TextButton(
+                                onClick = {
+                                    wakeSliderIndex = 10f
+                                    onUpdateWakeWordMicGainLevel(1.0f)
+                                }
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Reset to 100%")
                             }
                         }
 

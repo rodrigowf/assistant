@@ -336,6 +336,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                     onUpdateThemeMode = viewModel::updateThemeMode,
                     onUpdateAutoConnect = viewModel::updateAutoConnect,
                     onUpdateMicGainLevel = viewModel::updateMicGainLevel,
+                    onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
                     onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
                     onUpdateEarpieceMode = viewModel::updateEarpieceMode,
                     onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
