@@ -2404,7 +2404,6 @@ pre.field-value {
 
 /* Path text */
 .wd-list-path {
-  flex: 1;
   font-size: 0.80rem;
   font-family: "SF Mono", "Fira Code", monospace;
   color: var(--text);
@@ -2459,11 +2458,126 @@ pre.field-value {
   cursor: default;
 }
 
+/* SSH badge on list items */
+.wd-ssh-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(100, 160, 255, 0.15);
+  color: rgba(130, 180, 255, 0.9);
+  border: 1px solid rgba(100, 160, 255, 0.25);
+  flex-shrink: 0;
+}
+
+.wd-list-item.ssh {
+  border-color: rgba(100, 160, 255, 0.12);
+}
+
+.wd-list-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wd-list-path-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wd-list-subtitle {
+  font-size: 0.73rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "Add directory" toggle button */
+.wd-add-toggle {
+  margin-top: 6px;
+  padding: 5px 12px;
+  font-size: 0.79rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: color var(--transition), border-color var(--transition);
+}
+.wd-add-toggle:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
 /* Add new directory form */
 .wd-add-form {
   display: flex;
-  gap: 8px;
-  margin-top: 4px;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* Local / SSH type tabs */
+.wd-type-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.wd-type-tab {
+  padding: 4px 14px;
+  font-size: 0.79rem;
+  font-weight: 500;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+}
+.wd-type-tab.active {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--text-bright);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+.wd-type-tab:hover:not(.active) {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+/* Field rows */
+.wd-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wd-field-row {
+  display: flex;
+  gap: 10px;
+}
+
+.wd-field-row .wd-field {
+  flex: 1;
+}
+
+.wd-field-row .wd-field.wd-field-sm {
+  flex: 0 0 120px;
+}
+
+.wd-field-label {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  font-weight: 500;
 }
 
 .wd-input {
@@ -2488,6 +2602,12 @@ pre.field-value {
   color: var(--text-dim);
 }
 
+/* Add / Cancel action row */
+.wd-add-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .wd-add-btn {
   padding: 6px 14px;
   border-radius: var(--radius);
@@ -2508,6 +2628,20 @@ pre.field-value {
 .wd-add-btn:disabled {
   opacity: 0.35;
   cursor: default;
+}
+
+.wd-cancel-btn {
+  padding: 6px 12px;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.80rem;
+  border: 1px solid transparent;
+  transition: color var(--transition), border-color var(--transition);
+}
+.wd-cancel-btn:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.1);
 }
 
 .config-field-error {

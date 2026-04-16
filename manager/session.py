@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
+import tempfile
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -103,6 +105,7 @@ class SessionManager:
         self._status = SessionStatus.DISCONNECTED
         self._cost: float = 0.0
         self._turns: int = 0
+        self._ssh_wrapper_path: str | None = None  # temp script for SSH sessions
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -147,6 +150,13 @@ class SessionManager:
             await self._client.disconnect()
             self._client = None
         self._status = SessionStatus.DISCONNECTED
+        # Clean up SSH wrapper script if present
+        if self._ssh_wrapper_path:
+            try:
+                Path(self._ssh_wrapper_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._ssh_wrapper_path = None
 
     async def interrupt(self) -> None:
         """Interrupt the current response."""
@@ -253,7 +263,6 @@ class SessionManager:
     def _build_options(self) -> ClaudeAgentOptions:
         """Build SDK options from our config."""
         kwargs: dict = {
-            "cwd": self._config.project_dir,
             "include_partial_messages": True,
             "setting_sources": ["project", "local"],
         }
@@ -287,7 +296,60 @@ class SessionManager:
 
         kwargs["stderr"] = _log_stderr
 
+        if self._config.ssh_host:
+            # ── Path B: SSH remote execution ──────────────────────────────
+            # The SDK calls:  <cli_path> --output-format stream-json [flags...]
+            # We set cli_path to a temp shell script that SSHes into the remote
+            # host, cd's into the project dir, and execs `claude "$@"` so all
+            # SDK-supplied flags pass through unchanged.
+            kwargs["cli_path"] = self._write_ssh_wrapper()
+            # cwd must exist locally; the real working dir is set on the remote side
+            kwargs["cwd"] = str(Path.home())
+        else:
+            kwargs["cwd"] = self._config.project_dir
+
         return ClaudeAgentOptions(**kwargs)
+
+    def _write_ssh_wrapper(self) -> str:
+        """Write a temp shell script that SSHes into the remote host and runs claude.
+
+        The script forwards all arguments ("$@") so the SDK flags land on the
+        remote claude process unchanged.  Returns the path to the script.
+        """
+        import shlex
+
+        remote_path = self._config.project_dir.replace("'", "'\\''")
+
+        ssh_parts = ["ssh"]
+        ssh_parts += ["-T"]                                     # no pseudo-TTY
+        ssh_parts += ["-o", "BatchMode=yes"]                    # no interactive prompts
+        ssh_parts += ["-o", "StrictHostKeyChecking=accept-new"] # auto-accept on first connect
+        ssh_parts += ["-o", "ControlMaster=auto",               # connection multiplexing
+                      "-o", "ControlPersist=60s",
+                      "-o", f"ControlPath=/tmp/claude-ssh-{self._config.ssh_host}-%r"]
+        if self._config.ssh_key:
+            ssh_parts += ["-i", str(self._config.ssh_key)]
+        if self._config.ssh_user:
+            ssh_parts.append(f"{self._config.ssh_user}@{self._config.ssh_host}")
+        else:
+            ssh_parts.append(self._config.ssh_host)
+
+        ssh_cmd = shlex.join(ssh_parts)
+
+        script = (
+            "#!/bin/sh\n"
+            f"{ssh_cmd} bash -c 'cd '\"'\"'{remote_path}'\"'\"' && exec claude \"$@\"' _ \"$@\"\n"
+        )
+
+        fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
+        try:
+            os.write(fd, script.encode())
+        finally:
+            os.close(fd)
+        os.chmod(path, stat.S_IRWXU)  # 0o700 — owner execute only
+        self._ssh_wrapper_path = path
+        logger.debug("SSH wrapper script written to %s", path)
+        return path
 
     async def _process_message(self, msg: object) -> AsyncIterator[Event]:
         """Convert an SDK message into our typed Event stream."""

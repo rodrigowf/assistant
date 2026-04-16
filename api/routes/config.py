@@ -34,10 +34,45 @@ def _load_config() -> dict[str, Any]:
         defaults = _default_config()
         for k, v in defaults.items():
             data.setdefault(k, v)
+        # Migrate legacy string history to WorkingDirectoryEntry objects
+        data["working_directory_history"] = _migrate_wd_history(data["working_directory_history"])
+        # Migrate legacy string working_directory to an entry id
+        data["working_directory"] = _migrate_wd_active(
+            data["working_directory"], data["working_directory_history"]
+        )
         return data
     except (json.JSONDecodeError, IOError) as e:
         logger.error("Failed to load assistant config: %s", e)
         return _default_config()
+
+
+def _migrate_wd_history(history: list) -> list[dict]:
+    """Convert any legacy plain-string entries to WorkingDirectoryEntry dicts."""
+    result = []
+    for item in history:
+        if isinstance(item, str):
+            result.append({"id": item, "path": item, "label": None, "ssh_host": None, "ssh_user": None, "ssh_key": None})
+        elif isinstance(item, dict):
+            item.setdefault("id", item.get("path", ""))
+            item.setdefault("label", None)
+            item.setdefault("ssh_host", None)
+            item.setdefault("ssh_user", None)
+            item.setdefault("ssh_key", None)
+            result.append(item)
+    return result
+
+
+def _migrate_wd_active(active: str, history: list[dict]) -> str:
+    """Ensure active working_directory is an entry id (not a raw path)."""
+    ids = {e["id"] for e in history}
+    if active in ids:
+        return active
+    # Maybe it's a legacy path — find a matching entry
+    for entry in history:
+        if entry["path"] == active and not entry.get("ssh_host"):
+            return entry["id"]
+    # Fallback: first entry
+    return history[0]["id"] if history else active
 
 
 def _save_config(data: dict[str, Any]) -> None:
@@ -47,9 +82,11 @@ def _save_config(data: dict[str, Any]) -> None:
 
 
 def _default_config() -> dict[str, Any]:
+    default_path = str(PROJECT_ROOT)
+    default_entry = {"id": default_path, "path": default_path, "label": None, "ssh_host": None, "ssh_user": None, "ssh_key": None}
     return {
-        "working_directory": str(PROJECT_ROOT),
-        "working_directory_history": [str(PROJECT_ROOT)],
+        "working_directory": default_path,
+        "working_directory_history": [default_entry],
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
         "disabled_skills": [],  # list of skill names to hide
         "disabled_agents": [],  # list of agent names to hide
@@ -58,13 +95,32 @@ def _default_config() -> dict[str, Any]:
     }
 
 
+def _find_active_entry(config: dict[str, Any]) -> dict | None:
+    """Return the WorkingDirectoryEntry dict for the currently-active working_directory."""
+    active_id = config.get("working_directory", "")
+    for entry in config.get("working_directory_history", []):
+        if entry["id"] == active_id:
+            return entry
+    return None
+
+
 # -----------------------------------------------------------------------
 # Pydantic models
 # -----------------------------------------------------------------------
 
+class WorkingDirectoryEntry(BaseModel):
+    """A working directory target — local or remote via SSH."""
+    id: str                  # Unique stable identifier (path for local, host:path for SSH)
+    path: str                # Absolute path on the target machine
+    label: str | None = None # Optional human-readable name
+    ssh_host: str | None = None
+    ssh_user: str | None = None
+    ssh_key: str | None = None   # Path to private key file (on the local machine)
+
+
 class ConfigUpdate(BaseModel):
-    working_directory: str | None = None
-    working_directory_history: list[str] | None = None  # full replacement of the list
+    working_directory: str | None = None  # entry id to set as active
+    working_directory_history: list[WorkingDirectoryEntry] | None = None  # full replacement
     enabled_mcps: list[str] | None = None
     disabled_skills: list[str] | None = None
     disabled_agents: list[str] | None = None
@@ -87,28 +143,35 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
     """Update one or more config fields. Returns the full updated config."""
     config = _load_config()
 
-    if body.working_directory is not None:
-        new_dir = body.working_directory
-        if not Path(new_dir).is_dir():
-            raise HTTPException(status_code=400, detail=f"Directory does not exist: {new_dir}")
-        config["working_directory"] = new_dir
-        # Ensure selected dir is in history
-        history: list[str] = config.get("working_directory_history", [])
-        if new_dir not in history:
-            history.append(new_dir)
-        config["working_directory_history"] = history[:20]
-
     if body.working_directory_history is not None:
-        # Validate all paths exist; also ensure current selected dir stays consistent
-        validated: list[str] = []
-        for p in body.working_directory_history:
-            if not Path(p).is_dir():
-                raise HTTPException(status_code=400, detail=f"Directory does not exist: {p}")
-            validated.append(p)
+        validated: list[dict] = []
+        for entry in body.working_directory_history:
+            e = entry.model_dump()
+            if entry.ssh_host:
+                # Remote entry — we trust the user; we cannot validate a remote path locally.
+                # Ensure the id is set to host:path if not explicitly set.
+                if not e["id"] or e["id"] == e["path"]:
+                    e["id"] = f"{entry.ssh_host}:{entry.path}"
+            else:
+                # Local entry — validate the path exists.
+                if not Path(entry.path).is_dir():
+                    raise HTTPException(status_code=400, detail=f"Directory does not exist: {entry.path}")
+                if not e["id"] or e["id"] == "":
+                    e["id"] = entry.path
+            validated.append(e)
         config["working_directory_history"] = validated[:20]
-        # If current working_directory was removed from history, reset to first entry
-        if config["working_directory"] not in config["working_directory_history"]:
-            config["working_directory"] = config["working_directory_history"][0] if config["working_directory_history"] else ""
+        # If current active id was removed, reset to first entry
+        active_ids = {e["id"] for e in validated}
+        if config["working_directory"] not in active_ids:
+            config["working_directory"] = validated[0]["id"] if validated else ""
+
+    if body.working_directory is not None:
+        new_id = body.working_directory
+        history: list[dict] = config.get("working_directory_history", [])
+        ids = {e["id"] for e in history}
+        if new_id not in ids:
+            raise HTTPException(status_code=400, detail=f"Unknown working directory id: {new_id}")
+        config["working_directory"] = new_id
 
     if body.enabled_mcps is not None:
         config["enabled_mcps"] = body.enabled_mcps

@@ -101,9 +101,18 @@ export function listMcpServers(): Promise<McpServersResponse> {
 
 // Global config
 
+export interface WorkingDirectoryEntry {
+  id: string;           // Unique id: local path, or "host:path" for SSH
+  path: string;         // Absolute path on the target machine
+  label?: string | null;
+  ssh_host?: string | null;
+  ssh_user?: string | null;
+  ssh_key?: string | null;  // Path to private key on the local machine
+}
+
 export interface AssistantConfig {
-  working_directory: string;
-  working_directory_history: string[];
+  working_directory: string;                     // active entry id
+  working_directory_history: WorkingDirectoryEntry[];
   enabled_mcps: string[];
   disabled_skills: string[];
   disabled_agents: string[];
@@ -112,8 +121,8 @@ export interface AssistantConfig {
 }
 
 export interface ConfigUpdate {
-  working_directory?: string;
-  working_directory_history?: string[];
+  working_directory?: string;                            // entry id to activate
+  working_directory_history?: WorkingDirectoryEntry[];   // full list replacement
   enabled_mcps?: string[];
   disabled_skills?: string[];
   disabled_agents?: string[];
