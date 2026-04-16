@@ -13,6 +13,7 @@ __pycache__/
 
 # Manager local config
 .manager.json
+assistant_config.json
 
 # Frontend build output
 frontend/dist/
