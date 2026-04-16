@@ -377,7 +377,13 @@ class WakeWordDetector(
                 if (listenerFinished) return
                 listenerFinished = true
                 Log.d(TAG, "Recognizer error: $error")
-                val delay = if (error == SpeechRecognizer.ERROR_CLIENT)
+                // ERROR_CLIENT (7): double-call or internal SDK error — use flat delay, no backoff.
+                // ERROR_NO_SPEECH (6): Google Recognition Service crash or audio routing issue —
+                //   also use flat delay. Accumulating backoff here is wrong because the service
+                //   will recover in ~1s; we don't want to wait 2s/4s/8s/30s for something
+                //   that's not our fault and resolves quickly.
+                val delay = if (error == SpeechRecognizer.ERROR_CLIENT ||
+                                error == 6 /* ERROR_NO_SPEECH, added in API 23 */)
                     CLIENT_ERROR_DELAY_MS else -1L
                 finishRecognition(wakeWordDetected = false, delay = delay)
             }

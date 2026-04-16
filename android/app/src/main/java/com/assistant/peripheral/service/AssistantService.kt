@@ -236,10 +236,18 @@ class AssistantService : Service() {
             } else if (intent.getBooleanExtra(EXTRA_RESUME_WAKE_WORD, false)) {
                 Log.d(TAG, "Resuming wake word detection after voice session")
                 voiceSessionActive = false
-                // Always do a full restart here — the silence monitor may be in a broken
-                // state if the mic was held by WebRTC when resume() was last called
-                // (e.g. screen-unlock fired while the voice session was still active).
-                startWakeWord(lastWakeWord, lastVoiceWord)
+                // Re-read enabled state from SharedPreferences — the user may have toggled
+                // wake word OFF while the voice session was active. Without this check,
+                // resumeWakeWord() would unconditionally restart detection regardless of setting.
+                val enabledNow = prefs.getBoolean(PREF_ENABLED, false)
+                lastEnabled = enabledNow
+                if (enabledNow) {
+                    // Always do a full restart here — the silence monitor may be in a broken
+                    // state if the mic was held by WebRTC when resume() was last called.
+                    startWakeWord(lastWakeWord, lastVoiceWord)
+                } else {
+                    Log.d(TAG, "Wake word disabled — skipping restart after voice session")
+                }
             } else if (intent.hasExtra(EXTRA_ENABLE_WAKE_WORD)) {
                 val enableWakeWord = intent.getBooleanExtra(EXTRA_ENABLE_WAKE_WORD, false)
                 val wakeWord = intent.getStringExtra(EXTRA_WAKE_WORD) ?: "hey assistant"
