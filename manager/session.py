@@ -338,7 +338,7 @@ class SessionManager:
 
         script = (
             "#!/bin/sh\n"
-            f"{ssh_cmd} bash -c 'cd '\"'\"'{remote_path}'\"'\"' && exec claude \"$@\"' _ \"$@\"\n"
+            f"{ssh_cmd} bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null; cd '\"'\"'{remote_path}'\"'\"' && exec claude \"$@\"' _ \"$@\"\n"
         )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
