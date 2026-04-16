@@ -160,6 +160,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
         val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
         val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
+        val ECHO_DUCKING_GAIN = floatPreferencesKey("echo_ducking_gain")
         val USE_EARPIECE = booleanPreferencesKey("use_earpiece")
         val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
     }
@@ -169,16 +170,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             var previousServerUrl: String? = null
             dataStore.data.collect { preferences ->
-                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: "ws://192.168.0.28:8765"
+                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: AppSettings().serverUrl
                 val serverUrlChanged = previousServerUrl != null && previousServerUrl != newServerUrl
                 previousServerUrl = newServerUrl
 
                 _settings.value = AppSettings(
                     serverUrl = newServerUrl,
-                    autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: true,
-                    enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: false,
-                    wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: "hey assistant",
-                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: "hey realtime",
+                    autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
+                    enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
+                    wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
+                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: AppSettings().voiceWord,
                     themeMode = try {
                         ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
                     } catch (e: Exception) {
@@ -187,6 +188,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
                     wakeWordMicGainLevel = preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] ?: 1.0f,
                     speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
+                    echoDuckingGain = preferences[PreferenceKeys.ECHO_DUCKING_GAIN] ?: AppSettings().echoDuckingGain,
                     useEarpiece = preferences[PreferenceKeys.USE_EARPIECE] ?: false,
                     enableButtonTrigger = preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] ?: false
                 )
@@ -199,6 +201,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 voiceManager?.release()
                 voiceManager = VoiceManager(getApplication(), apiClient!!).also {
                     it.setMicGain(_settings.value.micGainLevel)
+                    it.setEchoDuckingGain(_settings.value.echoDuckingGain)
                     it.setUseEarpiece(_settings.value.useEarpiece)
                 }
                 setupVoiceManagerCallbacks()
@@ -909,8 +912,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             try {
                 val servers = NetworkScanner.scan(getApplication())
                 _discoveredServers.value = servers
-                // Auto-connect to first discovered server if not already connected
-                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected) {
+                // Auto-connect to first discovered server only if using the default URL
+                // (don't overwrite a user-configured server URL)
+                val currentUrl = _settings.value.serverUrl
+                val defaultUrl = AppSettings().serverUrl
+                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected && currentUrl == defaultUrl) {
                     connectToDiscoveredServer(servers.first())
                 }
             } finally {
@@ -956,17 +962,25 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateMicGainLevel(level: Float) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
-                preferences[PreferenceKeys.MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 2.0f)
+                preferences[PreferenceKeys.MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
             }
-            // Apply gain to active voice session
             voiceManager?.setMicGain(level)
+        }
+    }
+
+    fun updateEchoDuckingGain(gain: Float) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.ECHO_DUCKING_GAIN] = gain.coerceIn(0.0f, 1.0f)
+            }
+            voiceManager?.setEchoDuckingGain(gain)
         }
     }
 
     fun updateWakeWordMicGainLevel(level: Float) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
-                preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 2.0f)
+                preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
             }
             // Apply to wake word detector via AssistantService (restart with new gain)
             val s = _settings.value

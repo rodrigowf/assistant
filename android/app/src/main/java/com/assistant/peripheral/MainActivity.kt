@@ -338,6 +338,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                     onUpdateMicGainLevel = viewModel::updateMicGainLevel,
                     onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
                     onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
+                    onUpdateEchoDuckingGain = viewModel::updateEchoDuckingGain,
                     onUpdateEarpieceMode = viewModel::updateEarpieceMode,
                     onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
                     onUpdateWakeWord = viewModel::updateWakeWord,

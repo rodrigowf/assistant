@@ -51,6 +51,9 @@ class VoiceManager(
         private const val VOICE_MODEL = "gpt-realtime"
         private const val CONNECTION_TIMEOUT_MS = 15_000L
 
+        // RMS logging: emit one [AUDIO_RMS] line every N callback invocations (≈500ms at 100Hz)
+        private const val RMS_LOG_INTERVAL = 50
+
         // PeerConnectionFactory.initialize() is process-wide — must only be called once.
         @Volatile private var peerConnectionFactoryInitialized = false
     }
@@ -71,6 +74,15 @@ class VoiceManager(
     // Gain saved before agent speech — restored when speech ends or user interrupts
     private var gainBeforeSpeaking: Float? = null
     private var micRestoreJob: kotlinx.coroutines.Job? = null
+    // True while agent audio is actively playing (between output_audio_buffer.started and stopped/cleared)
+    private var agentAudioPlaying: Boolean = false
+    // Gain applied while agent is speaking (echo ducking level), default 5%
+    private var echoDuckingGain: Float = 0.05f
+
+    // RMS logging counter — incremented in audioRecordDataCallback
+    private var rmsLogCounter: Int = 0
+    // Session start time for relative timestamps in logs
+    private var sessionStartMs: Long = 0L
 
     // Audio effects for echo cancellation
     private var acousticEchoCanceler: AcousticEchoCanceler? = null
@@ -111,50 +123,61 @@ class VoiceManager(
      * - Orchestrator WebSocket should already be connected
      * - "voice_start" message should be sent via WebSocket before calling this
      */
+    /** Relative time since session start in ms, formatted as [+XXXXXms] */
+    private fun t(): String {
+        val elapsed = if (sessionStartMs > 0) System.currentTimeMillis() - sessionStartMs else 0L
+        return "[+${elapsed}ms]"
+    }
+
+    /** Log a mic state transition with full context */
+    private fun logMicState(action: String, extra: String = "") {
+        Log.i(TAG, "[MIC_STATE] ${t()} $action | gain=$micGainLevel gainSaved=$gainBeforeSpeaking agentPlaying=$agentAudioPlaying trackEnabled=${localAudioTrack?.enabled()} $extra")
+    }
+
     suspend fun start() = withContext(Dispatchers.IO) {
         if (_state.value != VoiceState.Off && _state.value !is VoiceState.Error) {
-            Log.w(TAG, "Voice session already active, state=${_state.value}")
+            Log.w(TAG, "[VM] Voice session already active, state=${_state.value}")
             return@withContext
         }
 
+        sessionStartMs = System.currentTimeMillis()
+        rmsLogCounter = 0
         _state.value = VoiceState.Connecting
         dcReady = false
         pendingCommands.clear()
-        Log.d(TAG, "Starting voice session...")
+        Log.i(TAG, "[VM] ===== SESSION START ===== epochMs=$sessionStartMs")
 
         try {
             // 1. Get ephemeral token from backend
-            // Web frontend: const tokenData = await fetchEphemeralToken()
-            Log.d(TAG, "Fetching ephemeral token from backend...")
+            Log.d(TAG, "[VM] ${t()} Fetching ephemeral token...")
             val tokenResponse = apiClient.getVoiceToken()
             if (tokenResponse == null) {
-                Log.e(TAG, "Failed to get voice token - null response")
+                Log.e(TAG, "[VM] ${t()} ERROR: Failed to get voice token (null response)")
                 _state.value = VoiceState.Error("Failed to get voice token from server")
                 _events.tryEmit(VoiceEvent.Error("Failed to get voice token"))
                 return@withContext
             }
-            Log.d(TAG, "Got voice token, expires in ${tokenResponse.expiresIn}s")
+            Log.i(TAG, "[VM] ${t()} Got voice token, expires in ${tokenResponse.expiresIn}s")
 
             // 2. Request audio focus
-            Log.d(TAG, "Requesting audio focus...")
+            Log.d(TAG, "[VM] ${t()} Requesting audio focus...")
             requestAudioFocus()
 
             // 3. Initialize WebRTC with timeout
-            // Web frontend: handles = await Promise.race([connect(), timeout])
-            Log.d(TAG, "Initializing WebRTC...")
+            Log.d(TAG, "[VM] ${t()} Initializing WebRTC (timeout=${CONNECTION_TIMEOUT_MS}ms)...")
             val success = withTimeoutOrNull(CONNECTION_TIMEOUT_MS) {
                 initializeWebRTC(tokenResponse.token)
             }
 
             if (success == null) {
-                Log.e(TAG, "WebRTC connection timed out")
+                Log.e(TAG, "[VM] ${t()} ERROR: WebRTC connection timed out after ${CONNECTION_TIMEOUT_MS}ms")
                 _state.value = VoiceState.Error("Voice connection timed out")
                 _events.tryEmit(VoiceEvent.Error("Voice connection timed out"))
                 cleanup()
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start voice session", e)
+            Log.e(TAG, "[VM] ${t()} ERROR: Failed to start voice session: ${e.javaClass.simpleName}: ${e.message}", e)
             _state.value = VoiceState.Error(e.message ?: "Unknown error: ${e.javaClass.simpleName}")
             _events.tryEmit(VoiceEvent.Error(e.message ?: "Unknown error"))
             cleanup()
@@ -429,20 +452,24 @@ class VoiceManager(
             override fun onBufferedAmountChange(previousAmount: Long) {}
 
             override fun onStateChange() {
-                Log.d(TAG, "Data channel state: ${channel.state()}")
+                Log.d(TAG, "[VM] ${t()} Data channel state: ${channel.state()}")
                 // Web frontend: dc.onopen = () => { onConnectedRef.current() }
                 if (channel.state() == DataChannel.State.OPEN) {
                     dcReady = true
                     _state.value = VoiceState.Active
                     _events.tryEmit(VoiceEvent.SessionCreated)
+                    Log.i(TAG, "[VM] ${t()} ===== DATA CHANNEL OPEN — session ready =====")
+                    logMicState("DC_OPEN initial state")
                     // Re-apply speaker routing: WebRTC may have reset MODE_IN_COMMUNICATION
                     // which reverts isSpeakerphoneOn to false (earpiece) on some devices.
                     applySpeakerRouting()
 
                     // Drain pending commands
-                    // Web frontend: const pending = pendingCommandsRef.current.splice(0); for (const cmd of pending) { ... }
                     val pending = pendingCommands.toList()
                     pendingCommands.clear()
+                    if (pending.isNotEmpty()) {
+                        Log.d(TAG, "[VM] ${t()} Draining ${pending.size} pending commands")
+                    }
                     for (cmd in pending) {
                         sendToOpenAI(cmd)
                     }
@@ -464,22 +491,22 @@ class VoiceManager(
             val json = JSONObject(message)
             val eventType = json.optString("type", "")
 
-            Log.d(TAG, "Received OpenAI event: $eventType")
+            // Log every event with timestamp — skip high-frequency audio delta events to avoid spam
+            val isNoisyEvent = eventType == "response.audio.delta" || eventType == "response.audio_transcript.delta"
+            if (!isNoisyEvent) {
+                Log.d(TAG, "[VOICE_EVENT] ${t()} type=$eventType state=${_state.value} agentPlaying=$agentAudioPlaying gain=$micGainLevel gainSaved=$gainBeforeSpeaking")
+            }
 
             // Mirror EVERY event to backend via WebSocket
-            // Web frontend: wsRef.current?.send({ type: "voice_event", event })
             val eventMap = jsonToMap(json)
             onVoiceEvent?.invoke(eventMap)
 
             // Handle OpenAI error events
-            // Web frontend: if (eventType === "error") { ... setVoiceError(...); cleanup(); updateStatus("error") }
             if (eventType == "error") {
                 val errorObj = json.optJSONObject("error")
                 val code = errorObj?.optString("code") ?: "unknown"
                 val errorMessage = errorObj?.optString("message") ?: "Unknown error"
-
-                Log.e(TAG, "OpenAI error: $code - $errorMessage")
-
+                Log.e(TAG, "[VOICE_EVENT] ${t()} ===== OPENAI ERROR: code=$code msg=$errorMessage =====")
                 if (code == "session_expired") {
                     _state.value = VoiceState.Error("Voice session expired — please restart")
                 } else {
@@ -490,14 +517,18 @@ class VoiceManager(
                 return
             }
 
-            // Update status and dispatch UI callbacks
-            // Web frontend: switch on eventType for status updates
             when (eventType) {
                 "response.created" -> {
+                    // Cancel any pending restore from the previous turn before ducking.
+                    // This prevents a RESTORE_DONE from firing mid-response and wiping gainBeforeSpeaking.
+                    micRestoreJob?.cancel()
+                    micRestoreJob = null
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} RESPONSE CREATED → ducking mic (restore timer cancelled)")
                     _state.value = VoiceState.Speaking
                     duckMicForAgentSpeech()
                 }
                 "response.done" -> {
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} RESPONSE DONE — not restoring mic yet, waiting for audio buffer")
                     _state.value = VoiceState.Active
                     // Do NOT restore mic here — audio is still playing after response.done.
                     // Wait for output_audio_buffer.stopped instead.
@@ -514,6 +545,7 @@ class VoiceManager(
                     val callId = json.optString("call_id", "")
                     val name = json.optString("name", "")
                     val argsStr = json.optString("arguments", "{}")
+                    Log.d(TAG, "[VOICE_EVENT] ${t()} TOOL_CALL name=$name callId=$callId")
                     try {
                         val args = JSONObject(argsStr)
                         _events.tryEmit(VoiceEvent.ToolUse(callId, name, jsonToMap(args)))
@@ -522,53 +554,74 @@ class VoiceManager(
                     }
                 }
                 "input_audio_buffer.speech_started" -> {
+                    if (agentAudioPlaying) {
+                        // Audio still playing — almost certainly echo pickup, not the user.
+                        Log.w(TAG, "[VOICE_EVENT] ${t()} ===== SPEECH_STARTED (SUPPRESSED — echo while agent playing) ===== gain=$micGainLevel trackEnabled=${localAudioTrack?.enabled()}")
+                        // Keep mic ducked
+                    } else {
+                        Log.i(TAG, "[VOICE_EVENT] ${t()} ===== SPEECH_STARTED (user speaking) → restoring mic =====")
+                        restoreMicImmediately()
+                    }
                     _state.value = VoiceState.Active
-                    restoreMicImmediately()  // User interrupted — restore mic immediately
                     _events.tryEmit(VoiceEvent.SpeechStarted)
                 }
                 "input_audio_buffer.speech_stopped" -> {
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} SPEECH_STOPPED")
                     _state.value = VoiceState.Thinking
                     _events.tryEmit(VoiceEvent.SpeechStopped)
                 }
-                // User speech transcript
-                // Web frontend: if (eventType === "conversation.item.input_audio_transcription.completed")
                 "conversation.item.input_audio_transcription.completed" -> {
                     val transcript = json.optString("transcript", "")
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} USER_TRANSCRIPT: \"$transcript\"")
                     if (transcript.isNotEmpty()) {
                         _events.tryEmit(VoiceEvent.UserTranscript(transcript))
                     }
                 }
-                // Assistant transcript streaming
-                // Web frontend: "response.audio_transcript.delta" / "response.audio_transcript.done"
                 "response.audio_transcript.delta" -> {
                     val delta = json.optString("delta", "")
                     _events.tryEmit(VoiceEvent.TextDelta(delta))
                 }
                 "response.audio_transcript.done" -> {
                     val transcript = json.optString("transcript", "")
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} AGENT_TRANSCRIPT: \"$transcript\"")
                     _events.tryEmit(VoiceEvent.TextComplete(transcript))
                 }
                 "output_audio_buffer.started" -> {
-                    // Audio playback started
+                    // Cancel any pending restore — new audio is starting, keep mic ducked
+                    micRestoreJob?.cancel()
+                    micRestoreJob = null
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} ===== AUDIO BUFFER STARTED (agent speaking) ===== agentPlaying: false→true (restore timer cancelled)")
+                    agentAudioPlaying = true
                     if (_state.value != VoiceState.Speaking) {
                         _state.value = VoiceState.Speaking
                     }
                     duckMicForAgentSpeech()
                 }
                 "output_audio_buffer.stopped" -> {
-                    // Audio playback truly finished — safe to restore mic after tail delay
+                    // Playback truly finished — safe to restore mic after tail delay
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} ===== AUDIO BUFFER STOPPED (playback done) ===== agentPlaying: true→false → restoring mic after 2000ms")
+                    agentAudioPlaying = false
                     _state.value = VoiceState.Active
-                    restoreMicAfterAgentSpeech()
+                    restoreMicAfterAgentSpeech(delayMs = 2000L)
                 }
-                "output_audio_buffer.cleared", "response.audio.done" -> {
-                    // Audio interrupted/cleared — restore mic after shorter tail delay
+                "output_audio_buffer.cleared" -> {
+                    // Buffer was cleared (interruption) — speaker may still be ringing for a moment
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} ===== AUDIO BUFFER CLEARED (interrupted) ===== agentPlaying: →false → restoring mic after 2000ms")
+                    agentAudioPlaying = false
                     _state.value = VoiceState.Active
-                    restoreMicAfterAgentSpeech(delayMs = 1000L)
+                    // Re-duck in case restore already fired from response.audio.done race
+                    duckMicForAgentSpeech()
+                    restoreMicAfterAgentSpeech(delayMs = 2000L)
+                }
+                "response.audio.done" -> {
+                    // Audio data is done being SENT — speaker buffer may still be draining.
+                    // Do NOT restore mic here; wait for output_audio_buffer.stopped/cleared.
+                    Log.i(TAG, "[VOICE_EVENT] ${t()} RESPONSE.AUDIO.DONE — not restoring mic (waiting for buffer stopped/cleared)")
                 }
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse data channel message", e)
+            Log.e(TAG, "[VM] ${t()} ERROR parsing data channel message: ${e.message}", e)
         }
     }
 
@@ -709,9 +762,12 @@ class VoiceManager(
     private fun duckMicForAgentSpeech() {
         if (gainBeforeSpeaking == null) {
             gainBeforeSpeaking = micGainLevel
-            micGainLevel = 0.0f
-            localAudioTrack?.setEnabled(false)
-            Log.d(TAG, "Agent speaking — mic disabled (was gain=$gainBeforeSpeaking)")
+            micGainLevel = echoDuckingGain
+            // Keep track enabled at low gain so loud user speech can still interrupt
+            localAudioTrack?.setEnabled(true)
+            Log.i(TAG, "[MIC_STATE] ${t()} DUCK → gain: ${gainBeforeSpeaking}→$echoDuckingGain trackEnabled: true agentPlaying=$agentAudioPlaying")
+        } else {
+            Log.d(TAG, "[MIC_STATE] ${t()} DUCK (already ducked, no-op) | gain=$micGainLevel gainSaved=$gainBeforeSpeaking trackEnabled=${localAudioTrack?.enabled()}")
         }
     }
 
@@ -719,15 +775,18 @@ class VoiceManager(
      * Restore mic after agent speech ends — delay so echo tail dies out, then re-enable track.
      */
     private fun restoreMicAfterAgentSpeech(delayMs: Long = 2000L) {
-        if (gainBeforeSpeaking == null) return
+        if (gainBeforeSpeaking == null) {
+            Log.d(TAG, "[MIC_STATE] ${t()} RESTORE_DELAYED (no-op, not ducked) delayMs=$delayMs")
+            return
+        }
         micRestoreJob?.cancel()
+        Log.i(TAG, "[MIC_STATE] ${t()} RESTORE_DELAYED scheduled in ${delayMs}ms | savedGain=$gainBeforeSpeaking")
         micRestoreJob = scope.launch {
             delay(delayMs)
             gainBeforeSpeaking?.let { saved ->
                 micGainLevel = saved
                 gainBeforeSpeaking = null
-                localAudioTrack?.setEnabled(true)
-                Log.d(TAG, "Agent done — mic re-enabled, gain restored to $micGainLevel (after ${delayMs}ms)")
+                Log.i(TAG, "[MIC_STATE] ${t()} RESTORE_DONE → gain: 0.05→$micGainLevel (after ${delayMs}ms delay)")
             }
         }
     }
@@ -741,9 +800,8 @@ class VoiceManager(
         gainBeforeSpeaking?.let { saved ->
             micGainLevel = saved
             gainBeforeSpeaking = null
-            localAudioTrack?.setEnabled(true)
-            Log.d(TAG, "User interrupted — mic re-enabled, gain restored to $micGainLevel immediately")
-        }
+            Log.i(TAG, "[MIC_STATE] ${t()} RESTORE_IMMEDIATE → gain: 0.05→$micGainLevel")
+        } ?: Log.d(TAG, "[MIC_STATE] ${t()} RESTORE_IMMEDIATE (no-op, not ducked)")
     }
 
     /**
@@ -784,8 +842,18 @@ class VoiceManager(
     fun getMicGain(): Float = micGainLevel
 
     /**
+     * Set the echo ducking gain — applied to mic while agent is speaking.
+     * 0.0 = fully muted, 0.05 = 5% (default), 0.1 = 10%, etc.
+     */
+    fun setEchoDuckingGain(gain: Float) {
+        echoDuckingGain = gain.coerceIn(0.0f, 1.0f)
+        Log.d(TAG, "Echo ducking gain set to: $echoDuckingGain")
+    }
+
+    /**
      * Audio data callback that applies gain to microphone input.
      * Called by JavaAudioDeviceModule before audio is fed into WebRTC.
+     * Also emits periodic [AUDIO_RMS] logs to confirm whether mic is live or muted.
      */
     private val audioRecordDataCallback = object : AudioRecordDataCallback {
         override fun onAudioDataRecorded(audioFormat: Int, channelCount: Int, sampleRate: Int, audioBuffer: ByteBuffer) {
@@ -793,7 +861,35 @@ class VoiceManager(
             if (micGainLevel != 1.0f) {
                 applyGainToBuffer(audioBuffer, micGainLevel)
             }
+
+            // Periodic RMS log — every RMS_LOG_INTERVAL callbacks (~500ms) so we can confirm
+            // whether audio reaching WebRTC is actually silent or live.
+            rmsLogCounter++
+            if (rmsLogCounter >= RMS_LOG_INTERVAL) {
+                rmsLogCounter = 0
+                val rms = computeRms(audioBuffer)
+                Log.d(TAG, "[AUDIO_RMS] ${t()} rms=${"%.1f".format(rms)} gain=$micGainLevel trackEnabled=${localAudioTrack?.enabled()} agentPlaying=$agentAudioPlaying")
+            }
         }
+    }
+
+    /** Compute RMS of 16-bit PCM samples in the buffer (does not advance buffer position). */
+    private fun computeRms(buffer: ByteBuffer): Double {
+        val originalOrder = buffer.order()
+        buffer.order(ByteOrder.LITTLE_ENDIAN)
+        val pos = buffer.position()
+        val lim = buffer.limit()
+        var sumSq = 0.0
+        var count = 0
+        var i = pos
+        while (i < lim - 1) {
+            val s = buffer.getShort(i).toDouble()
+            sumSq += s * s
+            count++
+            i += 2
+        }
+        buffer.order(originalOrder)
+        return if (count > 0) Math.sqrt(sumSq / count) else 0.0
     }
 
     /**
@@ -828,20 +924,21 @@ class VoiceManager(
      * Web frontend: stopVoice() in useVoiceOrchestrator
      */
     fun stop() {
-        Log.d(TAG, "Stopping voice session")
+        Log.i(TAG, "[VM] ${t()} ===== SESSION STOP =====")
         cleanup()
         _state.value = VoiceState.Off
         _events.tryEmit(VoiceEvent.SessionEnded)
     }
 
     private fun cleanup() {
-        Log.d(TAG, "Cleaning up voice resources")
+        Log.i(TAG, "[VM] ${t()} cleanup() | agentPlaying=$agentAudioPlaying gain=$micGainLevel gainSaved=$gainBeforeSpeaking")
 
         // Restore mic gain if session ends while agent was speaking
         micRestoreJob?.cancel()
         micRestoreJob = null
         gainBeforeSpeaking?.let { micGainLevel = it }
         gainBeforeSpeaking = null
+        agentAudioPlaying = false
 
         dcReady = false
         pendingCommands.clear()

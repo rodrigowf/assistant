@@ -33,6 +33,7 @@ fun SettingsScreen(
     onUpdateMicGainLevel: (Float) -> Unit,
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
+    onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateEarpieceMode: (Boolean) -> Unit,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
@@ -366,63 +367,34 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Mic gain slider with Fibonacci-like steps for finer control at low values
-                    // Steps: 0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 100, 150, 200%
-                    val gainSteps = listOf(0f, 1f, 2f, 3f, 5f, 8f, 13f, 21f, 34f, 55f, 100f, 150f, 200f)
+                    // Uniform steps 0..150% in steps of 10 (16 steps total)
+                    val volumeSteps = (0..150 step 10).map { it.toFloat() }
+                    val defaultVolumeIndex = volumeSteps.indexOf(100f).toFloat()
 
-                    // Find closest step index for current value
+                    // --- Microphone Gain ---
                     val currentGainPercent = (settings.micGainLevel * 100).roundToInt().toFloat()
-                    var sliderIndex by remember(settings.micGainLevel) {
-                        mutableFloatStateOf(gainSteps.indexOfFirst { it >= currentGainPercent }.coerceAtLeast(0).toFloat())
+                    var micSliderIndex by remember(settings.micGainLevel) {
+                        val closest = volumeSteps.minByOrNull { kotlin.math.abs(it - currentGainPercent) }
+                        mutableFloatStateOf(volumeSteps.indexOf(closest).coerceAtLeast(0).toFloat())
                     }
-                    val displayPercent = gainSteps.getOrElse(sliderIndex.roundToInt()) { 100f }.roundToInt()
+                    val micDisplayPercent = volumeSteps.getOrElse(micSliderIndex.roundToInt()) { 100f }.roundToInt()
 
-                    Text(
-                        text = "Microphone Gain: $displayPercent%",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-
+                    Text("Microphone Gain: $micDisplayPercent%", style = MaterialTheme.typography.bodyMedium)
                     Spacer(modifier = Modifier.height(8.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.VolumeDown,
-                            contentDescription = "Low",
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         Slider(
-                            value = sliderIndex,
-                            onValueChange = { sliderIndex = it },
-                            onValueChangeFinished = {
-                                val gainPercent = gainSteps.getOrElse(sliderIndex.roundToInt()) { 100f }
-                                onUpdateMicGainLevel(gainPercent / 100f)
-                            },
-                            valueRange = 0f..(gainSteps.size - 1).toFloat(),
-                            steps = gainSteps.size - 2,  // -2 because endpoints don't count as steps
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(horizontal = 8.dp)
+                            value = micSliderIndex,
+                            onValueChange = { micSliderIndex = it },
+                            onValueChangeFinished = { onUpdateMicGainLevel(volumeSteps.getOrElse(micSliderIndex.roundToInt()) { 100f } / 100f) },
+                            valueRange = 0f..(volumeSteps.size - 1).toFloat(),
+                            steps = volumeSteps.size - 2,
+                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                         )
-                        Icon(
-                            imageVector = Icons.Default.VolumeUp,
-                            contentDescription = "High",
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-
-                    // Reset button (default is 100% = index 10)
-                    if (displayPercent != 100) {
-                        TextButton(
-                            onClick = {
-                                sliderIndex = 10f  // Index of 100 in gainSteps
-                                onUpdateMicGainLevel(1.0f)
-                            }
-                        ) {
+                    if (micDisplayPercent != 100) {
+                        TextButton(onClick = { micSliderIndex = defaultVolumeIndex; onUpdateMicGainLevel(1.0f) }) {
                             Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Reset to 100%")
@@ -431,66 +403,80 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Speaker volume slider with uniformly distributed steps: 0..100..150%
-                    val speakerSteps = listOf(0f, 10f, 20f, 30f, 40f, 50f, 60f, 70f, 80f, 90f, 100f, 120f, 150f)
-
-                    // Find closest step index for current value
+                    // --- Speaker Volume ---
                     val currentSpeakerPercent = (settings.speakerVolumeLevel * 100).roundToInt().toFloat()
                     var speakerSliderIndex by remember(settings.speakerVolumeLevel) {
-                        val closest = speakerSteps.minByOrNull { kotlin.math.abs(it - currentSpeakerPercent) }
-                        mutableFloatStateOf(speakerSteps.indexOf(closest).coerceAtLeast(0).toFloat())
+                        val closest = volumeSteps.minByOrNull { kotlin.math.abs(it - currentSpeakerPercent) }
+                        mutableFloatStateOf(volumeSteps.indexOf(closest).coerceAtLeast(0).toFloat())
                     }
-                    val speakerDisplayPercent = speakerSteps.getOrElse(speakerSliderIndex.roundToInt()) { 100f }.roundToInt()
+                    val speakerDisplayPercent = volumeSteps.getOrElse(speakerSliderIndex.roundToInt()) { 100f }.roundToInt()
 
-                    Text(
-                        text = "Speaker Volume: $speakerDisplayPercent%",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-
+                    Text("Speaker Volume: $speakerDisplayPercent%", style = MaterialTheme.typography.bodyMedium)
                     Spacer(modifier = Modifier.height(8.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.VolumeDown,
-                            contentDescription = "Low",
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         Slider(
                             value = speakerSliderIndex,
                             onValueChange = { speakerSliderIndex = it },
-                            onValueChangeFinished = {
-                                val volPercent = speakerSteps.getOrElse(speakerSliderIndex.roundToInt()) { 100f }
-                                onUpdateSpeakerVolumeLevel(volPercent / 100f)
-                            },
-                            valueRange = 0f..(speakerSteps.size - 1).toFloat(),
-                            steps = speakerSteps.size - 2,  // -2 because endpoints don't count as steps
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(horizontal = 8.dp)
+                            onValueChangeFinished = { onUpdateSpeakerVolumeLevel(volumeSteps.getOrElse(speakerSliderIndex.roundToInt()) { 100f } / 100f) },
+                            valueRange = 0f..(volumeSteps.size - 1).toFloat(),
+                            steps = volumeSteps.size - 2,
+                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                         )
-                        Icon(
-                            imageVector = Icons.Default.VolumeUp,
-                            contentDescription = "High",
-                            modifier = Modifier.size(20.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-
-                    // Reset button for speaker (default is 100% = index 10)
                     if (speakerDisplayPercent != 100) {
-                        TextButton(
-                            onClick = {
-                                speakerSliderIndex = 10f  // Index of 100 in speakerSteps
-                                onUpdateSpeakerVolumeLevel(1.0f)
-                            }
-                        ) {
+                        TextButton(onClick = { speakerSliderIndex = defaultVolumeIndex; onUpdateSpeakerVolumeLevel(1.0f) }) {
                             Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Reset to 100%")
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // --- Echo Ducking Gain ---
+                    // Steps: 0.0%, 0.5%, 1.0%, ..., 10.0% (21 steps)
+                    // gain sent to VoiceManager = duckDisplayValue / 100f (e.g. 5.0% → 0.05)
+                    val duckSteps = (0..20).map { it * 0.5f }  // 0.0..10.0 representing percent
+                    val currentDuckPercent = settings.echoDuckingGain * 100f  // e.g. 0.05 → 5.0%
+                    var duckSliderIndex by remember(settings.echoDuckingGain) {
+                        val closest = duckSteps.minByOrNull { kotlin.math.abs(it - currentDuckPercent) }
+                        mutableFloatStateOf(duckSteps.indexOf(closest).coerceAtLeast(0).toFloat())
+                    }
+                    val duckDisplayValue = duckSteps.getOrElse(duckSliderIndex.roundToInt()) { 5.0f }
+
+                    Text("Echo Ducking: ${"%.1f".format(duckDisplayValue)}%", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "Mic gain while agent speaks — lower reduces echo, higher allows interruption",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Slider(
+                            value = duckSliderIndex,
+                            onValueChange = { duckSliderIndex = it },
+                            onValueChangeFinished = {
+                                val gain = duckSteps.getOrElse(duckSliderIndex.roundToInt()) { 5.0f } / 100f
+                                onUpdateEchoDuckingGain(gain)
+                            },
+                            valueRange = 0f..(duckSteps.size - 1).toFloat(),
+                            steps = duckSteps.size - 2,
+                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                        )
+                        Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (duckDisplayValue != 5.0f) {
+                        TextButton(onClick = {
+                            // Reset to 5% default (gain 0.05, step index 10)
+                            duckSliderIndex = 10f
+                            onUpdateEchoDuckingGain(0.05f)
+                        }) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Reset to 5%")
                         }
                     }
 
@@ -599,65 +585,35 @@ fun SettingsScreen(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        // Wake word mic sensitivity slider — independent of voice session gain.
-                        // Scales the RMS threshold: higher gain → more sensitive detection.
-                        val wakeGainSteps = listOf(0f, 1f, 2f, 3f, 5f, 8f, 13f, 21f, 34f, 55f, 100f, 150f, 200f)
+                        // Wake word mic sensitivity slider — uniform 0..150% in steps of 10
                         val currentWakeGainPercent = (settings.wakeWordMicGainLevel * 100).roundToInt().toFloat()
                         var wakeSliderIndex by remember(settings.wakeWordMicGainLevel) {
-                            mutableFloatStateOf(wakeGainSteps.indexOfFirst { it >= currentWakeGainPercent }.coerceAtLeast(0).toFloat())
+                            val closest = volumeSteps.minByOrNull { kotlin.math.abs(it - currentWakeGainPercent) }
+                            mutableFloatStateOf(volumeSteps.indexOf(closest).coerceAtLeast(0).toFloat())
                         }
-                        val wakeDisplayPercent = wakeGainSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f }.roundToInt()
+                        val wakeDisplayPercent = volumeSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f }.roundToInt()
 
+                        Text("Wake Word Sensitivity: $wakeDisplayPercent%", style = MaterialTheme.typography.bodyMedium)
                         Text(
-                            text = "Wake Word Sensitivity: $wakeDisplayPercent%",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Text(
-                            text = "Higher = easier to trigger (independent of voice session gain)",
+                            "Higher = easier to trigger (independent of voice session gain)",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-
                         Spacer(modifier = Modifier.height(8.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.VolumeDown,
-                                contentDescription = "Low",
-                                modifier = Modifier.size(20.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             Slider(
                                 value = wakeSliderIndex,
                                 onValueChange = { wakeSliderIndex = it },
-                                onValueChangeFinished = {
-                                    val gainPercent = wakeGainSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f }
-                                    onUpdateWakeWordMicGainLevel(gainPercent / 100f)
-                                },
-                                valueRange = 0f..(wakeGainSteps.size - 1).toFloat(),
-                                steps = wakeGainSteps.size - 2,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(horizontal = 8.dp)
+                                onValueChangeFinished = { onUpdateWakeWordMicGainLevel(volumeSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f } / 100f) },
+                                valueRange = 0f..(volumeSteps.size - 1).toFloat(),
+                                steps = volumeSteps.size - 2,
+                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                             )
-                            Icon(
-                                imageVector = Icons.Default.VolumeUp,
-                                contentDescription = "High",
-                                modifier = Modifier.size(20.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-
                         if (wakeDisplayPercent != 100) {
-                            TextButton(
-                                onClick = {
-                                    wakeSliderIndex = 10f
-                                    onUpdateWakeWordMicGainLevel(1.0f)
-                                }
-                            ) {
+                            TextButton(onClick = { wakeSliderIndex = defaultVolumeIndex; onUpdateWakeWordMicGainLevel(1.0f) }) {
                                 Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("Reset to 100%")
