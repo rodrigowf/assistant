@@ -72,6 +72,10 @@ class WakeWordDetector(
             val normalized = phrase.lowercase().trim()
             val variants = mutableListOf(normalized)
 
+            // Minimum length guard: don't generate variants shorter than the original phrase
+            // minus the longest word (prevents bare "wake up" from "hey wake up" when "hey"→"").
+            val minVariantLen = normalized.length - (normalized.split(" ").maxOfOrNull { it.length } ?: 0)
+
             // Per-word substitutions for common mishearings.
             // Each entry replaces the word in the full phrase (not added standalone).
             val wordSubs = mapOf(
@@ -89,7 +93,11 @@ class WakeWordDetector(
                 if (phraseWords.contains(word)) {
                     for (sub in subs) {
                         // Replace the word inside the full phrase context only
-                        variants.add(normalized.replace(word, sub))
+                        val variant = normalized.replace(word, sub).trim()
+                        // Skip variants that are too short (would cause false positives)
+                        if (variant.length >= minVariantLen) {
+                            variants.add(variant)
+                        }
                     }
                 }
             }
@@ -413,7 +421,11 @@ class WakeWordDetector(
                 val backoff = (POST_RECOGNITION_BASE_MS shl consecutiveMisses)
                     .coerceAtMost(POST_RECOGNITION_MAX_MS)
                 consecutiveMisses++
-                Log.d(TAG, "No match — miss #$consecutiveMisses, waiting ${backoff}ms")
+                if (consecutiveMisses >= 10) {
+                    Log.w(TAG, "No match — miss #$consecutiveMisses (at max backoff, recognizer may be stale)")
+                } else {
+                    Log.d(TAG, "No match — miss #$consecutiveMisses, waiting ${backoff}ms")
+                }
                 backoff
             }
         }

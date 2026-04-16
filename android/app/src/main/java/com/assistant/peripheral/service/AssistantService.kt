@@ -45,6 +45,9 @@ class AssistantService : Service() {
         private const val PREF_WAKE_WORD = "wake_word"
         private const val PREF_VOICE_WORD = "voice_word"
 
+        // Restart the detector periodically to recover from stale SpeechRecognizer state
+        private const val WATCHDOG_INTERVAL_MS = 2 * 60 * 60 * 1000L // 2 hours
+
         fun start(context: Context) {
             val intent = Intent(context, AssistantService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -127,6 +130,19 @@ class AssistantService : Service() {
     private val rearmHandler = Handler(Looper.getMainLooper())
     private val rearmRunnable = Runnable { rearmWakeWord() }
 
+    // Periodic watchdog: restarts the WakeWordDetector every 2 hours to recover from
+    // stale SpeechRecognizer connections (Samsung Android 5.0 binder death after long uptime).
+    private val watchdogHandler = Handler(Looper.getMainLooper())
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!voiceSessionActive && lastEnabled) {
+                Log.d(TAG, "Watchdog: periodic wake word restart to clear stale recognizer state")
+                startWakeWord(lastWakeWord, lastVoiceWord)
+            }
+            watchdogHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+        }
+    }
+
     // In-memory cache of last-known config (authoritative copy is in SharedPreferences)
     private var lastWakeWord: String = "hey assistant"
     private var lastVoiceWord: String = ""
@@ -203,6 +219,9 @@ class AssistantService : Service() {
         registerReceiver(screenReceiver, filter)
 
         startRecentsMonitor()
+
+        // Start the periodic watchdog to recover from stale SpeechRecognizer connections
+        watchdogHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -263,6 +282,7 @@ class AssistantService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         rearmHandler.removeCallbacks(rearmRunnable)
+        watchdogHandler.removeCallbacks(watchdogRunnable)
         unregisterReceiver(screenReceiver)
         wakeWordDetector?.release()
         stopRecentsMonitor()
