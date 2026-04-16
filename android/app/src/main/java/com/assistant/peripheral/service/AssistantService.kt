@@ -44,6 +44,7 @@ class AssistantService : Service() {
         private const val PREF_ENABLED = "wake_word_enabled"
         private const val PREF_WAKE_WORD = "wake_word"
         private const val PREF_VOICE_WORD = "voice_word"
+        private const val PREF_WAKE_MIC_GAIN = "wake_word_mic_gain"
 
         // Restart the detector periodically to recover from stale SpeechRecognizer state
         private const val WATCHDOG_INTERVAL_MS = 2 * 60 * 60 * 1000L // 2 hours
@@ -100,11 +101,12 @@ class AssistantService : Service() {
             context.startActivity(intent)
         }
 
-        fun updateWakeWord(context: Context, enabled: Boolean, wakeWord: String, voiceWord: String = "") {
+        fun updateWakeWord(context: Context, enabled: Boolean, wakeWord: String, voiceWord: String = "", wakeWordMicGain: Float = 1.0f) {
             val intent = Intent(context, AssistantService::class.java).apply {
                 putExtra(EXTRA_ENABLE_WAKE_WORD, enabled)
                 putExtra(EXTRA_WAKE_WORD, wakeWord)
                 putExtra(EXTRA_VOICE_WORD, voiceWord)
+                putExtra("wake_word_mic_gain", wakeWordMicGain)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -147,6 +149,7 @@ class AssistantService : Service() {
     private var lastWakeWord: String = "hey assistant"
     private var lastVoiceWord: String = ""
     private var lastEnabled: Boolean = false
+    private var lastWakeMicGain: Float = 1.0f
 
     // Receiver for screen-on (ACTION_SCREEN_ON) and keyguard dismiss (ACTION_USER_PRESENT).
     // ACTION_SCREEN_ON fires immediately when the display turns on (even with lock screen).
@@ -179,10 +182,12 @@ class AssistantService : Service() {
         val enabled = prefs.getBoolean(PREF_ENABLED, false)
         val wakeWord = prefs.getString(PREF_WAKE_WORD, "hey assistant") ?: "hey assistant"
         val voiceWord = prefs.getString(PREF_VOICE_WORD, "") ?: ""
+        val wakeMicGain = prefs.getFloat(PREF_WAKE_MIC_GAIN, 1.0f)
         // Sync in-memory cache
         lastEnabled = enabled
         lastWakeWord = wakeWord
         lastVoiceWord = voiceWord
+        lastWakeMicGain = wakeMicGain
 
         if (!enabled) return
 
@@ -252,17 +257,20 @@ class AssistantService : Service() {
                 val enableWakeWord = intent.getBooleanExtra(EXTRA_ENABLE_WAKE_WORD, false)
                 val wakeWord = intent.getStringExtra(EXTRA_WAKE_WORD) ?: "hey assistant"
                 val voiceWord = intent.getStringExtra(EXTRA_VOICE_WORD) ?: ""
+                val wakeMicGain = intent.getFloatExtra("wake_word_mic_gain", lastWakeMicGain)
                 // Persist config to SharedPreferences so it survives process death
                 prefs.edit()
                     .putBoolean(PREF_ENABLED, enableWakeWord)
                     .putString(PREF_WAKE_WORD, wakeWord)
                     .putString(PREF_VOICE_WORD, voiceWord)
+                    .putFloat(PREF_WAKE_MIC_GAIN, wakeMicGain)
                     .apply()
                 lastEnabled = enableWakeWord
                 lastWakeWord = wakeWord
                 lastVoiceWord = voiceWord
+                lastWakeMicGain = wakeMicGain
                 if (enableWakeWord) {
-                    startWakeWord(wakeWord, voiceWord)
+                    startWakeWord(wakeWord, voiceWord, wakeMicGain)
                 } else {
                     stopWakeWord()
                 }
@@ -273,12 +281,14 @@ class AssistantService : Service() {
             val enabled = prefs.getBoolean(PREF_ENABLED, false)
             val wakeWord = prefs.getString(PREF_WAKE_WORD, "hey assistant") ?: "hey assistant"
             val voiceWord = prefs.getString(PREF_VOICE_WORD, "") ?: ""
+            val wakeMicGain = prefs.getFloat(PREF_WAKE_MIC_GAIN, 1.0f)
             lastEnabled = enabled
             lastWakeWord = wakeWord
             lastVoiceWord = voiceWord
-            Log.d(TAG, "Sticky restart — restored config from prefs: enabled=$enabled, wake=\"$wakeWord\"")
+            lastWakeMicGain = wakeMicGain
+            Log.d(TAG, "Sticky restart — restored config from prefs: enabled=$enabled, wake=\"$wakeWord\", gain=$wakeMicGain")
             if (enabled) {
-                startWakeWord(wakeWord, voiceWord)
+                startWakeWord(wakeWord, voiceWord, wakeMicGain)
             }
         }
 
@@ -297,11 +307,11 @@ class AssistantService : Service() {
         Log.d(TAG, "Service destroyed")
     }
 
-    private fun startWakeWord(wakeWord: String, voiceWord: String) {
+    private fun startWakeWord(wakeWord: String, voiceWord: String, micGain: Float = lastWakeMicGain) {
         wakeWordDetector?.stop()
-        wakeWordDetector = WakeWordDetector(this, wakeWord, voiceWord)
+        wakeWordDetector = WakeWordDetector(this, wakeWord, voiceWord, micGain)
         wakeWordDetector?.start()
-        Log.d(TAG, "Wake word detection started — wake: \"$wakeWord\", voice: \"$voiceWord\"")
+        Log.d(TAG, "Wake word detection started — wake: \"$wakeWord\", voice: \"$voiceWord\", gain=$micGain")
     }
 
     private fun stopWakeWord() {

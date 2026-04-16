@@ -158,6 +158,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val VOICE_WORD = stringPreferencesKey("voice_word")
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
+        val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
         val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
         val USE_EARPIECE = booleanPreferencesKey("use_earpiece")
         val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
@@ -184,6 +185,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         ThemeMode.SYSTEM
                     },
                     micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
+                    wakeWordMicGainLevel = preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] ?: 1.0f,
                     speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
                     useEarpiece = preferences[PreferenceKeys.USE_EARPIECE] ?: false,
                     enableButtonTrigger = preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] ?: false
@@ -961,6 +963,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun updateWakeWordMicGainLevel(level: Float) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 2.0f)
+            }
+            // Apply to wake word detector via AssistantService (restart with new gain)
+            val s = _settings.value
+            if (s.enableWakeWord) {
+                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, s.voiceWord, level)
+            }
+        }
+    }
+
     fun updateEarpieceMode(enabled: Boolean) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
@@ -1002,7 +1017,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 preferences[PreferenceKeys.ENABLE_WAKE_WORD] = enabled
             }
             val s = _settings.value
-            AssistantService.updateWakeWord(getApplication(), enabled, s.wakeWord, s.voiceWord)
+            AssistantService.updateWakeWord(getApplication(), enabled, s.wakeWord, s.voiceWord, s.wakeWordMicGainLevel)
         }
     }
 
@@ -1013,7 +1028,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val s = _settings.value
             if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, word, s.voiceWord)
+                AssistantService.updateWakeWord(getApplication(), true, word, s.voiceWord, s.wakeWordMicGainLevel)
             }
         }
     }
@@ -1025,7 +1040,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             }
             val s = _settings.value
             if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, word)
+                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, word, s.wakeWordMicGainLevel)
             }
         }
     }

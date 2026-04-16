@@ -499,7 +499,8 @@ class VoiceManager(
                 }
                 "response.done" -> {
                     _state.value = VoiceState.Active
-                    restoreMicAfterAgentSpeech()
+                    // Do NOT restore mic here — audio is still playing after response.done.
+                    // Wait for output_audio_buffer.stopped instead.
                     _events.tryEmit(VoiceEvent.TurnComplete)
                 }
                 "response.output_item.added" -> {
@@ -554,10 +555,15 @@ class VoiceManager(
                     }
                     duckMicForAgentSpeech()
                 }
-                "output_audio_buffer.cleared", "response.audio.done" -> {
-                    // Audio finished or cleared
+                "output_audio_buffer.stopped" -> {
+                    // Audio playback truly finished — safe to restore mic after tail delay
                     _state.value = VoiceState.Active
                     restoreMicAfterAgentSpeech()
+                }
+                "output_audio_buffer.cleared", "response.audio.done" -> {
+                    // Audio interrupted/cleared — restore mic after shorter tail delay
+                    _state.value = VoiceState.Active
+                    restoreMicAfterAgentSpeech(delayMs = 1000L)
                 }
             }
 
@@ -697,23 +703,22 @@ class VoiceManager(
     fun isMuted(): Boolean = !(localAudioTrack?.enabled() ?: true)
 
     /**
-     * Duck mic to 2% while agent is speaking to prevent echo/self-interruption.
-     * Saves the current gain so it can be restored when speaking ends.
-     * No-op if mic is already ducked.
+     * Duck mic while agent is speaking: disable track + zero gain to minimize echo pickup.
+     * Saves current gain for restore. No-op if already ducked.
      */
     private fun duckMicForAgentSpeech() {
         if (gainBeforeSpeaking == null) {
             gainBeforeSpeaking = micGainLevel
-            micGainLevel = 0.02f
-            Log.d(TAG, "Agent speaking — mic ducked from $gainBeforeSpeaking to 0.02")
+            micGainLevel = 0.0f
+            localAudioTrack?.setEnabled(false)
+            Log.d(TAG, "Agent speaking — mic disabled (was gain=$gainBeforeSpeaking)")
         }
     }
 
     /**
-     * Restore mic gain after agent speech ends — with a 1s delay so any speaker
-     * echo has time to die out before the mic opens up again.
+     * Restore mic after agent speech ends — delay so echo tail dies out, then re-enable track.
      */
-    private fun restoreMicAfterAgentSpeech(delayMs: Long = 1000L) {
+    private fun restoreMicAfterAgentSpeech(delayMs: Long = 2000L) {
         if (gainBeforeSpeaking == null) return
         micRestoreJob?.cancel()
         micRestoreJob = scope.launch {
@@ -721,13 +726,14 @@ class VoiceManager(
             gainBeforeSpeaking?.let { saved ->
                 micGainLevel = saved
                 gainBeforeSpeaking = null
-                Log.d(TAG, "Agent done — mic restored to $micGainLevel (after ${delayMs}ms delay)")
+                localAudioTrack?.setEnabled(true)
+                Log.d(TAG, "Agent done — mic re-enabled, gain restored to $micGainLevel (after ${delayMs}ms)")
             }
         }
     }
 
     /**
-     * Restore mic gain immediately (user interrupted — we want the interruption heard).
+     * Restore mic immediately (user interrupted — re-enable track right away).
      */
     private fun restoreMicImmediately() {
         micRestoreJob?.cancel()
@@ -735,7 +741,8 @@ class VoiceManager(
         gainBeforeSpeaking?.let { saved ->
             micGainLevel = saved
             gainBeforeSpeaking = null
-            Log.d(TAG, "User interrupted — mic restored to $micGainLevel immediately")
+            localAudioTrack?.setEnabled(true)
+            Log.d(TAG, "User interrupted — mic re-enabled, gain restored to $micGainLevel immediately")
         }
     }
 

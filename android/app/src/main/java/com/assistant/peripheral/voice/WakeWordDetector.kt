@@ -36,7 +36,8 @@ import kotlin.math.sqrt
 class WakeWordDetector(
     private val context: Context,
     private val wakeWord: String,       // triggers turn-based recording
-    private val voiceWord: String = ""  // triggers realtime voice session (empty = disabled)
+    private val voiceWord: String = "", // triggers realtime voice session (empty = disabled)
+    private val micGain: Float = 1.0f  // scales RMS threshold (independent of voice session gain)
 ) {
     companion object {
         private const val TAG = "WakeWordDetector"
@@ -262,7 +263,8 @@ class WakeWordDetector(
                 }
                 return@launch
             }
-            Log.d(TAG, "Silence monitor started (threshold=$RMS_THRESHOLD)")
+            val effectiveThresholdLog = if (micGain > 0f) RMS_THRESHOLD / micGain else RMS_THRESHOLD
+            Log.d(TAG, "Silence monitor started (threshold=$RMS_THRESHOLD, gain=$micGain, effective=${effectiveThresholdLog.toInt()})")
 
             val buffer = ShortArray(bufferSize / 2)
             var activityStartMs = 0L
@@ -273,7 +275,12 @@ class WakeWordDetector(
 
                 val rms = computeRms(buffer, read)
 
-                if (rms >= RMS_THRESHOLD) {
+                // Scale threshold by mic gain so sensitivity stays constant regardless of gain setting.
+                // Higher gain → louder audio → lower effective threshold needed to trigger.
+                // If gain is 0, fall back to base threshold (avoids division by zero).
+                val effectiveThreshold = if (micGain > 0f) RMS_THRESHOLD / micGain else RMS_THRESHOLD
+
+                if (rms >= effectiveThreshold) {
                     if (activityStartMs == 0L) {
                         activityStartMs = System.currentTimeMillis()
                     } else if (System.currentTimeMillis() - activityStartMs >= ACTIVITY_HOLD_MS) {
