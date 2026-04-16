@@ -317,6 +317,7 @@ class SessionManager:
         remote claude process unchanged.  Returns the path to the script.
         """
         import shlex
+        import subprocess
 
         remote_path = self._config.project_dir.replace("'", "'\\''")
 
@@ -336,9 +337,31 @@ class SessionManager:
 
         ssh_cmd = shlex.join(ssh_parts)
 
+        # Resolve the absolute path of `claude` on the remote machine.
+        # Non-interactive SSH sessions don't load .profile/.bashrc so PATH
+        # may not include ~/.local/bin.  We probe common locations and fall
+        # back to `which claude` (sourcing the profile explicitly) so the
+        # wrapper can exec the binary directly without relying on PATH.
+        try:
+            result = subprocess.run(
+                ssh_parts + [
+                    "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
+                    " which claude 2>/dev/null"
+                    " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
+        except Exception as e:
+            logger.warning("Could not resolve remote claude path: %s", e)
+            remote_claude = "claude"
+
+        logger.debug("Remote claude path resolved to: %s", remote_claude)
+        remote_claude_escaped = remote_claude.replace("'", "'\\''")
+
         script = (
             "#!/bin/sh\n"
-            f"{ssh_cmd} bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null; cd '\"'\"'{remote_path}'\"'\"' && exec claude \"$@\"' _ \"$@\"\n"
+            f"{ssh_cmd} bash -c 'cd '\"'\"'{remote_path}'\"'\"' && exec '\"'\"'{remote_claude_escaped}'\"'\"' \"$@\"' _ \"$@\"\n"
         )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
