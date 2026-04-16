@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Personal Assistant
 
 **A transparent, hackable AI assistant that evolves with you.**
@@ -202,11 +206,36 @@ This ensures that the assistant is always evolving and that skills/scripts remai
 - Never use literal backtick command syntax in SKILL.md (triggers permission prompts)
 - Variable substitution: `$ARGUMENTS`, `$0`/`$1`/`$2`, `${CLAUDE_SESSION_ID}`
 
+### Two Distinct Agent Systems
+
+This project contains **two separate agent systems** that should not be confused:
+
+1. **`manager/session.py` → `SessionManager`** — Wraps the Claude Code SDK (`claude_agent_sdk`). Each instance spawns a Claude Code subprocess and streams events (`TextDelta`, `ToolUse`, `TurnComplete`, etc.). Managed by `api/pool.py` (`SessionPool`). Used for the main chat tabs.
+
+2. **`orchestrator/session.py` → `OrchestratorSession`** — A hand-written agent loop that calls Anthropic or OpenAI APIs directly. Has its own tool registry (`orchestrator/tools/`), system prompt, and JSONL persistence. Used for the orchestrator tab (higher-level coordination, voice mode). Does NOT use the Claude Code SDK.
+
+**Event flow for regular chat sessions:**
+```
+Frontend WebSocket → api/routes/chat.py → SessionPool.send()
+  → SessionManager.send() → claude_agent_sdk → Claude Code subprocess
+  → Events broadcast to all WebSocket subscribers
+```
+
+**Event flow for orchestrator:**
+```
+Frontend WebSocket → api/routes/orchestrator.py → OrchestratorSession.send()
+  → OrchestratorAgent.run() → ModelProvider → Anthropic/OpenAI API
+  → ToolRegistry.execute() (non-blocking, concurrent)
+  → Events broadcast via SessionPool.broadcast_orchestrator()
+```
+
 ### Testing
 
 Run the full suite: `context/scripts/run.sh -m pytest tests/ -v`
 
-Write tests alongside code. Mock external dependencies with `unittest.mock`.
+Run a single test: `context/scripts/run.sh -m pytest tests/test_foo.py::TestClass::test_method -v`
+
+Mock external dependencies with `unittest.mock`.
 
 ### Browser Automation
 

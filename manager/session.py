@@ -281,6 +281,12 @@ class SessionManager:
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
         kwargs["env"] = env
 
+        # Capture stderr so errors are visible in logs instead of being swallowed
+        def _log_stderr(line: str) -> None:
+            logger.error("claude CLI stderr [%s]: %s", self._local_id, line.rstrip())
+
+        kwargs["stderr"] = _log_stderr
+
         return ClaudeAgentOptions(**kwargs)
 
     async def _process_message(self, msg: object) -> AsyncIterator[Event]:
