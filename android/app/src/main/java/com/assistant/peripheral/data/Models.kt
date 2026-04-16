@@ -197,9 +197,9 @@ enum class ThemeMode {
 data class AppSettings(
     val serverUrl: String = "ws://192.168.0.200:80",
     val autoConnect: Boolean = true,
-    val enableWakeWord: Boolean = false,
-    val wakeWord: String = "hey assistant, assistant",   // comma-separated, triggers turn-based voice input
-    val voiceWord: String = "hey realtime, realtime",   // comma-separated, triggers realtime WebRTC voice session
+    val enableWakeWord: Boolean = true,
+    val wakeWord: String = "my friend",        // comma-separated, triggers turn-based voice input
+    val voiceWord: String = "wake up",         // comma-separated, triggers realtime WebRTC voice session
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,            // 0.0 to 2.0, where 1.0 is normal (voice session only)
     val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 2.0, scales RMS threshold for wake word detection
