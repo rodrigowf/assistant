@@ -169,16 +169,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             var previousServerUrl: String? = null
             dataStore.data.collect { preferences ->
-                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: "ws://192.168.0.28:8765"
+                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: AppSettings().serverUrl
                 val serverUrlChanged = previousServerUrl != null && previousServerUrl != newServerUrl
                 previousServerUrl = newServerUrl
 
                 _settings.value = AppSettings(
                     serverUrl = newServerUrl,
-                    autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: true,
-                    enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: false,
-                    wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: "hey assistant",
-                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: "hey realtime",
+                    autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
+                    enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
+                    wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
+                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: AppSettings().voiceWord,
                     themeMode = try {
                         ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
                     } catch (e: Exception) {
@@ -909,8 +909,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             try {
                 val servers = NetworkScanner.scan(getApplication())
                 _discoveredServers.value = servers
-                // Auto-connect to first discovered server if not already connected
-                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected) {
+                // Auto-connect to first discovered server only if using the default URL
+                // (don't overwrite a user-configured server URL)
+                val currentUrl = _settings.value.serverUrl
+                val defaultUrl = AppSettings().serverUrl
+                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected && currentUrl == defaultUrl) {
                     connectToDiscoveredServer(servers.first())
                 }
             } finally {
