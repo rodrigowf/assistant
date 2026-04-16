@@ -47,8 +47,11 @@ class WakeWordDetector(
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
 
-        // RMS threshold — 0..32767 scale. ~300 catches normal speech without being too sensitive.
-        private const val RMS_THRESHOLD = 300.0
+        // RMS threshold — 0..32767 scale. ~200 catches normal speech in a quiet room.
+        // Lowered from 300 after device cleanup reduced background noise — fewer ambient
+        // processes means the mic is quieter at rest, so the old threshold was rarely
+        // breached, giving fewer recognition opportunities per minute.
+        private const val RMS_THRESHOLD = 200.0
 
         // How long audio must stay above threshold before we start recognizer (avoids clicks/pops)
         private const val ACTIVITY_HOLD_MS = 30L
@@ -346,9 +349,12 @@ class WakeWordDetector(
             // Suppress the start/stop beep on most Android devices
             putExtra("android.speech.extra.DICTATION_MODE", true)
             // Wait longer for silence so speech isn't cut off mid-phrase
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            // Reduced minimum from 500ms — on this slow device the recognizer takes time to
+            // bind, so by the time it's "ready", the wake word may already be partially spoken.
+            // A lower minimum lets it accept short captures without timing out (ERROR_NO_SPEECH).
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
         }
 
         // Guard against double finishRecognition calls (onPartialResults early-exit + onResults/onError)
