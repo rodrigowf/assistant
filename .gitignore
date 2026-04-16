@@ -5,8 +5,8 @@ index/
 __pycache__/
 *.pyc
 
-# Virtual environment
-.venv/
+# Virtual environment (no trailing slash — .venv is a symlink on server)
+.venv
 
 # Environment
 .env
