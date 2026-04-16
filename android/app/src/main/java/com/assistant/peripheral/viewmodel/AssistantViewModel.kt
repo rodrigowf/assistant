@@ -884,7 +884,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off
             _isMuted.value = false
-            // Re-arm wake word detection now that the mic is free
+            // Wait for WebRTC to release the mic before re-arming wake word.
+            // Without this delay, AudioRecord fails 20+ times with "other input already
+            // started" — the WebRTC AudioRecord is still held by the system even after
+            // stop() returns, causing the wake word detector process to crash.
+            kotlinx.coroutines.delay(1500L)
             AssistantService.resumeWakeWord(getApplication())
         }
     }
