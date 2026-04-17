@@ -8,7 +8,7 @@ import {
   type McpServerConfig,
   type ModelInfo,
 } from "../api/rest";
-import { WorkingDirectoryList } from "./WorkingDirectoryList";
+import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
 
 interface Props {
   isOpen: boolean;
@@ -27,7 +27,6 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const savedMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasOpen = useRef(false);
 
-  // Clean up timer on unmount
   useEffect(() => () => { if (savedMsgTimer.current) clearTimeout(savedMsgTimer.current); }, []);
 
   const load = useCallback(async () => {
@@ -76,7 +75,6 @@ export function ConfigPage({ isOpen, onClose }: Props) {
       return updated;
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to save";
-      // Try to surface FastAPI detail string
       try { return Promise.reject(JSON.parse(msg.replace(/^\d+ /, "")).detail ?? msg); }
       catch { return Promise.reject(msg); }
     } finally {
@@ -92,7 +90,11 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     catch (e) { setError(String(e)); }
   }, [config, save]);
 
-  const mcpNames = Object.keys(mcpServers);
+  // Derived model state for dropdowns
+  const providers = [...new Set(models.map(m => m.provider))];
+  const selectedModel = models.find(m => m.model_id === config?.default_model);
+  const selectedProvider = selectedModel?.provider ?? providers[0] ?? "";
+  const providerModels = models.filter(m => m.provider === selectedProvider);
 
   if (!isOpen) return null;
 
@@ -127,51 +129,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
 
           {!loading && config && (
             <>
-              {/* ── Working Directories ───────────────────────── */}
-              <section className="config-section">
-                <h3 className="config-section-title">Working Directories</h3>
-                <p className="config-section-desc">
-                  Saved directories for new sessions. Select one to make it active.
-                  Local directories run Claude here; SSH directories run it on a remote machine.
-                </p>
-
-                <WorkingDirectoryList
-                  history={config.working_directory_history}
-                  activeId={config.working_directory}
-                  saving={saving}
-                  onSelect={async (id) => {
-                    try { await save({ working_directory: id }); }
-                    catch (e) { setError(String(e)); }
-                  }}
-                  onHistoryChange={async (newHistory, newActiveId) => {
-                    try { await save({ working_directory_history: newHistory, ...(newActiveId ? { working_directory: newActiveId } : {}) }); }
-                    catch (e) { setError(String(e)); }
-                  }}
-                />
-              </section>
-
-              {/* ── Session Flags ─────────────────────────────── */}
-              <section className="config-section">
-                <h3 className="config-section-title">Session Flags</h3>
-                <p className="config-section-desc">
-                  Extra flags applied when initializing new Claude Code sessions.
-                </p>
-                <div className="config-item-list">
-                  <label className={`config-item${config.chrome_extension ? " enabled" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={config.chrome_extension}
-                      onChange={() => save({ chrome_extension: !config.chrome_extension })}
-                    />
-                    <div className="config-item-info">
-                      <span className="config-item-name">Chrome Extension</span>
-                      <span className="config-item-detail">Launch sessions with --chrome flag to control Google Chrome tabs</span>
-                    </div>
-                  </label>
-                </div>
-              </section>
-
-              {/* ── Model Selection ───────────────────────────── */}
+              {/* ── Orchestrator Model ─────────────────────────── */}
               <section className="config-section">
                 <h3 className="config-section-title">Orchestrator Model</h3>
                 <p className="config-section-desc">
@@ -180,74 +138,73 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                 {models.length === 0 ? (
                   <div className="config-empty">No models available</div>
                 ) : (
-                  <div className="model-selector">
-                    {/* Group by provider */}
-                    {["anthropic", "openai"].map((provider) => {
-                      const providerModels = models.filter(m => m.provider === provider);
-                      if (providerModels.length === 0) return null;
-                      return (
-                        <div key={provider} className="model-provider-group">
-                          <div className="model-provider-label">
-                            {provider === "anthropic" ? "Anthropic" : "OpenAI"}
-                          </div>
-                          <div className="model-list">
-                            {providerModels.map((model) => {
-                              const isSelected = model.model_id === config.default_model;
-                              return (
-                                <button
-                                  key={model.model_id}
-                                  className={`model-option${isSelected ? " selected" : ""}`}
-                                  onClick={() => !isSelected && save({ default_model: model.model_id })}
-                                  disabled={saving}
-                                  title={`${model.display_name}${model.supports_audio ? " (audio)" : ""}${model.supports_vision ? " (vision)" : ""}`}
-                                >
-                                  <span className={`model-radio${isSelected ? " checked" : ""}`} />
-                                  <span className="model-name">{model.display_name}</span>
-                                  <span className="model-badges">
-                                    {model.supports_audio && (
-                                      <span className="model-badge audio" title="Supports audio input">🎤</span>
-                                    )}
-                                    {model.supports_vision && (
-                                      <span className="model-badge vision" title="Supports vision">👁</span>
-                                    )}
-                                  </span>
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      );
-                    })}
+                  <div className="model-dropdowns">
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">Provider</label>
+                      <select
+                        className="model-dropdown-select"
+                        value={selectedProvider}
+                        disabled={saving}
+                        onChange={(e) => {
+                          // When provider changes, auto-select first model of that provider
+                          const first = models.find(m => m.provider === e.target.value);
+                          if (first) save({ default_model: first.model_id }).catch(err => setError(String(err)));
+                        }}
+                      >
+                        {providers.map(p => (
+                          <option key={p} value={p}>
+                            {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">Model</label>
+                      <select
+                        className="model-dropdown-select"
+                        value={config.default_model}
+                        disabled={saving}
+                        onChange={(e) => save({ default_model: e.target.value }).catch(err => setError(String(err)))}
+                      >
+                        {providerModels.map(m => (
+                          <option key={m.model_id} value={m.model_id}>
+                            {m.display_name}
+                            {m.supports_audio ? " 🎤" : ""}
+                            {m.supports_vision ? " 👁" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
                 )}
               </section>
 
+              {/* ── Working Directories ───────────────────────── */}
+              <WorkingDirectorySection
+                history={config.working_directory_history}
+                activeId={config.working_directory}
+                saving={saving}
+                onSelect={(id) => save({ working_directory: id }).catch(e => setError(String(e)))}
+                onHistoryChange={async (newHistory, newActiveId) => {
+                  try { await save({ working_directory_history: newHistory, ...(newActiveId ? { working_directory: newActiveId } : {}) }); }
+                  catch (e) { setError(String(e)); }
+                }}
+              />
+
+              {/* ── Session Flags ─────────────────────────────── */}
+              <SessionFlagsSection
+                chromeEnabled={config.chrome_extension}
+                onChange={(v) => save({ chrome_extension: v }).catch(e => setError(String(e)))}
+                saving={saving}
+              />
+
               {/* ── MCP Servers ───────────────────────────────── */}
-              <section className="config-section">
-                <h3 className="config-section-title">MCP Servers</h3>
-                <p className="config-section-desc">
-                  Default MCP servers enabled for new sessions. Override per-session from the chat header.
-                </p>
-                {mcpNames.length === 0 ? (
-                  <div className="config-empty">No MCP servers configured in .claude.json</div>
-                ) : (
-                  <div className="config-item-list">
-                    {mcpNames.map((name) => {
-                      const cfg = mcpServers[name];
-                      const enabled = config.enabled_mcps.includes(name);
-                      return (
-                        <label key={name} className={`config-item${enabled ? " enabled" : ""}`}>
-                          <input type="checkbox" checked={enabled} onChange={() => toggleMcp(name)} />
-                          <div className="config-item-info">
-                            <span className="config-item-name">{name}</span>
-                            <span className="config-item-detail">{cfg.command} {cfg.args?.join(" ") ?? ""}</span>
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
+              <McpServersSection
+                mcpServers={mcpServers}
+                enabledMcps={config.enabled_mcps}
+                onToggle={toggleMcp}
+                saving={saving}
+              />
             </>
           )}
         </div>

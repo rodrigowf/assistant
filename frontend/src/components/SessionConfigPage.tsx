@@ -8,9 +8,8 @@ import {
   type AssistantConfig,
   type SessionConfig,
   type McpServerConfig,
-  type WorkingDirectoryEntry,
 } from "../api/rest";
-import { WorkingDirectoryList } from "./WorkingDirectoryList";
+import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
 
 interface Props {
   isOpen: boolean;
@@ -38,10 +37,7 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
   useEffect(() => () => { if (savedMsgTimer.current) clearTimeout(savedMsgTimer.current); }, []);
 
   const load = useCallback(async () => {
-    if (!sessionId) {
-      setLoading(false);
-      return;
-    }
+    if (!sessionId) { setLoading(false); return; }
     setLoading(true);
     setError(null);
     try {
@@ -110,8 +106,7 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
     await save({ enabled_mcps: Array.from(current) });
   }, [effectiveMcps, save]);
 
-  const mcpNames = Object.keys(mcpServers);
-  const wdHistory: WorkingDirectoryEntry[] = globalConfig?.working_directory_history ?? [];
+  const wdHistory = globalConfig?.working_directory_history ?? [];
 
   const handleSaveAndRestart = useCallback(() => {
     onSaveAndRestart();
@@ -159,100 +154,39 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
 
           {!loading && sessionConfig && globalConfig && (
             <>
-              {/* ── Working Directory ─────────────────────────── */}
-              <section className="config-section">
-                <div className="config-section-header">
-                  <h3 className="config-section-title">Working Directory</h3>
-                  {!isInherited("working_directory") && (
-                    <button className="session-cfg-reset-btn" onClick={() => resetToGlobal("working_directory")} title="Use global active directory">
-                      Reset to global
-                    </button>
-                  )}
-                </div>
-                <p className="config-section-desc">
-                  The directory Claude runs in for this session.
-                  {isInherited("working_directory") && <span className="session-cfg-inherited"> (using global active directory)</span>}
-                </p>
-                <WorkingDirectoryList
-                  history={wdHistory}
-                  activeId={effectiveWdId ?? ""}
-                  saving={saving}
-                  selectedLabel={isInherited("working_directory") ? "global default" : "selected"}
-                  onSelect={async (id) => { await save({ working_directory: id }); }}
-                  onHistoryChange={async (newHistory, newActiveId) => {
-                    try {
-                      const updated = await updateConfig({ working_directory_history: newHistory, ...(newActiveId ? { working_directory: newActiveId } : {}) });
-                      setGlobalConfig(updated);
-                      // If a new entry was added and selected, also save it as session override
-                      if (newActiveId) await save({ working_directory: newActiveId });
-                    } catch (e) { setError(String(e)); }
-                  }}
-                />
-              </section>
+              <WorkingDirectorySection
+                history={wdHistory}
+                activeId={effectiveWdId ?? ""}
+                saving={saving}
+                selectedLabel={isInherited("working_directory") ? "global default" : "selected"}
+                onSelect={(id) => save({ working_directory: id })}
+                onHistoryChange={async (newHistory, newActiveId) => {
+                  try {
+                    const updated = await updateConfig({ working_directory_history: newHistory, ...(newActiveId ? { working_directory: newActiveId } : {}) });
+                    setGlobalConfig(updated);
+                    if (newActiveId) await save({ working_directory: newActiveId });
+                  } catch (e) { setError(String(e)); }
+                }}
+                inherited={isInherited("working_directory")}
+                onReset={() => resetToGlobal("working_directory")}
+              />
 
-              {/* ── Session Flags ─────────────────────────────── */}
-              <section className="config-section">
-                <div className="config-section-header">
-                  <h3 className="config-section-title">Session Flags</h3>
-                  {!isInherited("chrome_extension") && (
-                    <button className="session-cfg-reset-btn" onClick={() => resetToGlobal("chrome_extension")} title="Reset to global default">
-                      Reset to global
-                    </button>
-                  )}
-                </div>
-                <p className="config-section-desc">
-                  Extra flags for this session.
-                  {isInherited("chrome_extension") && <span className="session-cfg-inherited"> (using global setting)</span>}
-                </p>
-                <div className="config-item-list">
-                  <label className={`config-item${effectiveChrome ? " enabled" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={effectiveChrome}
-                      onChange={() => save({ chrome_extension: !effectiveChrome })}
-                    />
-                    <div className="config-item-info">
-                      <span className="config-item-name">Chrome Extension</span>
-                      <span className="config-item-detail">Launch with --chrome flag to control Google Chrome tabs</span>
-                    </div>
-                  </label>
-                </div>
-              </section>
+              <SessionFlagsSection
+                chromeEnabled={effectiveChrome}
+                onChange={(v) => save({ chrome_extension: v })}
+                saving={saving}
+                inherited={isInherited("chrome_extension")}
+                onReset={() => resetToGlobal("chrome_extension")}
+              />
 
-              {/* ── MCP Servers ───────────────────────────────── */}
-              <section className="config-section">
-                <div className="config-section-header">
-                  <h3 className="config-section-title">MCP Servers</h3>
-                  {!isInherited("enabled_mcps") && (
-                    <button className="session-cfg-reset-btn" onClick={() => resetToGlobal("enabled_mcps")} title="Reset to global default">
-                      Reset to global
-                    </button>
-                  )}
-                </div>
-                <p className="config-section-desc">
-                  MCP servers enabled for this session.
-                  {isInherited("enabled_mcps") && <span className="session-cfg-inherited"> (using global setting)</span>}
-                </p>
-                {mcpNames.length === 0 ? (
-                  <div className="config-empty">No MCP servers configured in .claude.json</div>
-                ) : (
-                  <div className="config-item-list">
-                    {mcpNames.map((name) => {
-                      const cfg = mcpServers[name];
-                      const enabled = effectiveMcps.includes(name);
-                      return (
-                        <label key={name} className={`config-item${enabled ? " enabled" : ""}`}>
-                          <input type="checkbox" checked={enabled} onChange={() => toggleMcp(name)} />
-                          <div className="config-item-info">
-                            <span className="config-item-name">{name}</span>
-                            <span className="config-item-detail">{cfg.command} {cfg.args?.join(" ") ?? ""}</span>
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
+              <McpServersSection
+                mcpServers={mcpServers}
+                enabledMcps={effectiveMcps}
+                onToggle={toggleMcp}
+                saving={saving}
+                inherited={isInherited("enabled_mcps")}
+                onReset={() => resetToGlobal("enabled_mcps")}
+              />
             </>
           )}
         </div>
