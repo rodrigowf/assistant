@@ -288,16 +288,10 @@ class SessionManager:
         # Strip CLAUDECODE to allow launching SDK sessions from within a
         # Claude Code process (e.g. VSCode extension or the wrapper itself).
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-        if self._config.ssh_host:
-            # Override PWD to the remote project path so claude computes the
-            # correct project key (used for JSONL storage and memory paths).
-            # Without this the SDK sets PWD to the local cwd (Jetson home dir)
-            # and claude stores sessions under the wrong project bucket.
-            env["PWD"] = self._config.project_dir
+        if self._config.ssh_host and self._config.ssh_claude_config_dir:
             # Override CLAUDE_CONFIG_DIR so the remote claude writes its JSONL
             # to the correct path on the target machine.
-            if self._config.ssh_claude_config_dir:
-                env["CLAUDE_CONFIG_DIR"] = self._config.ssh_claude_config_dir
+            env["CLAUDE_CONFIG_DIR"] = self._config.ssh_claude_config_dir
         kwargs["env"] = env
 
         # Capture stderr so errors are visible in logs instead of being swallowed
@@ -385,10 +379,13 @@ class SessionManager:
         # the child process environment without triggering this behaviour.
         parts = []
         parts.append("cd " + sq(self._config.project_dir))
+        # Set PWD explicitly so claude computes the correct project key (JSONL bucket).
+        # After `cd`, the shell updates PWD automatically, but we set it explicitly here
+        # as well to be safe — the SDK also sets PWD from its local cwd on the Jetson,
+        # which would override the remote value without this.
+        exec_prefix = "PWD=" + sq(self._config.project_dir) + " "
         if self._config.ssh_claude_config_dir:
-            exec_prefix = "CLAUDE_CONFIG_DIR=" + sq(self._config.ssh_claude_config_dir) + " "
-        else:
-            exec_prefix = ""
+            exec_prefix += "CLAUDE_CONFIG_DIR=" + sq(self._config.ssh_claude_config_dir) + " "
         parts.append(exec_prefix + "exec " + sq(remote_claude) + ' "$@"')
         remote_cmd = " && ".join(parts)
 
