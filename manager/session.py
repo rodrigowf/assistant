@@ -379,25 +379,46 @@ class SessionManager:
         # the child process environment without triggering this behaviour.
         parts = []
         parts.append("cd " + sq(self._config.project_dir))
-        # Set PWD explicitly so claude computes the correct project key (JSONL bucket).
-        # After `cd`, the shell updates PWD automatically, but we set it explicitly here
-        # as well to be safe — the SDK also sets PWD from its local cwd on the Jetson,
-        # which would override the remote value without this.
-        exec_prefix = "PWD=" + sq(self._config.project_dir) + " "
+        exec_prefix = ""
         if self._config.ssh_claude_config_dir:
             exec_prefix += "CLAUDE_CONFIG_DIR=" + sq(self._config.ssh_claude_config_dir) + " "
-        parts.append(exec_prefix + "exec " + sq(remote_claude) + ' "$@"')
+        # No "$@" here — args are appended via ${_q} in the wrapper
+        parts.append(exec_prefix + "exec " + sq(remote_claude))
         remote_cmd = " && ".join(parts)
 
-        # sq(remote_cmd) wraps the whole script body in single quotes, escaping any
-        # embedded single quotes.  The "$@" inside the body stays literal inside the
-        # single-quoted block; bash expands it to positional args set by "_ SDK_FLAGS...".
+        # Build the wrapper script.
         #
-        # Final script line:
-        #   ssh ... bash -c 'cd /proj && [CLAUDE_CONFIG_DIR=/x ]exec /claude "$@"' _ "$@"
-        bash_c_arg = sq(remote_cmd)
+        # KEY INSIGHT: SSH joins all its trailing word-arguments into ONE remote command
+        # string.  "ssh host bash -c 'script' _ arg1 arg2" arrives at the remote shell
+        # as "bash -c script _ arg1 arg2" (one string), which it re-parses as bash with
+        # a single -c value of "script _ arg1 arg2".  This makes `_` and the args part
+        # of the -c body rather than positional params, silently breaking the `cd` and
+        # the "$@" expansion inside the script.
+        #
+        # Fix: expand "$@" locally in the wrapper, shell-quoting each arg, then pass
+        # the entire remote command — cd, env vars, exec, and all args — as ONE
+        # double-quoted string to SSH.  SSH forwards that single string to the remote
+        # shell, which parses and executes it correctly with cd working as expected.
+        #
+        # Generated wrapper:
+        #   #!/bin/sh
+        #   _q=''
+        #   for _a in "$@"; do
+        #     _q="${_q} '$(printf '%s' "$_a" | sed "s/'/'\\''/g")'"
+        #   done
+        #   exec ssh ... "cd '/proj' && [CLAUDE_CONFIG_DIR='/cfg'] exec '/claude'${_q}"
 
-        script = "#!/bin/sh\n" + ssh_cmd + " bash -c " + bash_c_arg + ' _ "$@"\n'
+        # remote_cmd already has sq()-quoted paths. We embed it in a double-quoted SSH
+        # arg. Since remote_cmd uses single quotes internally, no further escaping needed
+        # as long as remote_cmd itself contains no double quotes (it never does).
+        script = (
+            "#!/bin/sh\n"
+            "_q=''\n"
+            "for _a in \"$@\"; do\n"
+            "  _q=\"${_q} '$(printf '%s' \"$_a\" | sed \"s/'/'\\''/g\")'\"\n"
+            "done\n"
+            "exec " + ssh_cmd + " \"" + remote_cmd + "${_q}\"\n"
+        )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
         try:
