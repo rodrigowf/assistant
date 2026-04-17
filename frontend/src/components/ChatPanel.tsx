@@ -34,6 +34,8 @@ interface Props {
   voiceError?: string | null;
   /** Whether the current model supports audio input */
   supportsAudio?: boolean;
+  /** Open session-specific config panel (non-orchestrator only) */
+  onOpenSessionConfig?: () => void;
 }
 
 export function ChatPanel({
@@ -63,6 +65,7 @@ export function ChatPanel({
   speakerLevel,
   voiceError,
   supportsAudio,
+  onOpenSessionConfig,
 }: Props) {
   const isStreaming = status === "streaming" || status === "thinking" || status === "tool_use";
   const voiceActive = voiceStatus && voiceStatus !== "off" && voiceStatus !== "error";
@@ -88,6 +91,7 @@ export function ChatPanel({
             voiceStatus={isOrchestrator ? voiceStatus : undefined}
             onVoiceStart={isOrchestrator ? onVoiceStart : undefined}
             onVoiceStop={isOrchestrator ? onVoiceStop : undefined}
+            onOpenConfig={!isOrchestrator ? onOpenSessionConfig : undefined}
           />
           {isOrchestrator && voiceStatus === "error" && voiceError && (
             <span className="voice-error-message">{voiceError}</span>

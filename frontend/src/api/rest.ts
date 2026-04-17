@@ -115,8 +115,6 @@ export interface AssistantConfig {
   working_directory: string;                     // active entry id
   working_directory_history: WorkingDirectoryEntry[];
   enabled_mcps: string[];
-  disabled_skills: string[];
-  disabled_agents: string[];
   chrome_extension: boolean;
   default_model: string;
 }
@@ -125,8 +123,6 @@ export interface ConfigUpdate {
   working_directory?: string;                            // entry id to activate
   working_directory_history?: WorkingDirectoryEntry[];   // full list replacement
   enabled_mcps?: string[];
-  disabled_skills?: string[];
-  disabled_agents?: string[];
   chrome_extension?: boolean;
   default_model?: string;
 }
@@ -165,34 +161,24 @@ export function listModels(): Promise<ModelsResponse> {
   return json(`${BASE}/orchestrator/models`);
 }
 
-// Skills
+// Per-session config
 
-export interface SkillInfo {
-  name: string;
-  description: string;
-  dir: string;
+export interface SessionConfig {
+  working_directory: string | null;  // null = inherit active from global
+  enabled_mcps: string[] | null;     // null = inherit from global
+  chrome_extension: boolean | null;  // null = inherit from global
 }
 
-export interface SkillsResponse {
-  skills: SkillInfo[];
+export type SessionConfigUpdate = Partial<SessionConfig>;
+
+export function getSessionConfig(sessionId: string): Promise<SessionConfig> {
+  return json(`${BASE}/sessions/${sessionId}/config`);
 }
 
-export function listSkills(): Promise<SkillsResponse> {
-  return json(`${BASE}/skills`);
-}
-
-// Agents
-
-export interface AgentInfo {
-  name: string;
-  description: string;
-  file: string;
-}
-
-export interface AgentsResponse {
-  agents: AgentInfo[];
-}
-
-export function listAgents(): Promise<AgentsResponse> {
-  return json(`${BASE}/agents`);
+export function updateSessionConfig(sessionId: string, update: SessionConfigUpdate): Promise<SessionConfig> {
+  return json(`${BASE}/sessions/${sessionId}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
 }
