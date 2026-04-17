@@ -31,6 +31,7 @@ class ManagerConfig:
     ssh_host: str | None = None
     ssh_user: str | None = None
     ssh_key: str | None = None   # Path to private key file on the local machine
+    ssh_claude_config_dir: str | None = None  # Override CLAUDE_CONFIG_DIR on the remote machine
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> ManagerConfig:

@@ -37,6 +37,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [addWdHost, setAddWdHost] = useState("");
   const [addWdUser, setAddWdUser] = useState("");
   const [addWdKey, setAddWdKey] = useState("");
+  const [addWdConfigDir, setAddWdConfigDir] = useState("");
   const [addWdError, setAddWdError] = useState<string | null>(null);
   const [addWdOpen, setAddWdOpen] = useState(false);
 
@@ -113,7 +114,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
 
   const resetAddWdForm = () => {
     setAddWdPath(""); setAddWdLabel(""); setAddWdHost("");
-    setAddWdUser(""); setAddWdKey(""); setAddWdError(null);
+    setAddWdUser(""); setAddWdKey(""); setAddWdConfigDir(""); setAddWdError(null);
     setAddWdOpen(false);
   };
 
@@ -144,6 +145,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
       ssh_host: isSSH ? host : null,
       ssh_user: addWdUser.trim() || null,
       ssh_key: addWdKey.trim() || null,
+      claude_config_dir: addWdConfigDir.trim() || null,
     };
 
     try {
@@ -153,7 +155,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     } catch (e) {
       setAddWdError(String(e));
     }
-  }, [addWdType, addWdPath, addWdLabel, addWdHost, addWdUser, addWdKey, config, save, selectWd]);
+  }, [addWdType, addWdPath, addWdLabel, addWdHost, addWdUser, addWdKey, addWdConfigDir, config, save, selectWd]);
 
   const deleteWd = useCallback(async (id: string) => {
     if (!config) return;
@@ -335,17 +337,30 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                     </div>
 
                     {addWdType === "ssh" && (
-                      <div className="wd-field">
-                        <label className="wd-field-label">SSH key (local path, optional)</label>
-                        <input
-                          className="wd-input"
-                          type="text"
-                          value={addWdKey}
-                          onChange={(e) => setAddWdKey(e.target.value)}
-                          placeholder="~/.ssh/id_rsa"
-                          spellCheck={false}
-                        />
-                      </div>
+                      <>
+                        <div className="wd-field">
+                          <label className="wd-field-label">SSH key (local path, optional)</label>
+                          <input
+                            className="wd-input"
+                            type="text"
+                            value={addWdKey}
+                            onChange={(e) => setAddWdKey(e.target.value)}
+                            placeholder="~/.ssh/id_rsa"
+                            spellCheck={false}
+                          />
+                        </div>
+                        <div className="wd-field">
+                          <label className="wd-field-label">Context dir on remote (optional)</label>
+                          <input
+                            className="wd-input"
+                            type="text"
+                            value={addWdConfigDir}
+                            onChange={(e) => setAddWdConfigDir(e.target.value)}
+                            placeholder="/home/rodrigo/Projects/assistant/context"
+                            spellCheck={false}
+                          />
+                        </div>
+                      </>
                     )}
 
                     <div className="wd-field">

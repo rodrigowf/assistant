@@ -58,6 +58,7 @@ def _migrate_wd_history(history: list) -> list[dict]:
             item.setdefault("ssh_host", None)
             item.setdefault("ssh_user", None)
             item.setdefault("ssh_key", None)
+            item.setdefault("claude_config_dir", None)
             result.append(item)
     return result
 
@@ -83,7 +84,7 @@ def _save_config(data: dict[str, Any]) -> None:
 
 def _default_config() -> dict[str, Any]:
     default_path = str(PROJECT_ROOT)
-    default_entry = {"id": default_path, "path": default_path, "label": None, "ssh_host": None, "ssh_user": None, "ssh_key": None}
+    default_entry = {"id": default_path, "path": default_path, "label": None, "ssh_host": None, "ssh_user": None, "ssh_key": None, "claude_config_dir": None}
     return {
         "working_directory": default_path,
         "working_directory_history": [default_entry],
@@ -115,7 +116,8 @@ class WorkingDirectoryEntry(BaseModel):
     label: str | None = None # Optional human-readable name
     ssh_host: str | None = None
     ssh_user: str | None = None
-    ssh_key: str | None = None   # Path to private key file (on the local machine)
+    ssh_key: str | None = None          # Path to private key file (on the local machine)
+    claude_config_dir: str | None = None  # Override CLAUDE_CONFIG_DIR on the remote machine
 
 
 class ConfigUpdate(BaseModel):
