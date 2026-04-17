@@ -2429,23 +2429,33 @@ pre.field-value {
   letter-spacing: 0.02em;
 }
 
-/* Delete button */
+/* Edit / Delete icon buttons */
+.wd-list-edit,
 .wd-list-delete {
   width: 22px;
   height: 22px;
   border-radius: 4px;
   background: transparent;
   color: var(--text-dim);
+  border: none;
+  cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
   opacity: 0;
   flex-shrink: 0;
   transition: opacity var(--transition), background var(--transition), color var(--transition);
 }
 
+.wd-list-item:hover .wd-list-edit,
 .wd-list-item:hover .wd-list-delete {
   opacity: 1;
+}
+
+.wd-list-edit:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
 }
 
 .wd-list-delete:hover {
@@ -2453,9 +2463,20 @@ pre.field-value {
   color: var(--error);
 }
 
+.wd-list-edit:disabled,
 .wd-list-delete:disabled {
   opacity: 0 !important;
   cursor: default;
+}
+
+/* Edit form title */
+.wd-edit-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin-bottom: 8px;
 }
 
 /* SSH badge on list items */

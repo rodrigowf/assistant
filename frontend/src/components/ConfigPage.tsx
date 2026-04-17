@@ -40,6 +40,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [addWdConfigDir, setAddWdConfigDir] = useState("");
   const [addWdError, setAddWdError] = useState<string | null>(null);
   const [addWdOpen, setAddWdOpen] = useState(false);
+  const [editWdId, setEditWdId] = useState<string | null>(null); // id of entry being edited
 
   const savedMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasOpen = useRef(false);
@@ -115,8 +116,23 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const resetAddWdForm = () => {
     setAddWdPath(""); setAddWdLabel(""); setAddWdHost("");
     setAddWdUser(""); setAddWdKey(""); setAddWdConfigDir(""); setAddWdError(null);
-    setAddWdOpen(false);
+    setAddWdOpen(false); setEditWdId(null);
   };
+
+  const openEditWd = useCallback((entry: WorkingDirectoryEntry) => {
+    setEditWdId(entry.id);
+    setAddWdType(entry.ssh_host ? "ssh" : "local");
+    setAddWdPath(entry.path);
+    setAddWdLabel(entry.label ?? "");
+    setAddWdHost(entry.ssh_host ?? "");
+    setAddWdUser(entry.ssh_user ?? "");
+    setAddWdKey(entry.ssh_key ?? "");
+    // Only pre-fill if it differs from the auto-derived value
+    const derived = entry.ssh_host ? entry.path.replace(/\/$/, "") + "/.claude_config" : "";
+    setAddWdConfigDir(entry.claude_config_dir && entry.claude_config_dir !== derived ? entry.claude_config_dir : "");
+    setAddWdError(null);
+    setAddWdOpen(true);
+  }, []);
 
   const addWd = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
@@ -131,12 +147,6 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     if (isSSH && !host) { setAddWdError("SSH host is required"); return; }
 
     const id = isSSH ? `${host}:${path}` : path;
-    // If already in history, just select it
-    if (config.working_directory_history.some(e => e.id === id)) {
-      resetAddWdForm();
-      await selectWd(id);
-      return;
-    }
 
     const entry: WorkingDirectoryEntry = {
       id,
@@ -149,13 +159,25 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     };
 
     try {
-      const newHistory = [...config.working_directory_history, entry];
+      let newHistory: WorkingDirectoryEntry[];
+      if (editWdId !== null) {
+        // Replace existing entry (id may change if host/path changed)
+        newHistory = config.working_directory_history.map(e => e.id === editWdId ? entry : e);
+      } else {
+        // If already in history, just select it
+        if (config.working_directory_history.some(e => e.id === id)) {
+          resetAddWdForm();
+          await selectWd(id);
+          return;
+        }
+        newHistory = [...config.working_directory_history, entry];
+      }
       await save({ working_directory_history: newHistory, working_directory: id });
       resetAddWdForm();
     } catch (e) {
       setAddWdError(String(e));
     }
-  }, [addWdType, addWdPath, addWdLabel, addWdHost, addWdUser, addWdKey, addWdConfigDir, config, save, selectWd]);
+  }, [addWdType, addWdPath, addWdLabel, addWdHost, addWdUser, addWdKey, addWdConfigDir, editWdId, config, save, selectWd]);
 
   const deleteWd = useCallback(async (id: string) => {
     if (!config) return;
@@ -259,6 +281,17 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                           </div>
                           {isActive && <span className="wd-active-badge">active</span>}
                           <button
+                            className="wd-list-edit"
+                            onClick={() => openEditWd(entry)}
+                            disabled={saving}
+                            title="Edit"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                            </svg>
+                          </button>
+                          <button
                             className="wd-list-delete"
                             onClick={() => deleteWd(entry.id)}
                             disabled={saving || !canDelete}
@@ -281,6 +314,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                   </button>
                 ) : (
                   <form className="wd-add-form" onSubmit={addWd}>
+                    {editWdId !== null && <div className="wd-edit-title">Edit directory</div>}
                     {/* Local / SSH tabs */}
                     <div className="wd-type-tabs">
                       <button
@@ -350,13 +384,13 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                           />
                         </div>
                         <div className="wd-field">
-                          <label className="wd-field-label">Context dir on remote (optional)</label>
+                          <label className="wd-field-label">CLAUDE_CONFIG_DIR on remote (optional, defaults to &lt;path&gt;/.claude_config)</label>
                           <input
                             className="wd-input"
                             type="text"
                             value={addWdConfigDir}
                             onChange={(e) => setAddWdConfigDir(e.target.value)}
-                            placeholder="/home/rodrigo/Projects/assistant/context"
+                            placeholder={addWdPath.trim() ? addWdPath.trim().replace(/\/$/, "") + "/.claude_config" : "/home/user/projects/myapp/.claude_config"}
                             spellCheck={false}
                           />
                         </div>
@@ -383,7 +417,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                         type="submit"
                         disabled={saving || !addWdPath.trim() || (addWdType === "ssh" && !addWdHost.trim())}
                       >
-                        Add
+                        {editWdId !== null ? "Save" : "Add"}
                       </button>
                       <button
                         className="wd-cancel-btn"

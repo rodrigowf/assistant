@@ -154,6 +154,9 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
                 # Ensure the id is set to host:path if not explicitly set.
                 if not e["id"] or e["id"] == e["path"]:
                     e["id"] = f"{entry.ssh_host}:{entry.path}"
+                # Auto-derive CLAUDE_CONFIG_DIR as <remote_path>/.claude_config if not set
+                if not e.get("claude_config_dir"):
+                    e["claude_config_dir"] = entry.path.rstrip("/") + "/.claude_config"
             else:
                 # Local entry — validate the path exists.
                 if not Path(entry.path).is_dir():
