@@ -147,10 +147,22 @@ async def _handle_start(
     from manager.config import ManagerConfig
     from api.routes.config import _load_config as _load_assistant_config, _find_active_entry
     config = ManagerConfig.load()
-    # Apply global assistant config overrides (working directory, MCPs)
     assistant_cfg = _load_assistant_config()
     from dataclasses import replace
-    active_entry = _find_active_entry(assistant_cfg)
+
+    # Apply per-session config overrides (session config takes precedence over global)
+    from api.routes.session_config import load_session_config
+    session_cfg = load_session_config(resume_sdk_id) if resume_sdk_id else {}
+
+    # Resolve working directory: session-specific entry id → global active → fallback
+    session_wd_id = session_cfg.get("working_directory")
+    if session_wd_id:
+        # Find the entry in global history by id
+        history = assistant_cfg.get("working_directory_history", [])
+        active_entry = next((e for e in history if e["id"] == session_wd_id), None)
+    else:
+        active_entry = _find_active_entry(assistant_cfg)
+
     if active_entry:
         config = replace(
             config,
@@ -162,17 +174,25 @@ async def _handle_start(
         )
     else:
         config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
-    # If no per-session MCPs provided, use the globally-enabled MCPs from the config.
+
+    # If no per-session MCPs provided, use session-level or global enabled MCPs.
     # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".
     if mcp_servers is None:
-        enabled_mcps: list[str] = assistant_cfg.get("enabled_mcps", [])
+        # Session config takes precedence over global config (None = inherit)
+        raw_mcps = session_cfg.get("enabled_mcps")
+        if raw_mcps is None:
+            raw_mcps = assistant_cfg.get("enabled_mcps", [])
+        enabled_mcps: list[str] = raw_mcps or []
         if enabled_mcps:
             # Load full MCP configs from .claude.json and filter to enabled ones
             from api.routes.mcp import _load_mcp_servers
             all_mcps = _load_mcp_servers()
             mcp_servers = {k: v for k, v in all_mcps.items() if k in enabled_mcps} or None
-    # Apply chrome extension flag if enabled
-    if assistant_cfg.get("chrome_extension", False):
+    # Apply chrome extension flag if enabled (session config overrides global)
+    chrome = session_cfg.get("chrome_extension")
+    if chrome is None:
+        chrome = assistant_cfg.get("chrome_extension", False)
+    if chrome:
         config = replace(config, extra_args={"chrome": None})
     try:
         await ws.send_bytes(orjson.dumps({

@@ -2928,7 +2928,8 @@ pre.field-value {
   .send-btn,
   .interrupt-btn,
   .compact-btn,
-  .voice-record-btn {
+  .voice-record-btn,
+  .session-config-gear-btn {
     width: 44px;
     height: 44px;
   }
@@ -2971,4 +2972,110 @@ pre.field-value {
 /* ── Sidebar overlay (hidden on desktop) ── */
 .sidebar-overlay {
   display: none;
+}
+
+/* ============================================================
+   Session config gear button (inside .chat-input flex row)
+   ============================================================ */
+
+.session-config-gear-btn {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+  cursor: pointer;
+}
+
+.session-config-gear-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+/* ============================================================
+   Session config panel: section header (title + reset button)
+   ============================================================ */
+
+.config-section-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+
+.config-section-header .config-section-title {
+  margin-bottom: 0;
+}
+
+.session-cfg-reset-btn {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  background: transparent;
+  padding: 2px 7px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  transition: background var(--transition), color var(--transition);
+  white-space: nowrap;
+}
+
+.session-cfg-reset-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text-bright);
+}
+
+.session-cfg-inherited {
+  font-style: italic;
+  color: var(--text-dim);
+}
+
+/* ============================================================
+   Session config panel: footer with Save and Restart button
+   ============================================================ */
+
+.session-config-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 24px 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.02);
+  flex-shrink: 0;
+}
+
+.session-config-footer-hint {
+  font-size: 0.77rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+  flex: 1;
+  min-width: 0;
+}
+
+.session-config-restart-btn {
+  flex-shrink: 0;
+  padding: 8px 18px;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.84rem;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition: opacity var(--transition);
+}
+
+.session-config-restart-btn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.session-config-restart-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }

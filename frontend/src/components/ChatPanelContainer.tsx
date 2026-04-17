@@ -1,10 +1,12 @@
-import { useRef, useEffect, useCallback, useState } from "react";
+import { useRef, useEffect, useCallback, useState, lazy, Suspense } from "react";
 import { useTabsContext } from "../context/TabsContext";
 import { useChatInstance, type ChatInstance } from "../hooks/useChatInstance";
 import { useVoiceOrchestrator } from "../hooks/useVoiceOrchestrator";
 import { ChatPanel } from "./ChatPanel";
 import { listModels, type ModelsResponse } from "../api/rest";
 import type { SessionStatus, ConnectionState } from "../types";
+
+const SessionConfigPage = lazy(() => import("./SessionConfigPage").then(m => ({ default: m.SessionConfigPage })));
 
 /**
  * Headless component that manages one chat instance and syncs its state
@@ -208,6 +210,11 @@ export function ChatPanelContainer({
   // Check if any model supports audio (show button if audio is available)
   const supportsAudio = (modelsInfo?.audio_capable_models?.length ?? 0) > 0;
 
+  // Session config panel state — track which tab has it open
+  const [sessionConfigTabId, setSessionConfigTabId] = useState<string | null>(null);
+  const sessionConfigTab = sessionConfigTabId ? tabs.find(t => t.sessionId === sessionConfigTabId) : null;
+  const sessionConfigInstance = sessionConfigTabId ? instancesRef.current.get(sessionConfigTabId) : undefined;
+
   return (
     <>
       {/* Render a headless TabInstance for each open tab */}
@@ -264,6 +271,7 @@ export function ChatPanelContainer({
                 isActive={isActive}
                 hasMoreMessages={inst.hasMoreMessages}
                 onLoadMore={inst.loadMoreMessages}
+                onOpenSessionConfig={() => setSessionConfigTabId(tab.sessionId)}
               />
             )}
           </div>
@@ -283,6 +291,28 @@ export function ChatPanelContainer({
           </div>
         </main>
       )}
+
+      {/* Per-session config panel */}
+      <Suspense fallback={null}>
+        {sessionConfigTabId && (() => {
+          const cfgInst = instancesRef.current.get(sessionConfigTabId);
+          const cfgTab = tabs.find(t => t.sessionId === sessionConfigTabId);
+          const isStopped = cfgInst
+            ? cfgInst.status === "idle" || cfgInst.status === "disconnected"
+            : false;
+          return (
+            <SessionConfigPage
+              isOpen={true}
+              onClose={() => setSessionConfigTabId(null)}
+              sessionId={cfgTab?.resumeSdkId ?? null}
+              canRestart={isStopped}
+              onSaveAndRestart={() => {
+                cfgInst?.restart();
+              }}
+            />
+          );
+        })()}
+      </Suspense>
     </>
   );
 }

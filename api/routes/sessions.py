@@ -121,6 +121,20 @@ def list_pool_sessions(
     return result
 
 
+@router.get("/{session_id}/config")
+def get_session_config(session_id: str):
+    """Return per-session configuration (MCP servers, skills, agents flags)."""
+    from api.routes.session_config import load_session_config
+    return load_session_config(session_id)
+
+
+@router.put("/{session_id}/config")
+def update_session_config(session_id: str, body: dict):
+    """Save per-session configuration overrides."""
+    from api.routes.session_config import save_session_config
+    return save_session_config(session_id, body)
+
+
 @router.get("/{session_id}", response_model=SessionDetailResponse)
 def get_session(session_id: str, store: SessionStore = Depends(get_store)):
     detail = store.get_session(session_id)

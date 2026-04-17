@@ -196,3 +196,27 @@ export interface AgentsResponse {
 export function listAgents(): Promise<AgentsResponse> {
   return json(`${BASE}/agents`);
 }
+
+// Per-session config
+
+export interface SessionConfig {
+  working_directory: string | null;  // null = inherit active from global
+  enabled_mcps: string[] | null;     // null = inherit from global
+  disabled_skills: string[] | null;  // null = inherit from global
+  disabled_agents: string[] | null;  // null = inherit from global
+  chrome_extension: boolean | null;  // null = inherit from global
+}
+
+export type SessionConfigUpdate = Partial<SessionConfig>;
+
+export function getSessionConfig(sessionId: string): Promise<SessionConfig> {
+  return json(`${BASE}/sessions/${sessionId}/config`);
+}
+
+export function updateSessionConfig(sessionId: string, update: SessionConfigUpdate): Promise<SessionConfig> {
+  return json(`${BASE}/sessions/${sessionId}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+}
