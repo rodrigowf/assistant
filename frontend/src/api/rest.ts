@@ -107,7 +107,8 @@ export interface WorkingDirectoryEntry {
   label?: string | null;
   ssh_host?: string | null;
   ssh_user?: string | null;
-  ssh_key?: string | null;  // Path to private key on the local machine
+  ssh_key?: string | null;          // Path to private key on the local machine
+  claude_config_dir?: string | null; // Override CLAUDE_CONFIG_DIR on the remote machine
 }
 
 export interface AssistantConfig {

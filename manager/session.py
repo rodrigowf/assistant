@@ -288,6 +288,10 @@ class SessionManager:
         # Strip CLAUDECODE to allow launching SDK sessions from within a
         # Claude Code process (e.g. VSCode extension or the wrapper itself).
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        # For SSH sessions, override CLAUDE_CONFIG_DIR so the remote claude
+        # writes its JSONL to the correct path on the target machine.
+        if self._config.ssh_host and self._config.ssh_claude_config_dir:
+            env["CLAUDE_CONFIG_DIR"] = self._config.ssh_claude_config_dir
         kwargs["env"] = env
 
         # Capture stderr so errors are visible in logs instead of being swallowed

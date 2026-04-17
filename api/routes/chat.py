@@ -158,6 +158,7 @@ async def _handle_start(
             ssh_host=active_entry.get("ssh_host") or None,
             ssh_user=active_entry.get("ssh_user") or None,
             ssh_key=active_entry.get("ssh_key") or None,
+            ssh_claude_config_dir=active_entry.get("claude_config_dir") or None,
         )
     else:
         config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
