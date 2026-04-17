@@ -110,7 +110,26 @@ class SessionPool:
             fork=fork,
             config=config,
         )
-        await sm.start()
+        try:
+            await sm.start()
+        except Exception as e:
+            if resume_sdk_id and "No conversation found" in str(e):
+                # The SDK state for this session ID no longer exists (e.g. after a
+                # server restart).  Fall back to starting a fresh session so the
+                # frontend can continue working instead of showing an error.
+                logger.warning(
+                    "Resume SDK ID %s not found in Claude state; starting fresh session",
+                    resume_sdk_id,
+                )
+                sm = SessionManager(
+                    session_id=None,
+                    local_id=lid,
+                    fork=False,
+                    config=config,
+                )
+                await sm.start()
+            else:
+                raise
 
         self._sessions[lid] = sm
         self._subscribers[lid] = set()
