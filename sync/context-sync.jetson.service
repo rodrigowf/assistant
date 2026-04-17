@@ -1,0 +1,15 @@
+[Unit]
+Description=Assistant Context Real-Time Sync
+Documentation=https://github.com/rodrigowf/assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/assistant/sync/context-sync.sh %h/assistant/sync/config.env
+Restart=on-failure
+RestartSec=10s
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=default.target

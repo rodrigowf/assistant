@@ -65,3 +65,4 @@ android-device/build/
 android-device/local.properties
 android-device/**/*.apk
 android-device/**/*.aab
+sync/config.env
