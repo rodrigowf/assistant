@@ -15,7 +15,7 @@ type TabsAction =
   | { type: "OPEN_TAB"; sessionId: string; title: string; isOrchestrator?: boolean; resumeSdkId?: string }
   | { type: "CLOSE_TAB"; sessionId: string }
   | { type: "SWITCH_TAB"; sessionId: string }
-  | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title">> };
+  | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">> };
 
 // -------------------------------------------------------------------
 // Reducer
@@ -92,7 +92,7 @@ interface TabsContextValue {
   openTab: (sessionId: string, title?: string, isOrchestrator?: boolean, resumeSdkId?: string) => void;
   closeTab: (sessionId: string) => void;
   switchTab: (sessionId: string) => void;
-  updateTab: (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title">>) => void;
+  updateTab: (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">>) => void;
   isTabOpen: (sessionId: string) => boolean;
   hasActiveOrchestrator: () => boolean;
   /** Find a tab that was opened to resume a given SDK session ID. */
@@ -117,7 +117,7 @@ export function TabsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const updateTab = useCallback(
-    (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title">>) => {
+    (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">>) => {
       dispatch({ type: "UPDATE_TAB", sessionId, updates });
     },
     []
