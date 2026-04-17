@@ -212,8 +212,6 @@ export function ChatPanelContainer({
 
   // Session config panel state — track which tab has it open
   const [sessionConfigTabId, setSessionConfigTabId] = useState<string | null>(null);
-  const sessionConfigTab = sessionConfigTabId ? tabs.find(t => t.sessionId === sessionConfigTabId) : null;
-  const sessionConfigInstance = sessionConfigTabId ? instancesRef.current.get(sessionConfigTabId) : undefined;
 
   return (
     <>
