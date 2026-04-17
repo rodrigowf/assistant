@@ -361,21 +361,22 @@ class SessionManager:
             remote_claude = "claude"
 
         logger.debug("Remote claude path resolved to: %s", remote_claude)
-        remote_claude_escaped = remote_claude.replace("'", "'\\''")
 
-        # Build the remote command: optionally set CLAUDE_CONFIG_DIR, cd, exec claude
+        # Shell-escape helper: wrap value in single quotes, escaping embedded single quotes
+        def sq(s: str) -> str:
+            return "'" + s.replace("'", "'\\''") + "'"
+
+        # Build the remote bash -c script body
+        parts = []
         if self._config.ssh_claude_config_dir:
-            config_dir_escaped = self._config.ssh_claude_config_dir.replace("'", "'\\''")
-            remote_cmd = (
-                f"export CLAUDE_CONFIG_DIR='{config_dir_escaped}' && "
-                f"cd '{remote_path}' && exec '{remote_claude_escaped}' \"$@\""
-            )
-        else:
-            remote_cmd = f"cd '{remote_path}' && exec '{remote_claude_escaped}' \"$@\""
+            parts.append(f"export CLAUDE_CONFIG_DIR={sq(self._config.ssh_claude_config_dir)}")
+        parts.append(f"cd {sq(self._config.project_dir)}")
+        parts.append(f"exec {sq(remote_claude)} \"$@\"")
+        remote_cmd = " && ".join(parts)
 
         script = (
             "#!/bin/sh\n"
-            f"{ssh_cmd} bash -c '{remote_cmd}' _ \"$@\"\n"
+            f"{ssh_cmd} bash -c {sq(remote_cmd)} _ \"$@\"\n"
         )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
