@@ -194,6 +194,17 @@ async def _handle_start(
         chrome = assistant_cfg.get("chrome_extension", False)
     if chrome:
         config = replace(config, extra_args={"chrome": None})
+
+    # Resolve disabled skills/agents: session config overrides global (None = inherit)
+    disabled_skills = session_cfg.get("disabled_skills")
+    if disabled_skills is None:
+        disabled_skills = assistant_cfg.get("disabled_skills", [])
+    disabled_agents = session_cfg.get("disabled_agents")
+    if disabled_agents is None:
+        disabled_agents = assistant_cfg.get("disabled_agents", [])
+    disallowed = list(disabled_skills or []) + list(disabled_agents or [])
+    if disallowed:
+        config = replace(config, disallowed_tools=disallowed)
     try:
         await ws.send_bytes(orjson.dumps({
             "type": "status", "status": "connecting",

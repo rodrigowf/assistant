@@ -26,6 +26,7 @@ class ManagerConfig:
     max_turns: int | None = None
     mcp_servers: dict[str, McpServerConfig] | None = None
     extra_args: dict[str, str | None] | None = None
+    disallowed_tools: list[str] | None = None
 
     # SSH remote execution fields (all None = run locally)
     ssh_host: str | None = None
