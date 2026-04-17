@@ -367,17 +367,6 @@ class SessionManager:
         def sq(s: str) -> str:
             return "'" + s.replace("'", "'\\''") + "'"
 
-        # Build the remote bash -c command string and embed it safely in the script.
-        #
-        # Goal: ssh ... bash -c '<remote-cmd> "$@"' _ "$@"
-        #   - remote-cmd: the shell commands to run on the remote (export, cd, exec)
-        #   - "$@" after the closing ' expands SDK flags into bash positional args
-        #   - _ "$@" at the end sets $0 and passes SDK flags as $1,$2,...
-        #
-        # We write the entire SSH line to a HEREDOC in the script so no shell
-        # quoting of the wrapper script itself is needed for the bash -c argument.
-        # The sq() function ensures path values are safely embedded.
-
         # Build the remote bash -c script body:
         #   cd <sq(dir)> && CLAUDE_CONFIG_DIR=<sq(dir)> exec <sq(claude)> "$@"
         # The "$@" is INSIDE the bash -c body so bash expands it to positional args.
