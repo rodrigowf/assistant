@@ -12,13 +12,11 @@ from utils.paths import get_context_dir
 logger = logging.getLogger(__name__)
 
 # Keys that are valid in a session config (subset of global config)
-_ALLOWED_KEYS = {"working_directory", "enabled_mcps", "disabled_skills", "disabled_agents", "chrome_extension"}
+_ALLOWED_KEYS = {"working_directory", "enabled_mcps", "chrome_extension"}
 
 _DEFAULTS: dict[str, Any] = {
     "working_directory": None,     # None = inherit active from global config
     "enabled_mcps": None,          # None = inherit from global config
-    "disabled_skills": None,       # None = inherit from global config
-    "disabled_agents": None,       # None = inherit from global config
     "chrome_extension": None,      # None = inherit from global config
 }
 

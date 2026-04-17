@@ -284,8 +284,6 @@ class SessionManager:
             kwargs["mcp_servers"] = self._config.mcp_servers
         if self._config.extra_args:
             kwargs["extra_args"] = self._config.extra_args
-        if self._config.disallowed_tools:
-            kwargs["disallowed_tools"] = self._config.disallowed_tools
 
         # Strip CLAUDECODE to allow launching SDK sessions from within a
         # Claude Code process (e.g. VSCode extension or the wrapper itself).

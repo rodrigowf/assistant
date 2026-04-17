@@ -1,18 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   getConfig,
+  updateConfig,
   getSessionConfig,
   updateSessionConfig,
   listMcpServers,
-  listSkills,
-  listAgents,
   type AssistantConfig,
   type SessionConfig,
-  type SkillInfo,
-  type AgentInfo,
   type McpServerConfig,
   type WorkingDirectoryEntry,
 } from "../api/rest";
+import { WorkingDirectoryList } from "./WorkingDirectoryList";
 
 interface Props {
   isOpen: boolean;
@@ -29,8 +27,6 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
   const [globalConfig, setGlobalConfig] = useState<AssistantConfig | null>(null);
   const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(null);
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
-  const [skills, setSkills] = useState<SkillInfo[]>([]);
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -49,18 +45,14 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
     setLoading(true);
     setError(null);
     try {
-      const [globalCfg, sessionCfg, mcpRes, skillsRes, agentsRes] = await Promise.all([
+      const [globalCfg, sessionCfg, mcpRes] = await Promise.all([
         getConfig(),
         getSessionConfig(sessionId),
         listMcpServers(),
-        listSkills(),
-        listAgents(),
       ]);
       setGlobalConfig(globalCfg);
       setSessionConfig(sessionCfg);
       setMcpServers(mcpRes.servers);
-      setSkills(skillsRes.skills);
-      setAgents(agentsRes.agents);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -103,8 +95,6 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
   // Resolve effective values: session override or fall back to global
   const effectiveWdId = sessionConfig?.working_directory ?? globalConfig?.working_directory ?? null;
   const effectiveMcps = sessionConfig?.enabled_mcps ?? globalConfig?.enabled_mcps ?? [];
-  const effectiveDisabledSkills = sessionConfig?.disabled_skills ?? globalConfig?.disabled_skills ?? [];
-  const effectiveDisabledAgents = sessionConfig?.disabled_agents ?? globalConfig?.disabled_agents ?? [];
   const effectiveChrome = sessionConfig?.chrome_extension ?? globalConfig?.chrome_extension ?? false;
 
   const isInherited = (field: keyof SessionConfig) =>
@@ -114,27 +104,11 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
     await save({ [field]: null });
   }, [save]);
 
-  const selectWd = useCallback(async (id: string) => {
-    await save({ working_directory: id });
-  }, [save]);
-
   const toggleMcp = useCallback(async (name: string) => {
     const current = new Set(effectiveMcps);
     if (current.has(name)) current.delete(name); else current.add(name);
     await save({ enabled_mcps: Array.from(current) });
   }, [effectiveMcps, save]);
-
-  const toggleSkill = useCallback(async (name: string) => {
-    const current = new Set(effectiveDisabledSkills);
-    if (current.has(name)) current.delete(name); else current.add(name);
-    await save({ disabled_skills: Array.from(current) });
-  }, [effectiveDisabledSkills, save]);
-
-  const toggleAgent = useCallback(async (name: string) => {
-    const current = new Set(effectiveDisabledAgents);
-    if (current.has(name)) current.delete(name); else current.add(name);
-    await save({ disabled_agents: Array.from(current) });
-  }, [effectiveDisabledAgents, save]);
 
   const mcpNames = Object.keys(mcpServers);
   const wdHistory: WorkingDirectoryEntry[] = globalConfig?.working_directory_history ?? [];
@@ -199,40 +173,21 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
                   The directory Claude runs in for this session.
                   {isInherited("working_directory") && <span className="session-cfg-inherited"> (using global active directory)</span>}
                 </p>
-                {wdHistory.length > 0 && (
-                  <div className="wd-list">
-                    {wdHistory.map((entry) => {
-                      const isActive = entry.id === effectiveWdId;
-                      const isSSH = !!entry.ssh_host;
-                      const displayName = entry.label || (isSSH ? `${entry.ssh_host}:${entry.path}` : entry.path);
-                      const subtitle = isSSH
-                        ? `${entry.ssh_user ? entry.ssh_user + "@" : ""}${entry.ssh_host} · ${entry.path}`
-                        : null;
-                      return (
-                        <div key={entry.id} className={`wd-list-item${isActive ? " active" : ""}${isSSH ? " ssh" : ""}`}>
-                          <button
-                            className="wd-list-radio"
-                            onClick={() => !isActive && selectWd(entry.id)}
-                            title={isActive ? "Currently selected" : "Use this directory"}
-                            disabled={saving}
-                          >
-                            <span className={`wd-radio-dot${isActive ? " checked" : ""}`} />
-                          </button>
-                          <div className="wd-list-info">
-                            <div className="wd-list-path-row">
-                              {isSSH && <span className="wd-ssh-badge" title="Remote SSH">SSH</span>}
-                              <span className="wd-list-path" title={entry.id}>{displayName}</span>
-                            </div>
-                            {subtitle && <span className="wd-list-subtitle">{subtitle}</span>}
-                          </div>
-                          {isActive && <span className="wd-active-badge">
-                            {isInherited("working_directory") ? "global default" : "selected"}
-                          </span>}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                <WorkingDirectoryList
+                  history={wdHistory}
+                  activeId={effectiveWdId ?? ""}
+                  saving={saving}
+                  selectedLabel={isInherited("working_directory") ? "global default" : "selected"}
+                  onSelect={async (id) => { await save({ working_directory: id }); }}
+                  onHistoryChange={async (newHistory, newActiveId) => {
+                    try {
+                      const updated = await updateConfig({ working_directory_history: newHistory, ...(newActiveId ? { working_directory: newActiveId } : {}) });
+                      setGlobalConfig(updated);
+                      // If a new entry was added and selected, also save it as session override
+                      if (newActiveId) await save({ working_directory: newActiveId });
+                    } catch (e) { setError(String(e)); }
+                  }}
+                />
               </section>
 
               {/* ── Session Flags ─────────────────────────────── */}
@@ -291,74 +246,6 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
                           <div className="config-item-info">
                             <span className="config-item-name">{name}</span>
                             <span className="config-item-detail">{cfg.command} {cfg.args?.join(" ") ?? ""}</span>
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-
-              {/* ── Skills ───────────────────────────────────── */}
-              <section className="config-section">
-                <div className="config-section-header">
-                  <h3 className="config-section-title">Skills</h3>
-                  {!isInherited("disabled_skills") && (
-                    <button className="session-cfg-reset-btn" onClick={() => resetToGlobal("disabled_skills")} title="Reset to global default">
-                      Reset to global
-                    </button>
-                  )}
-                </div>
-                <p className="config-section-desc">
-                  Slash commands visible to this session.
-                  {isInherited("disabled_skills") && <span className="session-cfg-inherited"> (using global setting)</span>}
-                </p>
-                {skills.length === 0 ? (
-                  <div className="config-empty">No skills found</div>
-                ) : (
-                  <div className="config-item-list">
-                    {skills.map((skill) => {
-                      const enabled = !effectiveDisabledSkills.includes(skill.name);
-                      return (
-                        <label key={skill.name} className={`config-item${enabled ? " enabled" : ""}`}>
-                          <input type="checkbox" checked={enabled} onChange={() => toggleSkill(skill.name)} />
-                          <div className="config-item-info">
-                            <span className="config-item-name">/{skill.name}</span>
-                            {skill.description && <span className="config-item-detail">{skill.description}</span>}
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-
-              {/* ── Agents ───────────────────────────────────── */}
-              <section className="config-section">
-                <div className="config-section-header">
-                  <h3 className="config-section-title">Agents</h3>
-                  {!isInherited("disabled_agents") && (
-                    <button className="session-cfg-reset-btn" onClick={() => resetToGlobal("disabled_agents")} title="Reset to global default">
-                      Reset to global
-                    </button>
-                  )}
-                </div>
-                <p className="config-section-desc">
-                  Specialized subagents available to this session.
-                  {isInherited("disabled_agents") && <span className="session-cfg-inherited"> (using global setting)</span>}
-                </p>
-                {agents.length === 0 ? (
-                  <div className="config-empty">No agents found</div>
-                ) : (
-                  <div className="config-item-list">
-                    {agents.map((agent) => {
-                      const enabled = !effectiveDisabledAgents.includes(agent.name);
-                      return (
-                        <label key={agent.name} className={`config-item${enabled ? " enabled" : ""}`}>
-                          <input type="checkbox" checked={enabled} onChange={() => toggleAgent(agent.name)} />
-                          <div className="config-item-info">
-                            <span className="config-item-name">{agent.name}</span>
-                            {agent.description && <span className="config-item-detail">{agent.description}</span>}
                           </div>
                         </label>
                       );

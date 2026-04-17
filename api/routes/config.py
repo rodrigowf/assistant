@@ -89,8 +89,6 @@ def _default_config() -> dict[str, Any]:
         "working_directory": default_path,
         "working_directory_history": [default_entry],
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
-        "disabled_skills": [],  # list of skill names to hide
-        "disabled_agents": [],  # list of agent names to hide
         "chrome_extension": False,  # launch sessions with --chrome flag
         "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
     }
@@ -124,8 +122,6 @@ class ConfigUpdate(BaseModel):
     working_directory: str | None = None  # entry id to set as active
     working_directory_history: list[WorkingDirectoryEntry] | None = None  # full replacement
     enabled_mcps: list[str] | None = None
-    disabled_skills: list[str] | None = None
-    disabled_agents: list[str] | None = None
     chrome_extension: bool | None = None
     default_model: str | None = None  # default model for new orchestrator sessions
 
@@ -180,12 +176,6 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
 
     if body.enabled_mcps is not None:
         config["enabled_mcps"] = body.enabled_mcps
-
-    if body.disabled_skills is not None:
-        config["disabled_skills"] = body.disabled_skills
-
-    if body.disabled_agents is not None:
-        config["disabled_agents"] = body.disabled_agents
 
     if body.chrome_extension is not None:
         config["chrome_extension"] = body.chrome_extension
