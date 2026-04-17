@@ -388,7 +388,7 @@
 .message-list {
   flex: 1;
   overflow-y: auto;
-  padding: 40x 0 0;
+  padding: 40px 0 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -402,7 +402,7 @@
 }
 
 .message-list-inner {
-  padding-bottom: 8px;
+  padding-bottom: 26px;
 }
 
 .load-more-indicator {
