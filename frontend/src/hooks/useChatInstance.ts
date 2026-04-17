@@ -400,10 +400,12 @@ interface UseChatInstanceOptions {
   onVoiceCommand?: (command: Record<string, unknown>) => void;
   /** Called when the backend closes this session (session_stopped event). */
   onSessionClosed?: () => void;
+  /** Called when a fresh session receives its SDK session ID from the backend. */
+  onSdkSessionAssigned?: (sdkSessionId: string) => void;
 }
 
 export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
-  const { localId, resumeSdkId, onSessionChange, onStatusChange, wsEndpoint, skipHistory, onAgentSessionOpened, onAgentSessionClosed, onVoiceCommand, onSessionClosed } = options;
+  const { localId, resumeSdkId, onSessionChange, onStatusChange, wsEndpoint, skipHistory, onAgentSessionOpened, onAgentSessionClosed, onVoiceCommand, onSessionClosed, onSdkSessionAssigned } = options;
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const [wsActive, setWsActive] = useState(false);
   const [selectedMcps, setSelectedMcps] = useState<string[]>([]);
@@ -429,6 +431,8 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   onVoiceCommandRef.current = onVoiceCommand;
   const onSessionClosedRef = useRef(onSessionClosed);
   onSessionClosedRef.current = onSessionClosed;
+  const onSdkSessionAssignedRef = useRef(onSdkSessionAssigned);
+  onSdkSessionAssignedRef.current = onSdkSessionAssigned;
   const localIdRef = useRef(localId);
   localIdRef.current = localId;
   const resumeSdkIdRef = useRef(resumeSdkId);
@@ -482,6 +486,11 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
           sessionId: "",  // Don't update sessionId — local_id is stable
           inputTokens: (event.input_tokens as number | undefined) ?? (event.usage as Record<string, number> | undefined)?.input_tokens,
         });
+        // Capture the SDK session ID on first turn so the sidebar can match this tab
+        if (!resumeSdkIdRef.current && event.session_id) {
+          onSdkSessionAssignedRef.current?.(event.session_id as string);
+          resumeSdkIdRef.current = event.session_id as string;
+        }
         onSessionChangeRef.current?.();
         break;
       case "compact_complete":
@@ -550,7 +559,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     }
   }, [state.status, connectionState]);
 
-  // Auto-connect on mount
+  // Reset state and load history when the session (localId) changes.
+  // resumeSdkId is intentionally excluded — it may be set post-hoc after the
+  // first turn completes, and we must not RESET in that case (would clear live messages).
   useEffect(() => {
     let cancelled = false;
 
@@ -560,20 +571,21 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       paginationStartIndexRef.current = 0;
 
       // Load history using the SDK session ID (JSONL filename)
-      if (resumeSdkId && !skipHistory) {
+      const sdkId = resumeSdkIdRef.current;
+      if (sdkId && !skipHistory) {
         try {
-          const page = await getMessagesPaginated(resumeSdkId, 50);
+          const page = await getMessagesPaginated(sdkId, 50);
           if (cancelled) return;
           dispatch({ type: "LOAD_HISTORY", messages: page.messages });
           setHasMoreMessages(page.has_more);
           paginationStartIndexRef.current = page.start_index;
         } catch {
-          // Session may not exist anymore
+          // Session may not exist yet (e.g. running on remote backend)
         }
       }
 
       if (cancelled) return;
-      pendingStartRef.current = { resumeSdkId };
+      pendingStartRef.current = { resumeSdkId: resumeSdkIdRef.current };
       setWsActive(true);
     }
 
@@ -584,7 +596,8 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       wsClose();
       setWsActive(false);
     };
-  }, [localId, resumeSdkId, wsClose]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localId, wsClose]);
 
   const send = useCallback(
     (text: string) => {

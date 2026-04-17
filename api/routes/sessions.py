@@ -48,6 +48,13 @@ def list_sessions(
         local_id = s.get("session_id")  # pool keys sessions by local_id
         if sdk_id and local_id:
             sdk_to_local[sdk_id] = local_id
+    # Also include the orchestrator session mapping
+    if pool.has_orchestrator():
+        oid = pool.orchestrator_id
+        orc_session = pool.get_orchestrator()
+        jsonl_id = getattr(orc_session, "jsonl_id", oid) if orc_session else oid
+        if jsonl_id and oid:
+            sdk_to_local[jsonl_id] = oid
 
     return [
         SessionInfoResponse(

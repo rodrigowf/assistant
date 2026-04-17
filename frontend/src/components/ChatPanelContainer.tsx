@@ -43,6 +43,13 @@ function TabInstance({
     [updateTab, sessionId]
   );
 
+  const onSdkSessionAssigned = useCallback(
+    (sdkSessionId: string) => {
+      updateTab(sessionId, { resumeSdkId: sdkSessionId });
+    },
+    [updateTab, sessionId]
+  );
+
   const instance = useChatInstance({
     localId: sessionId,
     resumeSdkId,
@@ -53,6 +60,7 @@ function TabInstance({
     onAgentSessionOpened,
     onAgentSessionClosed,
     onSessionClosed,
+    onSdkSessionAssigned,
   });
 
   // Keep instancesRef up to date on every render.

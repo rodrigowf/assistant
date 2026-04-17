@@ -138,6 +138,9 @@ class SessionStore:
 
         sessions: list[SessionInfo] = []
         for jsonl_path in self._sessions_dir.glob("*.jsonl"):
+            # Skip Syncthing conflict files (e.g. foo.sync-conflict-20260416-XXXX.jsonl)
+            if ".sync-conflict-" in jsonl_path.name:
+                continue
             session_id = jsonl_path.stem
             info = self._parse_session_info(jsonl_path, session_id)
             if info is not None:
