@@ -381,9 +381,10 @@ class SessionManager:
         #   - sq(remote_cmd) is single-quoted (safe for all chars except the "$@")
         #   - ' "$@"' is appended outside the single-quoted block so $@ expands
         #   - the trailing _ "$@" sets $0 and passes SDK flags as $1,$2,...
+        bash_c_arg = sq(remote_cmd) + ' "$@"'
         script = (
             "#!/bin/sh\n"
-            f"{ssh_cmd} bash -c {sq(remote_cmd) + ' \"$@\"'} _ \"$@\"\n"
+            f'{ssh_cmd} bash -c {bash_c_arg} _ "$@"\n'
         )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
