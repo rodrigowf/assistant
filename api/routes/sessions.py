@@ -56,7 +56,13 @@ def list_sessions(
         if jsonl_id and oid:
             sdk_to_local[jsonl_id] = oid
 
-    return [
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    store_sessions = store.list_sessions()
+    store_sdk_ids = {s.session_id for s in store_sessions}
+
+    result = [
         SessionInfoResponse(
             session_id=s.session_id,
             started_at=s.started_at.isoformat(),
@@ -66,8 +72,30 @@ def list_sessions(
             is_orchestrator=s.is_orchestrator,
             local_id=sdk_to_local.get(s.session_id),
         )
-        for s in store.list_sessions()
+        for s in store_sessions
     ]
+
+    # Also include live pool sessions that have no local JSONL yet
+    # (e.g. brand-new SSH sessions whose JSONL lives on the remote machine)
+    for s in pool.list_sessions():
+        sdk_id = s.get("sdk_session_id")
+        local_id = s.get("session_id")
+        if sdk_id and sdk_id not in store_sdk_ids:
+            # Session is live but has no local history — show it with minimal metadata
+            result.insert(0, SessionInfoResponse(
+                session_id=sdk_id,
+                started_at=now_iso,
+                last_activity=now_iso,
+                title="(active session)",
+                message_count=s.get("turns", 0),
+                is_orchestrator=False,
+                local_id=local_id,
+            ))
+        elif not sdk_id and local_id and local_id not in store_sdk_ids:
+            # New session with no SDK ID yet — skip, nothing to show
+            pass
+
+    return result
 
 
 @router.get("/pool/live", response_model=list[PoolSessionResponse])

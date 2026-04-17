@@ -59,6 +59,9 @@ def _migrate_wd_history(history: list) -> list[dict]:
             item.setdefault("ssh_user", None)
             item.setdefault("ssh_key", None)
             item.setdefault("claude_config_dir", None)
+            # Auto-derive claude_config_dir for SSH entries that don't have it set
+            if item.get("ssh_host") and not item.get("claude_config_dir"):
+                item["claude_config_dir"] = item["path"].rstrip("/") + "/.claude_config"
             result.append(item)
     return result
 
