@@ -126,7 +126,7 @@ assistant/
 ├── default-skills/   # General-purpose skills (shareable)
 ├── default-scripts/  # General-purpose scripts (shareable)
 ├── default-agents/   # General-purpose agents (shareable)
-├── context/          # PRIVATE - Git submodule (assistant-context repo)
+├── context/          # PRIVATE - Standalone git repo, gitignored here (assistant-context repo)
 │   ├── *.jsonl       # Session files (SDK writes directly)
 │   ├── <uuid>/       # SDK state dirs (subagents, tool-results)
 │   ├── memory/       # Memory markdown files

@@ -51,7 +51,7 @@ assistant/                    # PUBLIC - shareable framework
 ├── index/                    # Vector search index (gitignored)
 └── .venv/                    # Python virtual environment
 
-context/                      # PRIVATE - Git submodule (assistant-context repo)
+context/                      # PRIVATE - Standalone git repo, gitignored here (assistant-context repo)
 ├── *.jsonl                   # Conversation JSONL files
 ├── <uuid>/                   # SDK state directories (subagents, tool-results)
 ├── memory/                   # Memory markdown files
@@ -65,11 +65,11 @@ context/                      # PRIVATE - Git submodule (assistant-context repo)
 
 **Public/Private separation:**
 - `default-skills/`, `default-scripts/`, and `default-agents/` contain general-purpose tools (shareable)
-- `context/` is a Git submodule pointing to a private repo (`assistant-context`)
+- `context/` is a standalone git repo (`assistant-context`), gitignored by the parent
 - `context/skills/` has symlinks to `default-skills/*` plus personalized skill folders
 - `context/scripts/` has symlinks to `default-scripts/*` plus personalized scripts
 - `context/agents/` has symlinks to `default-agents/*` plus personalized agents
-- Swap the `context/` submodule to migrate to a new environment
+- Swap the `context/` directory (clone a different context repo in its place) to migrate to a new environment
 
 `CLAUDE_CONFIG_DIR` is set to `.claude_config/` by `context/scripts/run.sh`. All code references `context/` directly via `utils/paths.py`.
 
@@ -104,7 +104,7 @@ The assistant supports multiple frontend surfaces beyond the main web interface:
 
 ### Memory System
 
-The `context/` folder is a Git submodule containing all private data, including the memory system:
+The `context/` folder is a standalone git repo (gitignored by the parent) containing all private data, including the memory system:
 
 ```
 context/
