@@ -113,7 +113,10 @@ class SessionPool:
         try:
             await sm.start()
         except Exception as e:
-            if resume_sdk_id and "No conversation found" in str(e):
+            # ProcessError stores the CLI stderr in e.stderr, not in str(e).
+            # Check both so we catch it regardless of SDK version.
+            stderr = getattr(e, "stderr", None) or ""
+            if resume_sdk_id and "No conversation found" in (str(e) + stderr):
                 # The SDK state for this session ID no longer exists (e.g. after a
                 # server restart).  Fall back to starting a fresh session so the
                 # frontend can continue working instead of showing an error.
