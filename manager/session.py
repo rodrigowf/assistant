@@ -366,17 +366,24 @@ class SessionManager:
         def sq(s: str) -> str:
             return "'" + s.replace("'", "'\\''") + "'"
 
-        # Build the remote bash -c script body
+        # Build the remote bash -c script body.
+        # IMPORTANT: "\"$@\"" must NOT be inside the sq()-quoted section —
+        # single quotes prevent $@ from expanding.  We close the quoted block
+        # before "$@" so the outer sh expands it into the bash -c positional args.
         parts = []
         if self._config.ssh_claude_config_dir:
             parts.append(f"export CLAUDE_CONFIG_DIR={sq(self._config.ssh_claude_config_dir)}")
         parts.append(f"cd {sq(self._config.project_dir)}")
-        parts.append(f"exec {sq(remote_claude)} \"$@\"")
+        parts.append(f"exec {sq(remote_claude)}")
         remote_cmd = " && ".join(parts)
 
+        # bash -c '<remote_cmd> "$@"' _ "$@"
+        #   - sq(remote_cmd) is single-quoted (safe for all chars except the "$@")
+        #   - ' "$@"' is appended outside the single-quoted block so $@ expands
+        #   - the trailing _ "$@" sets $0 and passes SDK flags as $1,$2,...
         script = (
             "#!/bin/sh\n"
-            f"{ssh_cmd} bash -c {sq(remote_cmd)} _ \"$@\"\n"
+            f"{ssh_cmd} bash -c {sq(remote_cmd) + ' \"$@\"'} _ \"$@\"\n"
         )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
