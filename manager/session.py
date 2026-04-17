@@ -362,58 +362,39 @@ class SessionManager:
 
         logger.debug("Remote claude path resolved to: %s", remote_claude)
 
-        # Shell-escape helper: wrap value in single quotes, escaping embedded single quotes
+        # Shell-escape helper: wraps a value in single quotes, escaping any embedded
+        # single quotes using the break-and-rejoin technique (e.g. ' → '\'' ).
         def sq(s: str) -> str:
             return "'" + s.replace("'", "'\\''") + "'"
 
-        # Build the remote bash -c script body.
+        # Build the remote bash -c script body:
+        #   cd <sq(dir)> && CLAUDE_CONFIG_DIR=<sq(dir)> exec <sq(claude)> "$@"
+        # The "$@" is INSIDE the bash -c body so bash expands it to positional args.
+        # Inside single quotes in the wrapper script, "$@" is literal (not expanded by sh).
         #
-        # Strategy: use sq() to quote each individual value, then join with &&.
-        # The resulting remote_cmd already has all values safely quoted with sq().
-        # We then wrap the WHOLE remote_cmd string with sq() for the bash -c argument.
-        #
-        # BUT: sq() produces 'value' strings. When we sq(remote_cmd), it will
-        # escape the single quotes inside (the ones from the individual sq() calls).
-        # That's actually correct — the outer sq() produces a valid single-quoted
-        # string with the inner single-quote sequences preserved.
-        #
-        # Example with path /home/foo (no quotes):
-        #   sq('/home/foo') = "'/home/foo'"
-        #   remote_cmd = "cd '/home/foo'"
-        #   sq(remote_cmd) = "'cd '\\'''/home/foo'\\'''" — WRONG, double escaping
-        #
-        # Correct approach: DON'T use sq() on individual values if sq()ing the whole.
-        # Instead, embed values raw and sq() the whole command once.
-        # But raw values may have spaces/special chars. Solution: use a different
-        # quoting approach — escape each value for embedding in a single-quoted context
-        # by ending the outer quote, adding the escaped value, and reopening.
-        #
-        # The final script line:
-        #   ssh ... bash -c 'cmd "$@"' _ "$@"
-        # where cmd has sq()-quoted values embedded via the break-and-rejoin technique.
-        #
-        # Since sq() already does the break-and-rejoin for individual values, we
-        # build remote_cmd from sq()-quoted parts, then use it as-is in a HEREDOC-style
-        # assignment. The trick: don't add another layer of quoting. Pass remote_cmd
-        # directly as the bash -c argument by putting it in an sh variable:
-
-        # Build plain remote command with sq()-quoted individual arguments
+        # NOTE: We intentionally avoid `export VAR=val` here. When a `bash -c` command
+        # containing `export` is run over SSH from a Python subprocess, bash emits a
+        # full `declare -x` environment dump on stdout — corrupting the SDK's JSON stream.
+        # Using the inline assignment prefix `VAR=val exec cmd` sets the variable in
+        # the child process environment without triggering this behaviour.
         parts = []
-        if self._config.ssh_claude_config_dir:
-            parts.append("export CLAUDE_CONFIG_DIR=" + sq(self._config.ssh_claude_config_dir))
         parts.append("cd " + sq(self._config.project_dir))
-        parts.append("exec " + sq(remote_claude) + ' "$@"')
+        if self._config.ssh_claude_config_dir:
+            exec_prefix = "CLAUDE_CONFIG_DIR=" + sq(self._config.ssh_claude_config_dir) + " "
+        else:
+            exec_prefix = ""
+        parts.append(exec_prefix + "exec " + sq(remote_claude) + ' "$@"')
         remote_cmd = " && ".join(parts)
 
-        # Write the SSH wrapper script. The remote command is assigned to a shell
-        # variable (avoiding all quoting of remote_cmd itself in the ssh arg), then
-        # invoked via `bash -c "$_cmd" _ "$@"` so positional args pass through.
-        # This sidesteps the double-quoting problem entirely.
-        script = (
-            "#!/bin/sh\n"
-            "_cmd=" + sq(remote_cmd) + "\n"
-            + ssh_cmd + ' bash -c "$_cmd" _ "$@"\n'
-        )
+        # sq(remote_cmd) wraps the whole script body in single quotes, escaping any
+        # embedded single quotes.  The "$@" inside the body stays literal inside the
+        # single-quoted block; bash expands it to positional args set by "_ SDK_FLAGS...".
+        #
+        # Final script line:
+        #   ssh ... bash -c 'cd /proj && [CLAUDE_CONFIG_DIR=/x ]exec /claude "$@"' _ "$@"
+        bash_c_arg = sq(remote_cmd)
+
+        script = "#!/bin/sh\n" + ssh_cmd + " bash -c " + bash_c_arg + ' _ "$@"\n'
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
         try:
