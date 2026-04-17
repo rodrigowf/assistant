@@ -35,10 +35,10 @@ remote_console.log
 # Claude Code runtime artifacts (created if CLAUDE_CONFIG_DIR is not set)
 .claude.json
 .claude.json.backup.*
-/debug/
-/projects/
-/todos/
-/plugins/
+debug/
+projects/
+todos/
+plugins/
 
 # Secrets, credentials, and certificates
 secrets/
