@@ -363,9 +363,19 @@ class SessionManager:
         logger.debug("Remote claude path resolved to: %s", remote_claude)
         remote_claude_escaped = remote_claude.replace("'", "'\\''")
 
+        # Build the remote command: optionally set CLAUDE_CONFIG_DIR, cd, exec claude
+        if self._config.ssh_claude_config_dir:
+            config_dir_escaped = self._config.ssh_claude_config_dir.replace("'", "'\\''")
+            remote_cmd = (
+                f"export CLAUDE_CONFIG_DIR='{config_dir_escaped}' && "
+                f"cd '{remote_path}' && exec '{remote_claude_escaped}' \"$@\""
+            )
+        else:
+            remote_cmd = f"cd '{remote_path}' && exec '{remote_claude_escaped}' \"$@\""
+
         script = (
             "#!/bin/sh\n"
-            f"{ssh_cmd} bash -c 'cd '\"'\"'{remote_path}'\"'\"' && exec '\"'\"'{remote_claude_escaped}'\"'\"' \"$@\"' _ \"$@\"\n"
+            f"{ssh_cmd} bash -c '{remote_cmd}' _ \"$@\"\n"
         )
 
         fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
