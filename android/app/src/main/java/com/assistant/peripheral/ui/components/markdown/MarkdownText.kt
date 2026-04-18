@@ -47,7 +47,7 @@ fun MarkdownText(
                 is MdBlock.OrderedList -> OrderedListBlock(block.items)
                 is MdBlock.Blockquote -> BlockquoteView(block.spans)
                 is MdBlock.Table -> TableBlock(block.headers, block.rows)
-                is MdBlock.HorizontalRule -> HorizontalDivider(
+                is MdBlock.HorizontalRule -> Divider(
                     modifier = Modifier.padding(vertical = 8.dp),
                     color = MdColors.border
                 )
@@ -237,7 +237,7 @@ private fun CodeBlockView(language: String, code: String) {
                         )
                     }
                 }
-                HorizontalDivider(color = MdColors.borderSubtle)
+                Divider(color = MdColors.borderSubtle)
             }
 
             // Code content with horizontal scroll

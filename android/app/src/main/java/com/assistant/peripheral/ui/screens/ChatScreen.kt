@@ -1,7 +1,9 @@
 package com.assistant.peripheral.ui.screens
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -20,8 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -127,7 +131,7 @@ fun ChatScreen(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 // Loading indicator at top when fetching older messages
                 if (isLoadingMoreMessages) {
@@ -295,7 +299,16 @@ private fun StatusBar(
     }
 }
 
-private const val FOLD_LINE_THRESHOLD = 25
+// User bubble palette — middle ground between the original Material primaryContainer
+// and the web's `--user-bg` (#18181F). Keeps the soft, muted feel of the web while
+// retaining enough blue saturation to distinguish user turns from assistant prose.
+private val UserBubbleBg = Color(0xFF1B2338)
+private val UserBubbleBorder = Color(0xFF303852)
+private val UserBubbleText = Color(0xFFEEEEF2)
+
+// Foldable user message — match web .user-text-foldable behaviour
+private const val USER_FOLD_LINE_THRESHOLD = 25
+private val USER_FOLD_COLLAPSED_MAX_HEIGHT = 150.dp
 
 @Composable
 private fun MessageItem(message: ChatMessage) {
@@ -306,6 +319,12 @@ private fun MessageItem(message: ChatMessage) {
     val compactBlock = message.blocks.filterIsInstance<MessageBlock.Compact>().firstOrNull()
     if (compactBlock != null) {
         CompactDivider(compactBlock.summary)
+        return
+    }
+
+    // Skip empty user/system messages (e.g. tool_result protocol wrappers).
+    // Assistant messages may legitimately be empty while streaming.
+    if ((isUser || isSystem) && message.content.isEmpty() && message.blocks.isEmpty()) {
         return
     }
 
@@ -323,9 +342,10 @@ private fun MessageItem(message: ChatMessage) {
                     bottomEnd = if (isUser) 4.dp else 16.dp
                 ),
                 color = when {
-                    isUser -> MaterialTheme.colorScheme.primaryContainer
+                    isUser -> UserBubbleBg
                     else -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
                 },
+                border = if (isUser) BorderStroke(1.dp, UserBubbleBorder) else null,
                 modifier = Modifier
                     .widthIn(max = 340.dp)
                     .animateContentSize()
@@ -334,15 +354,19 @@ private fun MessageItem(message: ChatMessage) {
                     if (message.blocks.isNotEmpty()) {
                         message.blocks.forEachIndexed { index, block ->
                             if (index > 0) Spacer(modifier = Modifier.height(8.dp))
-                            MessageBlockView(block, isUser = true)
+                            MessageBlockView(block, isUser = isUser)
                         }
                     } else {
-                        Text(
-                            text = message.content.ifEmpty { if (message.isStreaming) "..." else "" },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (isUser) MaterialTheme.colorScheme.onPrimaryContainer
-                                    else MaterialTheme.colorScheme.onErrorContainer
-                        )
+                        val text = message.content.ifEmpty { if (message.isStreaming) "..." else "" }
+                        if (isUser) {
+                            UserTextBlock(text)
+                        } else {
+                            Text(
+                                text = text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
                     }
 
                     if (message.isStreaming) {
@@ -394,11 +418,8 @@ private fun MessageBlockView(block: MessageBlock, isUser: Boolean = false) {
             val text = block.text.ifEmpty { if (block.isStreaming) "..." else "" }
             if (isUser) {
                 // User messages: plain text, no markdown (matches web .user-text)
-                Text(
-                    text = text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
+                // Foldable when over the line threshold (matches web .user-text-foldable)
+                UserTextBlock(text)
             } else {
                 // Assistant messages: full markdown rendering
                 MarkdownText(text = text)
@@ -415,6 +436,72 @@ private fun MessageBlockView(block: MessageBlock, isUser: Boolean = false) {
 
         is MessageBlock.Compact -> {
             // Handled separately as full-width divider
+        }
+    }
+}
+
+/**
+ * User-side text block. Mirrors web `.user-text` / `.user-text-foldable`:
+ * messages with more than [USER_FOLD_LINE_THRESHOLD] hard line breaks render
+ * collapsed (capped at [USER_FOLD_COLLAPSED_MAX_HEIGHT] with a bottom fade)
+ * and offer a "Show all (N lines)" / "Show less" toggle.
+ */
+@Composable
+private fun UserTextBlock(content: String) {
+    val lineCount = remember(content) { content.count { it == '\n' } + 1 }
+    val isTall = lineCount > USER_FOLD_LINE_THRESHOLD
+    var expanded by remember(content) { mutableStateOf(false) }
+
+    if (!isTall) {
+        Text(
+            text = content,
+            style = MaterialTheme.typography.bodyMedium,
+            color = UserBubbleText
+        )
+        return
+    }
+
+    Column(modifier = Modifier.animateContentSize()) {
+        Box {
+            Text(
+                text = content,
+                style = MaterialTheme.typography.bodyMedium,
+                color = UserBubbleText,
+                modifier = if (expanded) Modifier else Modifier
+                    .heightIn(max = USER_FOLD_COLLAPSED_MAX_HEIGHT)
+                    .clipToBounds()
+            )
+            if (!expanded) {
+                // Bottom-of-bubble fade matching web `mask-image: linear-gradient(...)`
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colorStops = arrayOf(
+                                    0.0f to UserBubbleBg.copy(alpha = 0f),
+                                    0.6f to UserBubbleBg.copy(alpha = 0f),
+                                    1.0f to UserBubbleBg
+                                )
+                            )
+                        )
+                )
+            }
+        }
+        TextButton(
+            onClick = { expanded = !expanded },
+            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+            modifier = Modifier
+                .align(Alignment.End)
+                .heightIn(min = 24.dp)
+                .padding(top = 4.dp)
+        ) {
+            Text(
+                text = if (expanded) "Show less" else "Show all ($lineCount lines)",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                fontSize = 11.sp
+            )
         }
     }
 }
@@ -624,7 +711,7 @@ private fun CompactDivider(summary: String) {
             .fillMaxWidth()
             .padding(vertical = 16.dp)
     ) {
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Divider(color = MaterialTheme.colorScheme.outlineVariant)
         Spacer(modifier = Modifier.height(8.dp))
         Row(
             modifier = Modifier
@@ -665,7 +752,7 @@ private fun CompactDivider(summary: String) {
             )
         }
         Spacer(modifier = Modifier.height(8.dp))
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Divider(color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 

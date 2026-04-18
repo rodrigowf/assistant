@@ -353,6 +353,14 @@ class ApiClient(private val baseUrl: String) {
             }
         }
 
+        // Skip protocol-only user/system messages (e.g. tool_result wrappers)
+        // that have no displayable content. These appear in JSONL as user-role
+        // entries containing only tool_result blocks, which we don't render
+        // standalone — the result is shown inside the corresponding tool_use block.
+        if (role != MessageRole.ASSISTANT && text.isEmpty() && blocks.isEmpty()) {
+            return null
+        }
+
         return ChatMessage(
             id = json.optString("id", java.util.UUID.randomUUID().toString()),
             role = role,
