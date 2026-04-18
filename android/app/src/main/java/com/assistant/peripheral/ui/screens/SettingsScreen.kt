@@ -16,6 +16,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.assistant.peripheral.data.AppSettings
 import com.assistant.peripheral.data.ConnectionState
+import com.assistant.peripheral.data.SavedServer
 import com.assistant.peripheral.data.ThemeMode
 import com.assistant.peripheral.network.DiscoveredServer
 import kotlin.math.roundToInt
@@ -43,6 +44,9 @@ fun SettingsScreen(
     onDisconnect: () -> Unit,
     onScanForServers: () -> Unit,
     onConnectToServer: (DiscoveredServer) -> Unit,
+    onAddSavedServer: (String, String) -> Unit,
+    onRemoveSavedServer: (String) -> Unit,
+    onSelectSavedServer: (SavedServer) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var serverUrl by remember(settings.serverUrl) { mutableStateOf(settings.serverUrl) }
@@ -166,6 +170,17 @@ fun SettingsScreen(
 
                     // Connection status
                     ConnectionStatusCard(connectionState)
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Saved Servers section
+                    SavedServersSection(
+                        savedServers = settings.savedServers,
+                        currentUrl = settings.serverUrl,
+                        onSelect = onSelectSavedServer,
+                        onRemove = onRemoveSavedServer,
+                        onAdd = onAddSavedServer
+                    )
 
                     Spacer(modifier = Modifier.height(16.dp))
 
@@ -705,6 +720,133 @@ fun SettingsScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun SavedServersSection(
+    savedServers: List<SavedServer>,
+    currentUrl: String,
+    onSelect: (SavedServer) -> Unit,
+    onRemove: (String) -> Unit,
+    onAdd: (String, String) -> Unit
+) {
+    var showAddForm by remember { mutableStateOf(false) }
+    var newLabel by remember { mutableStateOf("") }
+    var newUrl by remember { mutableStateOf("") }
+
+    Text(
+        text = "Saved Servers",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Spacer(modifier = Modifier.height(6.dp))
+
+    if (savedServers.isEmpty() && !showAddForm) {
+        Text(
+            text = "No saved servers. Add one for quick switching (e.g. Tailscale IP).",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    } else {
+        savedServers.forEach { server ->
+            val isSelected = currentUrl == server.url
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onSelect(server) },
+                color = if (isSelected)
+                    MaterialTheme.colorScheme.primaryContainer
+                else
+                    MaterialTheme.colorScheme.surfaceVariant,
+                shape = MaterialTheme.shapes.small
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Dns,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = if (isSelected)
+                            MaterialTheme.colorScheme.primary
+                        else
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = server.label,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = server.url,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(onClick = { onRemove(server.url) }) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Remove ${server.label}",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+    }
+
+    Spacer(modifier = Modifier.height(4.dp))
+
+    if (showAddForm) {
+        OutlinedTextField(
+            value = newLabel,
+            onValueChange = { newLabel = it },
+            label = { Text("Label") },
+            placeholder = { Text("e.g. Laptop (Tailscale)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        OutlinedTextField(
+            value = newUrl,
+            onValueChange = { newUrl = it },
+            label = { Text("WebSocket URL") },
+            placeholder = { Text("ws://100.111.80.128:8765") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Row {
+            TextButton(onClick = {
+                showAddForm = false
+                newLabel = ""
+                newUrl = ""
+            }) { Text("Cancel") }
+            Spacer(modifier = Modifier.width(4.dp))
+            TextButton(
+                onClick = {
+                    onAdd(newLabel, newUrl)
+                    showAddForm = false
+                    newLabel = ""
+                    newUrl = ""
+                },
+                enabled = newLabel.isNotBlank() && newUrl.isNotBlank()
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Save")
+            }
+        }
+    } else {
+        TextButton(onClick = { showAddForm = true }) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(modifier = Modifier.width(4.dp))
+            Text("Add server")
         }
     }
 }
