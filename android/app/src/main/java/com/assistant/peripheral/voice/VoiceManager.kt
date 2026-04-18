@@ -2,6 +2,7 @@ package com.assistant.peripheral.voice
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaRecorder
@@ -236,8 +237,12 @@ class VoiceManager(
             audioManager?.abandonAudioFocus(null)
         }
         audioManager?.mode = AudioManager.MODE_NORMAL
-        @Suppress("DEPRECATION")
-        audioManager?.isSpeakerphoneOn = false
+        // Release the routing override we set in applySpeakerRouting() so the next app
+        // gets default audio routing. Don't hardcode isSpeakerphoneOn = false here —
+        // that leaves the system stuck in earpiece, which is exactly the bug we're fixing.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager?.clearCommunicationDevice()
+        }
         audioFocusRequest = null
     }
 
@@ -816,14 +821,35 @@ class VoiceManager(
     /**
      * Apply speakerphone routing based on [useEarpiece].
      * Called both at session start and after data channel opens (WebRTC may reset the mode).
+     *
+     * On API 31+ (Android 12+), `setSpeakerphoneOn()` is deprecated and *requires*
+     * MODIFY_AUDIO_SETTINGS to even be accepted; it's also unreliable in MODE_IN_COMMUNICATION.
+     * The modern API is [AudioManager.setCommunicationDevice], which explicitly picks the
+     * output endpoint for voice-call audio. We prefer it on S+ and fall back to the legacy
+     * API on older devices.
      */
     private fun applySpeakerRouting() {
         val am = audioManager ?: return
-        @Suppress("DEPRECATION")
-        if (useEarpiece) {
-            am.isSpeakerphoneOn = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val targetType = if (useEarpiece)
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            else
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            val devices = am.availableCommunicationDevices
+            val target = devices.firstOrNull { it.type == targetType }
+            if (target != null) {
+                val ok = am.setCommunicationDevice(target)
+                Log.d(TAG, "setCommunicationDevice(${if (useEarpiece) "EARPIECE" else "SPEAKER"}) → $ok")
+            } else {
+                // Earpiece not present (e.g. tablet) — fall back to clearing and using legacy speakerphone.
+                Log.w(TAG, "No communication device of type $targetType available; falling back to legacy API")
+                am.clearCommunicationDevice()
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = !useEarpiece
+            }
         } else {
-            am.isSpeakerphoneOn = true
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = !useEarpiece
         }
     }
 
