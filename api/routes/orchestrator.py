@@ -195,7 +195,7 @@ async def _handle_start(
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
             }
-            session_update = session.get_session_update()
+            session_update = await session.get_session_update()
             if session_update:
                 reconnect_payload["voice_session_update"] = session_update
             await ws.send_bytes(orjson.dumps(reconnect_payload))
@@ -210,7 +210,7 @@ async def _handle_start(
                 "model_info": session.get_model_info(),
             }
             if current_voice:
-                session_update = session.get_session_update()
+                session_update = await session.get_session_update()
                 if session_update:
                     reconnect_payload["voice_session_update"] = session_update
             await ws.send_bytes(orjson.dumps(reconnect_payload))
@@ -264,7 +264,7 @@ async def _handle_start(
         "model_info": session.get_model_info(),
     }
     if voice:
-        session_update = session.get_session_update()
+        session_update = await session.get_session_update()
         if session_update:
             started_payload["voice_session_update"] = session_update
 
