@@ -104,12 +104,11 @@ class OrchestratorAgent:
         else:
             raise TypeError(f"prompt must be str or dict, got {type(prompt)}")
 
-        # Build system prompt with conversation history for context continuity
-        system = build_system_prompt(
-            self._config,
-            self._context,
-            history=self._history,
-        )
+        # Build system prompt. Text mode passes the full history to the
+        # provider via messages=, so we don't need to duplicate it in the
+        # system prompt. Voice mode builds its own prompt via
+        # OrchestratorSession.get_session_update().
+        system = build_system_prompt(self._config, self._context)
         tools = self._registry.get_definitions()
 
         total_input_tokens = 0

@@ -192,10 +192,19 @@ enum class ThemeMode {
 }
 
 /**
+ * A user-saved server entry shown in Settings for quick switching.
+ */
+data class SavedServer(
+    val label: String,
+    val url: String
+)
+
+/**
  * App settings stored in DataStore.
  */
 data class AppSettings(
     val serverUrl: String = "ws://192.168.0.200:80",
+    val savedServers: List<SavedServer> = emptyList(),
     val autoConnect: Boolean = true,
     val enableWakeWord: Boolean = true,
     val wakeWord: String = "my friend",        // comma-separated, triggers turn-based voice input

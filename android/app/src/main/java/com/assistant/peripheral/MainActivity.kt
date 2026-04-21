@@ -219,10 +219,13 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
 
     // Auto-connect or auto-scan on launch
     LaunchedEffect(Unit) {
+        val defaultUrl = com.assistant.peripheral.data.AppSettings().serverUrl
+        val hasCustomUrl = settings.serverUrl != defaultUrl
         if (settings.autoConnect) {
             viewModel.connect()
-        } else {
-            // Scan for backends even when auto-connect is off
+        } else if (!hasCustomUrl) {
+            // Only scan when using the default URL — if the user has chosen a server
+            // (saved or manually entered), skip the subnet sweep.
             viewModel.scanForServers()
         }
         // Start foreground service (wake word config applied separately below)
@@ -240,9 +243,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         )
     }
 
-    // Also scan when auto-connect is on but we fail to connect after a moment
+    // Also scan when auto-connect is on but we fail to connect after a moment.
+    // Skip when the user has a custom (non-default) server URL — no need to sweep the subnet.
     LaunchedEffect(settings.autoConnect) {
-        if (settings.autoConnect) {
+        val defaultUrl = com.assistant.peripheral.data.AppSettings().serverUrl
+        val hasCustomUrl = settings.serverUrl != defaultUrl
+        if (settings.autoConnect && !hasCustomUrl) {
             viewModel.scanForServers()
         }
     }
@@ -347,7 +353,10 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                     onConnect = viewModel::connect,
                     onDisconnect = viewModel::disconnect,
                     onScanForServers = viewModel::scanForServers,
-                    onConnectToServer = viewModel::connectToDiscoveredServer
+                    onConnectToServer = viewModel::connectToDiscoveredServer,
+                    onAddSavedServer = viewModel::addSavedServer,
+                    onRemoveSavedServer = viewModel::removeSavedServer,
+                    onSelectSavedServer = viewModel::selectSavedServer
                 )
             }
         }

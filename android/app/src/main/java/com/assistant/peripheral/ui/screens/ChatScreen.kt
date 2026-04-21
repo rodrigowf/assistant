@@ -1,12 +1,16 @@
 package com.assistant.peripheral.ui.screens
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -18,8 +22,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -27,6 +36,8 @@ import androidx.compose.ui.unit.sp
 import com.assistant.peripheral.data.*
 import com.assistant.peripheral.ui.components.VoiceButton
 import com.assistant.peripheral.ui.components.VoiceControls
+import com.assistant.peripheral.ui.components.markdown.MdColors
+import com.assistant.peripheral.ui.components.markdown.MarkdownText
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -120,7 +131,7 @@ fun ChatScreen(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 // Loading indicator at top when fetching older messages
                 if (isLoadingMoreMessages) {
@@ -288,6 +299,17 @@ private fun StatusBar(
     }
 }
 
+// User bubble palette — middle ground between the original Material primaryContainer
+// and the web's `--user-bg` (#18181F). Keeps the soft, muted feel of the web while
+// retaining enough blue saturation to distinguish user turns from assistant prose.
+private val UserBubbleBg = Color(0xFF1B2338)
+private val UserBubbleBorder = Color(0xFF303852)
+private val UserBubbleText = Color(0xFFEEEEF2)
+
+// Foldable user message — match web .user-text-foldable behaviour
+private const val USER_FOLD_LINE_THRESHOLD = 25
+private val USER_FOLD_COLLAPSED_MAX_HEIGHT = 150.dp
+
 @Composable
 private fun MessageItem(message: ChatMessage) {
     val isUser = message.role == MessageRole.USER
@@ -300,54 +322,87 @@ private fun MessageItem(message: ChatMessage) {
         return
     }
 
+    // Skip empty user/system messages (e.g. tool_result protocol wrappers).
+    // Assistant messages may legitimately be empty while streaming.
+    if ((isUser || isSystem) && message.content.isEmpty() && message.blocks.isEmpty()) {
+        return
+    }
+
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
     ) {
-        // Message bubble
-        Surface(
-            shape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (isUser) 16.dp else 4.dp,
-                bottomEnd = if (isUser) 4.dp else 16.dp
-            ),
-            color = when {
-                isUser -> MaterialTheme.colorScheme.primaryContainer
-                isSystem -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
-                else -> MaterialTheme.colorScheme.surfaceVariant
-            },
-            modifier = Modifier
-                .widthIn(max = 340.dp)
-                .animateContentSize()
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                // Render blocks
+        if (isUser || isSystem) {
+            // USER / SYSTEM: Keep bubble with rounded corners
+            Surface(
+                shape = RoundedCornerShape(
+                    topStart = 16.dp,
+                    topEnd = 16.dp,
+                    bottomStart = if (isUser) 16.dp else 4.dp,
+                    bottomEnd = if (isUser) 4.dp else 16.dp
+                ),
+                color = when {
+                    isUser -> UserBubbleBg
+                    else -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
+                },
+                border = if (isUser) BorderStroke(1.dp, UserBubbleBorder) else null,
+                modifier = Modifier
+                    .widthIn(max = 340.dp)
+                    .animateContentSize()
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    if (message.blocks.isNotEmpty()) {
+                        message.blocks.forEachIndexed { index, block ->
+                            if (index > 0) Spacer(modifier = Modifier.height(8.dp))
+                            MessageBlockView(block, isUser = isUser)
+                        }
+                    } else {
+                        val text = message.content.ifEmpty { if (message.isStreaming) "..." else "" }
+                        if (isUser) {
+                            UserTextBlock(text)
+                        } else {
+                            Text(
+                                text = text,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
+                    }
+
+                    if (message.isStreaming) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth().height(2.dp),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+        } else {
+            // ASSISTANT: Full-width prose, no bubble (matches web message-assistant)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .animateContentSize()
+            ) {
                 if (message.blocks.isNotEmpty()) {
                     message.blocks.forEachIndexed { index, block ->
-                        if (index > 0) Spacer(modifier = Modifier.height(8.dp))
-                        MessageBlockView(block, isUser = isUser)
+                        if (index > 0) Spacer(modifier = Modifier.height(4.dp))
+                        MessageBlockView(block, isUser = false)
                     }
                 } else {
-                    // Fallback to content
                     Text(
                         text = message.content.ifEmpty { if (message.isStreaming) "..." else "" },
                         style = MaterialTheme.typography.bodyMedium,
-                        color = when {
-                            isUser -> MaterialTheme.colorScheme.onPrimaryContainer
-                            isSystem -> MaterialTheme.colorScheme.onErrorContainer
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        }
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                 }
 
-                // Streaming indicator
                 if (message.isStreaming) {
                     Spacer(modifier = Modifier.height(8.dp))
                     LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(2.dp),
+                        modifier = Modifier.fillMaxWidth().height(2.dp),
                         color = MaterialTheme.colorScheme.primary
                     )
                 }
@@ -360,12 +415,15 @@ private fun MessageItem(message: ChatMessage) {
 private fun MessageBlockView(block: MessageBlock, isUser: Boolean = false) {
     when (block) {
         is MessageBlock.Text -> {
-            Text(
-                text = block.text.ifEmpty { if (block.isStreaming) "..." else "" },
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (isUser) MaterialTheme.colorScheme.onPrimaryContainer
-                        else MaterialTheme.colorScheme.onSurface
-            )
+            val text = block.text.ifEmpty { if (block.isStreaming) "..." else "" }
+            if (isUser) {
+                // User messages: plain text, no markdown (matches web .user-text)
+                // Foldable when over the line threshold (matches web .user-text-foldable)
+                UserTextBlock(text)
+            } else {
+                // Assistant messages: full markdown rendering
+                MarkdownText(text = text)
+            }
         }
 
         is MessageBlock.Thinking -> {
@@ -382,62 +440,138 @@ private fun MessageBlockView(block: MessageBlock, isUser: Boolean = false) {
     }
 }
 
+/**
+ * User-side text block. Mirrors web `.user-text` / `.user-text-foldable`:
+ * messages with more than [USER_FOLD_LINE_THRESHOLD] hard line breaks render
+ * collapsed (capped at [USER_FOLD_COLLAPSED_MAX_HEIGHT] with a bottom fade)
+ * and offer a "Show all (N lines)" / "Show less" toggle.
+ */
+@Composable
+private fun UserTextBlock(content: String) {
+    val lineCount = remember(content) { content.count { it == '\n' } + 1 }
+    val isTall = lineCount > USER_FOLD_LINE_THRESHOLD
+    var expanded by remember(content) { mutableStateOf(false) }
+
+    if (!isTall) {
+        Text(
+            text = content,
+            style = MaterialTheme.typography.bodyMedium,
+            color = UserBubbleText
+        )
+        return
+    }
+
+    Column(modifier = Modifier.animateContentSize()) {
+        Box {
+            Text(
+                text = content,
+                style = MaterialTheme.typography.bodyMedium,
+                color = UserBubbleText,
+                modifier = if (expanded) Modifier else Modifier
+                    .heightIn(max = USER_FOLD_COLLAPSED_MAX_HEIGHT)
+                    .clipToBounds()
+            )
+            if (!expanded) {
+                // Bottom-of-bubble fade matching web `mask-image: linear-gradient(...)`
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colorStops = arrayOf(
+                                    0.0f to UserBubbleBg.copy(alpha = 0f),
+                                    0.6f to UserBubbleBg.copy(alpha = 0f),
+                                    1.0f to UserBubbleBg
+                                )
+                            )
+                        )
+                )
+            }
+        }
+        TextButton(
+            onClick = { expanded = !expanded },
+            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+            modifier = Modifier
+                .align(Alignment.End)
+                .heightIn(min = 24.dp)
+                .padding(top = 4.dp)
+        ) {
+            Text(
+                text = if (expanded) "Show less" else "Show all ($lineCount lines)",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                fontSize = 11.sp
+            )
+        }
+    }
+}
+
 @Composable
 private fun ThinkingBlock(block: MessageBlock.Thinking) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember { mutableStateOf(block.isStreaming) }
 
-    Surface(
+    // Left-border-only style matching web .thinking-block
+    val borderColor = MdColors.thinkingBorder
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { expanded = !expanded },
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            Color(0xFFC4923A).copy(alpha = 0.3f)
-        )
+            .drawBehind {
+                // 2dp left border in amber
+                drawLine(
+                    color = borderColor,
+                    start = Offset(0f, 0f),
+                    end = Offset(0f, size.height),
+                    strokeWidth = 2.dp.toPx()
+                )
+            }
+            .background(
+                color = MdColors.thinkingBg,
+                shape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
+            )
+            .clickable { expanded = !expanded }
     ) {
-        Column(modifier = Modifier.padding(8.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Psychology,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                    tint = Color(0xFFC4923A)
+        // Toggle header
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Streaming dots
+            if (block.isStreaming) {
+                Text(
+                    text = "...",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MdColors.thinkingBorder
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Thinking",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color(0xFFC4923A)
-                )
-                if (block.isStreaming) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(12.dp),
-                        strokeWidth = 2.dp,
-                        color = Color(0xFFC4923A)
-                    )
-                }
-                Spacer(modifier = Modifier.weight(1f))
-                Icon(
-                    imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
-                    modifier = Modifier.size(20.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
+            Text(
+                text = if (block.isStreaming) "Thinking" else "Thought",
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.W600
+                ),
+                color = MdColors.thinkingBorder
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            Text(
+                text = if (expanded) "\u2212" else "+",  // − or +
+                style = MaterialTheme.typography.labelMedium,
+                color = MdColors.textMuted,
+                fontSize = 14.sp
+            )
+        }
 
-            if (expanded) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = block.text,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
-                )
-            }
+        // Content (collapsible)
+        if (expanded) {
+            Text(
+                text = block.text,
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontStyle = FontStyle.Italic,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                ),
+                color = MdColors.textMuted,
+                modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp)
+            )
         }
     }
 }
@@ -447,84 +581,122 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
     var expanded by remember { mutableStateOf(false) }
 
     val toolColor = getToolColor(block.toolName)
+    val summary = formatToolSummary(block.toolName, block.toolInput)
 
-    Surface(
+    // Left-border-only style matching web .tool-block
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { expanded = !expanded },
-        shape = RoundedCornerShape(8.dp),
-        color = toolColor.copy(alpha = 0.07f),
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            toolColor.copy(alpha = 0.3f)
-        )
-    ) {
-        Column(modifier = Modifier.padding(8.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = getToolIcon(block.toolName),
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                    tint = toolColor
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = block.toolName,
-                    style = MaterialTheme.typography.labelMedium.copy(
-                        fontFamily = FontFamily.Monospace
-                    ),
+            .drawBehind {
+                // 2dp left border in category color
+                drawLine(
                     color = toolColor,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
+                    start = Offset(0f, 0f),
+                    end = Offset(0f, size.height),
+                    strokeWidth = 2.dp.toPx()
                 )
+            }
+            .background(
+                color = toolColor.copy(alpha = 0.04f),
+                shape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
+            )
+            .clickable { expanded = !expanded }
+    ) {
+        // Toggle header
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = getToolIcon(block.toolName),
+                contentDescription = null,
+                modifier = Modifier.size(15.dp),
+                tint = toolColor
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+                    fontSize = 12.sp
+                ),
+                color = toolColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
 
-                // Status indicator
-                when {
-                    block.isExecuting -> {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(14.dp),
-                            strokeWidth = 2.dp,
-                            color = toolColor
-                        )
-                    }
-                    block.isComplete -> {
+            // Status badge (matching web .tool-status)
+            when {
+                block.isExecuting -> {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = toolColor
+                    )
+                }
+                block.isComplete -> {
+                    Row(
+                        modifier = Modifier
+                            .background(
+                                color = if (block.isError) MaterialTheme.colorScheme.errorContainer
+                                        else MaterialTheme.colorScheme.tertiaryContainer,
+                                shape = RoundedCornerShape(5.dp)
+                            )
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Icon(
                             imageVector = if (block.isError) Icons.Default.Error else Icons.Default.CheckCircle,
                             contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = if (block.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                            modifier = Modifier.size(10.dp),
+                            tint = if (block.isError) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.tertiary
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (block.isError) "error" else "done",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 9.sp,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.W600
+                            ),
+                            color = if (block.isError) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.tertiary
                         )
                     }
                 }
-
-                Spacer(modifier = Modifier.width(4.dp))
-                Icon(
-                    imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                    contentDescription = if (expanded) "Collapse" else "Expand",
-                    modifier = Modifier.size(20.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
 
-            if (expanded && block.result != null) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Surface(
-                    shape = RoundedCornerShape(4.dp),
-                    color = MaterialTheme.colorScheme.surface
-                ) {
-                    Text(
-                        text = block.result.take(500) + if (block.result.length > 500) "..." else "",
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp
-                        ),
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-                        modifier = Modifier.padding(8.dp)
-                    )
-                }
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (expanded) "\u25BC" else "\u25B6",  // ▼ or ▶
+                style = MaterialTheme.typography.labelSmall,
+                color = MdColors.textMuted,
+                fontSize = 10.sp
+            )
+        }
+
+        // Expanded content
+        if (expanded && block.result != null) {
+            Surface(
+                shape = RoundedCornerShape(4.dp),
+                color = MaterialTheme.colorScheme.surface,
+                modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp)
+            ) {
+                val scrollState = rememberScrollState()
+                Text(
+                    text = block.result,
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp
+                    ),
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                    modifier = Modifier
+                        .horizontalScroll(scrollState)
+                        .padding(8.dp)
+                )
             }
         }
     }
@@ -532,6 +704,8 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
 
 @Composable
 private fun CompactDivider(summary: String) {
+    var expanded by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -540,21 +714,41 @@ private fun CompactDivider(summary: String) {
         Divider(color = MaterialTheme.colorScheme.outlineVariant)
         Spacer(modifier = Modifier.height(8.dp))
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = summary.isNotBlank()) { expanded = !expanded },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
-            Icon(
-                imageVector = Icons.Default.Compress,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+            Text(
+                text = "\u27F3",  // ⟳
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "Conversation compacted",
+                text = "Context compacted",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+            )
+            if (summary.isNotBlank()) {
+                Text(
+                    text = if (expanded) " \u25B2" else " \u25BC",  // ▲ or ▼
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                )
+            }
+        }
+        if (expanded && summary.isNotBlank()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontStyle = FontStyle.Italic,
+                    lineHeight = 18.sp
+                ),
+                color = MdColors.textMuted,
+                modifier = Modifier.padding(horizontal = 16.dp)
             )
         }
         Spacer(modifier = Modifier.height(8.dp))
@@ -686,6 +880,53 @@ private fun ChatInputBar(
                 }
             }
         }
+    }
+}
+
+// Format a contextual summary for the tool (matching web formatToolSummary)
+private fun formatToolSummary(toolName: String, input: Map<String, Any?>): String {
+    fun formatPath(path: Any?): String {
+        val s = path?.toString() ?: return toolName
+        val parts = s.split("/")
+        return if (parts.size > 3) ".../${parts.takeLast(2).joinToString("/")}" else s
+    }
+
+    return when (toolName) {
+        "Read" -> input["file_path"]?.let { "Read ${formatPath(it)}" } ?: "Read"
+        "Write" -> input["file_path"]?.let { "Write ${formatPath(it)}" } ?: "Write"
+        "Edit" -> input["file_path"]?.let { "Edit ${formatPath(it)}" } ?: "Edit"
+        "NotebookEdit" -> input["notebook_path"]?.let { "Edit notebook ${formatPath(it)}" } ?: "Edit notebook"
+        "Bash" -> {
+            val desc = input["description"]?.toString()
+            val cmd = input["command"]?.toString()
+            when {
+                desc != null -> desc
+                cmd != null -> cmd.take(60) + if (cmd.length > 60) "..." else ""
+                else -> "Bash"
+            }
+        }
+        "Glob" -> input["pattern"]?.let { "Glob $it" } ?: "Glob"
+        "Grep" -> input["pattern"]?.let { "Grep \"$it\"" } ?: "Grep"
+        "WebFetch" -> input["url"]?.let { "Fetch $it" } ?: "WebFetch"
+        "WebSearch" -> input["query"]?.let { "Search \"$it\"" } ?: "WebSearch"
+        "Task" -> input["description"]?.let { "Task: $it" } ?: "Task"
+        "TodoWrite" -> "Update todos"
+        "AskUserQuestion" -> "Ask user"
+        "Skill" -> input["skill"]?.let { "/$it" } ?: "Skill"
+        "EnterPlanMode" -> "Enter plan mode"
+        "ExitPlanMode" -> "Exit plan mode"
+        // Orchestrator tools
+        "list_agent_sessions" -> "List active sessions"
+        "open_agent_session" -> if (input["resume_sdk_id"] != null) "Resume session" else "Open agent session"
+        "send_to_agent_session" -> {
+            val msg = input["message"]?.toString()
+            msg?.take(60)?.let { it + if (msg.length > 60) "..." else "" } ?: "Send to agent"
+        }
+        "search_history" -> input["query"]?.let { "Search history \"$it\"" } ?: "Search history"
+        "search_memory" -> input["query"]?.let { "Search memory \"$it\"" } ?: "Search memory"
+        "read_file" -> input["path"]?.let { "Read ${formatPath(it)}" } ?: "Read file"
+        "write_file" -> input["path"]?.let { "Write ${formatPath(it)}" } ?: "Write file"
+        else -> toolName
     }
 }
 

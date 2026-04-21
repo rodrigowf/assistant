@@ -21,7 +21,16 @@ def _get_auth_env() -> dict[str, str]:
 
 
 def _get_credentials_path() -> Path:
-    """Get path to Claude credentials file."""
+    """Get path to Claude credentials file.
+
+    Honors ``CLAUDE_CONFIG_DIR`` (set by run.sh) so credentials are read and
+    written at the same location the SDK reads them from — i.e. the project's
+    ``.claude_config/`` — rather than the user-global ``~/.claude/``. Falls
+    back to ``~/.claude/.credentials.json`` when the env var is unset.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir) / ".credentials.json"
     return Path.home() / ".claude" / ".credentials.json"
 
 

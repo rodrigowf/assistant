@@ -163,6 +163,21 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val ECHO_DUCKING_GAIN = floatPreferencesKey("echo_ducking_gain")
         val USE_EARPIECE = booleanPreferencesKey("use_earpiece")
         val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
+        val SAVED_SERVERS = stringPreferencesKey("saved_servers")
+    }
+
+    // Saved servers are persisted as "label\turl|label\turl|..." — no quoting needed
+    // since labels/urls never contain tab or pipe in practice.
+    private fun encodeSavedServers(servers: List<SavedServer>): String =
+        servers.joinToString("|") { "${it.label}\t${it.url}" }
+
+    private fun decodeSavedServers(raw: String?): List<SavedServer> {
+        if (raw.isNullOrEmpty()) return emptyList()
+        return raw.split("|").mapNotNull { entry ->
+            val parts = entry.split("\t", limit = 2)
+            if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank())
+                SavedServer(parts[0], parts[1]) else null
+        }
     }
 
     init {
@@ -176,6 +191,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
                 _settings.value = AppSettings(
                     serverUrl = newServerUrl,
+                    savedServers = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS]),
                     autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
                     enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
                     wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
@@ -939,6 +955,38 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.SERVER_URL] = url
+            }
+        }
+    }
+
+    fun addSavedServer(label: String, url: String) {
+        val cleanLabel = label.trim()
+        val cleanUrl = url.trim()
+        if (cleanLabel.isEmpty() || cleanUrl.isEmpty()) return
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                val existing = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS])
+                // Replace any entry with the same url, else append.
+                val updated = existing.filterNot { it.url == cleanUrl } + SavedServer(cleanLabel, cleanUrl)
+                preferences[PreferenceKeys.SAVED_SERVERS] = encodeSavedServers(updated)
+            }
+        }
+    }
+
+    fun removeSavedServer(url: String) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                val existing = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS])
+                val updated = existing.filterNot { it.url == url }
+                preferences[PreferenceKeys.SAVED_SERVERS] = encodeSavedServers(updated)
+            }
+        }
+    }
+
+    fun selectSavedServer(server: SavedServer) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.SERVER_URL] = server.url
             }
         }
     }
