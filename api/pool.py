@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import uuid as _uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -41,6 +42,14 @@ class SessionPool:
         self._sessions: dict[str, SessionManager] = {}
         self._subscribers: dict[str, set[WebSocket]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+        # Per-remote-host create() serialization. When N concurrent callers
+        # try to spawn sessions on the same SSH host, we serialize them here
+        # so (a) the ControlMaster socket is established by the first call
+        # before the rest rush in, and (b) a transient SSH failure doesn't
+        # get amplified by a parallel retry storm.  Local (non-SSH) sessions
+        # bypass this lock entirely — they have no shared resource to guard.
+        self._host_create_locks: dict[str, asyncio.Lock] = {}
 
         # Single orchestrator session
         self._orchestrator: Any | None = None  # OrchestratorSession
@@ -83,7 +92,34 @@ class SessionPool:
             mcp_servers: Optional dict of MCP servers to load. If provided, overrides
                          the mcp_servers in config.
         """
-        # Deduplicate: reuse an existing pool session with the same SDK ID
+        # Serialize concurrent create()s that target the same remote SSH host.
+        # This prevents a stampede of simultaneous SSH handshakes (e.g. from a
+        # browser reconnect storm) that historically triggered session churn
+        # on the remote host.  Local sessions skip the lock since there is no
+        # shared SSH resource to protect.
+        if config.ssh_host:
+            lock = self._host_create_locks.setdefault(config.ssh_host, asyncio.Lock())
+            async with lock:
+                return await self._do_create(
+                    config, local_id, resume_sdk_id, fork, mcp_servers
+                )
+        return await self._do_create(
+            config, local_id, resume_sdk_id, fork, mcp_servers
+        )
+
+    async def _do_create(
+        self,
+        config: ManagerConfig,
+        local_id: str | None,
+        resume_sdk_id: str | None,
+        fork: bool,
+        mcp_servers: dict[str, dict] | None,
+    ) -> str:
+        """Inner body of create(), executed under the per-host lock if SSH."""
+        # Deduplicate: reuse an existing pool session with the same SDK ID.
+        # Crucially this runs *inside* the host lock, so if two reconnects
+        # both try to spawn the same session the first wins and the second
+        # finds it already present.
         if resume_sdk_id and not fork:
             existing = self.find_by_sdk_id(resume_sdk_id)
             if existing:
@@ -120,10 +156,16 @@ class SessionPool:
                 # The SDK state for this session ID no longer exists (e.g. after a
                 # server restart).  Fall back to starting a fresh session so the
                 # frontend can continue working instead of showing an error.
+                # Back off briefly before the retry so a *transient* remote
+                # failure — which also surfaces as "No conversation found" when
+                # the SSH wrapper couldn't reach the remote claude — doesn't
+                # get hammered.  One retry only; if that also fails, surface
+                # the error to the caller instead of looping.
                 logger.warning(
                     "Resume SDK ID %s not found in Claude state; starting fresh session",
                     resume_sdk_id,
                 )
+                await asyncio.sleep(0.5 + random.random() * 0.5)
                 sm = SessionManager(
                     session_id=None,
                     local_id=lid,
