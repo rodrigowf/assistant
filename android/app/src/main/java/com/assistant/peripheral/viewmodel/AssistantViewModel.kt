@@ -161,7 +161,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
         val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
         val ECHO_DUCKING_GAIN = floatPreferencesKey("echo_ducking_gain")
-        val USE_EARPIECE = booleanPreferencesKey("use_earpiece")
+        val AUDIO_OUTPUT = stringPreferencesKey("audio_output")  // enum: EARPIECE / LOUDSPEAKER / BLUETOOTH
         val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
         val SAVED_SERVERS = stringPreferencesKey("saved_servers")
     }
@@ -205,7 +205,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     wakeWordMicGainLevel = preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] ?: 1.0f,
                     speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
                     echoDuckingGain = preferences[PreferenceKeys.ECHO_DUCKING_GAIN] ?: AppSettings().echoDuckingGain,
-                    useEarpiece = preferences[PreferenceKeys.USE_EARPIECE] ?: false,
+                    audioOutput = AudioOutput.fromString(preferences[PreferenceKeys.AUDIO_OUTPUT]),
                     enableButtonTrigger = preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] ?: false
                 )
                 // Sync button trigger setting to SharedPreferences so ButtonAccessibilityService can read it
@@ -218,7 +218,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 voiceManager = VoiceManager(getApplication(), apiClient!!).also {
                     it.setMicGain(_settings.value.micGainLevel)
                     it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                    it.setUseEarpiece(_settings.value.useEarpiece)
+                    it.setAudioOutput(_settings.value.audioOutput)
                 }
                 setupVoiceManagerCallbacks()
 
@@ -1038,15 +1038,23 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun updateEarpieceMode(enabled: Boolean) {
+    fun updateAudioOutput(output: AudioOutput) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
-                preferences[PreferenceKeys.USE_EARPIECE] = enabled
+                preferences[PreferenceKeys.AUDIO_OUTPUT] = output.name
             }
             // Apply immediately to VoiceManager so next session picks it up
-            voiceManager?.setUseEarpiece(enabled)
+            voiceManager?.setAudioOutput(output)
         }
     }
+
+    /**
+     * Whether a Bluetooth audio output device is currently available (paired + connected).
+     * UI should call this to decide whether to enable the BLUETOOTH segment. Safe to call
+     * on any thread; returns false if VoiceManager hasn't been initialized yet.
+     */
+    fun isBluetoothAudioAvailable(): Boolean =
+        voiceManager?.isBluetoothAudioAvailable() == true
 
     fun updateSpeakerVolumeLevel(level: Float) {
         viewModelScope.launch {

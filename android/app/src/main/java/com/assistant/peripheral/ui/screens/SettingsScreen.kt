@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.assistant.peripheral.data.AppSettings
+import com.assistant.peripheral.data.AudioOutput
 import com.assistant.peripheral.data.ConnectionState
 import com.assistant.peripheral.data.SavedServer
 import com.assistant.peripheral.data.ThemeMode
@@ -35,7 +36,8 @@ fun SettingsScreen(
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEchoDuckingGain: (Float) -> Unit,
-    onUpdateEarpieceMode: (Boolean) -> Unit,
+    onUpdateAudioOutput: (AudioOutput) -> Unit,
+    isBluetoothAvailable: Boolean,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
     onUpdateVoiceWord: (String) -> Unit,
@@ -497,27 +499,53 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Earpiece mode toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Earpiece Mode",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = if (settings.useEarpiece) "Audio routed to earpiece" else "Audio routed to loudspeaker",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = settings.useEarpiece,
-                            onCheckedChange = { onUpdateEarpieceMode(it) }
+                    // Audio output routing — 3 options: Earpiece, Loudspeaker, Bluetooth.
+                    // Bluetooth is grayed out when no BT audio device is connected.
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = "Audio Output",
+                            style = MaterialTheme.typography.bodyMedium
                         )
+                        Text(
+                            text = when (settings.audioOutput) {
+                                AudioOutput.EARPIECE -> "Audio routed to earpiece"
+                                AudioOutput.LOUDSPEAKER -> "Audio routed to loudspeaker"
+                                AudioOutput.BLUETOOTH ->
+                                    if (isBluetoothAvailable) "Audio routed to Bluetooth device"
+                                    else "No Bluetooth device connected"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        // Round icon-only toggle buttons. Selection is communicated by the
+                        // filled background; the subtitle above spells out the current choice.
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val options = listOf(
+                                Triple(AudioOutput.EARPIECE, "Earpiece", Icons.Default.Hearing),
+                                Triple(AudioOutput.LOUDSPEAKER, "Speaker", Icons.Default.VolumeUp),
+                                Triple(AudioOutput.BLUETOOTH, "Bluetooth", Icons.Default.Bluetooth),
+                            )
+                            options.forEach { (output, label, icon) ->
+                                val enabled = output != AudioOutput.BLUETOOTH || isBluetoothAvailable
+                                FilledIconToggleButton(
+                                    checked = settings.audioOutput == output,
+                                    onCheckedChange = { if (it) onUpdateAudioOutput(output) },
+                                    enabled = enabled,
+                                    modifier = Modifier.size(56.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = label,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(16.dp))
