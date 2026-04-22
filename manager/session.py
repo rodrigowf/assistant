@@ -5,13 +5,35 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import stat
+import subprocess
 import tempfile
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Cache of resolved remote `claude` absolute paths, keyed by a tuple that
+# identifies a unique SSH target. Avoids opening a fresh SSH connection to
+# probe `which claude` on every session start — under concurrent starts
+# those probes were the main source of session churn on the remote host.
+# Entry is whatever `_resolve_remote_claude` returned (including the
+# fallback string "claude") so we don't re-probe failures either.
+_REMOTE_CLAUDE_PATH_CACHE: dict[tuple[str | None, str | None, str | None], str] = {}
+_REMOTE_CLAUDE_PATH_LOCK = threading.Lock()
+
+
+def clear_remote_claude_path_cache() -> None:
+    """Forget every cached remote-claude path.
+
+    Intended for tests and for the rare case an operator wants to force a
+    re-probe after updating the remote `claude` install.
+    """
+    with _REMOTE_CLAUDE_PATH_LOCK:
+        _REMOTE_CLAUDE_PATH_CACHE.clear()
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -320,9 +342,6 @@ class SessionManager:
         The script forwards all arguments ("$@") so the SDK flags land on the
         remote claude process unchanged.  Returns the path to the script.
         """
-        import shlex
-        import subprocess
-
         remote_path = self._config.project_dir.replace("'", "'\\''")
 
         ssh_parts = ["ssh"]
@@ -341,26 +360,46 @@ class SessionManager:
 
         ssh_cmd = shlex.join(ssh_parts)
 
-        # Resolve the absolute path of `claude` on the remote machine.
-        # Non-interactive SSH sessions don't load .profile/.bashrc so PATH
-        # may not include ~/.local/bin.  We probe common locations and fall
-        # back to `which claude` (sourcing the profile explicitly) so the
-        # wrapper can exec the binary directly without relying on PATH.
-        try:
-            result = subprocess.run(
-                ssh_parts + [
-                    "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
-                    " which claude 2>/dev/null"
-                    " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
-                ],
-                capture_output=True, text=True, timeout=10,
-            )
-            remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
-        except Exception as e:
-            logger.warning("Could not resolve remote claude path: %s", e)
-            remote_claude = "claude"
-
-        logger.debug("Remote claude path resolved to: %s", remote_claude)
+        # Resolve the absolute path of `claude` on the remote machine — cached.
+        #
+        # Each probe opens an SSH connection and runs `which claude` on the
+        # remote.  Historically this ran on every SessionManager.start(), so
+        # a burst of N concurrent starts (e.g. browser reconnect storm)
+        # produced N SSH handshakes *before* the ControlMaster socket could
+        # be established.  On the remote side each handshake = one PAM
+        # session = one systemd --user manager, and the rapid open/close
+        # cycle is what triggered the 2026-04-20 session-churn crash.
+        #
+        # Cache key is (host, user, key) — changing any of these warrants a
+        # new probe.  The fallback result ("claude") is cached too so a
+        # broken/unreachable host doesn't re-probe on every retry.
+        cache_key = (
+            self._config.ssh_host,
+            self._config.ssh_user,
+            self._config.ssh_key,
+        )
+        with _REMOTE_CLAUDE_PATH_LOCK:
+            cached = _REMOTE_CLAUDE_PATH_CACHE.get(cache_key)
+        if cached is not None:
+            remote_claude = cached
+            logger.debug("Remote claude path (cached): %s", remote_claude)
+        else:
+            try:
+                result = subprocess.run(
+                    ssh_parts + [
+                        "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
+                        " which claude 2>/dev/null"
+                        " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                )
+                remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
+            except Exception as e:
+                logger.warning("Could not resolve remote claude path: %s", e)
+                remote_claude = "claude"
+            with _REMOTE_CLAUDE_PATH_LOCK:
+                _REMOTE_CLAUDE_PATH_CACHE[cache_key] = remote_claude
+            logger.debug("Remote claude path resolved to: %s (cached for future)", remote_claude)
 
         # Shell-escape helper: wraps a value in single quotes, escaping any embedded
         # single quotes using the break-and-rejoin technique (e.g. ' → '\'' ).
