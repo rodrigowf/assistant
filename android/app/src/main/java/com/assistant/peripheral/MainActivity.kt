@@ -345,7 +345,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                     onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
                     onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
                     onUpdateEchoDuckingGain = viewModel::updateEchoDuckingGain,
-                    onUpdateEarpieceMode = viewModel::updateEarpieceMode,
+                    onUpdateAudioOutput = viewModel::updateAudioOutput,
+                    // Recomputed on each recomposition so plugging/unplugging a BT device
+                    // and re-entering the Settings screen refreshes the enablement state.
+                    // TODO: surface this via a StateFlow if we want live updates without
+                    // leaving Settings.
+                    isBluetoothAvailable = viewModel.isBluetoothAudioAvailable(),
                     onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
                     onUpdateWakeWord = viewModel::updateWakeWord,
                     onUpdateVoiceWord = viewModel::updateVoiceWord,

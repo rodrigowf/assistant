@@ -11,6 +11,11 @@
          routing changes with "Audio Settings Permission Denial" and the user-facing
          "Earpiece Mode" toggle silently no-ops. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- BLUETOOTH: required on API 30 and below for startBluetoothSco() and querying
+         BT audio device state. On API 31+, BLUETOOTH_CONNECT replaces it (runtime grant). -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
