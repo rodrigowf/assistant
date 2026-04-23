@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -34,6 +35,44 @@ def clear_remote_claude_path_cache() -> None:
     """
     with _REMOTE_CLAUDE_PATH_LOCK:
         _REMOTE_CLAUDE_PATH_CACHE.clear()
+
+
+class RemoteHostUnreachableError(RuntimeError):
+    """Raised when an SSH target fails the ICMP reachability pre-probe."""
+
+
+def _probe_ssh_host_reachable(host: str, timeout_s: float = 2.0) -> bool:
+    """Return True if ``host`` replies to a single ICMP ping within *timeout_s*.
+
+    This is a cheap pre-flight so we don't let the SDK (or our own
+    version-probe) open an SSH connection to an unreachable host, which then
+    hangs in TCP retransmit for ~30 s while holding file descriptors and
+    burning CPU cycles in the SSH client.  When the laptop hibernates with
+    an in-flight remote session, this check turns a slow timeout cascade
+    into an instant clean failure.
+
+    The function is deliberately synchronous and non-awaitable — callers
+    that care about event-loop latency should run it in a thread.  The
+    2-second default is long enough for normal LAN jitter and short enough
+    that a typical failed probe costs less than one SSH TCP timeout.
+    """
+    if not host:
+        return True  # Nothing to probe; treat as reachable.
+    try:
+        # -c 1: one packet.  -W <s>: overall deadline for the reply.
+        # stdout/stderr discarded; we only care about the exit code.
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(int(max(1, timeout_s))), host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s + 1.0,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # If ping isn't available or the subprocess itself times out, assume
+        # unreachable rather than silently falling through — the whole point
+        # is to short-circuit bad paths.
+        return False
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -151,6 +190,22 @@ class SessionManager:
         is captured from ``server_info`` (if available) or from the first
         ``ResultMessage`` after a query, and stored as ``sdk_session_id``.
         """
+        # Cheap reachability pre-probe for remote sessions.  One ICMP ping,
+        # 2 s deadline — if the host is asleep/offline we raise immediately
+        # instead of letting the SDK sit in a 30 s SSH TCP timeout (which
+        # historically pinned the CPU and spun the fan on the Jetson while
+        # the laptop was hibernating).
+        if self._config.ssh_host:
+            reachable = await asyncio.get_running_loop().run_in_executor(
+                None, _probe_ssh_host_reachable, self._config.ssh_host, 2.0
+            )
+            if not reachable:
+                raise RemoteHostUnreachableError(
+                    f"SSH host {self._config.ssh_host!r} did not reply to ICMP ping; "
+                    "refusing to open SSH connection (prevents stuck sessions and "
+                    "fan/CPU churn while the remote is offline)."
+                )
+
         options = self._build_options()
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
@@ -384,22 +439,34 @@ class SessionManager:
             remote_claude = cached
             logger.debug("Remote claude path (cached): %s", remote_claude)
         else:
-            try:
-                result = subprocess.run(
-                    ssh_parts + [
-                        "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
-                        " which claude 2>/dev/null"
-                        " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
-                    ],
-                    capture_output=True, text=True, timeout=10,
+            # Before opening an SSH connection for the path probe, ping-probe
+            # the host.  If unreachable, use the "claude" fallback *without*
+            # caching it — when the host comes back online we want to probe
+            # properly rather than being stuck on the fallback forever.
+            if not _probe_ssh_host_reachable(self._config.ssh_host or "", 2.0):
+                logger.warning(
+                    "SSH host %r unreachable; using 'claude' fallback for this "
+                    "wrapper without caching (will re-probe next time)",
+                    self._config.ssh_host,
                 )
-                remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
-            except Exception as e:
-                logger.warning("Could not resolve remote claude path: %s", e)
                 remote_claude = "claude"
-            with _REMOTE_CLAUDE_PATH_LOCK:
-                _REMOTE_CLAUDE_PATH_CACHE[cache_key] = remote_claude
-            logger.debug("Remote claude path resolved to: %s (cached for future)", remote_claude)
+            else:
+                try:
+                    result = subprocess.run(
+                        ssh_parts + [
+                            "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
+                            " which claude 2>/dev/null"
+                            " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
+                        ],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
+                except Exception as e:
+                    logger.warning("Could not resolve remote claude path: %s", e)
+                    remote_claude = "claude"
+                with _REMOTE_CLAUDE_PATH_LOCK:
+                    _REMOTE_CLAUDE_PATH_CACHE[cache_key] = remote_claude
+                logger.debug("Remote claude path resolved to: %s (cached for future)", remote_claude)
 
         # Shell-escape helper: wraps a value in single quotes, escaping any embedded
         # single quotes using the break-and-rejoin technique (e.g. ' → '\'' ).
