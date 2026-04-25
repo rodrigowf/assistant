@@ -566,8 +566,15 @@ class SessionManager:
                     pass
 
         elif isinstance(msg, SystemMessage):
+            data = msg.data if isinstance(msg.data, dict) else {}
+            # The "init" system message carries the SDK session_id as its first
+            # message after connect. Capture it eagerly so sessions that are
+            # still mid-tool (no ResultMessage yet) are still addressable by
+            # their SDK id — otherwise they vanish from /api/sessions on refresh.
+            sid = data.get("session_id")
+            if sid and not self._sdk_session_id:
+                self._sdk_session_id = sid
             if msg.subtype == "compact":
-                data = msg.data if isinstance(msg.data, dict) else {}
                 trigger = data.get("trigger", "manual")
                 summary = data.get("summary", "")
                 yield CompactComplete(trigger=trigger, summary=summary)

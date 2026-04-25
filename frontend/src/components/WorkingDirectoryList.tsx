@@ -39,15 +39,19 @@ export function WorkingDirectoryList({
   };
 
   const openEditWd = useCallback((entry: WorkingDirectoryEntry) => {
+    // Coerce every field to a string — persisted history rows have occasionally
+    // been observed with undefined path/host (schema drift), and the form's
+    // .trim() calls crash hard when fed undefined.
+    const path = entry.path ?? "";
     setEditWdId(entry.id);
     setAddWdType(entry.ssh_host ? "ssh" : "local");
-    setAddWdPath(entry.path);
+    setAddWdPath(path);
     setAddWdLabel(entry.label ?? "");
     setAddWdHost(entry.ssh_host ?? "");
     setAddWdUser(entry.ssh_user ?? "");
     setAddWdKey(entry.ssh_key ?? "");
     // Only pre-fill if it differs from the auto-derived value
-    const derived = entry.ssh_host ? entry.path.replace(/\/$/, "") + "/.claude_config" : "";
+    const derived = entry.ssh_host ? path.replace(/\/$/, "") + "/.claude_config" : "";
     setAddWdConfigDir(entry.claude_config_dir && entry.claude_config_dir !== derived ? entry.claude_config_dir : "");
     setAddWdError(null);
     setAddWdOpen(true);
