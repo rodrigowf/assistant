@@ -80,6 +80,11 @@ class VoiceManager(
     private var micRestoreJob: kotlinx.coroutines.Job? = null
     // True while agent audio is actively playing (between output_audio_buffer.started and stopped/cleared)
     private var agentAudioPlaying: Boolean = false
+    // User-intent mute. Source of truth for the mute button — kept separate from
+    // localAudioTrack.enabled() because the duck/restore logic also toggles enabled
+    // for echo-suppression reasons. Without this flag, ducking would silently
+    // re-enable the mic after the user pressed mute.
+    private var userMuted: Boolean = false
     // Gain applied while agent is speaking (echo ducking level), default 5%
     private var echoDuckingGain: Float = 0.05f
 
@@ -330,6 +335,7 @@ class VoiceManager(
 
         val audioSource = factory.createAudioSource(audioConstraints)
         localAudioTrack = factory.createAudioTrack("audio0", audioSource)
+        userMuted = false
         localAudioTrack?.setEnabled(true)
 
         // Create peer connection
@@ -767,30 +773,36 @@ class VoiceManager(
      * Web frontend: toggleMute() in useVoiceOrchestrator
      */
     fun toggleMute(): Boolean {
-        val currentEnabled = localAudioTrack?.enabled() ?: true
-        val newEnabled = !currentEnabled
-        localAudioTrack?.setEnabled(newEnabled)
-        return !newEnabled  // Return muted state (inverse of enabled)
+        userMuted = !userMuted
+        // Apply to the track. When unmuting mid-duck we still want the track enabled
+        // so the user can interrupt; gain ducking continues independently.
+        localAudioTrack?.setEnabled(!userMuted)
+        Log.i(TAG, "[MIC_STATE] ${t()} TOGGLE_MUTE → userMuted=$userMuted trackEnabled=${!userMuted}")
+        return userMuted
     }
 
     /**
-     * Check if microphone is muted.
+     * Check if microphone is muted (user intent).
      */
-    fun isMuted(): Boolean = !(localAudioTrack?.enabled() ?: true)
+    fun isMuted(): Boolean = userMuted
 
     /**
-     * Duck mic while agent is speaking: disable track + zero gain to minimize echo pickup.
+     * Duck mic while agent is speaking: lower input gain to minimize echo pickup.
      * Saves current gain for restore. No-op if already ducked.
+     *
+     * The track stays enabled at low gain so loud user speech can still interrupt —
+     * UNLESS the user has explicitly muted, in which case we leave the track disabled.
      */
     private fun duckMicForAgentSpeech() {
         if (gainBeforeSpeaking == null) {
             gainBeforeSpeaking = micGainLevel
             micGainLevel = echoDuckingGain
-            // Keep track enabled at low gain so loud user speech can still interrupt
-            localAudioTrack?.setEnabled(true)
-            Log.i(TAG, "[MIC_STATE] ${t()} DUCK → gain: ${gainBeforeSpeaking}→$echoDuckingGain trackEnabled: true agentPlaying=$agentAudioPlaying")
+            if (!userMuted) {
+                localAudioTrack?.setEnabled(true)
+            }
+            Log.i(TAG, "[MIC_STATE] ${t()} DUCK → gain: ${gainBeforeSpeaking}→$echoDuckingGain trackEnabled=${localAudioTrack?.enabled()} userMuted=$userMuted agentPlaying=$agentAudioPlaying")
         } else {
-            Log.d(TAG, "[MIC_STATE] ${t()} DUCK (already ducked, no-op) | gain=$micGainLevel gainSaved=$gainBeforeSpeaking trackEnabled=${localAudioTrack?.enabled()}")
+            Log.d(TAG, "[MIC_STATE] ${t()} DUCK (already ducked, no-op) | gain=$micGainLevel gainSaved=$gainBeforeSpeaking trackEnabled=${localAudioTrack?.enabled()} userMuted=$userMuted")
         }
     }
 

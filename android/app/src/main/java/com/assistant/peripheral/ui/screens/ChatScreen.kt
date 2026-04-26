@@ -35,34 +35,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.assistant.peripheral.data.*
 import com.assistant.peripheral.ui.components.VoiceButton
-import com.assistant.peripheral.ui.components.VoiceControls
 import com.assistant.peripheral.ui.components.markdown.MdColors
 import com.assistant.peripheral.ui.components.markdown.MarkdownText
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     messages: List<ChatMessage>,
-    connectionState: ConnectionState,
-    sessionStatus: String,
-    isRecording: Boolean,
-    voiceState: VoiceState,
-    isOrchestratorSession: Boolean,
     hasMoreMessages: Boolean,
     isLoadingMoreMessages: Boolean,
-    onSendMessage: (String) -> Unit,
-    onStartRecording: () -> Unit,
-    onStopRecording: () -> Unit,
-    onInterrupt: () -> Unit,
-    onStartVoice: () -> Unit,
-    onStopVoice: () -> Unit,
-    onToggleMute: () -> Unit,
     onLoadMoreMessages: () -> Unit,
-    isMuted: Boolean,
     modifier: Modifier = Modifier
 ) {
-    var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
 
@@ -105,26 +89,9 @@ fun ChatScreen(
         }
     }
 
-    // Voice mode active
-    val isVoiceActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
-
     Column(
         modifier = modifier.fillMaxSize()
     ) {
-        // Connection and status bar
-        StatusBar(connectionState, sessionStatus, onInterrupt)
-
-        // Voice controls overlay when active
-        if (isVoiceActive) {
-            VoiceControls(
-                voiceState = voiceState,
-                isMuted = isMuted,
-                onToggleMute = onToggleMute,
-                onStop = onStopVoice,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-
         // Messages list
         Box(modifier = Modifier.weight(1f)) {
             LazyColumn(
@@ -190,109 +157,6 @@ fun ChatScreen(
                         Icons.Default.KeyboardArrowDown,
                         contentDescription = "Scroll to bottom"
                     )
-                }
-            }
-        }
-
-        // Input area with voice button (only for orchestrator)
-        ChatInputBar(
-            inputText = inputText,
-            onInputChange = { inputText = it },
-            onSend = {
-                if (inputText.isNotBlank()) {
-                    onSendMessage(inputText)
-                    inputText = ""
-                }
-            },
-            isRecording = isRecording,
-            onStartRecording = onStartRecording,
-            onStopRecording = onStopRecording,
-            isConnected = connectionState is ConnectionState.Connected,
-            isStreaming = sessionStatus == "streaming" || sessionStatus == "tool_use",
-            voiceState = voiceState,
-            onStartVoice = onStartVoice,
-            onStopVoice = onStopVoice,
-            isOrchestratorSession = isOrchestratorSession
-        )
-    }
-}
-
-@Composable
-private fun StatusBar(
-    connectionState: ConnectionState,
-    sessionStatus: String,
-    onInterrupt: () -> Unit
-) {
-    val isActive = sessionStatus in listOf("streaming", "tool_use", "thinking")
-
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        color = when {
-            connectionState is ConnectionState.Error -> MaterialTheme.colorScheme.errorContainer
-            connectionState is ConnectionState.Disconnected -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
-            connectionState is ConnectionState.Connecting -> MaterialTheme.colorScheme.tertiaryContainer
-            isActive -> MaterialTheme.colorScheme.primaryContainer
-            else -> Color.Transparent
-        },
-        tonalElevation = if (connectionState !is ConnectionState.Connected || isActive) 1.dp else 0.dp
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Status dot
-                val dotColor = when {
-                    connectionState is ConnectionState.Connected && isActive -> MaterialTheme.colorScheme.primary
-                    connectionState is ConnectionState.Connected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
-                    connectionState is ConnectionState.Connecting -> MaterialTheme.colorScheme.tertiary
-                    else -> MaterialTheme.colorScheme.error
-                }
-
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(dotColor)
-                )
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                Text(
-                    text = when {
-                        connectionState is ConnectionState.Error -> "Error: ${connectionState.message}"
-                        connectionState is ConnectionState.Disconnected -> "Disconnected"
-                        connectionState is ConnectionState.Connecting -> "Connecting..."
-                        sessionStatus == "streaming" -> "Generating..."
-                        sessionStatus == "tool_use" -> "Using tools..."
-                        sessionStatus == "thinking" -> "Thinking..."
-                        else -> "Connected"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
-                )
-            }
-
-            // Interrupt button (only show when streaming)
-            if (isActive) {
-                TextButton(
-                    onClick = onInterrupt,
-                    colors = ButtonDefaults.textButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
-                    )
-                ) {
-                    Icon(
-                        Icons.Default.Stop,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Stop")
                 }
             }
         }
@@ -757,7 +621,7 @@ private fun CompactDivider(summary: String) {
 }
 
 @Composable
-private fun ChatInputBar(
+fun ChatInputBar(
     inputText: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -771,8 +635,6 @@ private fun ChatInputBar(
     onStopVoice: () -> Unit,
     isOrchestratorSession: Boolean
 ) {
-    val isVoiceActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
-
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surfaceVariant,
@@ -795,89 +657,66 @@ private fun ChatInputBar(
                 Spacer(modifier = Modifier.width(8.dp))
             }
 
-            // Text input (hide when voice is active)
-            if (!isVoiceActive) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = onInputChange,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Type a message...") },
-                    singleLine = false,
-                    maxLines = 4,
-                    enabled = isConnected && !isRecording && !isStreaming,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(onSend = { onSend() }),
-                    shape = RoundedCornerShape(24.dp)
-                )
+            OutlinedTextField(
+                value = inputText,
+                onValueChange = onInputChange,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Type a message...") },
+                singleLine = false,
+                maxLines = 4,
+                enabled = isConnected && !isRecording && !isStreaming,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                shape = RoundedCornerShape(24.dp)
+            )
 
-                Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(8.dp))
 
-                // Voice record button (push-to-talk for audio messages) - only for orchestrator
-                if (isOrchestratorSession) {
-                    IconButton(
-                        onClick = {
-                            if (isRecording) onStopRecording() else onStartRecording()
-                        },
-                        enabled = isConnected && !isStreaming,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(
-                                if (isRecording) MaterialTheme.colorScheme.error
-                                else MaterialTheme.colorScheme.surfaceVariant
-                            )
-                    ) {
-                        Icon(
-                            imageVector = if (isRecording) Icons.Default.Stop else Icons.Default.Mic,
-                            contentDescription = if (isRecording) "Stop recording" else "Voice message",
-                            tint = if (isRecording) MaterialTheme.colorScheme.onError
-                                   else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(4.dp))
-                }
-
-                // Send button
+            // Voice record button (push-to-talk for audio messages) - only for orchestrator
+            if (isOrchestratorSession) {
                 IconButton(
-                    onClick = onSend,
-                    enabled = isConnected && inputText.isNotBlank() && !isRecording && !isStreaming,
+                    onClick = {
+                        if (isRecording) onStopRecording() else onStartRecording()
+                    },
+                    enabled = isConnected && !isStreaming,
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
                         .background(
-                            if (isConnected && inputText.isNotBlank() && !isRecording && !isStreaming) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
-                            }
+                            if (isRecording) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.surfaceVariant
                         )
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Send,
-                        contentDescription = "Send",
-                        tint = MaterialTheme.colorScheme.onPrimary
+                        imageVector = if (isRecording) Icons.Default.Stop else Icons.Default.Mic,
+                        contentDescription = if (isRecording) "Stop recording" else "Voice message",
+                        tint = if (isRecording) MaterialTheme.colorScheme.onError
+                               else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-            } else {
-                // When voice is active, show status text
-                Column(
-                    modifier = Modifier.weight(1f),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = when (voiceState) {
-                            is VoiceState.Connecting -> "Connecting voice..."
-                            is VoiceState.Active -> "Voice connected - speak naturally"
-                            is VoiceState.Listening -> "Listening..."
-                            is VoiceState.Speaking -> "Speaking..."
-                            is VoiceState.Thinking -> "Thinking..."
-                            is VoiceState.ToolUse -> "Using tools..."
-                            else -> ""
-                        },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+
+            // Send button
+            IconButton(
+                onClick = onSend,
+                enabled = isConnected && inputText.isNotBlank() && !isRecording && !isStreaming,
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (isConnected && inputText.isNotBlank() && !isRecording && !isStreaming) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
+                        }
                     )
-                }
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Send,
+                    contentDescription = "Send",
+                    tint = MaterialTheme.colorScheme.onPrimary
+                )
             }
         }
     }

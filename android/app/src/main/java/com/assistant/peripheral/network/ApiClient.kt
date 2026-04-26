@@ -309,6 +309,32 @@ class ApiClient(private val baseUrl: String) {
     }
 
     /**
+     * Close an active session in the pool (does NOT delete history).
+     * POST /api/sessions/{local_id}/close
+     *
+     * The backend keys the pool by local_id, so this must be a live pool local_id
+     * (from getLivePool()) — passing a JSONL session id will return 404.
+     */
+    suspend fun closePoolSession(localId: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/sessions/$localId/close")
+            Log.d(TAG, "POST $url")
+
+            val request = Request.Builder()
+                .url(url)
+                .post(okhttp3.RequestBody.create(null, ByteArray(0)))
+                .build()
+
+            val response = client.newCall(request).execute()
+            // 204 = closed, 404 = already gone (treat as success — desired end state)
+            response.isSuccessful || response.code == 404
+        } catch (e: Exception) {
+            Log.e(TAG, "closePoolSession error: ${e.message}", e)
+            false
+        }
+    }
+
+    /**
      * Delete a session.
      * DELETE /api/sessions/{session_id}
      */

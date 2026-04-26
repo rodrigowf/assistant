@@ -13,6 +13,7 @@ import com.assistant.peripheral.audio.AudioRecorder
 import com.assistant.peripheral.data.*
 import com.assistant.peripheral.network.ApiClient
 import com.assistant.peripheral.network.DiscoveredServer
+import com.assistant.peripheral.network.LiveSession
 import com.assistant.peripheral.network.NetworkScanner
 import com.assistant.peripheral.network.WebSocketEndpoint
 import com.assistant.peripheral.network.WebSocketManager
@@ -64,6 +65,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // Live session pool (truly open sessions)
     private val _liveSessionIds = MutableStateFlow<Set<String>>(emptySet())
     val liveSessionIds: StateFlow<Set<String>> = _liveSessionIds.asStateFlow()
+
+    // Map from SDK/JSONL session id -> local_id so we can call /close (which is
+    // keyed by local_id) when the user closes from the sessions list (which keys
+    // by JSONL session id).
+    private val _sdkToLocalId = MutableStateFlow<Map<String, String>>(emptyMap())
 
     // Whether current session is orchestrator
     private val _isOrchestratorSession = MutableStateFlow(false)
@@ -138,6 +144,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _isMuted = MutableStateFlow(false)
     val isMuted: StateFlow<Boolean> = _isMuted.asStateFlow()
 
+    // True when we're connected to the server but no orchestrator session is live.
+    // The UI uses this to redirect from the Chat tab to History so the user can
+    // pick or create a session — we no longer auto-spawn one on connect.
+    private val _noActiveOrchestrator = MutableStateFlow(false)
+    val noActiveOrchestrator: StateFlow<Boolean> = _noActiveOrchestrator.asStateFlow()
+
     // Settings
     private val _settings = MutableStateFlow(AppSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
@@ -164,6 +176,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val AUDIO_OUTPUT = stringPreferencesKey("audio_output")  // enum: EARPIECE / LOUDSPEAKER / BLUETOOTH
         val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
         val SAVED_SERVERS = stringPreferencesKey("saved_servers")
+        // Persisted across app restarts so we reattach to the same orchestrator
+        // session instead of forking a new one when getLivePool() races on launch.
+        val ORCHESTRATOR_LOCAL_ID = stringPreferencesKey("orchestrator_local_id")
     }
 
     // Saved servers are persisted as "label\turl|label\turl|..." — no quoting needed
@@ -184,10 +199,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Load settings from DataStore
         viewModelScope.launch {
             var previousServerUrl: String? = null
+            var firstEmission = true
             dataStore.data.collect { preferences ->
                 val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: AppSettings().serverUrl
                 val serverUrlChanged = previousServerUrl != null && previousServerUrl != newServerUrl
                 previousServerUrl = newServerUrl
+
+                // On first emission, restore the persisted orchestrator local_id so
+                // we reattach to the same session across app restarts. Without this,
+                // each launch generates a fresh UUID and forks a new orchestrator
+                // when getLivePool() races (e.g. backend slow on cold start).
+                if (firstEmission) {
+                    firstEmission = false
+                    preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID]?.takeIf { it.isNotBlank() }?.let {
+                        _currentLocalId.value = it
+                    }
+                }
 
                 _settings.value = AppSettings(
                     serverUrl = newServerUrl,
@@ -230,6 +257,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     _liveSessionIds.value = emptySet()
                     _currentSessionId.value = null
                     _currentLocalId.value = UUID.randomUUID().toString()
+                    // The persisted id belongs to the previous server's pool — drop it
+                    // so we don't try to reattach to a session that doesn't exist here.
+                    clearOrchestratorLocalId()
                     _pendingResumeSessionId.value = null
                     _jsonlSessionId = null
                     _isOrchestratorSession.value = false
@@ -337,26 +367,51 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private fun handleWebSocketEvent(event: WebSocketEvent) {
         when (event) {
             is WebSocketEvent.Connected -> {
-                // Check for existing orchestrator and reconnect to it, or start a new one
-                viewModelScope.launch {
-                    val livePool = apiClient?.getLivePool() ?: emptyList()
-                    val existingOrchestrator = livePool.find { it.isOrchestrator }
+                // If newSession() armed a pending Start (because it had to connect first),
+                // honour it and skip the resume-existing lookup.
+                if (pendingNewSessionStart) {
+                    pendingNewSessionStart = false
+                    _noActiveOrchestrator.value = false
+                    persistOrchestratorLocalId(_currentLocalId.value)
+                    webSocketManager.send(WebSocketMessage.Start(localId = _currentLocalId.value))
+                    return
+                }
 
-                    if (existingOrchestrator != null) {
+                // Check for an existing orchestrator on the server and reconnect to it.
+                // If there isn't one, do NOT auto-spawn one — the UI will route the
+                // user to History so they can pick or explicitly create a session.
+                //
+                // The pool lookup is retried once on miss because the backend can be
+                // slow to publish pool state on cold start; without the retry, a
+                // transient empty response would falsely trigger the empty-state UI.
+                viewModelScope.launch {
+                    suspend fun findOrchestrator(): LiveSession? =
+                        apiClient?.getLivePool()?.find { it.isOrchestrator }
+
+                    var existing = findOrchestrator()
+                    if (existing == null) {
+                        kotlinx.coroutines.delay(400L)
+                        existing = findOrchestrator()
+                    }
+
+                    if (existing != null) {
                         // Reuse the existing orchestrator's local_id so the backend
                         // recognises this as a reconnect (not a new/conflicting session)
-                        _currentLocalId.value = existingOrchestrator.localId
+                        _currentLocalId.value = existing.localId
+                        persistOrchestratorLocalId(existing.localId)
                         // Also track the sdk session id so we can load history
-                        _pendingResumeSessionId.value = existingOrchestrator.sdkSessionId
+                        _pendingResumeSessionId.value = existing.sdkSessionId
+                        _noActiveOrchestrator.value = false
                         webSocketManager.send(WebSocketMessage.Start(
-                            localId = existingOrchestrator.localId,
-                            resumeSdkId = existingOrchestrator.sdkSessionId
+                            localId = existing.localId,
+                            resumeSdkId = existing.sdkSessionId
                         ))
                     } else {
+                        // No live orchestrator. Stay idle — UI will switch to History.
                         _pendingResumeSessionId.value = null
-                        webSocketManager.send(WebSocketMessage.Start(
-                            localId = _currentLocalId.value
-                        ))
+                        _noActiveOrchestrator.value = true
+                        // Make sure stale session list is loaded so History has something to show.
+                        refreshSessions()
                     }
                 }
             }
@@ -365,6 +420,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 _currentSessionId.value = event.sessionId
                 _sessionStatus.value = "idle"
                 _isOrchestratorSession.value = true // Orchestrator sessions only via this endpoint
+                _noActiveOrchestrator.value = false
 
                 // Track the true JSONL session ID for voice resume.
                 // On reconnect the backend returns local_id as session_id — use
@@ -607,6 +663,27 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     /**
+     * Persist the orchestrator local_id so reopening the app reattaches to the same
+     * session instead of forking a new one. Called whenever we learn the current
+     * orchestrator id (from getLivePool() or a session_started event).
+     */
+    private fun persistOrchestratorLocalId(localId: String) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID] = localId
+            }
+        }
+    }
+
+    private fun clearOrchestratorLocalId() {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences.remove(PreferenceKeys.ORCHESTRATOR_LOCAL_ID)
+            }
+        }
+    }
+
+    /**
      * Re-establish the WebSocket connection if currently disconnected.
      * Call from MainActivity.onResume() so the app reconnects after screen lock/unlock
      * or switching back from another app.
@@ -664,9 +741,62 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
             // Extract SDK session IDs that are truly live
             _liveSessionIds.value = livePool.map { it.sdkSessionId }.toSet()
+            _sdkToLocalId.value = livePool.associate { it.sdkSessionId to it.localId }
 
             _sessions.value = sessions.sortedByDescending { it.lastActivity }
             _sessionsLoading.value = false
+        }
+    }
+
+    /**
+     * Close a live (open) pool session without deleting its history.
+     * Called from the session list "Close" dropdown action. The session id passed
+     * in is the JSONL/SDK id; we look up its local_id from the live pool because
+     * /close is keyed by local_id.
+     *
+     * If closing the currently-loaded session, also clears the in-memory chat so
+     * the UI doesn't keep showing a session that's no longer running.
+     */
+    fun closeSession(sessionId: String) {
+        viewModelScope.launch {
+            // Look up local_id; refresh the pool first if we don't have one cached.
+            var localId = _sdkToLocalId.value[sessionId]
+            if (localId == null) {
+                val livePool = apiClient?.getLivePool() ?: emptyList()
+                _sdkToLocalId.value = livePool.associate { it.sdkSessionId to it.localId }
+                localId = _sdkToLocalId.value[sessionId]
+            }
+            if (localId == null) {
+                Log.w(TAG, "closeSession: no live local_id for $sessionId — already closed?")
+                return@launch
+            }
+
+            val ok = apiClient?.closePoolSession(localId) ?: false
+            if (!ok) {
+                Log.w(TAG, "closeSession: backend rejected close for $localId")
+                return@launch
+            }
+
+            // Optimistic UI update so the user sees the "open" badge disappear
+            // without waiting for the next refresh.
+            _liveSessionIds.update { it - sessionId }
+            _sdkToLocalId.update { it - sessionId }
+
+            // If we just closed the current session, clear chat + drop persisted
+            // orchestrator id so we don't try to reattach to it on next launch.
+            if (currentSessionIdForPagination == sessionId || _currentLocalId.value == localId) {
+                _messages.value = emptyList()
+                _currentSessionId.value = null
+                currentSessionIdForPagination = null
+                _isOrchestratorSession.value = false
+                _hasMoreMessages.value = false
+                clearOrchestratorLocalId()
+                _currentLocalId.value = UUID.randomUUID().toString()
+            }
+            sessionCache.remove(sessionId)
+
+            // Refresh in the background to reconcile with server state
+            refreshSessions()
         }
     }
 
@@ -674,6 +804,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             // Save current session to cache before switching
             saveCurrentSessionToCache()
+            _noActiveOrchestrator.value = false
 
             // Check if session is already cached
             val cached = sessionCache[sessionId]
@@ -795,18 +926,31 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Generate new local ID
         _currentLocalId.value = UUID.randomUUID().toString()
         _messages.value = emptyList()
+        _noActiveOrchestrator.value = false
 
         // Reset pagination state
         currentSessionIdForPagination = null
         paginationStartIndex = 0
         _hasMoreMessages.value = false
 
-        // Reconnect
+        // Persist so a later reconnect finds this same session instead of forking.
+        persistOrchestratorLocalId(_currentLocalId.value)
+
+        // (Re)connect WebSocket and explicitly start the new session.
         if (connectionState.value is ConnectionState.Connected) {
+            // Already connected — the Connected handler won't re-fire, so send Start ourselves.
             webSocketManager.send(WebSocketMessage.Stop)
+            webSocketManager.send(WebSocketMessage.Start(localId = _currentLocalId.value))
+        } else {
+            // Not connected — connect, then send Start once Connected fires.
+            // We arm pendingNewSessionStart so the Connected handler picks it up.
+            pendingNewSessionStart = true
+            connect()
         }
-        connect()
     }
+
+    // Set by newSession() when we need to (re)connect first; consumed in the Connected handler.
+    private var pendingNewSessionStart: Boolean = false
 
     fun deleteSession(sessionId: String) {
         viewModelScope.launch {
