@@ -2080,8 +2080,8 @@ pre.field-value {
   display: none;
   align-items: center;
   justify-content: center;
-  width: 44px;
-  height: 48px;
+  width: 48px;
+  height: 52px;
   flex-shrink: 0;
   color: var(--text-muted);
   background: var(--bg-surface);
