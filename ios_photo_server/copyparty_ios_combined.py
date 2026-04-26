@@ -6,6 +6,7 @@ iOS Photo Server — Single-file combined version for Pythonista
 Run this script in Pythonista 3 on your iPhone/iPad to serve your
 entire photo library over the local network via a REST API.
 
+v1.3.2 — ObjCBlock wrapping for streaming export callbacks (fixes silent SIGSEGV mid-stream).
 v1.3.1 — Streaming video export (fixes OOM jetsam on large videos).
 v1.3.0 — Ultra-defensive for Pythonista stability:
   - Server starts IMMEDIATELY (before touching photo library)
@@ -41,9 +42,19 @@ Usage:
     Custom port:        python3 copyparty_ios_combined.py --port 8080
 """
 
-__version__ = '1.3.1'
+__version__ = '1.3.2'
 __author__ = 'Assistant'
 
+# v1.3.2 — ObjCBlock wrapping for streaming export callbacks:
+#   - In v1.3.1 we passed raw Python functions for dataReceivedHandler /
+#     completionHandler. Pythonista's objc_util does NOT auto-bridge those
+#     to ObjC blocks for arbitrary signatures: ObjC saw garbage block
+#     pointers and SIGSEGV'd the moment the framework tried to invoke them.
+#     Reliably reproducible on a 71 MB video (logs ended at "Streaming video
+#     to ..." with no chunk progress).
+#   - Both handlers are now wrapped with objc_util.ObjCBlock(..., restype=None,
+#     argtypes=[c_void_p]) and the BLOCKS (not the raw functions) are pinned
+#     on self for the lifetime of the request.
 # v1.3.1 — Streaming video export + size cap:
 #   - _export_video now uses requestDataForAssetResource_..._dataReceivedHandler_
 #     instead of writeDataForAssetResource_toFile_ to avoid OOM jetsam on
@@ -892,7 +903,7 @@ class PhotoBridge:
             str(info.get('id', ''))[:12]))
 
         try:
-            from objc_util import ObjCInstance
+            from objc_util import ObjCInstance, ObjCBlock
             import ctypes
 
             # Get ObjC PHAsset
@@ -1031,25 +1042,34 @@ class PhotoBridge:
                 finally:
                     done.set()
 
-            # Pin BOTH callbacks for the lifetime of the request. If either
-            # is GC'd while ObjC still holds the block, we crash.
-            self._active_data_handler = _data_received
-            self._active_completion = _completion
+            # v1.3.2: Wrap both Python callables as proper ObjC blocks. Raw
+            # Python functions do NOT auto-bridge to block pointers in
+            # Pythonista 3 — passing them caused a silent SIGSEGV in v1.3.1
+            # the moment iOS tried to invoke dataReceivedHandler.
+            #
+            # Block signatures:
+            #   dataReceivedHandler:^(NSData *data)        -> argtypes=[c_void_p]
+            #   completionHandler:^(NSError * _Nullable e) -> argtypes=[c_void_p]
+            # ObjCBlock prepends the implicit block-self pointer internally,
+            # so the Python callable still takes (data_ptr,) / (err_ptr,).
+            blk_data = ObjCBlock(_data_received, restype=None,
+                                 argtypes=[ctypes.c_void_p])
+            blk_done = ObjCBlock(_completion, restype=None,
+                                 argtypes=[ctypes.c_void_p])
+
+            # Pin the BLOCKS (not the raw functions) for the lifetime of the
+            # request. If either is GC'd while ObjC still holds the block, we
+            # crash. Also keep refs to the Python functions so the closures
+            # they capture (fh, bytes_written, etc.) stay alive.
+            self._active_data_handler = blk_data
+            self._active_completion = blk_done
+            self._active_data_pyfn = _data_received
+            self._active_completion_pyfn = _completion
 
             print('[Bridge] Streaming video to {}...'.format(temp_path))
             try:
                 res_manager.requestDataForAssetResource_options_dataReceivedHandler_completionHandler_(
-                    video_resource, res_options, _data_received, _completion)
-                # NOTE: if Pythonista fails to auto-bridge the data handler
-                # block signature, wrap manually:
-                #   from objc_util import ObjCBlock
-                #   from ctypes import c_void_p
-                #   blk_data = ObjCBlock(_data_received, restype=None, argtypes=[c_void_p])
-                #   blk_done = ObjCBlock(_completion,    restype=None, argtypes=[c_void_p])
-                #   self._active_data_handler = blk_data
-                #   self._active_completion = blk_done
-                #   res_manager.requestDataForAssetResource_options_dataReceivedHandler_completionHandler_(
-                #       video_resource, res_options, blk_data, blk_done)
+                    video_resource, res_options, blk_data, blk_done)
 
                 # Wait for completion (single 300s ceiling, applied to the
                 # completion event — data handler keeps the timer fed
@@ -1069,6 +1089,8 @@ class PhotoBridge:
                 # Release callback pins now that ObjC is done with them.
                 self._active_data_handler = None
                 self._active_completion = None
+                self._active_data_pyfn = None
+                self._active_completion_pyfn = None
 
             if write_error[0]:
                 print('[Bridge] Video stream write error: {}'.format(
