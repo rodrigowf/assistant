@@ -6,6 +6,7 @@ iOS Photo Server — Single-file combined version for Pythonista
 Run this script in Pythonista 3 on your iPhone/iPad to serve your
 entire photo library over the local network via a REST API.
 
+v1.3.1 — Streaming video export (fixes OOM jetsam on large videos).
 v1.3.0 — Ultra-defensive for Pythonista stability:
   - Server starts IMMEDIATELY (before touching photo library)
   - Photo enumeration happens in a background thread
@@ -40,8 +41,16 @@ Usage:
     Custom port:        python3 copyparty_ios_combined.py --port 8080
 """
 
-__version__ = '1.3.0'
+__version__ = '1.3.1'
 __author__ = 'Assistant'
+
+# v1.3.1 — Streaming video export + size cap:
+#   - _export_video now uses requestDataForAssetResource_..._dataReceivedHandler_
+#     instead of writeDataForAssetResource_toFile_ to avoid OOM jetsam on
+#     videos > ~100 MB (the old API buffered the whole video in RAM).
+#   - Pre-flight fileSize check rejects videos > 500 MB with HTTP 413.
+#   - Both data and completion handlers are now pinned on self to prevent
+#     GC mid-stream (extends the v1.2.1 single-callback pin pattern).
 
 # =====================================================================
 # IMPORTS
@@ -71,6 +80,11 @@ try:
     HAS_OBJC = True
 except ImportError:
     HAS_OBJC = False
+
+
+# v1.3.1: sentinel returned by _export_video when the source file exceeds
+# MAX_VIDEO_BYTES. _serve_video translates this to HTTP 413.
+_VIDEO_TOO_LARGE = '__VIDEO_TOO_LARGE__'
 
 
 # =====================================================================
@@ -859,13 +873,17 @@ class PhotoBridge:
             return None
 
     def _export_video(self, asset, info, temp_path):
-        """Export video to temp file.
+        """Export video to temp file via streaming PHAssetResourceManager.
 
-        v1.2.1: Uses PHAssetResourceManager.writeDataForAssetResource_toFile_
-        instead of the previous AVAssetExportSession pipeline.
-        The old approach used two nested async ObjC callbacks with Python
-        lambdas, which crashed Pythonista. This approach uses a single
-        callback that only receives an error parameter (or nil).
+        v1.3.1: Switched from writeDataForAssetResource_toFile_ (which
+        buffers the entire video into memory before writing — iOS jetsams
+        Pythonista on >100 MB videos) to the streaming variant
+        requestDataForAssetResource_options_dataReceivedHandler_completionHandler_,
+        which delivers NSData chunks to a handler we write directly to a
+        file handle. Peak memory stays ~constant regardless of video size.
+
+        Also adds a pre-flight fileSize check: videos > 500 MB return the
+        sentinel _VIDEO_TOO_LARGE so the HTTP layer can send 413.
         """
         if not HAS_OBJC:
             return None
@@ -874,6 +892,9 @@ class PhotoBridge:
             str(info.get('id', ''))[:12]))
 
         try:
+            from objc_util import ObjCInstance
+            import ctypes
+
             # Get ObjC PHAsset
             PHAsset = ObjCClass('PHAsset')
             fetch = PHAsset.fetchAssetsWithLocalIdentifiers_options_(
@@ -912,16 +933,41 @@ class PhotoBridge:
                 print('[Bridge] Video export: no video resource found')
                 return None
 
-            # Remove temp file if it exists (writeData requires non-existent target)
+            # --- v1.3.1 PRE-FLIGHT SIZE CHECK ---
+            # PHAssetResource exposes 'fileSize' as a private NSNumber-valued
+            # KVC key. Returns 0/None if unavailable; we only block when we
+            # have a confident reading above the cap.
+            fsize_pre = 0
+            try:
+                size_num = video_resource.valueForKey_('fileSize')
+                if size_num is not None:
+                    try:
+                        fsize_pre = int(size_num.longLongValue())
+                    except Exception:
+                        try:
+                            fsize_pre = int(size_num.intValue())
+                        except Exception:
+                            fsize_pre = 0
+            except Exception:
+                fsize_pre = 0
+            MAX_VIDEO_BYTES = 500 * 1024 * 1024  # 500 MB
+            if fsize_pre and fsize_pre > MAX_VIDEO_BYTES:
+                mb = fsize_pre / (1024.0 * 1024.0)
+                print('[Bridge] Video export REJECTED: {:.1f} MB exceeds '
+                      '{} MB cap'.format(mb, MAX_VIDEO_BYTES // (1024 * 1024)))
+                return _VIDEO_TOO_LARGE
+            if fsize_pre:
+                print('[Bridge] Video pre-flight size: {:.1f} MB'.format(
+                    fsize_pre / (1024.0 * 1024.0)))
+
+            # Remove temp file if it exists; we'll create fresh.
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except Exception:
                     pass
 
-            # Write video data directly to file using PHAssetResourceManager
-            # This is much simpler than AVAssetExportSession — one call,
-            # one callback, no nested async.
+            # Stream video data via PHAssetResourceManager.
             PHAssetResourceManager = ObjCClass('PHAssetResourceManager')
             PHAssetResourceRequestOptions = ObjCClass(
                 'PHAssetResourceRequestOptions')
@@ -930,43 +976,121 @@ class PhotoBridge:
             res_options = PHAssetResourceRequestOptions.alloc().init()
             res_options.setNetworkAccessAllowed_(True)
 
-            file_url = ObjCClass('NSURL').fileURLWithPath_(ns(temp_path))
-
             done = threading.Event()
             error_msg = [None]
+            bytes_written = [0]
+            chunks_received = [0]
+            last_log_mb = [0]
+            write_error = [None]
 
-            # Keep strong reference to callback to prevent GC
+            # Open file handle BEFORE issuing the request. The data handler
+            # is dispatched serially per-request from a background ObjC
+            # queue, so a single file handle with .write() is safe.
+            try:
+                fh = open(temp_path, 'wb')
+            except Exception as e:
+                print('[Bridge] Could not open temp file: {}'.format(e))
+                return None
+
+            def _data_received(data_ptr):
+                try:
+                    if not data_ptr:
+                        return
+                    nsdata = ObjCInstance(data_ptr)
+                    length = int(nsdata.length())
+                    if length <= 0:
+                        return
+                    # ctypes.string_at copies length bytes from the NSData
+                    # backing store into a fresh Python bytes object. The
+                    # NSData itself is autoreleased after the handler returns.
+                    buf_ptr = nsdata.bytes()
+                    chunk = ctypes.string_at(buf_ptr, length)
+                    fh.write(chunk)
+                    bytes_written[0] += length
+                    chunks_received[0] += 1
+                    # Log every 10 MB to avoid log spam
+                    mb_now = bytes_written[0] // (1024 * 1024)
+                    if mb_now >= last_log_mb[0] + 10:
+                        last_log_mb[0] = mb_now
+                        print('[Bridge] Streaming video: {} MB '
+                              '({} chunks)'.format(mb_now, chunks_received[0]))
+                except Exception as e:
+                    write_error[0] = 'data handler: {}'.format(e)
+                    # Don't set done here — let completion handler signal end.
+
             def _completion(err_ptr):
                 try:
-                    if err_ptr is not None:
-                        from objc_util import ObjCInstance
-                        err_obj = ObjCInstance(err_ptr)
-                        error_msg[0] = str(err_obj.localizedDescription())
+                    if err_ptr:
+                        try:
+                            err_obj = ObjCInstance(err_ptr)
+                            error_msg[0] = str(err_obj.localizedDescription())
+                        except Exception as e:
+                            error_msg[0] = 'err parse: {}'.format(e)
                 except Exception as e:
-                    error_msg[0] = 'Callback error: {}'.format(e)
+                    error_msg[0] = 'completion handler: {}'.format(e)
                 finally:
                     done.set()
 
-            # Store callback ref to prevent garbage collection
-            self._active_callback = _completion
+            # Pin BOTH callbacks for the lifetime of the request. If either
+            # is GC'd while ObjC still holds the block, we crash.
+            self._active_data_handler = _data_received
+            self._active_completion = _completion
 
-            print('[Bridge] Writing video to {}...'.format(temp_path))
-            res_manager.writeDataForAssetResource_toFile_options_completionHandler_(
-                video_resource, file_url, res_options, _completion)
+            print('[Bridge] Streaming video to {}...'.format(temp_path))
+            try:
+                res_manager.requestDataForAssetResource_options_dataReceivedHandler_completionHandler_(
+                    video_resource, res_options, _data_received, _completion)
+                # NOTE: if Pythonista fails to auto-bridge the data handler
+                # block signature, wrap manually:
+                #   from objc_util import ObjCBlock
+                #   from ctypes import c_void_p
+                #   blk_data = ObjCBlock(_data_received, restype=None, argtypes=[c_void_p])
+                #   blk_done = ObjCBlock(_completion,    restype=None, argtypes=[c_void_p])
+                #   self._active_data_handler = blk_data
+                #   self._active_completion = blk_done
+                #   res_manager.requestDataForAssetResource_options_dataReceivedHandler_completionHandler_(
+                #       video_resource, res_options, blk_data, blk_done)
 
-            # Wait for completion
-            done.wait(timeout=300)
+                # Wait for completion (single 300s ceiling, applied to the
+                # completion event — data handler keeps the timer fed
+                # implicitly since completion only fires after last chunk).
+                if not done.wait(timeout=300):
+                    print('[Bridge] Video stream timed out after 300s')
+                    error_msg[0] = error_msg[0] or 'timeout'
+            finally:
+                try:
+                    fh.flush()
+                except Exception:
+                    pass
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                # Release callback pins now that ObjC is done with them.
+                self._active_data_handler = None
+                self._active_completion = None
 
-            # Clean up callback ref
-            self._active_callback = None
+            if write_error[0]:
+                print('[Bridge] Video stream write error: {}'.format(
+                    write_error[0]))
+                return None
 
             if error_msg[0]:
-                print('[Bridge] Video write error: {}'.format(error_msg[0]))
+                print('[Bridge] Video stream completion error: {}'.format(
+                    error_msg[0]))
+                # Best-effort cleanup of partial file
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
                 return None
 
             if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
                 fsize = os.path.getsize(temp_path)
-                print('[Bridge] Video export complete: {} bytes'.format(fsize))
+                print('[Bridge] Video export complete: {} bytes '
+                      '({} chunks, {} bytes via handler)'.format(
+                          fsize, chunks_received[0], bytes_written[0]))
                 return (temp_path, info.get('filename', 'video.mp4'),
                         'video/mp4', fsize)
 
@@ -1412,6 +1536,10 @@ class PhotoRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_video(self, aid):
         result = _bridge.get_video_data(aid)
+        # v1.3.1: too-large sentinel → HTTP 413 Payload Too Large
+        if result == _VIDEO_TOO_LARGE:
+            return self._send_error(
+                413, 'Video exceeds 500 MB limit (use thumbnail/preview)')
         if not result:
             return self._send_error(404, 'Video export failed')
         fpath, fn, ct, fsz = result
