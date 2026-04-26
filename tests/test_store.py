@@ -164,6 +164,113 @@ class TestSessionStoreListSessions:
             assert store.list_sessions() == []
 
 
+class TestSessionStoreListSessionsCache:
+    """The (mtime_ns, size) cache keeps list_sessions() O(N) in file count
+    after the first call, instead of O(total bytes)."""
+
+    @pytest.fixture
+    def store_dir(self, tmp_path):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        return tmp_path, context_dir
+
+    def _make_store(self, project_dir, n_sessions=3):
+        for i in range(n_sessions):
+            _write_session_jsonl(
+                project_dir / "context" / f"sess{i}.jsonl",
+                f"sess{i}",
+                [_user_msg(f"Question {i}", f"2026-02-05T10:00:{i:02d}Z")],
+            )
+        with patch("utils.paths.PROJECT_ROOT", project_dir):
+            return SessionStore(project_dir)
+
+    def test_cache_hit_skips_reparse_for_unchanged_files(self, store_dir):
+        project_dir, context_dir = store_dir
+        store = self._make_store(project_dir, n_sessions=3)
+
+        store.list_sessions()  # cold — populates cache
+
+        with patch.object(SessionStore, "_parse_session_info", wraps=store._parse_session_info) as spy:
+            store.list_sessions()
+            assert spy.call_count == 0, (
+                f"unchanged files should not be re-parsed; was called {spy.call_count} times"
+            )
+
+    def test_cache_invalidated_when_file_changes(self, store_dir):
+        project_dir, context_dir = store_dir
+        store = self._make_store(project_dir, n_sessions=3)
+        store.list_sessions()  # populate cache
+
+        # Modify one session by appending a new message AND bumping mtime
+        target = context_dir / "sess1.jsonl"
+        with open(target, "a") as f:
+            f.write(json.dumps(_user_msg("New question", "2026-02-06T10:00:00Z")) + "\n")
+        # Force mtime to be measurably newer (the test runs in well under
+        # filesystem mtime resolution so we set it explicitly)
+        import os
+        st = target.stat()
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+        with patch.object(SessionStore, "_parse_session_info", wraps=store._parse_session_info) as spy:
+            sessions = store.list_sessions()
+            assert spy.call_count == 1, "only the modified file should be re-parsed"
+            # Verify the modified session reflects the new state
+            modified = [s for s in sessions if s.session_id == "sess1"][0]
+            assert modified.message_count == 2
+
+    def test_cache_drops_deleted_files(self, store_dir):
+        project_dir, context_dir = store_dir
+        store = self._make_store(project_dir, n_sessions=3)
+        store.list_sessions()
+        assert "sess1" in store._info_cache
+
+        (context_dir / "sess1.jsonl").unlink()
+        sessions = store.list_sessions()
+
+        assert "sess1" not in store._info_cache
+        assert all(s.session_id != "sess1" for s in sessions)
+
+    def test_cache_picks_up_new_files(self, store_dir):
+        project_dir, context_dir = store_dir
+        store = self._make_store(project_dir, n_sessions=2)
+        store.list_sessions()
+        assert len(store._info_cache) == 2
+
+        _write_session_jsonl(
+            context_dir / "brand_new.jsonl", "brand_new",
+            [_user_msg("Hello", "2026-03-01T10:00:00Z")],
+        )
+
+        sessions = store.list_sessions()
+        assert "brand_new" in store._info_cache
+        assert any(s.session_id == "brand_new" for s in sessions)
+
+    def test_titles_loaded_once_per_call(self, store_dir):
+        """_load_titles() should be called once per list_sessions() call,
+        not once per file. Hoisting it out of the parse loop avoids 92×
+        redundant reads of .titles.json on the Jetson."""
+        project_dir, context_dir = store_dir
+        store = self._make_store(project_dir, n_sessions=5)
+
+        with patch.object(SessionStore, "_load_titles", wraps=store._load_titles) as spy:
+            store.list_sessions()
+            assert spy.call_count == 1, (
+                f"titles should be loaded once per call, was {spy.call_count}"
+            )
+
+    def test_title_override_applied_on_cache_hit(self, store_dir):
+        """If the user renames a session, the new title should appear even
+        if the JSONL itself didn't change (titles live in a separate file)."""
+        project_dir, context_dir = store_dir
+        store = self._make_store(project_dir, n_sessions=2)
+        store.list_sessions()  # populate cache
+
+        store.rename_session("sess0", "Custom name")
+        sessions = store.list_sessions()
+        renamed = [s for s in sessions if s.session_id == "sess0"][0]
+        assert renamed.title == "Custom name"
+
+
 class TestSessionStoreGetSession:
     @pytest.fixture
     def populated_store(self, tmp_path):

@@ -54,6 +54,19 @@ async def lifespan(app: FastAPI):
     history_task = asyncio.create_task(history_indexer.run())
     app.state.history_indexer = history_indexer
 
+    # Pre-warm the SessionStore cache off the event loop so the first
+    # /api/sessions request doesn't pay the cold-cache cost (which can
+    # be 30–60s on slow storage like the Jetson's SD card).
+    async def _prewarm_sessions() -> None:
+        try:
+            count = await asyncio.to_thread(lambda: len(app.state.store.list_sessions()))
+            logger.info("SessionStore cache pre-warmed (%d sessions)", count)
+        except Exception:
+            logger.exception("SessionStore pre-warm failed")
+
+    prewarm_task = asyncio.create_task(_prewarm_sessions())
+    app.state.prewarm_task = prewarm_task
+
     try:
         yield
     finally:
@@ -68,7 +81,8 @@ async def lifespan(app: FastAPI):
         history_indexer.stop()
         memory_task.cancel()
         history_task.cancel()
-        for task in [memory_task, history_task]:
+        prewarm_task.cancel()
+        for task in [memory_task, history_task, prewarm_task]:
             try:
                 await task
             except asyncio.CancelledError:
