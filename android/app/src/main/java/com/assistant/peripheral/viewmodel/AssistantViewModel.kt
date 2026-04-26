@@ -296,7 +296,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // Set callback for mirroring OpenAI events to backend via WebSocket
             // Web frontend: wsRef.current?.send({ type: "voice_event", event })
             vm.setVoiceEventCallback { eventMap ->
-                webSocketManager.send(WebSocketMessage.VoiceEvent(eventMap))
+                // Voice runs on the orchestrator socket only.
+                webSocketManager.send(
+                    WebSocketMessage.VoiceEvent(eventMap),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                )
             }
         }
     }
@@ -367,13 +371,36 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private fun handleWebSocketEvent(event: WebSocketEvent) {
         when (event) {
             is WebSocketEvent.Connected -> {
+                val endpoint = try { WebSocketEndpoint.valueOf(event.endpoint) } catch (_: Exception) { return }
+
+                // Agent socket: the orchestrator-probe is irrelevant here. Just send the
+                // pending Start so the backend resumes/loads the requested Claude session.
+                if (endpoint == WebSocketEndpoint.AGENT) {
+                    pendingAgentResume?.let { pending ->
+                        pendingAgentResume = null
+                        webSocketManager.send(
+                            WebSocketMessage.Start(
+                                localId = pending.localId,
+                                resumeSdkId = pending.resumeSdkId
+                            ),
+                            endpoint = WebSocketEndpoint.AGENT
+                        )
+                    }
+                    return
+                }
+
+                // Orchestrator socket below.
                 // If newSession() armed a pending Start (because it had to connect first),
                 // honour it and skip the resume-existing lookup.
                 if (pendingNewSessionStart) {
                     pendingNewSessionStart = false
                     _noActiveOrchestrator.value = false
+                    _isOrchestratorSession.value = true
                     persistOrchestratorLocalId(_currentLocalId.value)
-                    webSocketManager.send(WebSocketMessage.Start(localId = _currentLocalId.value))
+                    webSocketManager.send(
+                        WebSocketMessage.Start(localId = _currentLocalId.value),
+                        endpoint = WebSocketEndpoint.ORCHESTRATOR
+                    )
                     return
                 }
 
@@ -398,14 +425,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         // Reuse the existing orchestrator's local_id so the backend
                         // recognises this as a reconnect (not a new/conflicting session)
                         _currentLocalId.value = existing.localId
+                        _isOrchestratorSession.value = true
                         persistOrchestratorLocalId(existing.localId)
                         // Also track the sdk session id so we can load history
                         _pendingResumeSessionId.value = existing.sdkSessionId
                         _noActiveOrchestrator.value = false
-                        webSocketManager.send(WebSocketMessage.Start(
-                            localId = existing.localId,
-                            resumeSdkId = existing.sdkSessionId
-                        ))
+                        webSocketManager.send(
+                            WebSocketMessage.Start(
+                                localId = existing.localId,
+                                resumeSdkId = existing.sdkSessionId
+                            ),
+                            endpoint = WebSocketEndpoint.ORCHESTRATOR
+                        )
                     } else {
                         // No live orchestrator. Stay idle — UI will switch to History.
                         _pendingResumeSessionId.value = null
@@ -419,8 +450,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             is WebSocketEvent.SessionStarted -> {
                 _currentSessionId.value = event.sessionId
                 _sessionStatus.value = "idle"
-                _isOrchestratorSession.value = true // Orchestrator sessions only via this endpoint
-                _noActiveOrchestrator.value = false
+                // Don't override _isOrchestratorSession here: SessionStarted arrives on
+                // both endpoints (orchestrator and agent). The flag is owned by the
+                // caller that initiated the session (loadSession / orchestrator-probe).
+                // Only clear noActiveOrchestrator if this is in fact an orchestrator session.
+                if (_isOrchestratorSession.value) {
+                    _noActiveOrchestrator.value = false
+                }
 
                 // Track the true JSONL session ID for voice resume.
                 // On reconnect the backend returns local_id as session_id — use
@@ -466,9 +502,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             is WebSocketEvent.Disconnected -> {
-                streamingMessageId = null
-                _streamingContent.value = ""
-                _sessionStatus.value = "disconnected"
+                // Only clear chat-streaming state when the endpoint owning the
+                // currently-displayed session went down. The orchestrator socket
+                // staying up while the agent socket disconnects (or vice versa)
+                // shouldn't wipe the active chat's streaming state.
+                val endpoint = try { WebSocketEndpoint.valueOf(event.endpoint) } catch (_: Exception) { null }
+                if (endpoint == null || endpoint == currentEndpoint()) {
+                    streamingMessageId = null
+                    _streamingContent.value = ""
+                    _sessionStatus.value = "disconnected"
+                }
             }
 
             is WebSocketEvent.MessageStart -> {
@@ -707,17 +750,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         )
         _messages.update { it + userMessage }
 
-        // Send to server
-        webSocketManager.send(WebSocketMessage.Send(text))
+        // Send to server — route to whichever socket owns the current chat tab.
+        webSocketManager.send(WebSocketMessage.Send(text), endpoint = currentEndpoint())
     }
 
     fun interrupt() {
-        webSocketManager.send(WebSocketMessage.Interrupt)
+        webSocketManager.send(WebSocketMessage.Interrupt, endpoint = currentEndpoint())
         _sessionStatus.value = "interrupted"
     }
 
     fun compact() {
-        webSocketManager.send(WebSocketMessage.Compact)
+        webSocketManager.send(WebSocketMessage.Compact, endpoint = currentEndpoint())
     }
 
     // Session management - debounced to prevent rapid duplicate refreshes
@@ -804,7 +847,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             // Save current session to cache before switching
             saveCurrentSessionToCache()
-            _noActiveOrchestrator.value = false
+
+            val endpoint = if (isOrchestrator) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
 
             // Check if session is already cached
             val cached = sessionCache[sessionId]
@@ -815,16 +859,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 _hasMoreMessages.value = cached.hasMoreMessages
                 _messages.value = cached.messages
                 _isOrchestratorSession.value = cached.isOrchestrator
+                if (isOrchestrator) _noActiveOrchestrator.value = false
 
-                // Still need to reconnect WebSocket for the new session
                 _currentLocalId.value = UUID.randomUUID().toString()
-                disconnect()
-                val endpoint = if (isOrchestrator) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
-                webSocketManager.connect(_settings.value.serverUrl, _currentLocalId.value, endpoint)
-                webSocketManager.send(WebSocketMessage.Start(
-                    localId = _currentLocalId.value,
-                    resumeSdkId = sessionId
-                ))
+                openSessionOnEndpoint(endpoint, _currentLocalId.value, sessionId)
                 return@launch
             }
 
@@ -841,22 +879,50 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
                 // Generate new local ID for this session
                 _currentLocalId.value = UUID.randomUUID().toString()
-
-                // Set orchestrator flag
                 _isOrchestratorSession.value = isOrchestrator
+                if (isOrchestrator) _noActiveOrchestrator.value = false
 
-                // Reconnect with resume - use appropriate endpoint
-                disconnect()
-                val endpoint = if (isOrchestrator) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
-                webSocketManager.connect(_settings.value.serverUrl, _currentLocalId.value, endpoint)
-
-                // Send start with resume
-                webSocketManager.send(WebSocketMessage.Start(
-                    localId = _currentLocalId.value,
-                    resumeSdkId = sessionId
-                ))
+                openSessionOnEndpoint(endpoint, _currentLocalId.value, sessionId)
             }
         }
+    }
+
+    /**
+     * Connect (if needed) the given endpoint and Start the session on it.
+     *
+     * Crucially, this does NOT touch the *other* endpoint's socket: opening a
+     * Claude Code (agent) session must not tear down the orchestrator socket,
+     * which may be running an active realtime voice conversation.
+     *
+     * If the target socket is already connected we re-Start it on the new
+     * local_id immediately. Otherwise we queue the Start via pendingAgentResume
+     * (or pendingNewSessionStart for orchestrator) and the Connected handler
+     * sends it once the handshake completes.
+     */
+    private fun openSessionOnEndpoint(
+        endpoint: WebSocketEndpoint,
+        localId: String,
+        resumeSdkId: String
+    ) {
+        if (webSocketManager.isConnected(endpoint)) {
+            webSocketManager.send(
+                WebSocketMessage.Start(localId = localId, resumeSdkId = resumeSdkId),
+                endpoint = endpoint
+            )
+            return
+        }
+        when (endpoint) {
+            WebSocketEndpoint.AGENT -> {
+                pendingAgentResume = PendingAgentResume(localId, resumeSdkId)
+            }
+            WebSocketEndpoint.ORCHESTRATOR -> {
+                // The orchestrator-probe in the Connected handler will pick up
+                // the live orchestrator on the server and resume it. We don't
+                // need pendingNewSessionStart — that path is for fresh sessions.
+                _pendingResumeSessionId.value = resumeSdkId
+            }
+        }
+        webSocketManager.connect(_settings.value.serverUrl, localId, endpoint)
     }
 
     /**
@@ -936,11 +1002,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Persist so a later reconnect finds this same session instead of forking.
         persistOrchestratorLocalId(_currentLocalId.value)
 
+        // newSession is orchestrator-only — and so the new session lives on the
+        // orchestrator socket. Mark the flag now so any subsequent send() routes
+        // there too.
+        _isOrchestratorSession.value = true
+
         // (Re)connect WebSocket and explicitly start the new session.
-        if (connectionState.value is ConnectionState.Connected) {
+        if (webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
             // Already connected — the Connected handler won't re-fire, so send Start ourselves.
-            webSocketManager.send(WebSocketMessage.Stop)
-            webSocketManager.send(WebSocketMessage.Start(localId = _currentLocalId.value))
+            webSocketManager.send(WebSocketMessage.Stop, endpoint = WebSocketEndpoint.ORCHESTRATOR)
+            webSocketManager.send(
+                WebSocketMessage.Start(localId = _currentLocalId.value),
+                endpoint = WebSocketEndpoint.ORCHESTRATOR
+            )
         } else {
             // Not connected — connect, then send Start once Connected fires.
             // We arm pendingNewSessionStart so the Connected handler picks it up.
@@ -951,6 +1025,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Set by newSession() when we need to (re)connect first; consumed in the Connected handler.
     private var pendingNewSessionStart: Boolean = false
+
+    // When loadSession() opens an agent session but the AGENT socket isn't connected yet,
+    // we stash the resume sdk id here. The Connected(AGENT) handler picks it up and
+    // sends the Start. Avoids racing send() against an in-flight WS handshake.
+    private data class PendingAgentResume(val localId: String, val resumeSdkId: String)
+    private var pendingAgentResume: PendingAgentResume? = null
+
+    /** Pick the WebSocket endpoint that owns the currently-displayed session. */
+    private fun currentEndpoint(): WebSocketEndpoint =
+        if (_isOrchestratorSession.value) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
 
     fun deleteSession(sessionId: String) {
         viewModelScope.launch {
@@ -1006,8 +1090,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 )
                 _messages.update { it + userMessage }
 
-                // Send audio to server
-                webSocketManager.send(WebSocketMessage.SendAudio(base64Audio, "wav"))
+                // Send audio to server — route to whichever socket owns the current chat tab.
+                webSocketManager.send(
+                    WebSocketMessage.SendAudio(base64Audio, "wav"),
+                    endpoint = currentEndpoint()
+                )
             }
         }
     }
@@ -1035,10 +1122,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // so the orchestrator resumes from the correct history file.
             // NOTE: _currentSessionId may be local_id on reconnect; _jsonlSessionId is always
             // the real SDK/JSONL id (matches web frontend's resumeSdkId behaviour).
-            webSocketManager.send(WebSocketMessage.VoiceStart(
-                localId = _currentLocalId.value,
-                resumeSdkId = _jsonlSessionId ?: _currentSessionId.value
-            ))
+            webSocketManager.send(
+                WebSocketMessage.VoiceStart(
+                    localId = _currentLocalId.value,
+                    resumeSdkId = _jsonlSessionId ?: _currentSessionId.value
+                ),
+                endpoint = WebSocketEndpoint.ORCHESTRATOR
+            )
             // Then start the actual WebRTC connection
             vm.start()
         }

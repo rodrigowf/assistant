@@ -14,6 +14,16 @@ enum class WebSocketEndpoint {
     AGENT          // /api/sessions/chat - Claude Code sessions
 }
 
+/**
+ * Holds up to one socket per [WebSocketEndpoint] so the orchestrator (which may
+ * be running a realtime voice conversation) keeps streaming even while the user
+ * opens a Claude Code session in the agent tab.
+ *
+ * The public [connectionState] tracks the orchestrator socket — that's what the
+ * top-level UI uses to mean "are we connected to the server". Per-endpoint
+ * Connected/Disconnected events are emitted on [events] so callers that care
+ * about the agent socket can react too.
+ */
 class WebSocketManager {
 
     companion object {
@@ -22,37 +32,53 @@ class WebSocketManager {
         private const val PING_INTERVAL_MS = 30000L
     }
 
-    private var webSocket: WebSocket? = null
-    private var client: OkHttpClient? = null
-    private var currentUrl: String? = null
-    private var shouldReconnect = false
-    private var currentLocalId: String? = null
-    private var currentEndpoint: WebSocketEndpoint = WebSocketEndpoint.ORCHESTRATOR
+    private data class Connection(
+        var webSocket: WebSocket? = null,
+        var client: OkHttpClient? = null,
+        var url: String? = null,
+        var localId: String? = null,
+        var shouldReconnect: Boolean = false,
+        val state: MutableStateFlow<ConnectionState> = MutableStateFlow(ConnectionState.Disconnected)
+    )
 
-    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
-    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+    private val connections: Map<WebSocketEndpoint, Connection> = mapOf(
+        WebSocketEndpoint.ORCHESTRATOR to Connection(),
+        WebSocketEndpoint.AGENT to Connection()
+    )
+
+    /** Orchestrator connection state — preserves the legacy single-socket contract for the UI. */
+    val connectionState: StateFlow<ConnectionState> =
+        connections.getValue(WebSocketEndpoint.ORCHESTRATOR).state.asStateFlow()
+
+    fun connectionState(endpoint: WebSocketEndpoint): StateFlow<ConnectionState> =
+        connections.getValue(endpoint).state.asStateFlow()
 
     private val _events = MutableSharedFlow<WebSocketEvent>(extraBufferCapacity = 64)
     val events: SharedFlow<WebSocketEvent> = _events.asSharedFlow()
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    fun connect(url: String, localId: String? = null, endpoint: WebSocketEndpoint = WebSocketEndpoint.ORCHESTRATOR) {
-        if (_connectionState.value is ConnectionState.Connected ||
-            _connectionState.value is ConnectionState.Connecting) {
+    fun connect(
+        url: String,
+        localId: String? = null,
+        endpoint: WebSocketEndpoint = WebSocketEndpoint.ORCHESTRATOR
+    ) {
+        val conn = connections.getValue(endpoint)
+        if (conn.state.value is ConnectionState.Connected ||
+            conn.state.value is ConnectionState.Connecting) {
             return
         }
 
-        currentUrl = url
-        currentLocalId = localId
-        currentEndpoint = endpoint
-        shouldReconnect = true
-        _connectionState.value = ConnectionState.Connecting
+        conn.url = url
+        conn.localId = localId
+        conn.shouldReconnect = true
+        conn.state.value = ConnectionState.Connecting
 
-        client = OkHttpClient.Builder()
+        val client = OkHttpClient.Builder()
             .pingInterval(PING_INTERVAL_MS, TimeUnit.MILLISECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .build()
+        conn.client = client
 
         val wsUrl = buildWebSocketUrl(url, endpoint)
         val request = Request.Builder()
@@ -61,57 +87,53 @@ class WebSocketManager {
 
         Log.d(TAG, "Connecting to: $wsUrl (endpoint: $endpoint)")
 
-        webSocket = client?.newWebSocket(request, object : WebSocketListener() {
+        conn.webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d(TAG, "WebSocket connected")
-                _connectionState.value = ConnectionState.Connected
-                _events.tryEmit(WebSocketEvent.Connected)
+                Log.d(TAG, "WebSocket connected ($endpoint)")
+                conn.state.value = ConnectionState.Connected
+                _events.tryEmit(WebSocketEvent.Connected(endpoint.name))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "Received text: $text")
+                Log.d(TAG, "Received text ($endpoint): $text")
                 parseMessage(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
                 val text = bytes.utf8()
-                Log.d(TAG, "Received binary: $text")
+                Log.d(TAG, "Received binary ($endpoint): $text")
                 parseMessage(text)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closing: $code - $reason")
+                Log.d(TAG, "WebSocket closing ($endpoint): $code - $reason")
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closed: $code - $reason")
-                handleDisconnect()
+                Log.d(TAG, "WebSocket closed ($endpoint): $code - $reason")
+                handleDisconnect(endpoint)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WebSocket failure: ${t.message}", t)
-                _connectionState.value = ConnectionState.Error(t.message ?: "Connection failed")
+                Log.e(TAG, "WebSocket failure ($endpoint): ${t.message}", t)
+                conn.state.value = ConnectionState.Error(t.message ?: "Connection failed")
                 _events.tryEmit(WebSocketEvent.Error(t.message ?: "Connection failed"))
-                handleDisconnect()
+                handleDisconnect(endpoint)
             }
         })
     }
 
-    private fun buildWebSocketUrl(baseUrl: String, endpoint: WebSocketEndpoint = WebSocketEndpoint.ORCHESTRATOR): String {
-        // Convert HTTP to WS and ensure correct API path
+    private fun buildWebSocketUrl(baseUrl: String, endpoint: WebSocketEndpoint): String {
         var url = baseUrl
             .replace("http://", "ws://")
             .replace("https://", "wss://")
 
-        // Remove trailing slash
         url = url.trimEnd('/')
 
-        // Remove any existing API paths
         url = url.replace("/api/orchestrator/chat", "")
             .replace("/api/sessions/chat", "")
 
-        // Add WebSocket path based on endpoint type
         url = when (endpoint) {
             WebSocketEndpoint.ORCHESTRATOR -> "$url/api/orchestrator/chat"
             WebSocketEndpoint.AGENT -> "$url/api/sessions/chat"
@@ -120,28 +142,41 @@ class WebSocketManager {
         return url
     }
 
-    private fun handleDisconnect() {
-        _connectionState.value = ConnectionState.Disconnected
-        _events.tryEmit(WebSocketEvent.Disconnected)
+    private fun handleDisconnect(endpoint: WebSocketEndpoint) {
+        val conn = connections.getValue(endpoint)
+        conn.state.value = ConnectionState.Disconnected
+        _events.tryEmit(WebSocketEvent.Disconnected(endpoint.name))
 
-        if (shouldReconnect) {
+        if (conn.shouldReconnect) {
             scope.launch {
                 delay(RECONNECT_DELAY_MS)
-                currentUrl?.let { connect(it, currentLocalId, currentEndpoint) }
+                conn.url?.let { connect(it, conn.localId, endpoint) }
             }
         }
     }
 
-    fun disconnect() {
-        shouldReconnect = false
-        webSocket?.close(1000, "User disconnected")
-        webSocket = null
-        client?.dispatcher?.executorService?.shutdown()
-        client = null
-        _connectionState.value = ConnectionState.Disconnected
+    /** Disconnect a specific endpoint (or all when null). */
+    fun disconnect(endpoint: WebSocketEndpoint? = null) {
+        val targets = if (endpoint == null) connections.keys else setOf(endpoint)
+        for (ep in targets) {
+            val conn = connections.getValue(ep)
+            conn.shouldReconnect = false
+            conn.webSocket?.close(1000, "User disconnected")
+            conn.webSocket = null
+            conn.client?.dispatcher?.executorService?.shutdown()
+            conn.client = null
+            conn.state.value = ConnectionState.Disconnected
+        }
     }
 
-    fun send(message: WebSocketMessage) {
+    /** Returns true if the given endpoint's socket is currently in [ConnectionState.Connected]. */
+    fun isConnected(endpoint: WebSocketEndpoint): Boolean =
+        connections.getValue(endpoint).state.value is ConnectionState.Connected
+
+    fun send(
+        message: WebSocketMessage,
+        endpoint: WebSocketEndpoint = WebSocketEndpoint.ORCHESTRATOR
+    ) {
         val json = when (message) {
             is WebSocketMessage.Start -> JSONObject().apply {
                 put("type", "start")
@@ -192,8 +227,8 @@ class WebSocketManager {
         }
 
         val jsonString = json.toString()
-        Log.d(TAG, "Sending: $jsonString")
-        webSocket?.send(jsonString)
+        Log.d(TAG, "Sending ($endpoint): $jsonString")
+        connections.getValue(endpoint).webSocket?.send(jsonString)
     }
 
     @Suppress("UNCHECKED_CAST")
