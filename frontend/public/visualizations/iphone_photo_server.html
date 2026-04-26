@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>iOS Photo Server</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  background: #0a0a1a;
+  color: #e0e0e0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+}
+.card {
+  background: linear-gradient(135deg, #16213e 0%, #1a1a2e 100%);
+  border: 1px solid #2a2a4a;
+  border-radius: 20px;
+  padding: 32px 24px;
+  max-width: 400px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+}
+h1 {
+  font-size: 22px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 4px;
+}
+.version {
+  font-size: 14px;
+  color: #64b5f6;
+  font-weight: 600;
+  margin-bottom: 20px;
+}
+.description {
+  font-size: 14px;
+  color: #999;
+  line-height: 1.5;
+  margin-bottom: 24px;
+}
+.download-btn {
+  display: block;
+  width: 100%;
+  padding: 16px 24px;
+  font-size: 17px;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(135deg, #1e88e5 0%, #1565c0 100%);
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  text-decoration: none;
+  transition: transform 0.1s, box-shadow 0.2s;
+  box-shadow: 0 4px 12px rgba(30,136,229,0.3);
+}
+.download-btn:active {
+  transform: scale(0.97);
+  box-shadow: 0 2px 6px rgba(30,136,229,0.3);
+}
+.instructions {
+  margin-top: 24px;
+  text-align: left;
+  background: rgba(0,0,0,0.3);
+  border-radius: 12px;
+  padding: 16px;
+}
+.instructions h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: #90caf9;
+  margin-bottom: 10px;
+}
+.instructions ol {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #bbb;
+  padding-left: 20px;
+}
+.instructions li {
+  margin-bottom: 4px;
+}
+.instructions code {
+  background: rgba(100,181,246,0.15);
+  color: #64b5f6;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.changelog {
+  margin-top: 20px;
+  text-align: left;
+  font-size: 12px;
+  color: #666;
+  line-height: 1.6;
+}
+.changelog summary {
+  color: #90caf9;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.changelog ul {
+  padding-left: 16px;
+  list-style: disc;
+}
+.changelog li { margin-bottom: 2px; }
+.tag {
+  display: inline-block;
+  background: rgba(100,181,246,0.15);
+  color: #64b5f6;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  margin-left: 4px;
+}
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="icon">&#128247;</div>
+  <h1>iOS Photo Server</h1>
+  <div class="version">v1.3.0 <span class="tag">latest</span></div>
+
+  <p class="description">
+    Serve your iPhone's photo library over the local network.
+    REST API for agentic access, plus a browser UI for browsing.
+  </p>
+
+  <a class="download-btn" href="/visualizations/copyparty_ios_combined.py"
+     download="copyparty_ios_combined.py">
+    &#11015; Download Script
+  </a>
+
+  <div class="instructions">
+    <h2>Setup</h2>
+    <ol>
+      <li>Tap <strong>Download</strong> above</li>
+      <li>Open the file in <strong>Pythonista 3</strong></li>
+      <li>Tap <strong>&#9654; Play</strong> to start the server</li>
+      <li>Grant photo access when prompted</li>
+      <li>The server URL will appear in the console</li>
+    </ol>
+  </div>
+
+  <div class="changelog">
+    <details>
+      <summary>Changelog</summary>
+      <ul>
+        <li><strong>1.3.0</strong> — Persistent logging to file, <code>/api/logs</code> endpoint for post-crash debugging</li>
+        <li><strong>1.2.1</strong> — Video export rewritten: PHAssetResourceManager (single callback), prevents crash</li>
+        <li><strong>1.2.0</strong> — Server starts before library loads, background enumeration, defensive property access</li>
+        <li><strong>1.1.0</strong> — Lazy filenames, no ObjC during scan, memory-safe metadata cache</li>
+        <li><strong>1.0.0</strong> — Initial release: full REST API, browse UI, photo + video serving</li>
+      </ul>
+    </details>
+  </div>
+</div>
+
+</body>
+</html>
