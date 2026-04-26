@@ -444,7 +444,9 @@ private fun ThinkingBlock(block: MessageBlock.Thinking) {
 private fun ToolUseBlock(block: MessageBlock.ToolUse) {
     var expanded by remember { mutableStateOf(false) }
 
-    val toolColor = getToolColor(block.toolName)
+    val category = getToolCategory(block.toolName)
+    val toolColor = ToolPalette.colorFor(category, block.isError)
+    val toolBg = ToolPalette.backgroundFor(category, block.isError)
     val summary = formatToolSummary(block.toolName, block.toolInput)
 
     // Left-border-only style matching web .tool-block
@@ -452,7 +454,6 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
         modifier = Modifier
             .fillMaxWidth()
             .drawBehind {
-                // 2dp left border in category color
                 drawLine(
                     color = toolColor,
                     start = Offset(0f, 0f),
@@ -461,7 +462,7 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
                 )
             }
             .background(
-                color = toolColor.copy(alpha = 0.04f),
+                color = toolBg,
                 shape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
             )
             .clickable { expanded = !expanded }
@@ -472,7 +473,7 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = getToolIcon(block.toolName),
+                imageVector = getToolIcon(block.toolName, block.isError, block.isComplete),
                 contentDescription = null,
                 modifier = Modifier.size(15.dp),
                 tint = toolColor
@@ -541,29 +542,113 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
             )
         }
 
-        // Expanded content
-        if (expanded && block.result != null) {
+        if (expanded) {
+            ToolBlockExpandedContent(block)
+        }
+    }
+}
+
+/**
+ * Body shown when a tool block is expanded. Mirrors the web frontend layout:
+ * an Input section followed by an Output section. Both are always rendered
+ * once expanded, even if empty - the placeholder text matches what the user
+ * sees on the web ("(no output)" rather than the bare string "null").
+ */
+@Composable
+private fun ToolBlockExpandedContent(block: MessageBlock.ToolUse) {
+    Column(modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp)) {
+        // Input
+        if (block.toolInput.isNotEmpty()) {
+            Text(
+                text = "Input",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+                    fontSize = 10.sp,
+                    letterSpacing = 0.4.sp
+                ),
+                color = MdColors.textMuted,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
             Surface(
                 shape = RoundedCornerShape(4.dp),
-                color = MaterialTheme.colorScheme.surface,
-                modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp)
+                color = MdColors.bgElevated,
+                modifier = Modifier.fillMaxWidth()
             ) {
-                val scrollState = rememberScrollState()
+                val inputScroll = rememberScrollState()
                 Text(
-                    text = block.result,
+                    text = formatToolInput(block.toolName, block.toolInput),
                     style = MaterialTheme.typography.bodySmall.copy(
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                         lineHeight = 16.sp
                     ),
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
+                    color = MdColors.text,
                     modifier = Modifier
-                        .horizontalScroll(scrollState)
+                        .horizontalScroll(inputScroll)
                         .padding(8.dp)
                 )
             }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
+        // Output
+        Text(
+            text = "Output",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+                fontSize = 10.sp,
+                letterSpacing = 0.4.sp
+            ),
+            color = MdColors.textMuted,
+            modifier = Modifier.padding(bottom = 4.dp)
+        )
+        Surface(
+            shape = RoundedCornerShape(4.dp),
+            color = MdColors.bgElevated,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            val outputScroll = rememberScrollState()
+            val resultText = block.result
+            val (display, isPlaceholder) = when {
+                resultText == null -> "(no output)" to true
+                resultText.isEmpty() -> "(empty)" to true
+                else -> resultText to false
+            }
+            Text(
+                text = display,
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
+                    fontStyle = if (isPlaceholder) FontStyle.Italic else FontStyle.Normal
+                ),
+                color = if (isPlaceholder) MdColors.textMuted else MdColors.text,
+                modifier = Modifier
+                    .horizontalScroll(outputScroll)
+                    .padding(8.dp)
+            )
         }
     }
+}
+
+/**
+ * Render a tool's input map as a key-value list. Long string values are
+ * truncated so the expanded view stays usable on a phone screen.
+ */
+private fun formatToolInput(toolName: String, input: Map<String, Any?>): String {
+    if (input.isEmpty()) return "(no input)"
+    val builder = StringBuilder()
+    for ((key, value) in input) {
+        val rendered = when (value) {
+            null -> "null"
+            is String -> if (value.length > 400) value.take(400) + "…" else value
+            is Map<*, *> -> value.toString()
+            is List<*> -> value.toString()
+            else -> value.toString()
+        }
+        builder.append(key).append(": ").append(rendered).append('\n')
+    }
+    return builder.toString().trimEnd()
 }
 
 @Composable
@@ -722,6 +807,105 @@ fun ChatInputBar(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool category + palette
+// ---------------------------------------------------------------------------
+//
+// Mirrors the web frontend's semantic, action-based coloring (frontend/src/
+// components/ToolUseBlock.tsx + index.css). Categories drive both the left
+// border colour and the tinted background, so the same tool reads as the same
+// colour family on web and mobile.
+//
+// HSL values from index.css were converted to ARGB on a per-channel basis;
+// the alpha for backgrounds matches the web's `hsla(..., 0.07)` -> ~0x12.
+
+private enum class ToolCategory { READ, WRITE, EXECUTE, SCRIPT, NAVIGATE, CAPTURE, INTERACT, TODO, TASK, AGENT, SEARCH, SYSTEM }
+
+private fun getToolCategory(toolName: String): ToolCategory {
+    // Read/inspect tools (passive observation)
+    if (toolName in setOf("Read", "Glob", "Grep", "WebFetch", "WebSearch")) return ToolCategory.READ
+    // Write/modify tools
+    if (toolName in setOf("Write", "Edit", "NotebookEdit")) return ToolCategory.WRITE
+    // Todo tracking
+    if (toolName == "TodoWrite") return ToolCategory.TODO
+    // Task delegation (subagents)
+    if (toolName == "Task") return ToolCategory.TASK
+    // Execute tools
+    if (toolName in setOf("Bash", "Skill", "EnterPlanMode", "ExitPlanMode")) return ToolCategory.EXECUTE
+    // User interaction
+    if (toolName == "AskUserQuestion") return ToolCategory.INTERACT
+    // Orchestrator agent session tools
+    if (toolName in setOf(
+            "list_agent_sessions", "open_agent_session", "close_agent_session",
+            "read_agent_session", "send_to_agent_session", "interrupt_agent_session",
+            "list_history"
+        )) return ToolCategory.AGENT
+    // Orchestrator search tools
+    if (toolName in setOf("search_history", "search_memory")) return ToolCategory.SEARCH
+    // Orchestrator file tools - reuse existing categories
+    if (toolName == "read_file") return ToolCategory.READ
+    if (toolName == "write_file") return ToolCategory.WRITE
+
+    // Browser MCP tools - categorize by action type
+    if (toolName.startsWith("mcp__chrome-devtools__")) {
+        val action = toolName.removePrefix("mcp__chrome-devtools__")
+        if (action in setOf("navigate_page", "click", "hover", "drag", "fill", "fill_form",
+                "press_key", "handle_dialog", "new_page", "close_page", "select_page",
+                "resize_page", "wait_for")) return ToolCategory.NAVIGATE
+        if (action in setOf("take_screenshot", "take_snapshot", "performance_start_trace",
+                "performance_stop_trace", "performance_analyze_insight")) return ToolCategory.CAPTURE
+        if (action == "evaluate_script") return ToolCategory.SCRIPT
+        if (action in setOf("list_console_messages", "list_network_requests", "get_console_message",
+                "get_network_request", "list_pages", "emulate")) return ToolCategory.READ
+    }
+
+    return ToolCategory.SYSTEM
+}
+
+private object ToolPalette {
+    // Border / icon / text colours per category (HSL -> ARGB from index.css).
+    private val borderColors = mapOf(
+        ToolCategory.READ     to Color(0xFF6E99C4),
+        ToolCategory.WRITE    to Color(0xFF59B18C),
+        ToolCategory.EXECUTE  to Color(0xFFC2975B),
+        ToolCategory.SCRIPT   to Color(0xFFBD8156),
+        ToolCategory.NAVIGATE to Color(0xFFB276A3),
+        ToolCategory.CAPTURE  to Color(0xFF58ABBB),
+        ToolCategory.INTERACT to Color(0xFFC78B57),
+        ToolCategory.TODO     to Color(0xFF9976B2),
+        ToolCategory.TASK     to Color(0xFF7B6DB0),
+        ToolCategory.AGENT    to Color(0xFF4EB2BC),
+        ToolCategory.SEARCH   to Color(0xFF876EB9),
+        ToolCategory.SYSTEM   to Color(0xFF737F96),
+    )
+
+    // Translucent fill — same hue as the border but at ~7% opacity (matches
+    // the web's `hsla(..., 0.07)` background).
+    private val backgroundColors = mapOf(
+        ToolCategory.READ     to Color(0x126E99C4),
+        ToolCategory.WRITE    to Color(0x1259B18C),
+        ToolCategory.EXECUTE  to Color(0x12C2975B),
+        ToolCategory.SCRIPT   to Color(0x12BD8156),
+        ToolCategory.NAVIGATE to Color(0x12B276A3),
+        ToolCategory.CAPTURE  to Color(0x1258ABBB),
+        ToolCategory.INTERACT to Color(0x12C78B57),
+        ToolCategory.TODO     to Color(0x149976B2),
+        ToolCategory.TASK     to Color(0x127B6DB0),
+        ToolCategory.AGENT    to Color(0x124EB2BC),
+        ToolCategory.SEARCH   to Color(0x12876EB9),
+        ToolCategory.SYSTEM   to Color(0x12737F96),
+    )
+
+    private val errorColor = Color(0xFFD45F5F)        // --error
+    private val errorBg = Color(0x1AD45F5F)           // --error-bg (~10% alpha)
+
+    fun colorFor(category: ToolCategory, isError: Boolean): Color =
+        if (isError) errorColor else borderColors.getValue(category)
+
+    fun backgroundFor(category: ToolCategory, isError: Boolean): Color =
+        if (isError) errorBg else backgroundColors.getValue(category)
+}
+
 // Format a contextual summary for the tool (matching web formatToolSummary)
 private fun formatToolSummary(toolName: String, input: Map<String, Any?>): String {
     fun formatPath(path: Any?): String {
@@ -729,79 +913,147 @@ private fun formatToolSummary(toolName: String, input: Map<String, Any?>): Strin
         val parts = s.split("/")
         return if (parts.size > 3) ".../${parts.takeLast(2).joinToString("/")}" else s
     }
+    fun shortId(id: Any?): String = id?.toString()?.take(8) ?: ""
 
-    return when (toolName) {
-        "Read" -> input["file_path"]?.let { "Read ${formatPath(it)}" } ?: "Read"
-        "Write" -> input["file_path"]?.let { "Write ${formatPath(it)}" } ?: "Write"
-        "Edit" -> input["file_path"]?.let { "Edit ${formatPath(it)}" } ?: "Edit"
-        "NotebookEdit" -> input["notebook_path"]?.let { "Edit notebook ${formatPath(it)}" } ?: "Edit notebook"
+    when (toolName) {
+        "Read" -> return input["file_path"]?.let { "Read ${formatPath(it)}" } ?: "Read"
+        "Write" -> return input["file_path"]?.let { "Write ${formatPath(it)}" } ?: "Write"
+        "Edit" -> return input["file_path"]?.let { "Edit ${formatPath(it)}" } ?: "Edit"
+        "NotebookEdit" -> return input["notebook_path"]?.let { "Edit notebook ${formatPath(it)}" } ?: "Edit notebook"
         "Bash" -> {
             val desc = input["description"]?.toString()
             val cmd = input["command"]?.toString()
-            when {
+            return when {
                 desc != null -> desc
                 cmd != null -> cmd.take(60) + if (cmd.length > 60) "..." else ""
                 else -> "Bash"
             }
         }
-        "Glob" -> input["pattern"]?.let { "Glob $it" } ?: "Glob"
-        "Grep" -> input["pattern"]?.let { "Grep \"$it\"" } ?: "Grep"
-        "WebFetch" -> input["url"]?.let { "Fetch $it" } ?: "WebFetch"
-        "WebSearch" -> input["query"]?.let { "Search \"$it\"" } ?: "WebSearch"
-        "Task" -> input["description"]?.let { "Task: $it" } ?: "Task"
-        "TodoWrite" -> "Update todos"
-        "AskUserQuestion" -> "Ask user"
-        "Skill" -> input["skill"]?.let { "/$it" } ?: "Skill"
-        "EnterPlanMode" -> "Enter plan mode"
-        "ExitPlanMode" -> "Exit plan mode"
+        "Glob" -> return input["pattern"]?.let { "Glob $it" } ?: "Glob"
+        "Grep" -> return input["pattern"]?.let { "Grep \"$it\"" } ?: "Grep"
+        "WebFetch" -> return input["url"]?.let { "Fetch $it" } ?: "WebFetch"
+        "WebSearch" -> return input["query"]?.let { "Search \"$it\"" } ?: "WebSearch"
+        "Task" -> return input["description"]?.let { "Task: $it" } ?: "Task"
+        "TodoWrite" -> return "Update todos"
+        "AskUserQuestion" -> return "Ask user"
+        "Skill" -> return input["skill"]?.let { "/$it" } ?: "Skill"
+        "EnterPlanMode" -> return "Enter plan mode"
+        "ExitPlanMode" -> return "Exit plan mode"
+
         // Orchestrator tools
-        "list_agent_sessions" -> "List active sessions"
-        "open_agent_session" -> if (input["resume_sdk_id"] != null) "Resume session" else "Open agent session"
+        "list_agent_sessions" -> return "List active sessions"
+        "open_agent_session" -> return if (input["resume_sdk_id"] != null) "Resume session" else "Open agent session"
+        "close_agent_session" -> return input["session_id"]?.let { "Close session ${shortId(it)}" } ?: "Close session"
+        "read_agent_session" -> return input["session_id"]?.let { "Read session ${shortId(it)}" } ?: "Read session"
         "send_to_agent_session" -> {
             val msg = input["message"]?.toString()
-            msg?.take(60)?.let { it + if (msg.length > 60) "..." else "" } ?: "Send to agent"
+            return msg?.take(60)?.let { it + if (msg.length > 60) "..." else "" } ?: "Send to agent"
         }
-        "search_history" -> input["query"]?.let { "Search history \"$it\"" } ?: "Search history"
-        "search_memory" -> input["query"]?.let { "Search memory \"$it\"" } ?: "Search memory"
-        "read_file" -> input["path"]?.let { "Read ${formatPath(it)}" } ?: "Read file"
-        "write_file" -> input["path"]?.let { "Write ${formatPath(it)}" } ?: "Write file"
-        else -> toolName
+        "interrupt_agent_session" -> return input["session_id"]?.let { "Interrupt session ${shortId(it)}" } ?: "Interrupt session"
+        "list_history" -> return "List session history"
+        "search_history" -> return input["query"]?.let { "Search history \"$it\"" } ?: "Search history"
+        "search_memory" -> return input["query"]?.let { "Search memory \"$it\"" } ?: "Search memory"
+        "read_file" -> return input["path"]?.let { "Read ${formatPath(it)}" } ?: "Read file"
+        "write_file" -> return input["path"]?.let { "Write ${formatPath(it)}" } ?: "Write file"
     }
+
+    if (toolName.startsWith("mcp__chrome-devtools__")) {
+        val action = toolName.removePrefix("mcp__chrome-devtools__")
+        return when (action) {
+            "navigate_page" -> when (input["type"]) {
+                "reload" -> "Reload page"
+                "back" -> "Go back"
+                "forward" -> "Go forward"
+                else -> input["url"]?.let { "Navigate to $it" } ?: "Navigate"
+            }
+            "click" -> if (input["dblClick"] == true) "Double click" else "Click"
+            "fill" -> "Fill input"
+            "fill_form" -> "Fill form"
+            "take_screenshot" -> "Screenshot"
+            "take_snapshot" -> "Snapshot"
+            "evaluate_script" -> "Run script"
+            "emulate" -> "Emulate device"
+            "hover" -> "Hover"
+            "drag" -> "Drag"
+            "press_key" -> input["key"]?.let { "Press $it" } ?: "Press key"
+            "wait_for" -> input["text"]?.let { "Wait for \"$it\"" } ?: "Wait"
+            "list_pages" -> "List pages"
+            "list_console_messages" -> "List console"
+            "list_network_requests" -> "List network"
+            "select_page" -> "Select page #${input["pageId"]}"
+            "new_page" -> "New page"
+            "close_page" -> "Close page"
+            "resize_page" -> "Resize to ${input["width"]}x${input["height"]}"
+            "performance_start_trace" -> "Start trace"
+            "performance_stop_trace" -> "Stop trace"
+            "get_console_message" -> "Get console message"
+            "get_network_request" -> "Get network request"
+            "handle_dialog" -> if (input["action"] == "accept") "Accept dialog" else "Dismiss dialog"
+            "upload_file" -> "Upload file"
+            else -> action.replace('_', ' ')
+        }
+    }
+
+    if (toolName.startsWith("mcp__")) {
+        val parts = toolName.split("__")
+        return if (parts.size >= 3) parts[2].replace('_', ' ') else toolName
+    }
+
+    return toolName
 }
 
-// Tool color mapping (matches web frontend)
-private fun getToolColor(toolName: String): Color {
-    return when {
-        toolName.contains("Read", ignoreCase = true) ||
-        toolName.contains("Glob", ignoreCase = true) ||
-        toolName.contains("Grep", ignoreCase = true) -> Color(0xFF5888CC) // tool-read
+// Tool icon mapping (matches web frontend, see ToolUseBlock.tsx getToolIcon)
+private fun getToolIcon(
+    toolName: String,
+    isError: Boolean,
+    isComplete: Boolean
+): androidx.compose.ui.graphics.vector.ImageVector {
+    if (!isComplete) return Icons.Default.MoreHoriz
+    if (isError) return Icons.Default.Error
 
-        toolName.contains("Write", ignoreCase = true) ||
-        toolName.contains("Edit", ignoreCase = true) -> Color(0xFF4AAA7A) // tool-write
+    when (toolName) {
+        "Read" -> return Icons.Default.Description
+        "Write" -> return Icons.Default.Code
+        "Edit" -> return Icons.Default.Edit
+        "Bash" -> return Icons.Default.Terminal
+        "Glob", "Grep" -> return Icons.Default.Search
+        "WebFetch" -> return Icons.Default.Language
+        "WebSearch" -> return Icons.Default.Search
+        "Task" -> return Icons.Default.SmartToy
+        "TodoWrite" -> return Icons.Default.Checklist
+        "AskUserQuestion" -> return Icons.Default.HelpOutline
+        "Skill" -> return Icons.Default.AutoAwesome
+        "EnterPlanMode", "ExitPlanMode" -> return Icons.Default.EditNote
+        "NotebookEdit" -> return Icons.Default.MenuBook
 
-        toolName.contains("Bash", ignoreCase = true) ||
-        toolName.contains("Execute", ignoreCase = true) -> Color(0xFFD4A04A) // tool-execute
-
-        toolName.contains("Task", ignoreCase = true) -> Color(0xFF8B7ACC) // tool-task
-
-        toolName.contains("WebFetch", ignoreCase = true) ||
-        toolName.contains("WebSearch", ignoreCase = true) -> Color(0xFF9B7ACC) // tool-search
-
-        else -> Color(0xFF7888AA) // tool-system
+        // Orchestrator tools
+        "list_agent_sessions" -> return Icons.Default.List
+        "open_agent_session" -> return Icons.Default.OpenInNew
+        "close_agent_session" -> return Icons.Default.Close
+        "read_agent_session" -> return Icons.Default.Visibility
+        "send_to_agent_session" -> return Icons.Default.Send
+        "interrupt_agent_session" -> return Icons.Default.Stop
+        "list_history" -> return Icons.Default.History
+        "search_history", "search_memory" -> return Icons.Default.Search
+        "read_file" -> return Icons.Default.Description
+        "write_file" -> return Icons.Default.Code
     }
-}
 
-private fun getToolIcon(toolName: String): androidx.compose.ui.graphics.vector.ImageVector {
-    return when {
-        toolName.contains("Read", ignoreCase = true) -> Icons.Default.Description
-        toolName.contains("Write", ignoreCase = true) ||
-        toolName.contains("Edit", ignoreCase = true) -> Icons.Default.Edit
-        toolName.contains("Bash", ignoreCase = true) -> Icons.Default.Terminal
-        toolName.contains("Task", ignoreCase = true) -> Icons.Default.Assignment
-        toolName.contains("WebFetch", ignoreCase = true) ||
-        toolName.contains("WebSearch", ignoreCase = true) -> Icons.Default.Search
-        toolName.contains("Glob", ignoreCase = true) ||
-        toolName.contains("Grep", ignoreCase = true) -> Icons.Default.FindInPage
-        else -> Icons.Default.Build
+    if (toolName.startsWith("mcp__chrome-devtools__")) {
+        val action = toolName.removePrefix("mcp__chrome-devtools__")
+        return when (action) {
+            "navigate_page" -> Icons.Default.Navigation
+            "click", "hover", "drag" -> Icons.Default.TouchApp
+            "fill", "fill_form", "press_key" -> Icons.Default.Keyboard
+            "take_screenshot" -> Icons.Default.CameraAlt
+            "take_snapshot" -> Icons.Default.ContentCopy
+            "evaluate_script" -> Icons.Default.Bolt
+            "list_console_messages", "get_console_message" -> Icons.Default.List
+            "list_network_requests", "get_network_request" -> Icons.Default.NetworkCheck
+            "performance_start_trace", "performance_stop_trace" -> Icons.Default.Speed
+            else -> Icons.Default.Build
+        }
     }
+
+    return Icons.Default.Build
 }

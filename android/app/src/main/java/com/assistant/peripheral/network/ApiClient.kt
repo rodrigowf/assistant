@@ -115,9 +115,7 @@ class ApiClient(private val baseUrl: String) {
             )
 
             val messagesArray = json.optJSONArray("messages") ?: JSONArray()
-            val messages = (0 until messagesArray.length()).mapNotNull { i ->
-                parseMessage(messagesArray.getJSONObject(i))
-            }
+            val messages = parseMessages(messagesArray)
 
             Pair(sessionInfo, messages)
         } catch (e: Exception) {
@@ -163,9 +161,7 @@ class ApiClient(private val baseUrl: String) {
             val json = JSONObject(body)
 
             val messagesArray = json.optJSONArray("messages") ?: JSONArray()
-            val messages = (0 until messagesArray.length()).mapNotNull { i ->
-                parseMessage(messagesArray.getJSONObject(i))
-            }
+            val messages = parseMessages(messagesArray)
 
             PaginatedMessages(
                 messages = messages,
@@ -356,7 +352,52 @@ class ApiClient(private val baseUrl: String) {
         }
     }
 
-    private fun parseMessage(json: JSONObject): ChatMessage? {
+    /**
+     * Tool result outcome harvested from a JSONL `tool_result` block, ready to be
+     * folded back into its originating `tool_use` block by tool_use_id.
+     */
+    private data class ToolOutcome(val output: String?, val isError: Boolean)
+
+    /**
+     * Parse a list of message JSON objects into ChatMessages, attaching tool_result
+     * blocks to their corresponding tool_use blocks by tool_use_id (matches the web
+     * frontend's two-pass approach in useChat.ts LOAD_HISTORY).
+     *
+     * Tool results come as separate user messages in JSONL — they must be merged
+     * back into the assistant's tool_use block so the UI can show input + output
+     * together, and the protocol-only user wrappers must be dropped.
+     */
+    private fun parseMessages(messagesArray: JSONArray): List<ChatMessage> {
+        val toolResults = collectToolResults(messagesArray)
+        val out = mutableListOf<ChatMessage>()
+        for (i in 0 until messagesArray.length()) {
+            val msg = parseMessage(messagesArray.getJSONObject(i), toolResults) ?: continue
+            out += msg
+        }
+        return out
+    }
+
+    private fun collectToolResults(messagesArray: JSONArray): Map<String, ToolOutcome> {
+        val results = mutableMapOf<String, ToolOutcome>()
+        for (i in 0 until messagesArray.length()) {
+            val msg = messagesArray.getJSONObject(i)
+            val blocks = msg.optJSONArray("blocks") ?: continue
+            for (j in 0 until blocks.length()) {
+                val b = blocks.getJSONObject(j)
+                if (b.optString("type") != "tool_result") continue
+                val id = b.optString("tool_use_id", "")
+                if (id.isEmpty()) continue
+                val output = if (b.isNull("output")) null else b.optString("output", "")
+                results[id] = ToolOutcome(output, b.optBoolean("is_error", false))
+            }
+        }
+        return results
+    }
+
+    private fun parseMessage(
+        json: JSONObject,
+        toolResults: Map<String, ToolOutcome> = emptyMap()
+    ): ChatMessage? {
         val role = when (json.optString("role", "").lowercase()) {
             "user" -> MessageRole.USER
             "assistant" -> MessageRole.ASSISTANT
@@ -369,7 +410,7 @@ class ApiClient(private val baseUrl: String) {
 
         val blocks = if (blocksArray != null) {
             (0 until blocksArray.length()).mapNotNull { i ->
-                parseBlock(blocksArray.getJSONObject(i))
+                parseBlock(blocksArray.getJSONObject(i), toolResults)
             }
         } else {
             if (text.isNotEmpty()) {
@@ -397,7 +438,10 @@ class ApiClient(private val baseUrl: String) {
         )
     }
 
-    private fun parseBlock(json: JSONObject): MessageBlock? {
+    private fun parseBlock(
+        json: JSONObject,
+        toolResults: Map<String, ToolOutcome> = emptyMap()
+    ): MessageBlock? {
         return when (json.optString("type", "")) {
             "text" -> MessageBlock.Text(
                 text = json.optString("text", ""),
@@ -407,19 +451,64 @@ class ApiClient(private val baseUrl: String) {
                 text = json.optString("text", ""),
                 isStreaming = false
             )
-            "tool_use" -> MessageBlock.ToolUse(
-                toolUseId = json.optString("tool_use_id", ""),
-                toolName = json.optString("tool_name", ""),
-                toolInput = emptyMap(), // Simplified for now
-                result = json.optString("output", null),
-                isError = json.optBoolean("is_error", false),
-                isComplete = true
-            )
+            "tool_use" -> {
+                val id = json.optString("tool_use_id", "")
+                val outcome = toolResults[id]
+                // Prefer the matched tool_result; fall back to an inline `output` on
+                // the tool_use block itself when the history endpoint attached it
+                // there directly. JSON null becomes Kotlin null (not the literal
+                // string "null") — `optString(key, null)` is broken for that.
+                val result: String? = outcome?.output
+                    ?: if (json.isNull("output")) null else json.optString("output", "").ifEmpty { null }
+                val isError = outcome?.isError ?: json.optBoolean("is_error", false)
+                MessageBlock.ToolUse(
+                    toolUseId = id,
+                    toolName = json.optString("tool_name", ""),
+                    toolInput = jsonObjectToMap(json.optJSONObject("tool_input")),
+                    result = result,
+                    isError = isError,
+                    isComplete = true
+                )
+            }
+            // tool_result blocks are folded into their corresponding tool_use above;
+            // dropping them here mirrors the web frontend's behaviour.
+            "tool_result" -> null
             "compact" -> MessageBlock.Compact(
                 summary = json.optString("text", json.optString("summary", ""))
             )
             else -> null
         }
+    }
+
+    private fun jsonObjectToMap(json: JSONObject?): Map<String, Any?> {
+        if (json == null) return emptyMap()
+        val map = mutableMapOf<String, Any?>()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = json.opt(key)
+            map[key] = when (value) {
+                is JSONObject -> jsonObjectToMap(value)
+                is JSONArray -> jsonArrayToList(value)
+                JSONObject.NULL -> null
+                else -> value
+            }
+        }
+        return map
+    }
+
+    private fun jsonArrayToList(array: JSONArray): List<Any?> {
+        val list = mutableListOf<Any?>()
+        for (i in 0 until array.length()) {
+            val value = array.opt(i)
+            list.add(when (value) {
+                is JSONObject -> jsonObjectToMap(value)
+                is JSONArray -> jsonArrayToList(value)
+                JSONObject.NULL -> null
+                else -> value
+            })
+        }
+        return list
     }
 
     private fun parseTimestamp(timestamp: String): Long {
