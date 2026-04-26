@@ -449,15 +449,22 @@ mkdir -p index logs
 info "Created index/, logs/"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 9: Mirror Claude Code credentials into .claude_config/
+# Step 9: Link Claude Code credentials into .claude_config/
 # ─────────────────────────────────────────────────────────────────────────────
 # run.sh sets CLAUDE_CONFIG_DIR=$PROJECT_DIR/.claude_config, so the SDK reads
-# OAuth credentials from there — NOT from ~/.claude/. If the user is already
-# logged in globally, mirror the creds so sessions work without re-login.
-if [ -f "$HOME/.claude/.credentials.json" ] && [ ! -f ".claude_config/.credentials.json" ]; then
-    cp "$HOME/.claude/.credentials.json" ".claude_config/.credentials.json"
-    chmod 600 ".claude_config/.credentials.json"
-    info "Mirrored Claude Code credentials to .claude_config/"
+# OAuth credentials from there — NOT from ~/.claude/. Symlink (rather than
+# copy) so OAuth token refreshes by any Claude Code instance propagate
+# automatically. A stale copy here causes 401s once the cached token expires.
+if [ -f "$HOME/.claude/.credentials.json" ]; then
+    if [ -L ".claude_config/.credentials.json" ]; then
+        info "Claude Code credentials symlink already present"
+    else
+        if [ -f ".claude_config/.credentials.json" ]; then
+            rm -f ".claude_config/.credentials.json"
+        fi
+        ln -s "$HOME/.claude/.credentials.json" ".claude_config/.credentials.json"
+        info "Linked Claude Code credentials into .claude_config/"
+    fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
