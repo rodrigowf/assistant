@@ -189,7 +189,14 @@ class SessionPool:
         return lid
 
     async def close(self, session_id: str) -> None:
-        """Remove a session, notify subscribers, and clean up."""
+        """Remove a session, notify subscribers, and clean up.
+
+        Awaits ``sm.stop()`` so the SDK transport, the local ssh client (for
+        remote sessions), and the remote ``claude`` process all shut down
+        deterministically.  Relying on Python GC is not enough: GC cannot run
+        async cleanup, so the subprocess + SSH connection + remote children
+        would otherwise leak across close/reopen cycles.
+        """
         sm = self._sessions.pop(session_id, None)
         if sm is None:
             return
@@ -200,7 +207,17 @@ class SessionPool:
 
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
-        # sm is garbage-collected; the SDK subprocess exits naturally.
+
+        try:
+            # Bound the wait so a misbehaving SDK transport (e.g. a remote
+            # ssh that won't close) can't hang the close request.  After the
+            # timeout the SessionManager is dropped anyway; the worst case
+            # is one orphaned ssh that the OS reaps when its parent exits.
+            await asyncio.wait_for(sm.stop(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("SessionManager %s did not stop within 10s; abandoning", session_id)
+        except Exception:
+            logger.exception("Error stopping SessionManager %s during close", session_id)
 
     async def interrupt(self, session_id: str) -> None:
         """Interrupt the current response for a session."""
@@ -308,6 +325,20 @@ class SessionPool:
                 await session.stop()
             except Exception:
                 pass
+
+    async def close_all(self) -> None:
+        """Stop every active session in the pool. Used at app shutdown so
+        SDK subprocesses (and the remote ssh+claude they spawn) don't leak
+        across backend restarts."""
+        for sid in list(self._sessions.keys()):
+            try:
+                await self.close(sid)
+            except Exception:
+                logger.exception("Error closing session %s during shutdown", sid)
+        try:
+            await self.stop_orchestrator()
+        except Exception:
+            logger.exception("Error stopping orchestrator during shutdown")
 
     @property
     def orchestrator_subscriber_count(self) -> int:

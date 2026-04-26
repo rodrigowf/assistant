@@ -57,6 +57,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Drain the session pool first so remote SSH + claude children get
+        # clean SIGTERMs instead of being orphaned by the backend exiting.
+        try:
+            await app.state.pool.close_all()
+        except Exception:
+            logger.exception("Error draining session pool on shutdown")
+
         memory_watcher.stop()
         history_indexer.stop()
         memory_task.cancel()

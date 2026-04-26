@@ -260,3 +260,90 @@ async def test_pool_resume_fallback_retries_only_once_with_backoff():
     assert sleep_mock.await_count == 1
     slept = sleep_mock.await_args.args[0]
     assert 0.5 <= slept <= 1.0
+
+
+# ----------------------------------------------------------------------
+# Fix 5 — SessionPool.close() awaits SessionManager.stop()
+#
+# Without this, the SDK transport (and for SSH sessions, the local ssh
+# client + the remote claude process + its MCP children) leak across
+# every close/reopen cycle.  Empirically this stranded ~5 zombie remote
+# claude processes per day on a busy backend.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pool_close_awaits_session_manager_stop():
+    """close() must call sm.stop() — not rely on garbage collection."""
+    pool = SessionPool()
+    cfg = ManagerConfig(project_dir="/local/project")
+
+    stop_called = False
+
+    async def fake_start(self):
+        self._sdk_session_id = f"sdk-{self._local_id}"
+        return self._local_id
+
+    async def fake_stop(self):
+        nonlocal stop_called
+        stop_called = True
+
+    with patch.object(SessionManager, "start", fake_start):
+        with patch.object(SessionManager, "stop", fake_stop):
+            sid = await pool.create(cfg)
+            await pool.close(sid)
+
+    assert stop_called, "pool.close() must await sm.stop() to release the SDK transport"
+    assert not pool.has(sid)
+
+
+@pytest.mark.asyncio
+async def test_pool_close_tolerates_slow_session_manager_stop():
+    """A misbehaving stop() must not hang the close request indefinitely."""
+    pool = SessionPool()
+    cfg = ManagerConfig(project_dir="/local/project")
+
+    async def fake_start(self):
+        self._sdk_session_id = f"sdk-{self._local_id}"
+        return self._local_id
+
+    # A stop() coroutine that would hang forever — close() must time it out.
+    async def hanging_stop(self):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+
+    with patch.object(SessionManager, "start", fake_start):
+        with patch.object(SessionManager, "stop", hanging_stop):
+            sid = await pool.create(cfg)
+            # Shorten the timeout so the test runs fast.
+            with patch("api.pool.asyncio.wait_for", side_effect=asyncio.TimeoutError):
+                await pool.close(sid)
+
+    # Even with a hanging stop(), close() returns and the session is gone.
+    assert not pool.has(sid)
+
+
+@pytest.mark.asyncio
+async def test_pool_close_all_drains_every_session():
+    """close_all() shuts down every active SessionManager and the orchestrator."""
+    pool = SessionPool()
+    cfg = ManagerConfig(project_dir="/local/project")
+
+    stops: list[str] = []
+
+    async def fake_start(self):
+        self._sdk_session_id = f"sdk-{self._local_id}"
+        return self._local_id
+
+    async def fake_stop(self):
+        stops.append(self._local_id)
+
+    with patch.object(SessionManager, "start", fake_start):
+        with patch.object(SessionManager, "stop", fake_stop):
+            sids = [await pool.create(cfg) for _ in range(3)]
+            await pool.close_all()
+
+    assert sorted(stops) == sorted(sids)
+    assert not pool._sessions
