@@ -6,6 +6,7 @@ iOS Photo Server — Single-file combined version for Pythonista
 Run this script in Pythonista 3 on your iPhone/iPad to serve your
 entire photo library over the local network via a REST API.
 
+v1.3.3 — AVAssetExportSession path (single-shot completion blocks; iOS streams to disk).
 v1.3.2 — ObjCBlock wrapping for streaming export callbacks (fixes silent SIGSEGV mid-stream).
 v1.3.1 — Streaming video export (fixes OOM jetsam on large videos).
 v1.3.0 — Ultra-defensive for Pythonista stability:
@@ -42,9 +43,21 @@ Usage:
     Custom port:        python3 copyparty_ios_combined.py --port 8080
 """
 
-__version__ = '1.3.2'
+__version__ = '1.3.3'
 __author__ = 'Assistant'
 
+# v1.3.3 — AVAssetExportSession (let iOS stream-to-disk):
+#   - Both v1.3.1 (raw Python blocks) and v1.3.2 (ObjCBlock-wrapped) crashed
+#     in PHAssetResourceManager's multi-shot dataReceivedHandler. The block
+#     bridging just doesn't survive in Pythonista for streaming callbacks.
+#   - Switched _export_video to PHImageManager.requestExportSessionForVideo
+#     + AVAssetExportSession. Both blocks involved are SINGLE-SHOT
+#     completion-style (same shape v1.2.1 used reliably), so Pythonista's
+#     bridge handles them fine. iOS itself streams the export to disk in
+#     framework-managed chunks — no Python-side memory cost regardless of
+#     video size.
+#   - AVAssetExportPresetPassthrough = no transcoding (lossless source copy).
+#   - Pre-flight cap raised 500 MB -> 4 GB (export streams to disk).
 # v1.3.2 — ObjCBlock wrapping for streaming export callbacks:
 #   - In v1.3.1 we passed raw Python functions for dataReceivedHandler /
 #     completionHandler. Pythonista's objc_util does NOT auto-bridge those
@@ -884,17 +897,25 @@ class PhotoBridge:
             return None
 
     def _export_video(self, asset, info, temp_path):
-        """Export video to temp file via streaming PHAssetResourceManager.
+        """Export video to temp file via PHImageManager + AVAssetExportSession.
 
-        v1.3.1: Switched from writeDataForAssetResource_toFile_ (which
-        buffers the entire video into memory before writing — iOS jetsams
-        Pythonista on >100 MB videos) to the streaming variant
-        requestDataForAssetResource_options_dataReceivedHandler_completionHandler_,
-        which delivers NSData chunks to a handler we write directly to a
-        file handle. Peak memory stays ~constant regardless of video size.
+        v1.3.3: Replaces both v1.3.0's writeDataForAssetResource_toFile_
+        (OOM jetsam at ~150 MB — buffered whole file in RAM) and v1.3.1/
+        v1.3.2's requestDataForAssetResource_..._dataReceivedHandler_
+        (silent SIGSEGV — multi-shot data block doesn't bridge in
+        Pythonista even with ObjCBlock wrapping).
 
-        Also adds a pre-flight fileSize check: videos > 500 MB return the
-        sentinel _VIDEO_TOO_LARGE so the HTTP layer can send 413.
+        Strategy: ask PHImageManager for an AVAssetExportSession, configure
+        outputURL/outputFileType, and let iOS handle the export. The session
+        writes to disk in framework-managed chunks (no Python-side RAM cost)
+        and reports completion via a single-shot block — the same shape
+        v1.2.1 used reliably.
+
+        AVAssetExportPresetPassthrough = no transcoding (copies the source
+        bitstream directly), so it's fast and lossless.
+
+        Pre-flight fileSize is still checked but the cap is raised to 4 GB
+        (sanity guard) since the export session streams to disk.
         """
         if not HAS_OBJC:
             return None
@@ -915,53 +936,42 @@ class PhotoBridge:
                 return None
             objc_asset = fetch.objectAtIndex_(0)
 
-            # Get asset resources and find the video resource
+            # --- Pre-flight size check (best-effort, via PHAssetResource KVC) ---
             PHAssetResource = ObjCClass('PHAssetResource')
             resources = PHAssetResource.assetResourcesForAsset_(objc_asset)
-            if not resources or resources.count() == 0:
-                print('[Bridge] Video export: no resources found')
-                return None
-
-            video_resource = None
-            for i in range(resources.count()):
-                r = resources.objectAtIndex_(i)
-                rtype = int(r.type())
-                # PHAssetResourceType: 1=photo, 2=video, 3=audio,
-                # 5=pairedVideo (Live Photo), 9=adjustmentBasePairedVideo
-                if rtype == 2:
-                    video_resource = r
-                    break
-
-            if video_resource is None:
-                # Fallback: try any resource that isn't a photo
+            fsize_pre = 0
+            if resources and resources.count() > 0:
+                # Find video resource for fileSize lookup (rtype 2)
+                vr = None
                 for i in range(resources.count()):
                     r = resources.objectAtIndex_(i)
-                    if int(r.type()) != 1:
-                        video_resource = r
+                    if int(r.type()) == 2:
+                        vr = r
                         break
-
-            if video_resource is None:
-                print('[Bridge] Video export: no video resource found')
-                return None
-
-            # --- v1.3.1 PRE-FLIGHT SIZE CHECK ---
-            # PHAssetResource exposes 'fileSize' as a private NSNumber-valued
-            # KVC key. Returns 0/None if unavailable; we only block when we
-            # have a confident reading above the cap.
-            fsize_pre = 0
-            try:
-                size_num = video_resource.valueForKey_('fileSize')
-                if size_num is not None:
+                if vr is None:
+                    for i in range(resources.count()):
+                        r = resources.objectAtIndex_(i)
+                        if int(r.type()) != 1:
+                            vr = r
+                            break
+                if vr is not None:
                     try:
-                        fsize_pre = int(size_num.longLongValue())
+                        size_num = vr.valueForKey_('fileSize')
+                        if size_num is not None:
+                            try:
+                                fsize_pre = int(size_num.longLongValue())
+                            except Exception:
+                                try:
+                                    fsize_pre = int(size_num.intValue())
+                                except Exception:
+                                    fsize_pre = 0
                     except Exception:
-                        try:
-                            fsize_pre = int(size_num.intValue())
-                        except Exception:
-                            fsize_pre = 0
-            except Exception:
-                fsize_pre = 0
-            MAX_VIDEO_BYTES = 500 * 1024 * 1024  # 500 MB
+                        fsize_pre = 0
+
+            # 4 GB sanity cap — AVAssetExportSession itself can handle
+            # essentially any size, but we don't want to fill the user's
+            # iPhone disk on a runaway request.
+            MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
             if fsize_pre and fsize_pre > MAX_VIDEO_BYTES:
                 mb = fsize_pre / (1024.0 * 1024.0)
                 print('[Bridge] Video export REJECTED: {:.1f} MB exceeds '
@@ -971,136 +981,137 @@ class PhotoBridge:
                 print('[Bridge] Video pre-flight size: {:.1f} MB'.format(
                     fsize_pre / (1024.0 * 1024.0)))
 
-            # Remove temp file if it exists; we'll create fresh.
+            # Remove stale temp file. AVAssetExportSession refuses to write
+            # if outputURL points at an existing file.
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except Exception:
                     pass
 
-            # Stream video data via PHAssetResourceManager.
-            PHAssetResourceManager = ObjCClass('PHAssetResourceManager')
-            PHAssetResourceRequestOptions = ObjCClass(
-                'PHAssetResourceRequestOptions')
+            # --- Set up PHImageManager export request ---
+            PHImageManager = ObjCClass('PHImageManager')
+            PHVideoRequestOptions = ObjCClass('PHVideoRequestOptions')
 
-            res_manager = PHAssetResourceManager.defaultManager()
-            res_options = PHAssetResourceRequestOptions.alloc().init()
-            res_options.setNetworkAccessAllowed_(True)
-
-            done = threading.Event()
-            error_msg = [None]
-            bytes_written = [0]
-            chunks_received = [0]
-            last_log_mb = [0]
-            write_error = [None]
-
-            # Open file handle BEFORE issuing the request. The data handler
-            # is dispatched serially per-request from a background ObjC
-            # queue, so a single file handle with .write() is safe.
+            manager = PHImageManager.defaultManager()
+            v_options = PHVideoRequestOptions.alloc().init()
+            v_options.setNetworkAccessAllowed_(True)
+            # 0 = Automatic, 1 = Current, 2 = Original, 3 = MediumQuality,
+            # 4 = HighQualityFormat. Use Original to avoid lossy transcoding.
             try:
-                fh = open(temp_path, 'wb')
-            except Exception as e:
-                print('[Bridge] Could not open temp file: {}'.format(e))
-                return None
+                v_options.setVersion_(2)  # PHVideoRequestOptionsVersionOriginal
+            except Exception:
+                pass
+            try:
+                v_options.setDeliveryMode_(2)  # HighQualityFormat
+            except Exception:
+                pass
 
-            def _data_received(data_ptr):
-                try:
-                    if not data_ptr:
-                        return
-                    nsdata = ObjCInstance(data_ptr)
-                    length = int(nsdata.length())
-                    if length <= 0:
-                        return
-                    # ctypes.string_at copies length bytes from the NSData
-                    # backing store into a fresh Python bytes object. The
-                    # NSData itself is autoreleased after the handler returns.
-                    buf_ptr = nsdata.bytes()
-                    chunk = ctypes.string_at(buf_ptr, length)
-                    fh.write(chunk)
-                    bytes_written[0] += length
-                    chunks_received[0] += 1
-                    # Log every 10 MB to avoid log spam
-                    mb_now = bytes_written[0] // (1024 * 1024)
-                    if mb_now >= last_log_mb[0] + 10:
-                        last_log_mb[0] = mb_now
-                        print('[Bridge] Streaming video: {} MB '
-                              '({} chunks)'.format(mb_now, chunks_received[0]))
-                except Exception as e:
-                    write_error[0] = 'data handler: {}'.format(e)
-                    # Don't set done here — let completion handler signal end.
+            # State holders for the two single-shot completion blocks.
+            export_done = threading.Event()
+            export_error = [None]
+            session_holder = [None]   # AVAssetExportSession from result handler
+            stage_holder = ['init']
 
-            def _completion(err_ptr):
+            # NSURL for the output file
+            NSURL = ObjCClass('NSURL')
+            out_url = NSURL.fileURLWithPath_(temp_path)
+
+            # Step 2 — runs after exportAsynchronouslyWithCompletionHandler_
+            # finishes writing the file (or errors out).
+            def _on_export_complete(blk_self):
                 try:
-                    if err_ptr:
+                    sess = session_holder[0]
+                    if sess is None:
+                        export_error[0] = 'no session in completion'
+                        return
+                    status = int(sess.status())
+                    # AVAssetExportSessionStatus:
+                    # 0 Unknown, 1 Waiting, 2 Exporting, 3 Completed,
+                    # 4 Failed, 5 Cancelled
+                    stage_holder[0] = 'export status={}'.format(status)
+                    if status == 3:
+                        return
+                    err = sess.error()
+                    if err is not None:
                         try:
-                            err_obj = ObjCInstance(err_ptr)
-                            error_msg[0] = str(err_obj.localizedDescription())
-                        except Exception as e:
-                            error_msg[0] = 'err parse: {}'.format(e)
+                            export_error[0] = str(err.localizedDescription())
+                        except Exception:
+                            export_error[0] = 'export status {}'.format(status)
+                    else:
+                        export_error[0] = 'export status {}'.format(status)
                 except Exception as e:
-                    error_msg[0] = 'completion handler: {}'.format(e)
+                    export_error[0] = 'export complete handler: {}'.format(e)
                 finally:
-                    done.set()
+                    export_done.set()
 
-            # v1.3.2: Wrap both Python callables as proper ObjC blocks. Raw
-            # Python functions do NOT auto-bridge to block pointers in
-            # Pythonista 3 — passing them caused a silent SIGSEGV in v1.3.1
-            # the moment iOS tried to invoke dataReceivedHandler.
+            # Step 1 — runs once we get the session back from PHImageManager.
+            # We configure outputURL/type and kick off the actual export.
+            def _on_session_ready(blk_self, session_ptr, info_ptr):
+                try:
+                    if not session_ptr:
+                        export_error[0] = 'no session pointer'
+                        export_done.set()
+                        return
+                    sess = ObjCInstance(session_ptr)
+                    session_holder[0] = sess
+                    sess.setOutputURL_(out_url)
+                    # AVFileTypeQuickTimeMovie = 'com.apple.quicktime-movie'
+                    sess.setOutputFileType_('com.apple.quicktime-movie')
+                    sess.setShouldOptimizeForNetworkUse_(False)
+                    stage_holder[0] = 'session configured'
+                    sess.exportAsynchronouslyWithCompletionHandler_(
+                        blk_export_done)
+                except Exception as e:
+                    export_error[0] = 'session ready handler: {}'.format(e)
+                    export_done.set()
+
+            # Wrap both as ObjCBlocks. These are SINGLE-SHOT completion-style
+            # blocks (same shape as v1.2.1's working completion handler), which
+            # is the form Pythonista's bridge handles reliably.
             #
             # Block signatures:
-            #   dataReceivedHandler:^(NSData *data)        -> argtypes=[c_void_p]
-            #   completionHandler:^(NSError * _Nullable e) -> argtypes=[c_void_p]
-            # ObjCBlock prepends the implicit block-self pointer internally,
-            # so the Python callable still takes (data_ptr,) / (err_ptr,).
-            blk_data = ObjCBlock(_data_received, restype=None,
-                                 argtypes=[ctypes.c_void_p])
-            blk_done = ObjCBlock(_completion, restype=None,
-                                 argtypes=[ctypes.c_void_p])
+            #   resultHandler:^(AVAssetExportSession *s, NSDictionary *info)
+            #     -> Python (blk_self, session_ptr, info_ptr)
+            #   completionHandler:^(void)
+            #     -> Python (blk_self,)
+            blk_session_ready = ObjCBlock(
+                _on_session_ready, restype=None,
+                argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p])
+            blk_export_done = ObjCBlock(
+                _on_export_complete, restype=None,
+                argtypes=[ctypes.c_void_p])
 
-            # Pin the BLOCKS (not the raw functions) for the lifetime of the
-            # request. If either is GC'd while ObjC still holds the block, we
-            # crash. Also keep refs to the Python functions so the closures
-            # they capture (fh, bytes_written, etc.) stay alive.
-            self._active_data_handler = blk_data
-            self._active_completion = blk_done
-            self._active_data_pyfn = _data_received
-            self._active_completion_pyfn = _completion
+            # Pin everything. Closures over export_done / session_holder /
+            # export_error need to stay reachable while ObjC holds the blocks.
+            self._active_session_ready = blk_session_ready
+            self._active_export_done = blk_export_done
+            self._active_session_pyfn = _on_session_ready
+            self._active_export_pyfn = _on_export_complete
 
-            print('[Bridge] Streaming video to {}...'.format(temp_path))
+            print('[Bridge] Requesting export session -> {}'.format(temp_path))
             try:
-                res_manager.requestDataForAssetResource_options_dataReceivedHandler_completionHandler_(
-                    video_resource, res_options, blk_data, blk_done)
+                # AVAssetExportPresetPassthrough = passthrough (no transcode)
+                manager.requestExportSessionForVideo_options_exportPreset_resultHandler_(
+                    objc_asset, v_options, 'AVAssetExportPresetPassthrough',
+                    blk_session_ready)
 
-                # Wait for completion (single 300s ceiling, applied to the
-                # completion event — data handler keeps the timer fed
-                # implicitly since completion only fires after last chunk).
-                if not done.wait(timeout=300):
-                    print('[Bridge] Video stream timed out after 300s')
-                    error_msg[0] = error_msg[0] or 'timeout'
+                # Single timeout for the full pipeline (session + export).
+                # Passthrough is roughly real-time-or-better but big videos
+                # still take a while.
+                if not export_done.wait(timeout=600):
+                    export_error[0] = export_error[0] or (
+                        'timeout after 600s (stage: {})'.format(
+                            stage_holder[0]))
             finally:
-                try:
-                    fh.flush()
-                except Exception:
-                    pass
-                try:
-                    fh.close()
-                except Exception:
-                    pass
-                # Release callback pins now that ObjC is done with them.
-                self._active_data_handler = None
-                self._active_completion = None
-                self._active_data_pyfn = None
-                self._active_completion_pyfn = None
+                self._active_session_ready = None
+                self._active_export_done = None
+                self._active_session_pyfn = None
+                self._active_export_pyfn = None
 
-            if write_error[0]:
-                print('[Bridge] Video stream write error: {}'.format(
-                    write_error[0]))
-                return None
-
-            if error_msg[0]:
-                print('[Bridge] Video stream completion error: {}'.format(
-                    error_msg[0]))
-                # Best-effort cleanup of partial file
+            if export_error[0]:
+                print('[Bridge] Video export error: {}'.format(
+                    export_error[0]))
                 try:
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
@@ -1111,8 +1122,8 @@ class PhotoBridge:
             if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
                 fsize = os.path.getsize(temp_path)
                 print('[Bridge] Video export complete: {} bytes '
-                      '({} chunks, {} bytes via handler)'.format(
-                          fsize, chunks_received[0], bytes_written[0]))
+                      '({:.1f} MB) at {}'.format(
+                          fsize, fsize / (1024.0 * 1024.0), temp_path))
                 return (temp_path, info.get('filename', 'video.mp4'),
                         'video/mp4', fsize)
 
