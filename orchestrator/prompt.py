@@ -12,8 +12,6 @@ from orchestrator.config import OrchestratorConfig
 # Limits for content injection
 MAX_MEMORY_CHARS = 12000
 MAX_MEMORY_INDEX_CHARS = 20000
-MAX_HISTORY_MESSAGES = 20
-MAX_HISTORY_CHARS = 6000
 
 # Shared memory index filename
 MEMORY_INDEX_FILENAME = "MEMORY.md"
@@ -327,67 +325,78 @@ def _guidelines_section() -> str:
 - **Verify writes** — after updating any memory file, confirm nothing was accidentally omitted"""
 
 
+def _format_message(msg: dict[str, Any]) -> str | None:
+    """Render a single Anthropic-format message as a Markdown line.
+
+    Returns None for empty messages that shouldn't appear in the transcript.
+    """
+    role = msg.get("role", "?")
+    label = "User" if role == "user" else "Assistant"
+    content = msg.get("content", "")
+
+    if isinstance(content, str):
+        text = content.strip()
+        return f"**{label}:** {text}" if text else None
+
+    if not isinstance(content, list):
+        return None
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type", "")
+        if btype == "text":
+            text = block.get("text", "").strip()
+            if text:
+                parts.append(text)
+        elif btype == "tool_use":
+            parts.append(f"[used tool: {block.get('name', '?')}]")
+        elif btype == "tool_result":
+            result_content = block.get("content", "")
+            if isinstance(result_content, list):
+                result_content = " ".join(
+                    b.get("text", "") for b in result_content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            # Tool-result payloads have already been clipped upstream by
+            # truncate_tool_results(); pass them through as-is.
+            parts.append(f"[tool result: {result_content}]")
+
+    return f"**{label}:** {' '.join(parts)}" if parts else None
+
+
 def _history_section(
-    history: list[dict[str, Any]] | None,
+    recent_messages: list[dict[str, Any]] | None,
     summary: str | None = None,
 ) -> str | None:
     """Format recent conversation history for injection into the system prompt.
 
-    Used to provide conversation context when resuming sessions or switching
-    between voice and text modes.
+    ``recent_messages`` is the already-budgeted list of verbatim messages
+    (tool results pre-clipped). ``summary`` covers everything older.
+
+    Returns None when there's nothing to render.
     """
-    if not history:
+    if not recent_messages and not summary:
         return None
 
-    recent = history[-MAX_HISTORY_MESSAGES:]
-    lines: list[str] = ["## Recent Conversation History",
-                        "(from your previous text/voice conversation in this session)\n"]
+    lines: list[str] = [
+        "## Recent Conversation History",
+        "(from your previous text/voice conversation in this session)\n",
+    ]
 
     if summary:
         lines.append("### Earlier Conversation Summary")
         lines.append(summary.strip())
-        lines.append("\n### Recent Messages")
+        if recent_messages:
+            lines.append("\n### Recent Messages")
 
-    for msg in recent:
-        role = msg.get("role", "?")
-        content = msg.get("content", "")
-        label = "User" if role == "user" else "Assistant"
+    for msg in recent_messages or []:
+        formatted = _format_message(msg)
+        if formatted:
+            lines.append(formatted)
 
-        if isinstance(content, str):
-            lines.append(f"**{label}:** {content.strip()}")
-        elif isinstance(content, list):
-            # Anthropic content block list — extract text, summarize tool blocks
-            parts: list[str] = []
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type", "")
-                if btype == "text":
-                    text = block.get("text", "").strip()
-                    if text:
-                        parts.append(text)
-                elif btype == "tool_use":
-                    parts.append(f"[used tool: {block.get('name', '?')}]")
-                elif btype == "tool_result":
-                    result_content = block.get("content", "")
-                    if isinstance(result_content, list):
-                        result_content = " ".join(
-                            b.get("text", "") for b in result_content
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        )
-                    preview = str(result_content)[:200]
-                    if len(str(result_content)) > 200:
-                        preview += "..."
-                    parts.append(f"[tool result: {preview}]")
-            if parts:
-                lines.append(f"**{label}:** {' '.join(parts)}")
-
-    section = "\n".join(lines)
-
-    if len(section) > MAX_HISTORY_CHARS:
-        section = section[:MAX_HISTORY_CHARS] + "\n... (history truncated)"
-
-    return section
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +406,7 @@ def _history_section(
 def build_system_prompt(
     config: OrchestratorConfig,
     context: dict[str, Any],
-    history: list[dict[str, Any]] | None = None,
+    recent_messages: list[dict[str, Any]] | None = None,
     history_summary: str | None = None,
 ) -> str:
     """Build the orchestrator's system prompt.
@@ -408,7 +417,12 @@ def build_system_prompt(
     3. Capabilities (MCP orchestration)
     4. Knowledge (memory system with contents)
     5. Guidelines
-    6. Context (conversation history, if provided)
+    6. Context (recent verbatim messages + summary of older ones)
+
+    The caller is responsible for splitting raw history into
+    ``recent_messages`` (kept verbatim, with tool results pre-clipped) and
+    ``history_summary`` (digest of older messages) using the token-budget
+    helpers in ``orchestrator.token_budget``.
     """
     sections = [
         _role_section(),
@@ -416,6 +430,6 @@ def build_system_prompt(
         _mcp_section(),
         _memory_section(config),
         _guidelines_section(),
-        _history_section(history, history_summary) if history else None,
+        _history_section(recent_messages, history_summary),
     ]
     return "\n\n".join(s for s in sections if s)

@@ -9,7 +9,9 @@ Structure:
     ├── *.jsonl          # Session files (SDK writes here directly)
     ├── <uuid>/          # SDK state directories (subagents, tool-results)
     ├── .titles.json     # Custom session titles
-    └── memory/          # Memory files (Markdown)
+    ├── memory/          # Memory files (Markdown)
+    └── public/          # Public static files served at URL root
+                         # (visualizations/, photo-server/, downloads, etc.)
 """
 from pathlib import Path
 
@@ -30,6 +32,15 @@ def get_context_dir() -> Path:
 def get_memory_dir() -> Path:
     """Get the memory directory."""
     return get_context_dir() / "memory"
+
+
+def get_public_dir() -> Path:
+    """Get the public static files directory.
+
+    Anything placed here is served at the URL root by the backend
+    (e.g. context/public/photo-server/file.py → /photo-server/file.py).
+    """
+    return get_context_dir() / "public"
 
 
 def get_sessions_dir() -> Path:
@@ -56,6 +67,7 @@ def ensure_context_dirs() -> None:
     """Ensure all context directories exist."""
     get_context_dir().mkdir(parents=True, exist_ok=True)
     get_memory_dir().mkdir(parents=True, exist_ok=True)
+    get_public_dir().mkdir(parents=True, exist_ok=True)
     get_index_dir().mkdir(parents=True, exist_ok=True)
 
 

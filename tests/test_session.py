@@ -56,7 +56,7 @@ def _make_mock_client(init_messages=None, response_messages_fn=None, server_info
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
     client.query = AsyncMock()
-    client.interrupt = MagicMock()
+    client.interrupt = AsyncMock()
 
     # get_server_info returns initialization data after connect()
     if server_info is None:

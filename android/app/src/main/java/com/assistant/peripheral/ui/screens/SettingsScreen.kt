@@ -15,7 +15,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.assistant.peripheral.data.AppSettings
+import com.assistant.peripheral.data.AudioOutput
 import com.assistant.peripheral.data.ConnectionState
+import com.assistant.peripheral.data.SavedServer
 import com.assistant.peripheral.data.ThemeMode
 import com.assistant.peripheral.network.DiscoveredServer
 import kotlin.math.roundToInt
@@ -34,7 +36,8 @@ fun SettingsScreen(
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEchoDuckingGain: (Float) -> Unit,
-    onUpdateEarpieceMode: (Boolean) -> Unit,
+    onUpdateAudioOutput: (AudioOutput) -> Unit,
+    isBluetoothAvailable: Boolean,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
     onUpdateVoiceWord: (String) -> Unit,
@@ -43,6 +46,9 @@ fun SettingsScreen(
     onDisconnect: () -> Unit,
     onScanForServers: () -> Unit,
     onConnectToServer: (DiscoveredServer) -> Unit,
+    onAddSavedServer: (String, String) -> Unit,
+    onRemoveSavedServer: (String) -> Unit,
+    onSelectSavedServer: (SavedServer) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var serverUrl by remember(settings.serverUrl) { mutableStateOf(settings.serverUrl) }
@@ -64,82 +70,6 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Appearance Section
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp)
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Palette,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            text = "Appearance",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Text(
-                        text = "Theme",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Theme selection
-                    Column(Modifier.selectableGroup()) {
-                        ThemeMode.values().forEach { mode ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .selectable(
-                                        selected = settings.themeMode == mode,
-                                        onClick = { onUpdateThemeMode(mode) },
-                                        role = Role.RadioButton
-                                    )
-                                    .padding(vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                RadioButton(
-                                    selected = settings.themeMode == mode,
-                                    onClick = null
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Icon(
-                                    imageVector = when (mode) {
-                                        ThemeMode.SYSTEM -> Icons.Default.BrightnessAuto
-                                        ThemeMode.LIGHT -> Icons.Default.LightMode
-                                        ThemeMode.DARK -> Icons.Default.DarkMode
-                                    },
-                                    contentDescription = null,
-                                    modifier = Modifier.size(20.dp),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = when (mode) {
-                                        ThemeMode.SYSTEM -> "System default"
-                                        ThemeMode.LIGHT -> "Light"
-                                        ThemeMode.DARK -> "Dark"
-                                    },
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
             // Connection Section
             Card(
                 modifier = Modifier.fillMaxWidth()
@@ -166,6 +96,17 @@ fun SettingsScreen(
 
                     // Connection status
                     ConnectionStatusCard(connectionState)
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Saved Servers section
+                    SavedServersSection(
+                        savedServers = settings.savedServers,
+                        currentUrl = settings.serverUrl,
+                        onSelect = onSelectSavedServer,
+                        onRemove = onRemoveSavedServer,
+                        onAdd = onAddSavedServer
+                    )
 
                     Spacer(modifier = Modifier.height(16.dp))
 
@@ -482,27 +423,53 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Earpiece mode toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Earpiece Mode",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = if (settings.useEarpiece) "Audio routed to earpiece" else "Audio routed to loudspeaker",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = settings.useEarpiece,
-                            onCheckedChange = { onUpdateEarpieceMode(it) }
+                    // Audio output routing — 3 options: Earpiece, Loudspeaker, Bluetooth.
+                    // Bluetooth is grayed out when no BT audio device is connected.
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = "Audio Output",
+                            style = MaterialTheme.typography.bodyMedium
                         )
+                        Text(
+                            text = when (settings.audioOutput) {
+                                AudioOutput.EARPIECE -> "Audio routed to earpiece"
+                                AudioOutput.LOUDSPEAKER -> "Audio routed to loudspeaker"
+                                AudioOutput.BLUETOOTH ->
+                                    if (isBluetoothAvailable) "Audio routed to Bluetooth device"
+                                    else "No Bluetooth device connected"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        // Round icon-only toggle buttons. Selection is communicated by the
+                        // filled background; the subtitle above spells out the current choice.
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            val options = listOf(
+                                Triple(AudioOutput.EARPIECE, "Earpiece", Icons.Default.Hearing),
+                                Triple(AudioOutput.LOUDSPEAKER, "Speaker", Icons.Default.VolumeUp),
+                                Triple(AudioOutput.BLUETOOTH, "Bluetooth", Icons.Default.Bluetooth),
+                            )
+                            options.forEach { (output, label, icon) ->
+                                val enabled = output != AudioOutput.BLUETOOTH || isBluetoothAvailable
+                                FilledIconToggleButton(
+                                    checked = settings.audioOutput == output,
+                                    onCheckedChange = { if (it) onUpdateAudioOutput(output) },
+                                    enabled = enabled,
+                                    modifier = Modifier.size(56.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = label,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(16.dp))
@@ -660,6 +627,82 @@ fun SettingsScreen(
                 }
             }
 
+            // Appearance Section
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Palette,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Appearance",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        text = "Theme",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Theme selection
+                    Column(Modifier.selectableGroup()) {
+                        ThemeMode.values().forEach { mode ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .selectable(
+                                        selected = settings.themeMode == mode,
+                                        onClick = { onUpdateThemeMode(mode) },
+                                        role = Role.RadioButton
+                                    )
+                                    .padding(vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = settings.themeMode == mode,
+                                    onClick = null
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Icon(
+                                    imageVector = when (mode) {
+                                        ThemeMode.SYSTEM -> Icons.Default.BrightnessAuto
+                                        ThemeMode.LIGHT -> Icons.Default.LightMode
+                                        ThemeMode.DARK -> Icons.Default.DarkMode
+                                    },
+                                    contentDescription = null,
+                                    modifier = Modifier.size(20.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = when (mode) {
+                                        ThemeMode.SYSTEM -> "System default"
+                                        ThemeMode.LIGHT -> "Light"
+                                        ThemeMode.DARK -> "Dark"
+                                    },
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
             // About Section
             Card(
                 modifier = Modifier.fillMaxWidth()
@@ -705,6 +748,133 @@ fun SettingsScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun SavedServersSection(
+    savedServers: List<SavedServer>,
+    currentUrl: String,
+    onSelect: (SavedServer) -> Unit,
+    onRemove: (String) -> Unit,
+    onAdd: (String, String) -> Unit
+) {
+    var showAddForm by remember { mutableStateOf(false) }
+    var newLabel by remember { mutableStateOf("") }
+    var newUrl by remember { mutableStateOf("") }
+
+    Text(
+        text = "Saved Servers",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Spacer(modifier = Modifier.height(6.dp))
+
+    if (savedServers.isEmpty() && !showAddForm) {
+        Text(
+            text = "No saved servers. Add one for quick switching (e.g. Tailscale IP).",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    } else {
+        savedServers.forEach { server ->
+            val isSelected = currentUrl == server.url
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onSelect(server) },
+                color = if (isSelected)
+                    MaterialTheme.colorScheme.primaryContainer
+                else
+                    MaterialTheme.colorScheme.surfaceVariant,
+                shape = MaterialTheme.shapes.small
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Dns,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                        tint = if (isSelected)
+                            MaterialTheme.colorScheme.primary
+                        else
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = server.label,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = server.url,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(onClick = { onRemove(server.url) }) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Remove ${server.label}",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+    }
+
+    Spacer(modifier = Modifier.height(4.dp))
+
+    if (showAddForm) {
+        OutlinedTextField(
+            value = newLabel,
+            onValueChange = { newLabel = it },
+            label = { Text("Label") },
+            placeholder = { Text("e.g. Laptop (Tailscale)") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        OutlinedTextField(
+            value = newUrl,
+            onValueChange = { newUrl = it },
+            label = { Text("WebSocket URL") },
+            placeholder = { Text("ws://100.111.80.128:8765") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+        Row {
+            TextButton(onClick = {
+                showAddForm = false
+                newLabel = ""
+                newUrl = ""
+            }) { Text("Cancel") }
+            Spacer(modifier = Modifier.width(4.dp))
+            TextButton(
+                onClick = {
+                    onAdd(newLabel, newUrl)
+                    showAddForm = false
+                    newLabel = ""
+                    newUrl = ""
+                },
+                enabled = newLabel.isNotBlank() && newUrl.isNotBlank()
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Save")
+            }
+        }
+    } else {
+        TextButton(onClick = { showAddForm = true }) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(modifier = Modifier.width(4.dp))
+            Text("Add server")
         }
     }
 }

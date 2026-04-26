@@ -76,7 +76,8 @@ def list_sessions(
     ]
 
     # Also include live pool sessions that have no local JSONL yet
-    # (e.g. brand-new SSH sessions whose JSONL lives on the remote machine)
+    # (e.g. brand-new SSH sessions whose JSONL lives on the remote machine,
+    # or sessions still mid-first-turn that haven't published their SDK id yet).
     for s in pool.list_sessions():
         sdk_id = s.get("sdk_session_id")
         local_id = s.get("session_id")
@@ -91,9 +92,20 @@ def list_sessions(
                 is_orchestrator=False,
                 local_id=local_id,
             ))
-        elif not sdk_id and local_id and local_id not in store_sdk_ids:
-            # New session with no SDK ID yet — skip, nothing to show
-            pass
+        elif not sdk_id and local_id:
+            # No SDK id yet (e.g. still mid-first-turn). Surface it keyed by
+            # local_id so the frontend can reconnect after a refresh instead
+            # of losing the tab. session_id falls back to local_id here since
+            # the detail endpoints also accept local ids via the pool.
+            result.insert(0, SessionInfoResponse(
+                session_id=local_id,
+                started_at=now_iso,
+                last_activity=now_iso,
+                title="(active session)",
+                message_count=s.get("turns", 0),
+                is_orchestrator=False,
+                local_id=local_id,
+            ))
 
     return result
 

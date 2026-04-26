@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +107,11 @@ class SessionStore:
     def __init__(self, project_dir: str | Path) -> None:
         self._project_dir = Path(project_dir).resolve()
         self._sessions_dir = self._resolve_sessions_dir()
+        # Per-file cache: session_id → (mtime_ns, size, SessionInfo).
+        # On every list_sessions() call we stat each file; entries are reused
+        # when (mtime_ns, size) match, and re-parsed only when changed.
+        # mtime_ns avoids float precision pitfalls on filesystems with sub-ms mtimes.
+        self._info_cache: dict[str, tuple[int, int, SessionInfo]] = {}
 
     def _resolve_sessions_dir(self) -> Path:
         """Get the sessions directory.
@@ -132,19 +138,52 @@ class SessionStore:
         JSONL files that can't be parsed (no valid timestamps) are skipped
         but NOT deleted — they may be in-progress sessions or have a format
         we don't understand yet.
+
+        Uses a per-file (mtime_ns, size) cache: files that haven't changed
+        since the last call are not re-read. Cold cache parses every file
+        once; subsequent calls only re-parse files whose stats changed.
         """
         if not self._sessions_dir.is_dir():
             return []
 
+        # Load titles once per call (used by every parse + override even on
+        # cache hits, since titles can change without the JSONL changing).
+        titles = self._load_titles()
+
         sessions: list[SessionInfo] = []
+        seen_ids: set[str] = set()
+
         for jsonl_path in self._sessions_dir.glob("*.jsonl"):
             # Skip Syncthing conflict files (e.g. foo.sync-conflict-20260416-XXXX.jsonl)
             if ".sync-conflict-" in jsonl_path.name:
                 continue
             session_id = jsonl_path.stem
-            info = self._parse_session_info(jsonl_path, session_id)
-            if info is not None:
+            seen_ids.add(session_id)
+
+            try:
+                st = jsonl_path.stat()
+            except OSError:
+                continue
+
+            cached = self._info_cache.get(session_id)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                # File unchanged — reuse cached info but apply current title
+                # (title overrides live in .titles.json, not in the JSONL).
+                info = cached[2]
+                title = titles.get(session_id) or info.title
+                if title != info.title:
+                    info = dataclasses.replace(info, title=title)
                 sessions.append(info)
+                continue
+
+            info = self._parse_session_info(jsonl_path, session_id, titles=titles)
+            if info is not None:
+                self._info_cache[session_id] = (st.st_mtime_ns, st.st_size, info)
+                sessions.append(info)
+
+        # Drop cache entries for files that no longer exist
+        for stale_id in set(self._info_cache) - seen_ids:
+            del self._info_cache[stale_id]
 
         sessions.sort(key=lambda s: s.last_activity, reverse=True)
         return sessions
@@ -307,8 +346,18 @@ class SessionStore:
             pass
         return messages
 
-    def _parse_session_info(self, jsonl_path: Path, session_id: str) -> SessionInfo | None:
-        """Extract summary metadata from a JSONL file without loading all messages."""
+    def _parse_session_info(
+        self,
+        jsonl_path: Path,
+        session_id: str,
+        titles: dict[str, str] | None = None,
+    ) -> SessionInfo | None:
+        """Extract summary metadata from a JSONL file without loading all messages.
+
+        ``titles`` may be passed in by the caller to avoid re-reading
+        ``.titles.json`` once per file in a tight loop. If omitted, it is
+        loaded here.
+        """
         first_user_text: str = ""
         first_timestamp: str | None = None
         last_timestamp: str | None = None
@@ -348,7 +397,8 @@ class SessionStore:
         if first_timestamp is None:
             return None
 
-        titles = self._load_titles()
+        if titles is None:
+            titles = self._load_titles()
         title = titles.get(session_id) or (first_user_text[:100] if first_user_text else "(empty session)")
 
         return SessionInfo(

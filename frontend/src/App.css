@@ -362,9 +362,9 @@
   bottom: 16px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--bg-secondary);
+  background: var(--bg-elevated);
   color: var(--text-bright);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border);
   border-radius: 50%;
   width: 40px;
   height: 40px;
@@ -381,7 +381,7 @@
 }
 
 .scroll-to-bottom-btn:hover {
-  background: rgba(0, 0, 0, 0.6);
+  background: var(--bg-hover);
   opacity: 1;
 }
 
@@ -1023,22 +1023,8 @@ pre.field-value {
 */
 .chat-input-bar {
   background: var(--bg-surface);
-  border-top: 1px solid var(--border-subtle);
-  box-shadow: 0 -8px 20px var(--bg);
   flex-shrink: 0;
   position: relative;
-}
-
-/* Solid buffer above input bar — extends surface bg upward for breathing room */
-.chat-input-bar::before {
-  content: "";
-  position: absolute;
-  top: -18px;
-  left: 0;
-  right: 0;
-  height: 18px;
-  background: var(--bg);
-  pointer-events: none;
 }
 
 /* Gradient fade below the tab bar — on .main-content with high z-index
@@ -1049,7 +1035,7 @@ pre.field-value {
   top: var(--topbar-height);
   left: 0;
   right: 0;
-  height: 50px;
+  height: 40px;
   background: linear-gradient(to bottom, var(--bg) 20%, transparent);
   pointer-events: none;
   z-index: 10;
@@ -1089,6 +1075,23 @@ pre.field-value {
 }
 
 .chat-input textarea::placeholder { color: var(--text-muted); }
+
+/* Shared sizing for all chat input icon-only action buttons — keeps them
+   identical across the row regardless of icon/label content. The
+   voice-start-btn (label + icon) is intentionally excluded so it can
+   accommodate the "Start Voice" text. */
+.chat-input .send-btn,
+.chat-input .interrupt-btn,
+.chat-input .compact-btn,
+.chat-input .voice-record-btn,
+.chat-input .session-config-gear-btn {
+  width: 48px;
+  min-width: 48px;
+  height: 48px;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  padding: 0;
+}
 
 .send-btn,
 .interrupt-btn {
@@ -1624,9 +1627,14 @@ pre.field-value {
    ============================================================ */
 
 .status-bar-container {
-  background: var(--bg-surface);
+  background: #121214; /* intermediate tone — darker than --bg-surface, lighter than --bg */
+  border-top: 1px solid var(--border-subtle);
+  box-shadow: 0 -8px 10px var(--bg);
   flex-shrink: 0;
+  position: relative;
 }
+
+
 
 .status-bar {
   display: flex;
@@ -2072,7 +2080,8 @@ pre.field-value {
   display: none;
   align-items: center;
   justify-content: center;
-  width: 44px;
+  width: 48px;
+  height: 52px;
   flex-shrink: 0;
   color: var(--text-muted);
   background: var(--bg-surface);
@@ -2131,9 +2140,6 @@ pre.field-value {
   }
 
   .chat-input textarea { font-size: 16px; } /* prevent iOS zoom */
-
-  .send-btn,
-  .interrupt-btn { width: 44px; height: 44px; }
 
   /* ---- Voice bar ---- */
   .voice-bar {
@@ -2857,16 +2863,6 @@ pre.field-value {
 
   .chat-input textarea {
     font-size: 0.92rem;
-    min-height: 44px;
-  }
-
-  .send-btn,
-  .interrupt-btn,
-  .compact-btn,
-  .voice-record-btn,
-  .session-config-gear-btn {
-    width: 44px;
-    height: 44px;
   }
 
   .status-bar {

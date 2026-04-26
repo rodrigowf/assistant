@@ -2,6 +2,7 @@ package com.assistant.peripheral.ui.screens
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -38,6 +39,7 @@ fun SessionsScreen(
     onNewSession: () -> Unit,
     onRenameSession: (String, String) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onCloseSession: (String) -> Unit,
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -118,7 +120,8 @@ fun SessionsScreen(
                             isOpen = liveSessionIds.contains(session.sessionId),
                             onClick = { onSessionClick(session.sessionId, session.isOrchestrator) },
                             onRename = { newTitle -> onRenameSession(session.sessionId, newTitle) },
-                            onDelete = { onDeleteSession(session.sessionId) }
+                            onDelete = { onDeleteSession(session.sessionId) },
+                            onClose = { onCloseSession(session.sessionId) }
                         )
                     }
                 }
@@ -143,7 +146,8 @@ private fun SessionItem(
     isOpen: Boolean,
     onClick: () -> Unit,
     onRename: (String) -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onClose: () -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
     var isEditing by remember { mutableStateOf(false) }
@@ -161,14 +165,24 @@ private fun SessionItem(
         label = "pulseAlpha"
     )
 
+    // Distinct card backgrounds so users can see at a glance which sessions are
+    // selected vs open vs idle. Previously "open" was nearly invisible (0.08 alpha)
+    // and idle matched the screen background, making the card outline disappear.
     val backgroundColor by animateColorAsState(
         targetValue = when {
-            isSelected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
-            isOpen -> MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-            else -> MaterialTheme.colorScheme.surface
+            isSelected -> MaterialTheme.colorScheme.primaryContainer
+            isOpen -> MaterialTheme.colorScheme.primary.copy(alpha = 0.20f)
+            else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
         },
         label = "backgroundColor"
     )
+
+    // A subtle border helps further distinguish the selected and open cards.
+    val borderStroke = when {
+        isSelected -> BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+        isOpen -> BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+        else -> null
+    }
 
     Card(
         modifier = Modifier
@@ -176,7 +190,8 @@ private fun SessionItem(
             .padding(horizontal = 12.dp, vertical = 4.dp)
             .clickable { onClick() },
         shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = backgroundColor)
+        colors = CardDefaults.cardColors(containerColor = backgroundColor),
+        border = borderStroke
     ) {
         Row(
             modifier = Modifier
@@ -370,6 +385,18 @@ private fun SessionItem(
                                 Icon(Icons.Default.Edit, contentDescription = null)
                             }
                         )
+                        if (isOpen) {
+                            DropdownMenuItem(
+                                text = { Text("Close") },
+                                onClick = {
+                                    showMenu = false
+                                    onClose()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Default.Close, contentDescription = null)
+                                }
+                            )
+                        }
                         DropdownMenuItem(
                             text = { Text("Delete") },
                             onClick = {

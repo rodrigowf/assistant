@@ -192,10 +192,19 @@ enum class ThemeMode {
 }
 
 /**
+ * A user-saved server entry shown in Settings for quick switching.
+ */
+data class SavedServer(
+    val label: String,
+    val url: String
+)
+
+/**
  * App settings stored in DataStore.
  */
 data class AppSettings(
     val serverUrl: String = "ws://192.168.0.200:80",
+    val savedServers: List<SavedServer> = emptyList(),
     val autoConnect: Boolean = true,
     val enableWakeWord: Boolean = true,
     val wakeWord: String = "my friend",        // comma-separated, triggers turn-based voice input
@@ -205,6 +214,24 @@ data class AppSettings(
     val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for wake word detection
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
-    val useEarpiece: Boolean = false,          // false = loudspeaker (default), true = earpiece
+    val audioOutput: AudioOutput = AudioOutput.LOUDSPEAKER,  // where voice session audio is routed
     val enableButtonTrigger: Boolean = false   // long-press recents button starts voice session
 )
+
+/**
+ * Audio output routing for voice sessions.
+ *
+ * BLUETOOTH requires a connected Bluetooth audio device — UI should gray this option out
+ * when none is available. VoiceManager.isBluetoothAudioAvailable() exposes that state.
+ */
+enum class AudioOutput {
+    EARPIECE,
+    LOUDSPEAKER,
+    BLUETOOTH;
+
+    companion object {
+        /** Safe parse for DataStore — falls back to LOUDSPEAKER on unknown / null. */
+        fun fromString(value: String?): AudioOutput =
+            values().firstOrNull { it.name == value } ?: LOUDSPEAKER
+    }
+}

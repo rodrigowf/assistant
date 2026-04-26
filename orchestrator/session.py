@@ -32,6 +32,13 @@ from orchestrator.config import (
 from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.providers.anthropic import AnthropicProvider
 from orchestrator.providers.openai_text import OpenAITextProvider, create_audio_message
+from orchestrator.token_budget import (
+    RECENT_VERBATIM_TOKENS,
+    estimate_message_tokens,
+    scale_summary_max_tokens,
+    split_by_token_budget,
+    truncate_tool_results,
+)
 from orchestrator.tools import registry
 from orchestrator.types import (
     OrchestratorEvent,
@@ -43,9 +50,6 @@ from orchestrator.types import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Messages to keep verbatim in the voice system prompt; older ones are summarized.
-MAX_VOICE_HISTORY_MESSAGES = 20
 
 
 class OrchestratorSession:
@@ -82,7 +86,7 @@ class OrchestratorSession:
 
         session = OrchestratorSession(config=config, context=context, voice=True)
         session_id = await session.start()
-        session_update = session.get_session_update()  # send to frontend
+        session_update = await session.get_session_update()  # send to frontend
         # Then for each event from frontend:
         voice_commands = await session.process_voice_event(event)
         # voice_commands is a list of dicts to send back to frontend
@@ -171,15 +175,13 @@ class OrchestratorSession:
         self._jsonl_path = self._get_jsonl_path()
         self._writer = HistoryWriter(self._jsonl_path)
 
-        # If resuming, load history from the existing JSONL
+        # If resuming, load history from the existing JSONL.
+        # For voice mode the summary is built fresh in get_session_update() on
+        # every (re)connect, so we don't precompute it here.
         if self._resume_id and self._jsonl_path.is_file():
             loader = HistoryLoader(self._jsonl_path)
             history = loader.load()
             self._agent.history = history
-            if self._voice and len(history) > MAX_VOICE_HISTORY_MESSAGES:
-                self._history_summary = await self._summarize_history(
-                    history[:-MAX_VOICE_HISTORY_MESSAGES]
-                )
         else:
             # New session — write metadata as first line
             self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,26 +259,65 @@ class OrchestratorSession:
         """Get current model information."""
         return self._config.to_dict()
 
-    def get_session_update(self) -> dict[str, Any] | None:
+    async def get_session_update(self) -> dict[str, Any] | None:
         """Return the OpenAI session.update payload for voice mode.
 
         The caller (WebSocket handler) should send this back to the frontend
         as a voice_command so the frontend can forward it to OpenAI via the
         data channel.
+
+        History is reloaded from the JSONL every call so that voice restarts
+        (which reconnect to the same in-memory session) always see the full
+        conversation, not whatever snapshot was loaded at start(). The
+        summarizer is also re-run here so the digest covers recent turns.
         """
         if not self._voice or self._voice_provider is None:
             return None
 
         from orchestrator.prompt import build_system_prompt
-        history = self._agent.history if self._agent else None
+
+        recent_messages, history_summary = await self._build_history_for_prompt()
+
         system = build_system_prompt(
             self._config,
             self._context,
-            history=history,
-            history_summary=self._history_summary,
+            recent_messages=recent_messages,
+            history_summary=history_summary,
         )
         tools = registry.get_openai_definitions()
         return self._voice_provider.get_session_update_payload(system, tools)
+
+    async def _build_history_for_prompt(
+        self,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Load history fresh from JSONL, clip tool results, split by token
+        budget, and summarize the older prefix.
+
+        Returns (recent_verbatim_messages, summary_or_none).
+        """
+        if self._jsonl_path is None or not self._jsonl_path.is_file():
+            return [], None
+
+        history = HistoryLoader(self._jsonl_path).load()
+        if not history:
+            return [], None
+
+        # Clip oversized tool results before budgeting so we don't evict
+        # useful conversational turns to make room for a 50KB file dump.
+        clipped = truncate_tool_results(history)
+
+        older, recent = split_by_token_budget(clipped, RECENT_VERBATIM_TOKENS)
+
+        summary: str | None = None
+        if older:
+            prefix_tokens = sum(estimate_message_tokens(m) for m in older)
+            summary_budget = scale_summary_max_tokens(len(older), prefix_tokens)
+            summary = await self._summarize_history(
+                older, max_tokens=summary_budget
+            )
+
+        self._history_summary = summary
+        return recent, summary
 
     async def process_voice_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         """Process a single mirrored OpenAI Realtime event.
@@ -582,52 +623,77 @@ class OrchestratorSession:
         if self._agent:
             await self._agent.interrupt()
 
-    async def _summarize_history(self, messages: list[dict[str, Any]]) -> str:
+    async def _summarize_history(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 2048,
+    ) -> str:
         """Summarize older conversation messages using a fast Anthropic call.
 
-        Called when history exceeds MAX_VOICE_HISTORY_MESSAGES so voice
-        sessions get a concise digest of what happened earlier.
+        Produces a structured digest so that when voice mode resumes the
+        orchestrator can pick up the thread coherently. ``max_tokens`` scales
+        with the prefix size (see ``scale_summary_max_tokens``).
         """
-        if not messages:
+        if not messages or max_tokens <= 0:
             return ""
 
-        # Build a compact transcript for the summarizer
+        # Build a transcript for the summarizer. Keep more per-message content
+        # than the old 300-char clip so long-form answers survive summarization.
         lines: list[str] = []
         for msg in messages:
             role = msg.get("role", "?")
             content = msg.get("content", "")
             label = "User" if role == "user" else "Assistant"
             if isinstance(content, str):
-                lines.append(f"{label}: {content.strip()[:500]}")
+                lines.append(f"{label}: {content.strip()[:2000]}")
             elif isinstance(content, list):
                 parts: list[str] = []
                 for block in content:
                     if not isinstance(block, dict):
                         continue
-                    if block.get("type") == "text":
-                        parts.append(block.get("text", "").strip()[:300])
-                    elif block.get("type") == "tool_use":
+                    btype = block.get("type")
+                    if btype == "text":
+                        parts.append(block.get("text", "").strip()[:1500])
+                    elif btype == "tool_use":
                         parts.append(f"[tool: {block.get('name', '?')}]")
+                    elif btype == "tool_result":
+                        rc = block.get("content", "")
+                        if isinstance(rc, list):
+                            rc = " ".join(
+                                b.get("text", "") for b in rc
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        parts.append(f"[tool result: {str(rc)[:400]}]")
                 if parts:
                     lines.append(f"{label}: {' '.join(parts)}")
 
         transcript = "\n".join(lines)
+
+        instructions = (
+            "Summarize the conversation below into a structured digest the "
+            "assistant will read to resume the chat. Use these sections, in "
+            "order, and only include ones that apply:\n"
+            "- **Topics & goals**: what was being worked on, and why\n"
+            "- **Decisions made**: concrete choices, trade-offs accepted\n"
+            "- **Open threads**: unresolved questions, things the user wanted "
+            "to come back to, work in progress\n"
+            "- **Key entities**: files, sessions, projects, people, tools "
+            "mentioned that matter for continuity\n"
+            "- **User preferences/context expressed**: anything about how the "
+            "user wants the assistant to behave, tone, constraints\n"
+            "Be factual and specific — prefer concrete names over generic "
+            "summaries. Omit pleasantries and filler. Write in the same "
+            "language(s) the conversation used.\n\n"
+            f"Conversation:\n{transcript}"
+        )
 
         try:
             import anthropic
             client = anthropic.AsyncAnthropic()
             response = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=512,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "Summarize the following conversation in 3-5 concise sentences, "
-                        "focusing on what was discussed, decisions made, and any important context "
-                        "the assistant should remember. Be factual and brief.\n\n"
-                        f"{transcript}"
-                    ),
-                }],
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": instructions}],
             )
             return response.content[0].text if response.content else ""
         except Exception as e:

@@ -1,7 +1,10 @@
 package com.assistant.peripheral.voice
 
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaRecorder
@@ -9,6 +12,7 @@ import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.util.Log
+import com.assistant.peripheral.data.AudioOutput
 import com.assistant.peripheral.data.VoiceState
 import com.assistant.peripheral.network.ApiClient
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -68,14 +72,19 @@ class VoiceManager(
     // Microphone gain (0.0 to 2.0, default 1.0)
     private var micGainLevel: Float = 1.0f
 
-    // Audio output routing: false = loudspeaker (default), true = earpiece
-    private var useEarpiece: Boolean = false
+    // Audio output routing: EARPIECE, LOUDSPEAKER (default), or BLUETOOTH
+    private var audioOutput: AudioOutput = AudioOutput.LOUDSPEAKER
 
     // Gain saved before agent speech — restored when speech ends or user interrupts
     private var gainBeforeSpeaking: Float? = null
     private var micRestoreJob: kotlinx.coroutines.Job? = null
     // True while agent audio is actively playing (between output_audio_buffer.started and stopped/cleared)
     private var agentAudioPlaying: Boolean = false
+    // User-intent mute. Source of truth for the mute button — kept separate from
+    // localAudioTrack.enabled() because the duck/restore logic also toggles enabled
+    // for echo-suppression reasons. Without this flag, ducking would silently
+    // re-enable the mic after the user pressed mute.
+    private var userMuted: Boolean = false
     // Gain applied while agent is speaking (echo ducking level), default 5%
     private var echoDuckingGain: Float = 0.05f
 
@@ -225,7 +234,7 @@ class VoiceManager(
                 Log.d(TAG, "STREAM_VOICE_CALL was 0, raised to $target/$maxVoice")
             }
         }
-        Log.d(TAG, "Audio routed to ${if (useEarpiece) "earpiece" else "loudspeaker"}")
+        Log.d(TAG, "Audio routed to ${audioOutput.name.lowercase()}")
     }
 
     private fun releaseAudioFocus() {
@@ -236,8 +245,22 @@ class VoiceManager(
             audioManager?.abandonAudioFocus(null)
         }
         audioManager?.mode = AudioManager.MODE_NORMAL
-        @Suppress("DEPRECATION")
-        audioManager?.isSpeakerphoneOn = false
+        // Release the routing override we set in applySpeakerRouting() so the next app
+        // gets default audio routing. Don't hardcode isSpeakerphoneOn = false here —
+        // that leaves the system stuck in earpiece, which is exactly the bug we fixed.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager?.clearCommunicationDevice()
+        } else {
+            // Tear down legacy Bluetooth SCO if we started it, so BT doesn't remain
+            // held open for the next app.
+            @Suppress("DEPRECATION")
+            audioManager?.let {
+                if (it.isBluetoothScoOn) {
+                    it.stopBluetoothSco()
+                    it.isBluetoothScoOn = false
+                }
+            }
+        }
         audioFocusRequest = null
     }
 
@@ -312,6 +335,7 @@ class VoiceManager(
 
         val audioSource = factory.createAudioSource(audioConstraints)
         localAudioTrack = factory.createAudioTrack("audio0", audioSource)
+        userMuted = false
         localAudioTrack?.setEnabled(true)
 
         // Create peer connection
@@ -361,6 +385,11 @@ class VoiceManager(
             override fun onAddStream(stream: MediaStream) {
                 // Web frontend: pc.ontrack = (e) => { remoteStream = e.streams[0]; audioEl.srcObject = remoteStream }
                 Log.d(TAG, "Remote stream added with ${stream.audioTracks.size} audio tracks")
+                // Re-apply routing one more time — WebRTC reconfigures the audio output
+                // right before the first remote audio packet plays, and on some Lollipop
+                // devices that reverts speaker routing silently. Running applySpeakerRouting()
+                // here catches the flake observed on the Samsung A300M.
+                applySpeakerRouting()
                 // Audio is automatically played through the device speaker
             }
 
@@ -744,30 +773,36 @@ class VoiceManager(
      * Web frontend: toggleMute() in useVoiceOrchestrator
      */
     fun toggleMute(): Boolean {
-        val currentEnabled = localAudioTrack?.enabled() ?: true
-        val newEnabled = !currentEnabled
-        localAudioTrack?.setEnabled(newEnabled)
-        return !newEnabled  // Return muted state (inverse of enabled)
+        userMuted = !userMuted
+        // Apply to the track. When unmuting mid-duck we still want the track enabled
+        // so the user can interrupt; gain ducking continues independently.
+        localAudioTrack?.setEnabled(!userMuted)
+        Log.i(TAG, "[MIC_STATE] ${t()} TOGGLE_MUTE → userMuted=$userMuted trackEnabled=${!userMuted}")
+        return userMuted
     }
 
     /**
-     * Check if microphone is muted.
+     * Check if microphone is muted (user intent).
      */
-    fun isMuted(): Boolean = !(localAudioTrack?.enabled() ?: true)
+    fun isMuted(): Boolean = userMuted
 
     /**
-     * Duck mic while agent is speaking: disable track + zero gain to minimize echo pickup.
+     * Duck mic while agent is speaking: lower input gain to minimize echo pickup.
      * Saves current gain for restore. No-op if already ducked.
+     *
+     * The track stays enabled at low gain so loud user speech can still interrupt —
+     * UNLESS the user has explicitly muted, in which case we leave the track disabled.
      */
     private fun duckMicForAgentSpeech() {
         if (gainBeforeSpeaking == null) {
             gainBeforeSpeaking = micGainLevel
             micGainLevel = echoDuckingGain
-            // Keep track enabled at low gain so loud user speech can still interrupt
-            localAudioTrack?.setEnabled(true)
-            Log.i(TAG, "[MIC_STATE] ${t()} DUCK → gain: ${gainBeforeSpeaking}→$echoDuckingGain trackEnabled: true agentPlaying=$agentAudioPlaying")
+            if (!userMuted) {
+                localAudioTrack?.setEnabled(true)
+            }
+            Log.i(TAG, "[MIC_STATE] ${t()} DUCK → gain: ${gainBeforeSpeaking}→$echoDuckingGain trackEnabled=${localAudioTrack?.enabled()} userMuted=$userMuted agentPlaying=$agentAudioPlaying")
         } else {
-            Log.d(TAG, "[MIC_STATE] ${t()} DUCK (already ducked, no-op) | gain=$micGainLevel gainSaved=$gainBeforeSpeaking trackEnabled=${localAudioTrack?.enabled()}")
+            Log.d(TAG, "[MIC_STATE] ${t()} DUCK (already ducked, no-op) | gain=$micGainLevel gainSaved=$gainBeforeSpeaking trackEnabled=${localAudioTrack?.enabled()} userMuted=$userMuted")
         }
     }
 
@@ -805,25 +840,136 @@ class VoiceManager(
     }
 
     /**
-     * Set audio output routing. Must be called before starting a voice session to take effect.
-     * @param earpiece true = route to earpiece, false = route to loudspeaker (default)
+     * Set audio output routing. If called during an active session, routing is reapplied
+     * immediately; otherwise it takes effect when the next session starts.
      */
-    fun setUseEarpiece(earpiece: Boolean) {
-        useEarpiece = earpiece
-        Log.d(TAG, "Audio output: ${if (earpiece) "earpiece" else "loudspeaker"}")
+    fun setAudioOutput(output: AudioOutput) {
+        audioOutput = output
+        Log.d(TAG, "Audio output set to: $output")
+        // If we're mid-session (audioManager already initialized), apply right away so
+        // the user hears the change without having to stop/start the voice session.
+        if (audioManager != null) {
+            applySpeakerRouting()
+        }
     }
 
     /**
-     * Apply speakerphone routing based on [useEarpiece].
-     * Called both at session start and after data channel opens (WebRTC may reset the mode).
+     * Whether a Bluetooth audio output device (A2DP/HEADSET/SCO/BLE) is currently available.
+     * Used by the UI to enable/disable the BLUETOOTH segment.
+     *
+     * Safe to call at any time — lazily initializes AudioManager if needed.
+     */
+    fun isBluetoothAudioAvailable(): Boolean {
+        val am = audioManager ?: (context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
+            ?.also { audioManager = it }
+            ?: return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // API 23+: enumerate output devices — this only returns currently connected ones.
+            val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            return devices.any { isBluetoothDevice(it.type) }
+        }
+        // API 21–22: AudioManager.isBluetoothScoAvailableOffCall reports the phone's
+        // HARDWARE capability, not whether a device is actually connected — so it always
+        // returns true on most phones. Use BluetoothAdapter's profile connection state
+        // instead, which reflects live connection status.
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
+        if (!adapter.isEnabled) return false
+        @Suppress("DEPRECATION")
+        val headsetState = adapter.getProfileConnectionState(BluetoothProfile.HEADSET)
+        @Suppress("DEPRECATION")
+        val a2dpState = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
+        return headsetState == BluetoothProfile.STATE_CONNECTED ||
+               a2dpState == BluetoothProfile.STATE_CONNECTED
+    }
+
+    private fun isBluetoothDevice(type: Int): Boolean = when (type) {
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> true
+        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+            type == AudioDeviceInfo.TYPE_BLE_BROADCAST
+        else false
+    }
+
+    /**
+     * Apply routing based on [audioOutput]. Called at session start, after data channel opens,
+     * and whenever the user changes the setting mid-session.
+     *
+     * Two code paths:
+     * - **API 31+**: prefer [AudioManager.setCommunicationDevice] — the only reliable API
+     *   on Android 12+. `setSpeakerphoneOn()` is deprecated and often silently rejected.
+     * - **API 21–30**: legacy path using `setSpeakerphoneOn` + `startBluetoothSco`.
+     *
+     * If the requested device isn't available (e.g. BLUETOOTH picked but no BT device
+     * connected, or earpiece missing on a tablet), falls back to loudspeaker.
      */
     private fun applySpeakerRouting() {
         val am = audioManager ?: return
-        @Suppress("DEPRECATION")
-        if (useEarpiece) {
-            am.isSpeakerphoneOn = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            applyRoutingModern(am)
         } else {
+            applyRoutingLegacy(am)
+        }
+        // Post-write verification — useful for debugging devices where the call silently no-ops.
+        @Suppress("DEPRECATION")
+        Log.d(TAG, "[ROUTE] after applySpeakerRouting: target=$audioOutput speakerOn=${am.isSpeakerphoneOn} scoOn=${am.isBluetoothScoOn} mode=${am.mode}")
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.S)
+    private fun applyRoutingModern(am: AudioManager) {
+        val devices = am.availableCommunicationDevices
+        val target: android.media.AudioDeviceInfo? = when (audioOutput) {
+            AudioOutput.EARPIECE ->
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+            AudioOutput.LOUDSPEAKER ->
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            AudioOutput.BLUETOOTH ->
+                devices.firstOrNull { isBluetoothDevice(it.type) }
+        }
+
+        if (target != null) {
+            val ok = am.setCommunicationDevice(target)
+            Log.d(TAG, "setCommunicationDevice(${audioOutput.name}, type=${target.type}) → $ok")
+            if (!ok && audioOutput == AudioOutput.BLUETOOTH) {
+                // BT sometimes refuses right after connect — retry once with SPEAKER as safety net
+                Log.w(TAG, "Bluetooth setCommunicationDevice failed; falling back to loudspeaker")
+                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    ?.let { am.setCommunicationDevice(it) }
+            }
+        } else {
+            Log.w(TAG, "No communication device for $audioOutput in $devices — clearing + falling back to speaker")
+            am.clearCommunicationDevice()
+            @Suppress("DEPRECATION")
             am.isSpeakerphoneOn = true
+        }
+    }
+
+    private fun applyRoutingLegacy(am: AudioManager) {
+        @Suppress("DEPRECATION")
+        when (audioOutput) {
+            AudioOutput.EARPIECE -> {
+                am.stopBluetoothSco()
+                am.isBluetoothScoOn = false
+                am.isSpeakerphoneOn = false
+            }
+            AudioOutput.LOUDSPEAKER -> {
+                am.stopBluetoothSco()
+                am.isBluetoothScoOn = false
+                am.isSpeakerphoneOn = true
+            }
+            AudioOutput.BLUETOOTH -> {
+                if (isBluetoothAudioAvailable()) {
+                    am.isSpeakerphoneOn = false
+                    am.startBluetoothSco()
+                    am.isBluetoothScoOn = true
+                } else {
+                    Log.w(TAG, "BLUETOOTH requested but no BT device available; falling back to loudspeaker")
+                    am.stopBluetoothSco()
+                    am.isBluetoothScoOn = false
+                    am.isSpeakerphoneOn = true
+                }
+            }
         }
     }
 

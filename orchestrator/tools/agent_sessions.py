@@ -262,12 +262,28 @@ async def send_to_agent_session(
 ) -> str:
     import asyncio
     from api.serializers import serialize_event
-    from manager.types import TextComplete, TurnComplete, TextDelta, ToolUse, ToolResult
+    from manager.types import SessionStatus, TextComplete, TurnComplete, TextDelta, ToolUse, ToolResult
 
     pool = context["pool"]
 
     if not pool.has(session_id):
         return json.dumps({"error": f"No active session with ID {session_id}"})
+
+    # If a turn is already in flight on this session, interrupt it first so
+    # this new message can take effect immediately instead of queueing behind
+    # the per-session lock in pool.send().  This is what makes voice mode able
+    # to redirect a Claude session mid-turn — without it, the second voice
+    # command sits idle until the first turn completes naturally.
+    sm = pool.get(session_id)
+    if sm is not None and sm.status in (
+        SessionStatus.STREAMING,
+        SessionStatus.THINKING,
+        SessionStatus.TOOL_USE,
+    ):
+        try:
+            await pool.interrupt(session_id)
+        except Exception as e:
+            logger.warning("Failed to interrupt session %s before redirect: %s", session_id, e)
 
     texts: list[str] = []
     cost = 0.0

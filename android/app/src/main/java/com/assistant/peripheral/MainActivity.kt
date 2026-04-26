@@ -32,6 +32,8 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.assistant.peripheral.data.VoiceState
 import com.assistant.peripheral.service.AssistantService
+import com.assistant.peripheral.ui.components.StatusBar
+import com.assistant.peripheral.ui.components.VoiceControls
 import com.assistant.peripheral.ui.screens.ChatScreen
 import com.assistant.peripheral.ui.screens.SessionsScreen
 import com.assistant.peripheral.ui.screens.SettingsScreen
@@ -180,6 +182,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isLoadingMoreMessages by viewModel.isLoadingMoreMessages.collectAsState()
     val discoveredServers by viewModel.discoveredServers.collectAsState()
     val isScanning by viewModel.isScanning.collectAsState()
+    val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
 
     // Wire wake word detection: start turn-based recording and navigate to chat
     val coroutineScope = rememberCoroutineScope()
@@ -219,10 +222,13 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
 
     // Auto-connect or auto-scan on launch
     LaunchedEffect(Unit) {
+        val defaultUrl = com.assistant.peripheral.data.AppSettings().serverUrl
+        val hasCustomUrl = settings.serverUrl != defaultUrl
         if (settings.autoConnect) {
             viewModel.connect()
-        } else {
-            // Scan for backends even when auto-connect is off
+        } else if (!hasCustomUrl) {
+            // Only scan when using the default URL — if the user has chosen a server
+            // (saved or manually entered), skip the subnet sweep.
             viewModel.scanForServers()
         }
         // Start foreground service (wake word config applied separately below)
@@ -240,9 +246,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         )
     }
 
-    // Also scan when auto-connect is on but we fail to connect after a moment
+    // Also scan when auto-connect is on but we fail to connect after a moment.
+    // Skip when the user has a custom (non-default) server URL — no need to sweep the subnet.
     LaunchedEffect(settings.autoConnect) {
-        if (settings.autoConnect) {
+        val defaultUrl = com.assistant.peripheral.data.AppSettings().serverUrl
+        val hasCustomUrl = settings.serverUrl != defaultUrl
+        if (settings.autoConnect && !hasCustomUrl) {
             viewModel.scanForServers()
         }
     }
@@ -254,102 +263,160 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         }
     }
 
-    Scaffold(
-        bottomBar = {
-            NavigationBar {
-                val navBackStackEntry by navController.currentBackStackEntryAsState()
-                val currentDestination = navBackStackEntry?.destination
+    // When we connect and there's no live orchestrator on the server, route the user
+    // to History so they can pick or create a session — instead of staring at an empty
+    // chat for a session that doesn't exist.
+    LaunchedEffect(noActiveOrchestrator) {
+        if (noActiveOrchestrator) {
+            navController.navigate(Screen.Sessions.route) {
+                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                launchSingleTop = true
+                restoreState = true
+            }
+        }
+    }
 
-                screens.forEach { screen ->
-                    NavigationBarItem(
-                        icon = { Icon(screen.icon, contentDescription = screen.title) },
-                        label = { Text(screen.title) },
-                        selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
-                        onClick = {
-                            navController.navigate(screen.route) {
-                                popUpTo(navController.graph.findStartDestination().id) {
-                                    saveState = true
-                                }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        }
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination?.route
+    val isVoiceActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
+
+    // Chat input state lives at app scope so it persists across tab switches.
+    var chatInputText by remember { mutableStateOf("") }
+
+    Scaffold { innerPadding ->
+    Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
+        // Page content
+        Box(modifier = Modifier.weight(1f)) {
+            NavHost(
+                navController = navController,
+                startDestination = Screen.Chat.route
+            ) {
+                composable(Screen.Chat.route) {
+                    ChatScreen(
+                        messages = messages,
+                        hasMoreMessages = hasMoreMessages,
+                        isLoadingMoreMessages = isLoadingMoreMessages,
+                        onLoadMoreMessages = viewModel::loadMoreMessages
+                    )
+                }
+
+                composable(Screen.Sessions.route) {
+                    SessionsScreen(
+                        sessions = sessions,
+                        currentSessionId = currentSessionId,
+                        liveSessionIds = liveSessionIds,
+                        isLoading = sessionsLoading,
+                        onSessionClick = { sessionId, isOrchestrator ->
+                            viewModel.loadSession(sessionId, isOrchestrator)
+                            navController.navigate(Screen.Chat.route)
+                        },
+                        onNewSession = {
+                            viewModel.newSession()
+                            navController.navigate(Screen.Chat.route)
+                        },
+                        onRenameSession = viewModel::renameSession,
+                        onDeleteSession = viewModel::deleteSession,
+                        onCloseSession = viewModel::closeSession,
+                        onRefresh = viewModel::refreshSessions
+                    )
+                }
+
+                composable(Screen.Settings.route) {
+                    SettingsScreen(
+                        settings = settings,
+                        connectionState = connectionState,
+                        discoveredServers = discoveredServers,
+                        isScanning = isScanning,
+                        onUpdateServerUrl = viewModel::updateServerUrl,
+                        onUpdateThemeMode = viewModel::updateThemeMode,
+                        onUpdateAutoConnect = viewModel::updateAutoConnect,
+                        onUpdateMicGainLevel = viewModel::updateMicGainLevel,
+                        onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
+                        onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
+                        onUpdateEchoDuckingGain = viewModel::updateEchoDuckingGain,
+                        onUpdateAudioOutput = viewModel::updateAudioOutput,
+                        // Recomputed on each recomposition so plugging/unplugging a BT device
+                        // and re-entering the Settings screen refreshes the enablement state.
+                        // TODO: surface this via a StateFlow if we want live updates without
+                        // leaving Settings.
+                        isBluetoothAvailable = viewModel.isBluetoothAudioAvailable(),
+                        onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
+                        onUpdateWakeWord = viewModel::updateWakeWord,
+                        onUpdateVoiceWord = viewModel::updateVoiceWord,
+                        onUpdateEnableButtonTrigger = viewModel::updateEnableButtonTrigger,
+                        onConnect = viewModel::connect,
+                        onDisconnect = viewModel::disconnect,
+                        onScanForServers = viewModel::scanForServers,
+                        onConnectToServer = viewModel::connectToDiscoveredServer,
+                        onAddSavedServer = viewModel::addSavedServer,
+                        onRemoveSavedServer = viewModel::removeSavedServer,
+                        onSelectSavedServer = viewModel::selectSavedServer
                     )
                 }
             }
         }
-    ) { innerPadding ->
-        NavHost(
-            navController = navController,
-            startDestination = Screen.Chat.route,
-            modifier = Modifier.padding(innerPadding)
-        ) {
-            composable(Screen.Chat.route) {
-                ChatScreen(
-                    messages = messages,
-                    connectionState = connectionState,
-                    sessionStatus = sessionStatus,
-                    isRecording = isRecording,
-                    voiceState = voiceState,
-                    isOrchestratorSession = isOrchestratorSession,
-                    hasMoreMessages = hasMoreMessages,
-                    isLoadingMoreMessages = isLoadingMoreMessages,
-                    onSendMessage = viewModel::sendMessage,
-                    onStartRecording = viewModel::startRecording,
-                    onStopRecording = viewModel::stopRecording,
-                    onInterrupt = viewModel::interrupt,
-                    onStartVoice = viewModel::startVoiceSession,
-                    onStopVoice = viewModel::stopVoiceSession,
-                    onToggleMute = viewModel::toggleMute,
-                    onLoadMoreMessages = viewModel::loadMoreMessages,
-                    isMuted = isMuted
-                )
-            }
 
-            composable(Screen.Sessions.route) {
-                SessionsScreen(
-                    sessions = sessions,
-                    currentSessionId = currentSessionId,
-                    liveSessionIds = liveSessionIds,
-                    isLoading = sessionsLoading,
-                    onSessionClick = { sessionId, isOrchestrator ->
-                        viewModel.loadSession(sessionId, isOrchestrator)
-                        navController.navigate(Screen.Chat.route)
-                    },
-                    onNewSession = {
-                        viewModel.newSession()
-                        navController.navigate(Screen.Chat.route)
-                    },
-                    onRenameSession = viewModel::renameSession,
-                    onDeleteSession = viewModel::deleteSession,
-                    onRefresh = viewModel::refreshSessions
-                )
-            }
+        // Bottom stack: status bar + chat input (chat tab only, not in voice mode)
+        // -> voice controls (when active, global) -> nav tabs.
+        // StatusBar is chat-only since it reflects the current chat session;
+        // VoiceControls already surfaces its own state during voice mode.
+        if (currentRoute == Screen.Chat.route && !isVoiceActive) {
+            StatusBar(
+                connectionState = connectionState,
+                sessionStatus = sessionStatus,
+                onInterrupt = viewModel::interrupt
+            )
+            com.assistant.peripheral.ui.screens.ChatInputBar(
+                inputText = chatInputText,
+                onInputChange = { chatInputText = it },
+                onSend = {
+                    if (chatInputText.isNotBlank()) {
+                        viewModel.sendMessage(chatInputText)
+                        chatInputText = ""
+                    }
+                },
+                isRecording = isRecording,
+                onStartRecording = viewModel::startRecording,
+                onStopRecording = viewModel::stopRecording,
+                isConnected = connectionState is com.assistant.peripheral.data.ConnectionState.Connected,
+                isStreaming = sessionStatus == "streaming" || sessionStatus == "tool_use",
+                voiceState = voiceState,
+                onStartVoice = viewModel::startVoiceSession,
+                onStopVoice = viewModel::stopVoiceSession,
+                isOrchestratorSession = isOrchestratorSession
+            )
+        }
 
-            composable(Screen.Settings.route) {
-                SettingsScreen(
-                    settings = settings,
-                    connectionState = connectionState,
-                    discoveredServers = discoveredServers,
-                    isScanning = isScanning,
-                    onUpdateServerUrl = viewModel::updateServerUrl,
-                    onUpdateThemeMode = viewModel::updateThemeMode,
-                    onUpdateAutoConnect = viewModel::updateAutoConnect,
-                    onUpdateMicGainLevel = viewModel::updateMicGainLevel,
-                    onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
-                    onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
-                    onUpdateEchoDuckingGain = viewModel::updateEchoDuckingGain,
-                    onUpdateEarpieceMode = viewModel::updateEarpieceMode,
-                    onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
-                    onUpdateWakeWord = viewModel::updateWakeWord,
-                    onUpdateVoiceWord = viewModel::updateVoiceWord,
-                    onUpdateEnableButtonTrigger = viewModel::updateEnableButtonTrigger,
-                    onConnect = viewModel::connect,
-                    onDisconnect = viewModel::disconnect,
-                    onScanForServers = viewModel::scanForServers,
-                    onConnectToServer = viewModel::connectToDiscoveredServer
+        if (isVoiceActive) {
+            VoiceControls(
+                voiceState = voiceState,
+                isMuted = isMuted,
+                onToggleMute = viewModel::toggleMute,
+                onStop = viewModel::stopVoiceSession,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        NavigationBar {
+            val currentDestination = navBackStackEntry?.destination
+
+            screens.forEach { screen ->
+                NavigationBarItem(
+                    icon = { Icon(screen.icon, contentDescription = screen.title) },
+                    label = { Text(screen.title) },
+                    selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
+                    onClick = {
+                        navController.navigate(screen.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
                 )
             }
         }
+    }
     }
 }

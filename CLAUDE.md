@@ -55,6 +55,7 @@ context/                      # PRIVATE - Standalone git repo, gitignored here (
 ├── *.jsonl                   # Conversation JSONL files
 ├── <uuid>/                   # SDK state directories (subagents, tool-results)
 ├── memory/                   # Memory markdown files
+├── public/                   # Static files served at URL root (visualizations/, photo-server/, downloads, etc.)
 ├── skills/                   # Symlinks to default-skills + personalized skills
 ├── scripts/                  # Symlinks to default-scripts + personalized scripts
 ├── agents/                   # Symlinks to default-agents + personalized agents
@@ -114,6 +115,7 @@ context/
 ├── memory/            # Memory files (Markdown)
 │   ├── MEMORY.md      # Authoritative index (keep under 200 lines)
 │   └── *.md           # Detailed topic files
+├── public/            # Static files served at URL root (visualizations/, photo-server/, downloads, etc.)
 ├── skills/            # Symlinks to default-skills/* + personalized folders
 ├── scripts/           # Symlinks to default-scripts/* + personalized files
 ├── secrets/           # OAuth credentials and tokens

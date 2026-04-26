@@ -2,16 +2,77 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import shlex
 import stat
+import subprocess
 import tempfile
+import threading
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Cache of resolved remote `claude` absolute paths, keyed by a tuple that
+# identifies a unique SSH target. Avoids opening a fresh SSH connection to
+# probe `which claude` on every session start — under concurrent starts
+# those probes were the main source of session churn on the remote host.
+# Entry is whatever `_resolve_remote_claude` returned (including the
+# fallback string "claude") so we don't re-probe failures either.
+_REMOTE_CLAUDE_PATH_CACHE: dict[tuple[str | None, str | None, str | None], str] = {}
+_REMOTE_CLAUDE_PATH_LOCK = threading.Lock()
+
+
+def clear_remote_claude_path_cache() -> None:
+    """Forget every cached remote-claude path.
+
+    Intended for tests and for the rare case an operator wants to force a
+    re-probe after updating the remote `claude` install.
+    """
+    with _REMOTE_CLAUDE_PATH_LOCK:
+        _REMOTE_CLAUDE_PATH_CACHE.clear()
+
+
+class RemoteHostUnreachableError(RuntimeError):
+    """Raised when an SSH target fails the ICMP reachability pre-probe."""
+
+
+def _probe_ssh_host_reachable(host: str, timeout_s: float = 2.0) -> bool:
+    """Return True if ``host`` replies to a single ICMP ping within *timeout_s*.
+
+    This is a cheap pre-flight so we don't let the SDK (or our own
+    version-probe) open an SSH connection to an unreachable host, which then
+    hangs in TCP retransmit for ~30 s while holding file descriptors and
+    burning CPU cycles in the SSH client.  When the laptop hibernates with
+    an in-flight remote session, this check turns a slow timeout cascade
+    into an instant clean failure.
+
+    The function is deliberately synchronous and non-awaitable — callers
+    that care about event-loop latency should run it in a thread.  The
+    2-second default is long enough for normal LAN jitter and short enough
+    that a typical failed probe costs less than one SSH TCP timeout.
+    """
+    if not host:
+        return True  # Nothing to probe; treat as reachable.
+    try:
+        # -c 1: one packet.  -W <s>: overall deadline for the reply.
+        # stdout/stderr discarded; we only care about the exit code.
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(int(max(1, timeout_s))), host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s + 1.0,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # If ping isn't available or the subprocess itself times out, assume
+        # unreachable rather than silently falling through — the whole point
+        # is to short-circuit bad paths.
+        return False
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -129,6 +190,22 @@ class SessionManager:
         is captured from ``server_info`` (if available) or from the first
         ``ResultMessage`` after a query, and stored as ``sdk_session_id``.
         """
+        # Cheap reachability pre-probe for remote sessions.  One ICMP ping,
+        # 2 s deadline — if the host is asleep/offline we raise immediately
+        # instead of letting the SDK sit in a 30 s SSH TCP timeout (which
+        # historically pinned the CPU and spun the fan on the Jetson while
+        # the laptop was hibernating).
+        if self._config.ssh_host:
+            reachable = await asyncio.get_running_loop().run_in_executor(
+                None, _probe_ssh_host_reachable, self._config.ssh_host, 2.0
+            )
+            if not reachable:
+                raise RemoteHostUnreachableError(
+                    f"SSH host {self._config.ssh_host!r} did not reply to ICMP ping; "
+                    "refusing to open SSH connection (prevents stuck sessions and "
+                    "fan/CPU churn while the remote is offline)."
+                )
+
         options = self._build_options()
         self._client = ClaudeSDKClient(options)
         await self._client.connect()
@@ -159,9 +236,14 @@ class SessionManager:
             self._ssh_wrapper_path = None
 
     async def interrupt(self) -> None:
-        """Interrupt the current response."""
+        """Interrupt the current response.
+
+        ``ClaudeSDKClient.interrupt()`` is a coroutine — it must be awaited or
+        the signal never reaches the CLI and the in-flight ``receive_response()``
+        keeps streaming until the turn finishes naturally.
+        """
         if self._client is not None:
-            self._client.interrupt()
+            await self._client.interrupt()
         self._status = SessionStatus.INTERRUPTED
 
     # ------------------------------------------------------------------
@@ -320,9 +402,6 @@ class SessionManager:
         The script forwards all arguments ("$@") so the SDK flags land on the
         remote claude process unchanged.  Returns the path to the script.
         """
-        import shlex
-        import subprocess
-
         remote_path = self._config.project_dir.replace("'", "'\\''")
 
         ssh_parts = ["ssh"]
@@ -341,26 +420,58 @@ class SessionManager:
 
         ssh_cmd = shlex.join(ssh_parts)
 
-        # Resolve the absolute path of `claude` on the remote machine.
-        # Non-interactive SSH sessions don't load .profile/.bashrc so PATH
-        # may not include ~/.local/bin.  We probe common locations and fall
-        # back to `which claude` (sourcing the profile explicitly) so the
-        # wrapper can exec the binary directly without relying on PATH.
-        try:
-            result = subprocess.run(
-                ssh_parts + [
-                    "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
-                    " which claude 2>/dev/null"
-                    " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
-                ],
-                capture_output=True, text=True, timeout=10,
-            )
-            remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
-        except Exception as e:
-            logger.warning("Could not resolve remote claude path: %s", e)
-            remote_claude = "claude"
-
-        logger.debug("Remote claude path resolved to: %s", remote_claude)
+        # Resolve the absolute path of `claude` on the remote machine — cached.
+        #
+        # Each probe opens an SSH connection and runs `which claude` on the
+        # remote.  Historically this ran on every SessionManager.start(), so
+        # a burst of N concurrent starts (e.g. browser reconnect storm)
+        # produced N SSH handshakes *before* the ControlMaster socket could
+        # be established.  On the remote side each handshake = one PAM
+        # session = one systemd --user manager, and the rapid open/close
+        # cycle is what triggered the 2026-04-20 session-churn crash.
+        #
+        # Cache key is (host, user, key) — changing any of these warrants a
+        # new probe.  The fallback result ("claude") is cached too so a
+        # broken/unreachable host doesn't re-probe on every retry.
+        cache_key = (
+            self._config.ssh_host,
+            self._config.ssh_user,
+            self._config.ssh_key,
+        )
+        with _REMOTE_CLAUDE_PATH_LOCK:
+            cached = _REMOTE_CLAUDE_PATH_CACHE.get(cache_key)
+        if cached is not None:
+            remote_claude = cached
+            logger.debug("Remote claude path (cached): %s", remote_claude)
+        else:
+            # Before opening an SSH connection for the path probe, ping-probe
+            # the host.  If unreachable, use the "claude" fallback *without*
+            # caching it — when the host comes back online we want to probe
+            # properly rather than being stuck on the fallback forever.
+            if not _probe_ssh_host_reachable(self._config.ssh_host or "", 2.0):
+                logger.warning(
+                    "SSH host %r unreachable; using 'claude' fallback for this "
+                    "wrapper without caching (will re-probe next time)",
+                    self._config.ssh_host,
+                )
+                remote_claude = "claude"
+            else:
+                try:
+                    result = subprocess.run(
+                        ssh_parts + [
+                            "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
+                            " which claude 2>/dev/null"
+                            " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
+                        ],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
+                except Exception as e:
+                    logger.warning("Could not resolve remote claude path: %s", e)
+                    remote_claude = "claude"
+                with _REMOTE_CLAUDE_PATH_LOCK:
+                    _REMOTE_CLAUDE_PATH_CACHE[cache_key] = remote_claude
+                logger.debug("Remote claude path resolved to: %s (cached for future)", remote_claude)
 
         # Shell-escape helper: wraps a value in single quotes, escaping any embedded
         # single quotes using the break-and-rejoin technique (e.g. ' → '\'' ).
@@ -460,8 +571,15 @@ class SessionManager:
                     pass
 
         elif isinstance(msg, SystemMessage):
+            data = msg.data if isinstance(msg.data, dict) else {}
+            # The "init" system message carries the SDK session_id as its first
+            # message after connect. Capture it eagerly so sessions that are
+            # still mid-tool (no ResultMessage yet) are still addressable by
+            # their SDK id — otherwise they vanish from /api/sessions on refresh.
+            sid = data.get("session_id")
+            if sid and not self._sdk_session_id:
+                self._sdk_session_id = sid
             if msg.subtype == "compact":
-                data = msg.data if isinstance(msg.data, dict) else {}
                 trigger = data.get("trigger", "manual")
                 summary = data.get("summary", "")
                 yield CompactComplete(trigger=trigger, summary=summary)

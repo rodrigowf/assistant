@@ -54,14 +54,35 @@ async def lifespan(app: FastAPI):
     history_task = asyncio.create_task(history_indexer.run())
     app.state.history_indexer = history_indexer
 
+    # Pre-warm the SessionStore cache off the event loop so the first
+    # /api/sessions request doesn't pay the cold-cache cost (which can
+    # be 30–60s on slow storage like the Jetson's SD card).
+    async def _prewarm_sessions() -> None:
+        try:
+            count = await asyncio.to_thread(lambda: len(app.state.store.list_sessions()))
+            logger.info("SessionStore cache pre-warmed (%d sessions)", count)
+        except Exception:
+            logger.exception("SessionStore pre-warm failed")
+
+    prewarm_task = asyncio.create_task(_prewarm_sessions())
+    app.state.prewarm_task = prewarm_task
+
     try:
         yield
     finally:
+        # Drain the session pool first so remote SSH + claude children get
+        # clean SIGTERMs instead of being orphaned by the backend exiting.
+        try:
+            await app.state.pool.close_all()
+        except Exception:
+            logger.exception("Error draining session pool on shutdown")
+
         memory_watcher.stop()
         history_indexer.stop()
         memory_task.cancel()
         history_task.cancel()
-        for task in [memory_task, history_task]:
+        prewarm_task.cancel()
+        for task in [memory_task, history_task, prewarm_task]:
             try:
                 await task
             except asyncio.CancelledError:
@@ -106,8 +127,15 @@ def create_app() -> FastAPI:
                 return FileResponse(file_path)
             return FileResponse(compat_dist / "index.html")
 
+    # Public files directory (context/public/ — synced across machines, served at URL root).
+    # Anything placed under context/public/ is reachable at the matching URL path
+    # (e.g. context/public/photo-server/file.py → /photo-server/file.py).
+    project_root = Path(__file__).resolve().parent.parent
+    context_public = project_root / "context" / "public"
+    context_public_resolved = context_public.resolve() if context_public.exists() else None
+
     # Serve the production frontend build if it exists
-    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    frontend_dist = project_root / "frontend" / "dist"
     if frontend_dist.exists():
         app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
 
@@ -117,10 +145,23 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}")
         async def serve_spa(full_path: str):
-            # Serve index.html for all non-API routes (SPA client-side routing)
+            # 1) Check context/public/ first — runtime-served public files
+            #    (visualizations, photo-server, downloads, etc.) without rebuild.
+            if context_public_resolved is not None and full_path:
+                candidate = (context_public / full_path).resolve()
+                # Path traversal guard: candidate must stay under context/public/.
+                if (
+                    candidate.is_relative_to(context_public_resolved)
+                    and candidate.is_file()
+                ):
+                    return FileResponse(candidate)
+
+            # 2) Then check the built frontend dist for static assets.
             file_path = frontend_dist / full_path
             if file_path.exists() and file_path.is_file():
                 return FileResponse(file_path)
+
+            # 3) SPA fallback — serve index.html for client-side routing.
             return FileResponse(frontend_dist / "index.html")
 
     return app

@@ -52,6 +52,23 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
   const [showScrollButton, setShowScrollButton] = useState(false);
   const prependAnchorRef = useRef<number | null>(null);
 
+  // Buffer new messages while the user is scrolled up, so the view isn't
+  // pulled while they're reading. `displayedMessages` is the snapshot we
+  // actually render; `messages` is the latest from upstream. When the user
+  // returns to the bottom, the buffer is flushed in one pass.
+  const [displayedMessages, setDisplayedMessages] = useState(messages);
+  const isFrozenRef = useRef(false);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  // Sync displayed messages with upstream when not frozen. Always sync on
+  // prepend (load-more) — that's a history insert at the top, not a new
+  // message at the bottom, so it shouldn't be buffered.
+  useEffect(() => {
+    if (!isFrozenRef.current || prependAnchorRef.current !== null) {
+      setDisplayedMessages(messages);
+    }
+  }, [messages]);
+
   const scrollToBottom = useCallback(() => {
     const el = parentRef.current;
     if (el && el.clientHeight > 0) {
@@ -61,12 +78,34 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
     }
   }, []);
 
+  // Release the freeze, flush any buffered messages, and snap to the bottom.
+  const flushBuffer = useCallback(() => {
+    isFrozenRef.current = false;
+    isNearBottomRef.current = true;
+    setShowScrollButton(false);
+    setDisplayedMessages(messagesRef.current);
+    // Scroll immediately so it works even when there are no buffered messages
+    // (the displayedMessages-change effect wouldn't fire in that case).
+    const el = parentRef.current;
+    if (el) iosScrollTo(el, el.scrollHeight);
+  }, []);
+
   const handleScroll = useCallback(() => {
     const el = parentRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    isNearBottomRef.current = distanceFromBottom <= NEAR_BOTTOM_THRESHOLD;
-    setShowScrollButton(distanceFromBottom > NEAR_BOTTOM_THRESHOLD);
+    const nearBottom = distanceFromBottom <= NEAR_BOTTOM_THRESHOLD;
+    isNearBottomRef.current = nearBottom;
+    setShowScrollButton(!nearBottom);
+
+    if (nearBottom) {
+      // Back at the bottom — release the freeze and flush any buffered messages.
+      if (isFrozenRef.current) flushBuffer();
+    } else {
+      // Scrolled away from the bottom — freeze so incoming messages buffer
+      // instead of extending the rendered list and shifting the viewport.
+      isFrozenRef.current = true;
+    }
 
     if (el.scrollTop <= LOAD_MORE_THRESHOLD && hasMoreMessages && onLoadMore && !isLoadingRef.current) {
       isLoadingRef.current = true;
@@ -78,7 +117,7 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
         isLoadingRef.current = false;
       });
     }
-  }, [hasMoreMessages, onLoadMore]);
+  }, [hasMoreMessages, onLoadMore, flushBuffer]);
 
   useEffect(() => {
     const el = parentRef.current;
@@ -104,7 +143,7 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
   }, [isActive, scrollToBottom]);
 
   useEffect(() => {
-    if (messages.length !== prevCountRef.current) {
+    if (displayedMessages.length !== prevCountRef.current) {
       if (prependAnchorRef.current !== null) {
         const el = parentRef.current;
         if (el) {
@@ -123,10 +162,10 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
         scrollToBottom();
       }
     }
-    prevCountRef.current = messages.length;
-  }, [messages.length, scrollToBottom]);
+    prevCountRef.current = displayedMessages.length;
+  }, [displayedMessages.length, scrollToBottom]);
 
-  const lastMsg = messages[messages.length - 1];
+  const lastMsg = displayedMessages[displayedMessages.length - 1];
   const lastMsgBlocks = lastMsg?.blocks.length ?? 0;
   useEffect(() => {
     if (isNearBottomRef.current) {
@@ -134,7 +173,7 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
     }
   }, [lastMsgBlocks, scrollToBottom]);
 
-  if (messages.length === 0) {
+  if (displayedMessages.length === 0) {
     return (
       <div className="message-list empty" ref={parentRef}>
         <div className="empty-state">
@@ -154,13 +193,17 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
           </div>
         )}
         <div className="message-list-inner">
-          {messages.map((msg) => (
+          {displayedMessages.map((msg) => (
             <Message key={msg.id} message={msg} />
           ))}
         </div>
       </div>
       {showScrollButton && (
-        <button className="scroll-to-bottom-btn" onClick={scrollToBottom} aria-label="Scroll to bottom">
+        <button
+          className="scroll-to-bottom-btn"
+          onClick={flushBuffer}
+          aria-label="Scroll to bottom"
+        >
           ↓
         </button>
       )}

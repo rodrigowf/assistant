@@ -449,7 +449,55 @@ mkdir -p index logs
 info "Created index/, logs/"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 9: Create default manager config
+# Step 9: Link Claude Code credentials into .claude_config/
+# ─────────────────────────────────────────────────────────────────────────────
+# run.sh sets CLAUDE_CONFIG_DIR=$PROJECT_DIR/.claude_config, so the SDK reads
+# OAuth credentials from there — NOT from ~/.claude/. Symlink (rather than
+# copy) so OAuth token refreshes by any Claude Code instance propagate
+# automatically. A stale copy here causes 401s once the cached token expires.
+if [ -f "$HOME/.claude/.credentials.json" ]; then
+    if [ -L ".claude_config/.credentials.json" ]; then
+        info "Claude Code credentials symlink already present"
+    else
+        if [ -f ".claude_config/.credentials.json" ]; then
+            rm -f ".claude_config/.credentials.json"
+        fi
+        ln -s "$HOME/.claude/.credentials.json" ".claude_config/.credentials.json"
+        info "Linked Claude Code credentials into .claude_config/"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 10: Create default assistant_config.json
+# ─────────────────────────────────────────────────────────────────────────────
+# The API seeds a default if missing, but writing it up front lets the user
+# edit it (e.g. add SSH working-directory entries) before starting the backend.
+if [ ! -f "assistant_config.json" ]; then
+    step "Creating default assistant_config.json..."
+    cat > assistant_config.json <<EOF
+{
+  "working_directory": "$SCRIPT_DIR",
+  "working_directory_history": [
+    {
+      "id": "$SCRIPT_DIR",
+      "path": "$SCRIPT_DIR",
+      "label": "Local",
+      "ssh_host": null,
+      "ssh_user": null,
+      "ssh_key": null,
+      "claude_config_dir": null
+    }
+  ],
+  "enabled_mcps": [],
+  "chrome_extension": false,
+  "default_model": "claude-sonnet-4-5-20250929"
+}
+EOF
+    info "Created assistant_config.json"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 11: Create default manager config
 # ─────────────────────────────────────────────────────────────────────────────
 if [ ! -f ".manager.json" ]; then
     step "Creating default configuration..."
@@ -465,7 +513,7 @@ EOF
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 10: Verify installation
+# Step 12: Verify installation
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 step "Verifying installation..."
