@@ -106,8 +106,15 @@ def create_app() -> FastAPI:
                 return FileResponse(file_path)
             return FileResponse(compat_dist / "index.html")
 
+    # Public files directory (context/public/ — synced across machines, served at URL root).
+    # Anything placed under context/public/ is reachable at the matching URL path
+    # (e.g. context/public/photo-server/file.py → /photo-server/file.py).
+    project_root = Path(__file__).resolve().parent.parent
+    context_public = project_root / "context" / "public"
+    context_public_resolved = context_public.resolve() if context_public.exists() else None
+
     # Serve the production frontend build if it exists
-    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    frontend_dist = project_root / "frontend" / "dist"
     if frontend_dist.exists():
         app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
 
@@ -117,10 +124,23 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}")
         async def serve_spa(full_path: str):
-            # Serve index.html for all non-API routes (SPA client-side routing)
+            # 1) Check context/public/ first — runtime-served public files
+            #    (visualizations, photo-server, downloads, etc.) without rebuild.
+            if context_public_resolved is not None and full_path:
+                candidate = (context_public / full_path).resolve()
+                # Path traversal guard: candidate must stay under context/public/.
+                if (
+                    candidate.is_relative_to(context_public_resolved)
+                    and candidate.is_file()
+                ):
+                    return FileResponse(candidate)
+
+            # 2) Then check the built frontend dist for static assets.
             file_path = frontend_dist / full_path
             if file_path.exists() and file_path.is_file():
                 return FileResponse(file_path)
+
+            # 3) SPA fallback — serve index.html for client-side routing.
             return FileResponse(frontend_dist / "index.html")
 
     return app
