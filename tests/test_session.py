@@ -225,6 +225,88 @@ class TestSessionManagerLifecycle:
             # idle-wait phase).
             await sm.stop()
 
+    @pytest.mark.asyncio
+    async def test_subprocess_pid_captured_at_connect(self):
+        """The bundled-claude subprocess pid (from the SDK's private
+        transport._process.pid) must be captured at connect time so the
+        kill fallback in stop() has something to signal."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+        # Simulate the SDK's private structure
+        client._transport = MagicMock()
+        client._transport._process = MagicMock()
+        client._transport._process.pid = 99999  # arbitrary non-real pid
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+            assert sm.subprocess_pid == 99999
+            await sm.stop()
+            # After stop the captured pid should be cleared
+            assert sm.subprocess_pid is None
+
+    @pytest.mark.asyncio
+    async def test_subprocess_pid_none_when_sdk_shape_changes(self):
+        """If a future SDK refactor moves the private attribute, we should
+        log a debug and continue — NOT crash the session.  The pool's
+        orphan reaper still acts as a fallback."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client), \
+             patch("manager.session._extract_subprocess_pid", return_value=None):
+            sm = SessionManager()
+            await sm.start()
+            assert sm.subprocess_pid is None
+            await sm.stop()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_disconnect_timeout_triggers_subprocess_kill(self):
+        """If client.disconnect() exceeds 8s (because the SDK's transport
+        sits in `await self._process.wait()` after a SIGTERM the bundled
+        claude is ignoring), the lifecycle finally must escalate to
+        kill_claude_subprocess() so we don't leak."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+
+        # Make disconnect() hang forever (simulating the real SDK bug)
+        async def _hang():
+            await asyncio.sleep(60)
+        client.disconnect = AsyncMock(side_effect=_hang)
+
+        client._transport = MagicMock()
+        client._transport._process = MagicMock()
+        client._transport._process.pid = 88888
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client), \
+             patch("manager.session._process_alive", return_value=True), \
+             patch("manager.session.kill_claude_subprocess", return_value=True) as kill_mock, \
+             patch("manager.session.asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
+            sm = SessionManager()
+            await sm.start()
+            await sm.stop()
+
+            # The kill fallback must have been invoked with the pid
+            kill_mock.assert_called_once_with(88888)
+            assert sm.status == SessionStatus.DISCONNECTED
+
+    @pytest.mark.asyncio
+    async def test_clean_disconnect_does_not_kill(self):
+        """If client.disconnect() returns cleanly AND the subprocess exits
+        on its own, kill_claude_subprocess must NOT be called.  Steady-
+        state cleanup should be silent."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+        client._transport = MagicMock()
+        client._transport._process = MagicMock()
+        client._transport._process.pid = 77777
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client), \
+             patch("manager.session._process_alive", return_value=False), \
+             patch("manager.session.kill_claude_subprocess") as kill_mock:
+            sm = SessionManager()
+            await sm.start()
+            await sm.stop()
+
+            # Process is gone (mocked _process_alive=False) → no kill
+            kill_mock.assert_not_called()
+
 
 class TestSessionManagerSend:
     @pytest.mark.asyncio

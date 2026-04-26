@@ -43,6 +43,11 @@ async def lifespan(app: FastAPI):
 
     app.state.connections = ConnectionManager()
     app.state.pool = SessionPool()
+    # Background orphan reaper — last-line defense against leaked
+    # bundled-claude subprocesses (per-session SIGKILL inside
+    # SessionManager is the primary defense).  Cheap when nothing is
+    # leaked: a few os.kill(0) liveness checks every 30s.
+    await app.state.pool.start_orphan_reaper()
 
     project_path = Path(config.project_dir)
 
@@ -70,6 +75,14 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Stop the reaper before close_all so it doesn't race against the
+        # final shutdown drain (kill_claude_subprocess on a pid that
+        # close_all is also handling would just be a redundant SIGTERM).
+        try:
+            await app.state.pool.stop_orphan_reaper()
+        except Exception:
+            logger.exception("Error stopping orphan reaper on shutdown")
+
         # Drain the session pool first so remote SSH + claude children get
         # clean SIGTERMs instead of being orphaned by the backend exiting.
         try:

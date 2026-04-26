@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
 import shlex
+import signal
 import stat
 import subprocess
 import tempfile
@@ -128,6 +130,139 @@ from .types import (
 )
 
 
+def _process_alive(pid: int) -> bool:
+    """Return True if a process with *pid* exists and we can signal it.
+
+    Uses ``os.kill(pid, 0)`` — the kernel resolves the pid and checks
+    permissions but doesn't actually deliver any signal.  Distinguishes
+    cleanly between "process is gone" (ESRCH) and "process exists but we
+    can't touch it" (EPERM, treated as alive).
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as e:
+        return e.errno != errno.ESRCH
+
+
+def _process_comm(pid: int) -> str | None:
+    """Read /proc/<pid>/comm and return its content (the kernel's view of
+    the executable basename, capped at 15 chars).  Returns None if the
+    process is gone or /proc isn't readable.
+
+    Used as a sanity check before SIGKILL: PIDs are reused by the kernel
+    after a process exits, so before nuking pid X we verify it still looks
+    like the `claude` subprocess we spawned — not some innocent process
+    that happened to be assigned the recycled pid.
+    """
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip() or None
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _looks_like_claude(pid: int) -> bool:
+    """Return True if /proc/<pid>/comm matches the bundled `claude` cli.
+
+    The kernel's comm is the basename of the executable, capped at 15
+    chars — for our subprocess that's exactly ``claude``.  We accept any
+    value that starts with ``claude`` to tolerate possible future renames.
+    """
+    comm = _process_comm(pid)
+    return comm is not None and comm.startswith("claude")
+
+
+def _extract_subprocess_pid(client: ClaudeSDKClient) -> int | None:
+    """Best-effort extraction of the bundled-claude subprocess PID from a
+    connected ``ClaudeSDKClient``.
+
+    The SDK doesn't expose this publicly, so we walk private attributes:
+    ``client._transport._process.pid``.  Wrapped in defensive ``getattr``s
+    and a broad except so any future SDK refactor (renamed attribute,
+    custom transport, etc.) just yields None instead of crashing the
+    session — at worst we lose the per-session SIGKILL fallback and
+    rely on the pool's orphan reaper to clean up.
+    """
+    try:
+        transport = getattr(client, "_transport", None)
+        if transport is None:
+            return None
+        process = getattr(transport, "_process", None)
+        if process is None:
+            return None
+        pid = getattr(process, "pid", None)
+        return int(pid) if pid is not None else None
+    except Exception:
+        logger.debug("could not extract SDK subprocess pid", exc_info=True)
+        return None
+
+
+def kill_claude_subprocess(pid: int, *, sigterm_grace_s: float = 0.5) -> bool:
+    """Force-kill an orphaned bundled-claude subprocess identified by *pid*.
+
+    Verifies the pid still belongs to a process whose ``/proc/<pid>/comm``
+    starts with ``claude`` before signalling — the kernel can recycle pids
+    immediately after a process exits, and we never want to SIGKILL an
+    unrelated process that happened to inherit the number.
+
+    First sends SIGTERM (giving the subprocess *sigterm_grace_s* seconds
+    to wind down via its normal handlers — flushing JSONL, etc.); if the
+    process is still alive after that, escalates to SIGKILL.  Returns
+    True if a signal was sent (process was alive and looked like claude),
+    False otherwise.
+
+    Safe to call concurrently from the per-session lifecycle finally and
+    from the pool's orphan reaper — the second caller will simply observe
+    the process is gone (or no longer matches ``claude``) and no-op.
+    """
+    if not _process_alive(pid):
+        return False
+    if not _looks_like_claude(pid):
+        # PID was reused by the kernel for an unrelated process — bail
+        # out instead of nuking something innocent.
+        logger.info(
+            "Skipping kill of pid %d: comm=%r does not look like claude",
+            pid,
+            _process_comm(pid),
+        )
+        return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        logger.exception("SIGTERM to pid %d failed", pid)
+
+    # Brief grace period — bundled claude can take a moment to flush JSONL
+    # before exiting.  Synchronous poll (no asyncio) so this helper is
+    # safely callable from sync contexts (e.g. the orphan reaper).
+    import time
+    end = time.monotonic() + sigterm_grace_s
+    while time.monotonic() < end:
+        if not _process_alive(pid):
+            return True
+        time.sleep(0.05)
+
+    if _process_alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+            logger.warning(
+                "Pid %d (claude) ignored SIGTERM after %.1fs; sent SIGKILL", pid, sigterm_grace_s
+            )
+        except ProcessLookupError:
+            return False
+        except OSError:
+            logger.exception("SIGKILL to pid %d failed", pid)
+    return True
+
+
 class SessionManager:
     """Manage a single Claude Code conversation.
 
@@ -178,6 +313,13 @@ class SessionManager:
         self._connect_done: asyncio.Event = asyncio.Event()
         self._connect_error: BaseException | None = None
         self._stop_requested: asyncio.Event = asyncio.Event()
+        # PID of the bundled `claude` subprocess that the SDK transport opens
+        # at connect() time.  Captured so we can SIGKILL it ourselves if the
+        # SDK's transport.close() hangs on its own bounded-but-actually-
+        # unbounded `await self._process.wait()` after SIGTERM.  Setting this
+        # to None after a successful clean exit lets stop() distinguish
+        # "process already gone" from "we should kill it".
+        self._subprocess_pid: int | None = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -255,6 +397,18 @@ class SessionManager:
             self._client = ClaudeSDKClient(options)
             await self._client.connect()
 
+            # Capture the bundled-claude subprocess PID via the SDK's
+            # private transport attribute.  This is best-effort: if a
+            # future SDK release moves the field, we fall back to the
+            # pool-level orphan reaper as a safety net.  A captured PID
+            # lets stop() force-kill if SDK transport.close() hangs on
+            # its (unbounded) `await self._process.wait()` after SIGTERM.
+            self._subprocess_pid = _extract_subprocess_pid(self._client)
+            if self._subprocess_pid is not None:
+                logger.debug(
+                    "Session %s SDK subprocess pid=%d", self._local_id, self._subprocess_pid
+                )
+
             # Capture the SDK session ID if available at connect time.
             if self._resume_id:
                 self._sdk_session_id = self._resume_id
@@ -285,14 +439,49 @@ class SessionManager:
         finally:
             # Disconnect runs in this same task, so the SDK's task group
             # __aexit__ sees the same owner that __aenter__'d it.
+            #
+            # Bound the disconnect at 8s — comfortably under pool.close()'s
+            # 10s outer timeout — so we always get a chance to escalate to
+            # SIGKILL if the SDK transport's own internal wait() blocks.
+            # The SDK's transport.close() does:
+            #     self._process.terminate()
+            #     await self._process.wait()   # NO TIMEOUT
+            # If the bundled `claude` ignores SIGTERM (mid-flush, busy-loop,
+            # etc.) the wait blocks forever and the lifecycle task pins a
+            # CPU until we force-kill.  Pre-fix, this leaked subprocesses
+            # accumulated on the Jetson at ~2.5% CPU each.
+            pid_to_kill = self._subprocess_pid
             if self._client is not None:
                 try:
-                    await self._client.disconnect()
+                    await asyncio.wait_for(self._client.disconnect(), timeout=8.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "client.disconnect() for session %s exceeded 8s; will force-kill pid %s",
+                        self._local_id,
+                        pid_to_kill,
+                    )
                 except Exception:
                     logger.exception(
                         "client.disconnect() failed for session %s", self._local_id
                     )
                 self._client = None
+
+            # SIGTERM/SIGKILL fallback for orphaned subprocesses.  Runs
+            # whether disconnect succeeded, timed out, or threw — the only
+            # cost when the SDK already cleaned up is one cheap os.kill(0)
+            # liveness check that finds the pid gone.
+            if pid_to_kill is not None and _process_alive(pid_to_kill):
+                killed = await asyncio.get_running_loop().run_in_executor(
+                    None, kill_claude_subprocess, pid_to_kill
+                )
+                if killed:
+                    logger.warning(
+                        "Reaped orphaned claude subprocess pid=%d for session %s",
+                        pid_to_kill,
+                        self._local_id,
+                    )
+            self._subprocess_pid = None
+
             self._status = SessionStatus.DISCONNECTED
             # Clean up SSH wrapper script if present
             if self._ssh_wrapper_path:
@@ -424,6 +613,14 @@ class SessionManager:
     def is_resumed(self) -> bool:
         """True if this session was resumed from an existing SDK session."""
         return self._resume_id is not None
+
+    @property
+    def subprocess_pid(self) -> int | None:
+        """PID of the bundled-claude subprocess (or None if not connected
+        / not yet captured / SDK transport changed shape).  Used by the
+        pool's orphan reaper as a fallback in case the per-session
+        SIGKILL path didn't run."""
+        return self._subprocess_pid
 
     # ------------------------------------------------------------------
     # Internals

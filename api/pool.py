@@ -28,7 +28,12 @@ from starlette.websockets import WebSocket, WebSocketState
 
 from api.serializers import serialize_event
 from manager.config import ManagerConfig
-from manager.session import SessionManager
+from manager.session import (
+    SessionManager,
+    _process_alive,
+    _looks_like_claude,
+    kill_claude_subprocess,
+)
 from manager.types import Event
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,20 @@ class SessionPool:
 
         # Watchers: receive agent_session_opened / agent_session_closed events
         self._watchers: set[WebSocket] = set()
+
+        # Belt-and-braces: PIDs of every bundled-claude subprocess we ever
+        # spawned, mapped to a (session_id, first_seen_at) tuple.  The
+        # reaper task scans this periodically and SIGKILLs any pid whose
+        # owning session has been gone from the pool for more than the
+        # grace period — covers the case where the per-session SIGKILL
+        # path inside _lifecycle() was itself bypassed (lifecycle task
+        # cancelled hard, SDK transport refactored so we couldn't grab
+        # the pid, etc.).  See manager.session.kill_claude_subprocess.
+        self._tracked_pids: dict[int, tuple[str, float]] = {}
+        # Sessions that have been removed from _sessions but whose pid we
+        # still want to keep an eye on for ``orphan_grace_seconds``.
+        self._closed_session_pids: dict[str, tuple[int, float]] = {}
+        self._reaper_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
     # Agent session lifecycle
@@ -179,6 +198,14 @@ class SessionPool:
         self._sessions[lid] = sm
         self._subscribers[lid] = set()
         self._locks[lid] = asyncio.Lock()
+        # Track the bundled-claude subprocess pid for the orphan reaper.
+        # Best-effort: the SessionManager exposes None when the SDK
+        # transport refactored its private shape — we'll just rely on
+        # the per-session SIGKILL path in that case.
+        pid = sm.subprocess_pid
+        if pid is not None:
+            import time as _time
+            self._tracked_pids[pid] = (lid, _time.monotonic())
 
         await self._notify_watchers({
             "type": "agent_session_opened",
@@ -207,6 +234,17 @@ class SessionPool:
 
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
+
+        # Hand the pid off to the closed-session shadow map so the reaper
+        # has a grace window to verify the subprocess actually exits.
+        # If sm.stop() (which calls our SIGKILL fallback) succeeds, the
+        # pid will be gone by the time the reaper looks at it — no-op.
+        # If it doesn't, the reaper escalates after orphan_grace_seconds.
+        pid = sm.subprocess_pid
+        if pid is not None:
+            import time as _time
+            self._closed_session_pids[session_id] = (pid, _time.monotonic())
+            self._tracked_pids.pop(pid, None)
 
         try:
             # Bound the wait so a misbehaving SDK transport (e.g. a remote
@@ -339,6 +377,118 @@ class SessionPool:
             await self.stop_orchestrator()
         except Exception:
             logger.exception("Error stopping orchestrator during shutdown")
+
+    # ------------------------------------------------------------------
+    # Orphan reaper — last-line defense for leaked claude subprocesses
+    # ------------------------------------------------------------------
+
+    async def start_orphan_reaper(
+        self,
+        *,
+        interval_seconds: float = 30.0,
+        orphan_grace_seconds: float = 30.0,
+    ) -> None:
+        """Spawn the background task that nukes orphaned `claude` subprocesses.
+
+        Runs every *interval_seconds* and force-kills any tracked pid whose
+        owning session has been gone from the pool for *orphan_grace_seconds*.
+        Idempotent — safe to call multiple times; the second call no-ops.
+
+        The grace period gives the per-session SIGKILL path inside
+        SessionManager._lifecycle a chance to do the cleanup itself.  The
+        reaper only acts when that path failed (lifecycle task cancelled,
+        SDK refactored, etc.) — in steady state it observes that every
+        previously-tracked pid is already gone and just trims bookkeeping.
+        """
+        if self._reaper_task is not None and not self._reaper_task.done():
+            return
+        self._reaper_task = asyncio.create_task(
+            self._reaper_loop(interval_seconds, orphan_grace_seconds),
+            name="pool-orphan-reaper",
+        )
+
+    async def stop_orphan_reaper(self) -> None:
+        if self._reaper_task is None:
+            return
+        self._reaper_task.cancel()
+        try:
+            await self._reaper_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._reaper_task = None
+
+    async def _reaper_loop(
+        self, interval_seconds: float, orphan_grace_seconds: float
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, self._reap_orphans_once, orphan_grace_seconds
+                    )
+                except Exception:
+                    logger.exception("orphan reaper iteration failed")
+        except asyncio.CancelledError:
+            raise
+
+    def _reap_orphans_once(self, orphan_grace_seconds: float) -> None:
+        """One pass of the orphan reaper.  Synchronous so it can run in a
+        thread executor — kill_claude_subprocess does sleep() polls."""
+        import time as _time
+        now = _time.monotonic()
+
+        # Pass 1: prune tracked pids that are already dead (process exited
+        # normally — bookkeeping cleanup, no signals sent).
+        dead_pids = [pid for pid in self._tracked_pids if not _process_alive(pid)]
+        for pid in dead_pids:
+            self._tracked_pids.pop(pid, None)
+
+        # Pass 2: closed sessions whose grace period expired.  Force-kill
+        # the subprocess if it's still alive AND still looks like claude
+        # (kill_claude_subprocess does the comm check internally).
+        expired = [
+            sid
+            for sid, (_pid, closed_at) in self._closed_session_pids.items()
+            if (now - closed_at) >= orphan_grace_seconds
+        ]
+        for sid in expired:
+            pid, _closed_at = self._closed_session_pids.pop(sid)
+            if not _process_alive(pid):
+                continue
+            if not _looks_like_claude(pid):
+                # PID was reused by something else after the subprocess
+                # exited — leave it alone.
+                continue
+            killed = kill_claude_subprocess(pid)
+            if killed:
+                logger.warning(
+                    "Orphan reaper: killed leaked claude subprocess pid=%d "
+                    "(session %s closed %.0fs ago)",
+                    pid,
+                    sid,
+                    now - _closed_at,
+                )
+
+        # Pass 3 (paranoid): a session is *still* in the pool but its
+        # claimed pid no longer matches a live `claude` process — likely
+        # the SDK crashed and we never noticed.  Mark the session as dead
+        # so the next operation triggers a fresh start.  We don't kill
+        # anything here; the pid is already gone.
+        for pid, (sid, _seen_at) in list(self._tracked_pids.items()):
+            if sid not in self._sessions:
+                # Session vanished without going through close() — should
+                # be rare but possible if a test or code path popped it
+                # directly.  Treat the pid as orphaned.
+                self._tracked_pids.pop(pid, None)
+                if _process_alive(pid) and _looks_like_claude(pid):
+                    if kill_claude_subprocess(pid):
+                        logger.warning(
+                            "Orphan reaper: killed pid=%d for vanished "
+                            "session %s (no close() recorded)",
+                            pid,
+                            sid,
+                        )
 
     @property
     def orchestrator_subscriber_count(self) -> int:
