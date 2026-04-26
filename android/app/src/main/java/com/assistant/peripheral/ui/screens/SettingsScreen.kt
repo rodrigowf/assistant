@@ -763,6 +763,9 @@ private fun SavedServersSection(
     var showAddForm by remember { mutableStateOf(false) }
     var newLabel by remember { mutableStateOf("") }
     var newUrl by remember { mutableStateOf("") }
+    var editingUrl by remember { mutableStateOf<String?>(null) }
+    var editLabel by remember { mutableStateOf("") }
+    var editUrl by remember { mutableStateOf("") }
 
     Text(
         text = "Saved Servers",
@@ -780,48 +783,116 @@ private fun SavedServersSection(
     } else {
         savedServers.forEach { server ->
             val isSelected = currentUrl == server.url
+            val isEditing = editingUrl == server.url
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onSelect(server) },
+                    .then(
+                        if (isEditing) Modifier
+                        else Modifier.clickable { onSelect(server) }
+                    ),
                 color = if (isSelected)
                     MaterialTheme.colorScheme.primaryContainer
                 else
                     MaterialTheme.colorScheme.surfaceVariant,
                 shape = MaterialTheme.shapes.small
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Dns,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                        tint = if (isSelected)
-                            MaterialTheme.colorScheme.primary
-                        else
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = server.label,
-                            style = MaterialTheme.typography.bodyMedium
+                if (isEditing) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = editLabel,
+                            onValueChange = { editLabel = it },
+                            label = { Text("Label") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true
                         )
-                        Text(
-                            text = server.url,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        Spacer(modifier = Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = editUrl,
+                            onValueChange = { editUrl = it },
+                            label = { Text("WebSocket URL") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true
                         )
+                        Row {
+                            TextButton(onClick = {
+                                editingUrl = null
+                                editLabel = ""
+                                editUrl = ""
+                            }) { Text("Cancel") }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            TextButton(
+                                onClick = {
+                                    val originalUrl = server.url
+                                    val cleanLabel = editLabel.trim()
+                                    val cleanUrl = editUrl.trim()
+                                    if (cleanLabel.isNotBlank() && cleanUrl.isNotBlank()) {
+                                        if (cleanUrl != originalUrl) {
+                                            onRemove(originalUrl)
+                                        }
+                                        onAdd(cleanLabel, cleanUrl)
+                                        editingUrl = null
+                                        editLabel = ""
+                                        editUrl = ""
+                                    }
+                                },
+                                enabled = editLabel.isNotBlank() && editUrl.isNotBlank() &&
+                                    (editLabel.trim() != server.label || editUrl.trim() != server.url)
+                            ) {
+                                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Save")
+                            }
+                        }
                     }
-                    IconButton(onClick = { onRemove(server.url) }) {
+                } else {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Icon(
-                            imageVector = Icons.Default.Delete,
-                            contentDescription = "Remove ${server.label}",
+                            imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Dns,
+                            contentDescription = null,
                             modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            tint = if (isSelected)
+                                MaterialTheme.colorScheme.primary
+                            else
+                                MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = server.label,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = server.url,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(onClick = {
+                            editingUrl = server.url
+                            editLabel = server.label
+                            editUrl = server.url
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Edit ${server.label}",
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        IconButton(onClick = { onRemove(server.url) }) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = "Remove ${server.label}",
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
             }
