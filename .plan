@@ -1,0 +1,221 @@
+# iOS Photo Server — Architecture (Agent-First Design)
+
+## Core Principle
+
+This is an **API-first photo server** running on Pythonista (iPhone 11).
+The primary consumer is an AI agent that connects over the local network to:
+1. Discover what media exists on the phone
+2. Browse with filters (date range, media type, album)
+3. Download specific files on demand
+4. Get thumbnails for visual inspection
+
+The HTML browser UI is a thin layer on top of the same API.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  copyparty_ios.py  (launcher, ~80 lines)    │
+│  - Request photo permissions                │
+│  - Start HTTP server                        │
+│  - Print IP:port + QR code to console       │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│  photo_server.py  (HTTP server, ~350 lines) │
+│  - Routes requests to API or browser UI     │
+│  - JSON responses for /api/* endpoints      │
+│  - HTML responses for browser navigation    │
+│  - Streams file data with Range support     │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│  ios_photo_bridge.py  (~200 lines)          │
+│  - Wraps Pythonista `photos` + `objc_util`  │
+│  - Lists assets with full metadata          │
+│  - Returns photo bytes (JPEG)               │
+│  - Exports videos to temp files             │
+│  - Retrieves original filenames via ObjC    │
+└─────────────────────────────────────────────┘
+```
+
+## REST API Specification
+
+All API endpoints return JSON. All support CORS (so the assistant
+frontend or any agent can call them from anywhere on the LAN).
+
+### GET /api/status
+Server health + library summary.
+```json
+{
+  "status": "ok",
+  "device": "iPhone 11",
+  "photo_count": 4230,
+  "video_count": 312,
+  "total_count": 4542,
+  "albums": 17,
+  "server_uptime": 3600
+}
+```
+
+### GET /api/assets
+List assets with filtering, pagination, and sorting.
+
+**Query parameters:**
+| Param     | Type   | Default    | Description |
+|-----------|--------|------------|-------------|
+| type      | string | all        | `photo`, `video`, or `all` |
+| album     | string | (none)     | Filter by album name |
+| after     | string | (none)     | ISO date, assets created after |
+| before    | string | (none)     | ISO date, assets created before |
+| sort      | string | date_desc  | `date_asc`, `date_desc`, `size_asc`, `size_desc` |
+| offset    | int    | 0          | Pagination offset |
+| limit     | int    | 100        | Page size (max 500) |
+| fields    | string | default    | `default`, `full`, or comma-separated field list |
+
+**Response:**
+```json
+{
+  "total": 4542,
+  "offset": 0,
+  "limit": 100,
+  "assets": [
+    {
+      "id": "106E6FC8-E4B0-4790-8E83-1187E4A3C5E7/L0/001",
+      "filename": "IMG_1234.HEIC",
+      "media_type": "photo",
+      "width": 4032,
+      "height": 3024,
+      "creation_date": "2025-12-25T10:30:00",
+      "modification_date": "2025-12-25T10:30:05",
+      "size_estimate": 3200000,
+      "duration": null,
+      "favorite": false,
+      "hidden": false,
+      "location": {"latitude": 40.7128, "longitude": -74.0060},
+      "urls": {
+        "full": "/media/106E6FC8.../full",
+        "thumb": "/media/106E6FC8.../thumb",
+        "preview": "/media/106E6FC8.../preview"
+      }
+    }
+  ]
+}
+```
+
+### GET /api/assets/{id}
+Full metadata for a single asset.
+
+### GET /api/albums
+List all albums with asset counts.
+```json
+{
+  "albums": [
+    {"name": "Camera Roll", "count": 3800, "type": "smart"},
+    {"name": "Favorites", "count": 45, "type": "smart"},
+    {"name": "Vacation 2025", "count": 230, "type": "user"}
+  ]
+}
+```
+
+### GET /media/{id}/full
+Download the full-resolution file.
+- Photos: Returns JPEG (HEIC auto-converted by Pythonista)
+- Videos: Returns MP4
+- Headers: Content-Type, Content-Length, Content-Disposition
+- Supports Range requests for video streaming
+
+### GET /media/{id}/thumb
+Thumbnail (max 300px, JPEG). Fast — uses Pythonista's built-in
+thumbnail generation.
+
+### GET /media/{id}/preview
+Medium-resolution preview (max 1200px, JPEG). Good for agent
+visual inspection without downloading the full 12MP file.
+
+### GET /api/search
+Search by filename pattern.
+```
+GET /api/search?q=IMG_20251225*&type=photo
+```
+
+## Agent Integration Pattern
+
+From the assistant, an agent would interact like this:
+
+```python
+import requests
+
+BASE = "http://192.168.1.42:3691"
+
+# 1. Check what's available
+status = requests.get(f"{BASE}/api/status").json()
+print(f"Phone has {status['photo_count']} photos, {status['video_count']} videos")
+
+# 2. List recent photos
+recent = requests.get(f"{BASE}/api/assets", params={
+    "type": "photo",
+    "after": "2025-12-01",
+    "sort": "date_desc",
+    "limit": 20
+}).json()
+
+# 3. Download a specific photo
+for asset in recent["assets"]:
+    r = requests.get(f"{BASE}{asset['urls']['full']}")
+    with open(asset["filename"], "wb") as f:
+        f.write(r.content)
+
+# 4. Get a thumbnail for quick inspection
+thumb = requests.get(f"{BASE}{recent['assets'][0]['urls']['thumb']}")
+```
+
+## Key Design Decisions
+
+1. **Single-file option**: All three modules can be concatenated into
+   one .py file for easy transfer to Pythonista (copy-paste or AirDrop).
+   We'll write them as separate modules but provide a combined version.
+
+2. **No authentication**: This runs on a local/home network. Adding
+   auth is a future enhancement if needed.
+
+3. **Lazy loading**: Asset metadata is cached in memory on first
+   enumeration. Photo/video data is fetched on-demand per request.
+
+4. **Video temp files**: Videos must be exported via PHImageManager
+   to a temp file. We cache these and clean up on server shutdown.
+
+5. **Port 3691**: Default port (mnemonic: "foto" → F=6, O=0... actually
+   just a memorable unused port). Configurable via argument.
+
+6. **CORS**: All endpoints send `Access-Control-Allow-Origin: *` so
+   any agent/browser on the network can call the API.
+
+## iOS / Pythonista Specifics
+
+- **Permissions**: First `photos.get_assets()` call triggers the iOS
+  permission dialog. If denied → API returns 403 with instructions.
+- **HEIC → JPEG**: `asset.get_image_data()` returns JPEG automatically.
+- **Video export**: Requires `objc_util` to call `PHImageManager.
+  requestExportSessionForVideo_options_resultHandler_`. We wrap this
+  with a synchronization primitive (threading.Event) since the ObjC
+  callback is async.
+- **Filenames**: `photos` module doesn't expose filenames directly.
+  We use `objc_util.ObjCInstance(asset).filename()` to get the
+  original filename (e.g., IMG_1234.HEIC).
+- **Memory**: Stream large files in 64KB chunks. Never load an entire
+  video into memory.
+- **Background**: Pythonista keeps scripts running while the app is
+  in foreground. If the user switches away, iOS may suspend it after
+  ~30 seconds. This is acceptable for the use case — user runs the
+  script, agent connects and does its work, done.
+
+## File Sizes (estimated)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| ios_photo_bridge.py | ~200 | Photo library abstraction |
+| photo_server.py | ~350 | HTTP server + API + UI |
+| copyparty_ios.py | ~80  | Launcher |
+| **Total** | **~630** | |
+| copyparty_ios_combined.py | ~630 | Single-file version |
