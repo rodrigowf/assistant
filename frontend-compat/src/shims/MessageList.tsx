@@ -60,8 +60,6 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
   const isFrozenRef = useRef(false);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
-  const bufferedCount = Math.max(0, messages.length - displayedMessages.length);
-
   // Sync displayed messages with upstream when not frozen. Always sync on
   // prepend (load-more) — that's a history insert at the top, not a new
   // message at the bottom, so it shouldn't be buffered.
@@ -80,12 +78,16 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
     }
   }, []);
 
-  // Release the freeze and let the auto-scroll effects pull us to the new bottom.
+  // Release the freeze, flush any buffered messages, and snap to the bottom.
   const flushBuffer = useCallback(() => {
     isFrozenRef.current = false;
     isNearBottomRef.current = true;
     setShowScrollButton(false);
     setDisplayedMessages(messagesRef.current);
+    // Scroll immediately so it works even when there are no buffered messages
+    // (the displayedMessages-change effect wouldn't fire in that case).
+    const el = parentRef.current;
+    if (el) iosScrollTo(el, el.scrollHeight);
   }, []);
 
   const handleScroll = useCallback(() => {
@@ -200,9 +202,9 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
         <button
           className="scroll-to-bottom-btn"
           onClick={flushBuffer}
-          aria-label={bufferedCount > 0 ? `Show ${bufferedCount} new message${bufferedCount === 1 ? '' : 's'}` : 'Scroll to bottom'}
+          aria-label="Scroll to bottom"
         >
-          {bufferedCount > 0 ? `↓ ${bufferedCount} new` : '↓'}
+          ↓
         </button>
       )}
     </div>

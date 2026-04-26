@@ -362,9 +362,9 @@
   bottom: 16px;
   left: 50%;
   transform: translateX(-50%);
-  background: var(--bg-secondary);
+  background: var(--bg-elevated);
   color: var(--text-bright);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--border);
   border-radius: 50%;
   width: 40px;
   height: 40px;
@@ -381,7 +381,7 @@
 }
 
 .scroll-to-bottom-btn:hover {
-  background: rgba(0, 0, 0, 0.6);
+  background: var(--bg-hover);
   opacity: 1;
 }
 
