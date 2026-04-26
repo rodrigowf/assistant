@@ -76,6 +76,14 @@ export function ChatPanel({
       {error && (
         <div className="error-banner">{error}</div>
       )}
+      <div className="status-bar-container">
+        <StatusBar
+          status={status}
+          connectionState={connectionState}
+          cost={cost}
+          turns={turns}
+        />
+      </div>
       {/* Hide text input when voice is active */}
       {!voiceActive && (
         <div className="chat-input-bar">
@@ -131,14 +139,6 @@ export function ChatPanel({
           </div>
         </div>
       )}
-      <div className="status-bar-container">
-        <StatusBar
-          status={status}
-          connectionState={connectionState}
-          cost={cost}
-          turns={turns}
-        />
-      </div>
     </main>
   );
 }
