@@ -1,5 +1,6 @@
 """Tests for manager/session.py — mocked SDK, no real Claude Code."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -150,6 +151,79 @@ class TestSessionManagerLifecycle:
             assert sm.local_id == "local-xyz"
             # SDK session ID captured from the resume_id
             assert sm.sdk_session_id == "existing-session-abc"
+
+    @pytest.mark.asyncio
+    async def test_stop_from_different_task_succeeds(self):
+        """Regression: stop() must work even when called from a different
+        asyncio task than start(). This used to fail because the SDK's
+        internal anyio task group was entered in the start-task and trying
+        to exit it from another task raised:
+          RuntimeError: Attempted to exit cancel scope in a different task
+        On the Jetson (2026-04-26) this leak pinned the event loop in a
+        spin and accumulated 6h+ of CPU on the backend in 16h of uptime.
+        The fix: a lifecycle task owns both connect() and disconnect().
+        """
+        client = _make_mock_client(server_info={"session_id": "x"})
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager(local_id="cross-task")
+            # Start from this task.
+            await sm.start()
+            assert sm.status == SessionStatus.IDLE
+
+            # Stop from a different task — this is what FastAPI request
+            # handlers do (each HTTP request runs in its own task).
+            stop_task = asyncio.create_task(sm.stop())
+            await stop_task  # must not raise
+
+            assert sm.status == SessionStatus.DISCONNECTED
+            client.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_double_start_raises(self):
+        """Calling start() twice on the same SessionManager is a programming
+        error and should raise rather than silently leak a second lifecycle
+        task."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+            with pytest.raises(RuntimeError, match="called twice"):
+                await sm.start()
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_double_stop_is_noop(self):
+        """Calling stop() twice should be safe — the second call is a no-op
+        rather than awaiting a dead task or raising."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+            await sm.stop()
+            await sm.stop()  # must not raise
+
+            assert sm.status == SessionStatus.DISCONNECTED
+            # disconnect() only called once — second stop() short-circuited
+            client.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_propagates_to_start_caller(self):
+        """If client.connect() fails, start() must raise the underlying
+        exception to its caller — not swallow it inside the lifecycle task."""
+        client = _make_mock_client(server_info={"session_id": "x"})
+        client.connect.side_effect = ConnectionRefusedError("nope")
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            with pytest.raises(ConnectionRefusedError, match="nope"):
+                await sm.start()
+
+            # And stop() afterwards is a no-op (lifecycle never entered the
+            # idle-wait phase).
+            await sm.stop()
 
 
 class TestSessionManagerSend:

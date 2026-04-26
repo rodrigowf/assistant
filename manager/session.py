@@ -167,6 +167,17 @@ class SessionManager:
         self._cost: float = 0.0
         self._turns: int = 0
         self._ssh_wrapper_path: str | None = None  # temp script for SSH sessions
+        # Lifecycle task — owns connect() AND disconnect() for the entire
+        # session, so the SDK's internal anyio task group is entered and
+        # exited from the same task.  Without this, calling stop() from a
+        # different task than start() raises:
+        #   RuntimeError: Attempted to exit cancel scope in a different task
+        # which leaks the cancelled-but-never-awaited subprocess and pins
+        # the event loop in a tight spin handling the orphaned task.
+        self._lifecycle_task: asyncio.Task[None] | None = None
+        self._connect_done: asyncio.Event = asyncio.Event()
+        self._connect_error: BaseException | None = None
+        self._stop_requested: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -189,12 +200,21 @@ class SessionManager:
         The local ID is stable and never changes.  The real SDK session ID
         is captured from ``server_info`` (if available) or from the first
         ``ResultMessage`` after a query, and stored as ``sdk_session_id``.
+
+        The actual connect happens inside :meth:`_lifecycle` — a long-lived
+        task that also owns the eventual disconnect.  This guarantees both
+        sides of the SDK's anyio task group run in the same asyncio task,
+        which the SDK requires (otherwise ``__aexit__`` raises and leaks).
         """
+        if self._lifecycle_task is not None:
+            raise RuntimeError("SessionManager.start() called twice")
+
         # Cheap reachability pre-probe for remote sessions.  One ICMP ping,
         # 2 s deadline — if the host is asleep/offline we raise immediately
         # instead of letting the SDK sit in a 30 s SSH TCP timeout (which
         # historically pinned the CPU and spun the fan on the Jetson while
-        # the laptop was hibernating).
+        # the laptop was hibernating).  Done here (not in the lifecycle
+        # task) so the caller sees the failure synchronously.
         if self._config.ssh_host:
             reachable = await asyncio.get_running_loop().run_in_executor(
                 None, _probe_ssh_host_reachable, self._config.ssh_host, 2.0
@@ -206,34 +226,101 @@ class SessionManager:
                     "fan/CPU churn while the remote is offline)."
                 )
 
-        options = self._build_options()
-        self._client = ClaudeSDKClient(options)
-        await self._client.connect()
-
-        # Capture the SDK session ID if available at connect time.
-        if self._resume_id:
-            self._sdk_session_id = self._resume_id
-        else:
-            server_info = await self._client.get_server_info()
-            if server_info:
-                self._sdk_session_id = server_info.get("session_id")
-
-        self._status = SessionStatus.IDLE
+        self._lifecycle_task = asyncio.create_task(
+            self._lifecycle(), name=f"sm-lifecycle-{self._local_id}"
+        )
+        await self._connect_done.wait()
+        if self._connect_error is not None:
+            # The lifecycle task already finished with the error; surface it
+            # to the caller of start() and clear the task reference so any
+            # follow-up stop() is a no-op instead of awaiting a dead task.
+            self._lifecycle_task = None
+            err = self._connect_error
+            self._connect_error = None
+            raise err
         return self._local_id
 
+    async def _lifecycle(self) -> None:
+        """Own connect → idle-wait → disconnect from a single task.
+
+        Both ``client.connect()`` (which enters the SDK's anyio task group)
+        and ``client.disconnect()`` (which exits it) run inside this task.
+        That's the only way to satisfy anyio's "exit from the same task you
+        entered" invariant when the actual stop() trigger arrives from a
+        different task (an HTTP request handler, the pool drain on shutdown,
+        etc.).
+        """
+        try:
+            options = self._build_options()
+            self._client = ClaudeSDKClient(options)
+            await self._client.connect()
+
+            # Capture the SDK session ID if available at connect time.
+            if self._resume_id:
+                self._sdk_session_id = self._resume_id
+            else:
+                try:
+                    server_info = await self._client.get_server_info()
+                    if server_info:
+                        self._sdk_session_id = server_info.get("session_id")
+                except Exception:
+                    # Failing to read server_info shouldn't kill the session;
+                    # the SDK ID will be filled in from the first ResultMessage.
+                    logger.exception("get_server_info failed for session %s", self._local_id)
+
+            self._status = SessionStatus.IDLE
+        except BaseException as e:
+            # Surface the error to start() and exit; do NOT signal _connect_done
+            # before recording the error or start() will see "succeeded".
+            self._connect_error = e
+            self._connect_done.set()
+            return
+
+        # Tell start() it can return.
+        self._connect_done.set()
+
+        # Idle-wait until stop() is requested.  No CPU cost — pure event wait.
+        try:
+            await self._stop_requested.wait()
+        finally:
+            # Disconnect runs in this same task, so the SDK's task group
+            # __aexit__ sees the same owner that __aenter__'d it.
+            if self._client is not None:
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    logger.exception(
+                        "client.disconnect() failed for session %s", self._local_id
+                    )
+                self._client = None
+            self._status = SessionStatus.DISCONNECTED
+            # Clean up SSH wrapper script if present
+            if self._ssh_wrapper_path:
+                try:
+                    Path(self._ssh_wrapper_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self._ssh_wrapper_path = None
+
     async def stop(self) -> None:
-        """Disconnect from Claude Code."""
-        if self._client is not None:
-            await self._client.disconnect()
-            self._client = None
-        self._status = SessionStatus.DISCONNECTED
-        # Clean up SSH wrapper script if present
-        if self._ssh_wrapper_path:
-            try:
-                Path(self._ssh_wrapper_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-            self._ssh_wrapper_path = None
+        """Request disconnect and wait for the lifecycle task to finish.
+
+        Safe to call from any task — the actual SDK disconnect is performed
+        inside :meth:`_lifecycle`, which is the same task that connected.
+        """
+        if self._lifecycle_task is None:
+            # Either start() failed or stop() is being called twice; in both
+            # cases the right thing is to no-op cleanly.
+            self._status = SessionStatus.DISCONNECTED
+            return
+        self._stop_requested.set()
+        try:
+            await self._lifecycle_task
+        except Exception:
+            logger.exception(
+                "Lifecycle task for session %s exited with error", self._local_id
+            )
+        self._lifecycle_task = None
 
     async def interrupt(self) -> None:
         """Interrupt the current response.
