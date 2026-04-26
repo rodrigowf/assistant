@@ -145,30 +145,30 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
     }
   }, [lastMsgBlocks, scrollToBottom]);
 
-  if (displayedMessages.length === 0) {
-    return (
-      <div className="message-list empty" ref={parentRef}>
-        <div className="empty-state">
-          <p className="empty-title">Start a conversation</p>
-          <p className="empty-hint">Send a message to begin</p>
-        </div>
-      </div>
-    );
-  }
+  const isEmpty = displayedMessages.length === 0;
 
   return (
     <div className="message-list-wrapper">
-      <div className="message-list" ref={parentRef}>
-        {hasMoreMessages && (
-          <div className="load-more-indicator">
-            <span>Scroll up for older messages</span>
+      <div className={isEmpty ? "message-list empty" : "message-list"} ref={parentRef}>
+        {isEmpty ? (
+          <div className="empty-state">
+            <p className="empty-title">Start a conversation</p>
+            <p className="empty-hint">Send a message to begin</p>
           </div>
+        ) : (
+          <>
+            {hasMoreMessages && (
+              <div className="load-more-indicator">
+                <span>Scroll up for older messages</span>
+              </div>
+            )}
+            <div className="message-list-inner">
+              {displayedMessages.map((msg) => (
+                <Message key={msg.id} message={msg} />
+              ))}
+            </div>
+          </>
         )}
-        <div className="message-list-inner">
-          {displayedMessages.map((msg) => (
-            <Message key={msg.id} message={msg} />
-          ))}
-        </div>
       </div>
       {showScrollButton && (
         <button
