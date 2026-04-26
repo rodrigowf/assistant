@@ -236,9 +236,14 @@ class SessionManager:
             self._ssh_wrapper_path = None
 
     async def interrupt(self) -> None:
-        """Interrupt the current response."""
+        """Interrupt the current response.
+
+        ``ClaudeSDKClient.interrupt()`` is a coroutine — it must be awaited or
+        the signal never reaches the CLI and the in-flight ``receive_response()``
+        keeps streaming until the turn finishes naturally.
+        """
         if self._client is not None:
-            self._client.interrupt()
+            await self._client.interrupt()
         self._status = SessionStatus.INTERRUPTED
 
     # ------------------------------------------------------------------
