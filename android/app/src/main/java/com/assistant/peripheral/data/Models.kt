@@ -130,11 +130,9 @@ sealed class WebSocketEvent {
     // Error
     data class Error(val message: String, val detail: String? = null) : WebSocketEvent()
 
-    // Connection — endpoint identifies which socket connected/disconnected.
-    // Use a string ("ORCHESTRATOR" / "AGENT") to avoid pulling the network-layer
-    // enum into this data module.
-    data class Connected(val endpoint: String) : WebSocketEvent()
-    data class Disconnected(val endpoint: String) : WebSocketEvent()
+    // Connection
+    object Connected : WebSocketEvent()
+    object Disconnected : WebSocketEvent()
 
     // Session list (from REST API via ViewModel)
     data class SessionList(val sessions: List<SessionInfo>) : WebSocketEvent()

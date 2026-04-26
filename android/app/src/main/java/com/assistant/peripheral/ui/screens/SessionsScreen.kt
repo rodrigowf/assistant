@@ -35,7 +35,7 @@ fun SessionsScreen(
     currentSessionId: String?,
     liveSessionIds: Set<String>,
     isLoading: Boolean,
-    onSessionClick: (String, Boolean) -> Unit,  // (sessionId, isOrchestrator)
+    onSessionClick: (String, Boolean, String?) -> Unit,  // (sessionId, isOrchestrator, liveLocalId)
     onNewSession: () -> Unit,
     onRenameSession: (String, String) -> Unit,
     onDeleteSession: (String) -> Unit,
@@ -118,7 +118,7 @@ fun SessionsScreen(
                             session = session,
                             isSelected = session.sessionId == currentSessionId,
                             isOpen = liveSessionIds.contains(session.sessionId),
-                            onClick = { onSessionClick(session.sessionId, session.isOrchestrator) },
+                            onClick = { onSessionClick(session.sessionId, session.isOrchestrator, session.localId) },
                             onRename = { newTitle -> onRenameSession(session.sessionId, newTitle) },
                             onDelete = { onDeleteSession(session.sessionId) },
                             onClose = { onCloseSession(session.sessionId) }

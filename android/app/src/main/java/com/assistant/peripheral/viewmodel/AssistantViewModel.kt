@@ -48,12 +48,44 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // Connection state
     val connectionState: StateFlow<ConnectionState> = webSocketManager.connectionState
 
-    // Current session
-    private val _currentSessionId = MutableStateFlow<String?>(null)
-    val currentSessionId: StateFlow<String?> = _currentSessionId.asStateFlow()
+    // Per-endpoint chat state buckets — ensures events from the orchestrator
+    // socket and the agent socket never write into each other's UI state.
+    // The visible flows (messages, sessionStatus, hasMoreMessages, etc.) are
+    // derived: they mirror whichever bucket the user is currently looking at,
+    // chosen by [_isOrchestratorSession].
+    private class ChatStateBucket {
+        // The session id reported by the backend (sdk/JSONL id, or local_id on
+        // reconnect). Distinct per endpoint.
+        val currentSessionId = MutableStateFlow<String?>(null)
+        // The true JSONL/SDK id, set from pendingResumeSessionId on SessionStarted.
+        var jsonlSessionId: String? = null
+        // Local id — only meaningful for orchestrator (the pool is keyed by it);
+        // for agent the live local_id is generated per loadSession.
+        val currentLocalId = MutableStateFlow(UUID.randomUUID().toString())
+        // The conversation displayed for this tab.
+        val messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+        // Pagination state for message history.
+        var currentSessionIdForPagination: String? = null
+        var paginationStartIndex: Int = 0
+        val hasMoreMessages = MutableStateFlow(false)
+        // Streaming-message scratchpad — owned by this endpoint.
+        var streamingMessageId: String? = null
+        val streamingContent = MutableStateFlow("")
+        var currentThinkingContent = ""
+        val currentToolBlocks = mutableMapOf<String, MessageBlock.ToolUse>()
+        // Session lifecycle.
+        val sessionStatus = MutableStateFlow("idle")
+        // Used so SessionStarted can fetch history for the right sdk id.
+        val pendingResumeSessionId = MutableStateFlow<String?>(null)
+    }
 
-    private val _currentLocalId = MutableStateFlow(UUID.randomUUID().toString())
-    val currentLocalId: StateFlow<String> = _currentLocalId.asStateFlow()
+    private val buckets: Map<WebSocketEndpoint, ChatStateBucket> = mapOf(
+        WebSocketEndpoint.ORCHESTRATOR to ChatStateBucket(),
+        WebSocketEndpoint.AGENT to ChatStateBucket()
+    )
+
+    private fun bucket(endpoint: WebSocketEndpoint): ChatStateBucket = buckets.getValue(endpoint)
+    private fun activeBucket(): ChatStateBucket = bucket(currentEndpoint())
 
     // All sessions (from REST API)
     private val _sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
@@ -71,13 +103,44 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // by JSONL session id).
     private val _sdkToLocalId = MutableStateFlow<Map<String, String>>(emptyMap())
 
-    // Whether current session is orchestrator
+    // Whether current session is orchestrator — drives which bucket the UI sees.
     private val _isOrchestratorSession = MutableStateFlow(false)
     val isOrchestratorSession: StateFlow<Boolean> = _isOrchestratorSession.asStateFlow()
 
-    // Messages for current session
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+    // ---- Public state, mirrored from the active bucket -------------------
+    // Each public flow follows _isOrchestratorSession and re-emits whichever
+    // bucket's flow matches. flatMapLatest cancels the previous inner
+    // collection on switch, so the UI never reads stale data from the
+    // background tab.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private fun <T> mirrorActive(initial: T, pick: (ChatStateBucket) -> StateFlow<T>): StateFlow<T> =
+        _isOrchestratorSession
+            .flatMapLatest { isOrch ->
+                pick(bucket(if (isOrch) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT))
+            }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, initial)
+
+    val currentSessionId: StateFlow<String?> =
+        mirrorActive(null) { it.currentSessionId }
+
+    /**
+     * Local id for the *currently displayed* tab. The orchestrator's local id
+     * is the pool key on the backend; the agent's is generated per loadSession.
+     */
+    val currentLocalId: StateFlow<String> =
+        mirrorActive(buckets.getValue(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value) { it.currentLocalId }
+
+    val messages: StateFlow<List<ChatMessage>> =
+        mirrorActive(emptyList()) { it.messages }
+
+    val hasMoreMessages: StateFlow<Boolean> =
+        mirrorActive(false) { it.hasMoreMessages }
+
+    val sessionStatus: StateFlow<String> =
+        mirrorActive("idle") { it.sessionStatus }
+
+    private val _isLoadingMoreMessages = MutableStateFlow(false)
+    val isLoadingMoreMessages: StateFlow<Boolean> = _isLoadingMoreMessages.asStateFlow()
 
     // Session cache - keeps messages and state for multiple sessions in memory
 
@@ -89,48 +152,23 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     )
     private val sessionCache = LinkedHashMap<String, CachedSession>(MAX_CACHED_SESSIONS, 0.75f, true)
 
-    // Pagination state
-    private var currentSessionIdForPagination: String? = null
-    private var paginationStartIndex: Int = 0
-    private val _hasMoreMessages = MutableStateFlow(false)
-    val hasMoreMessages: StateFlow<Boolean> = _hasMoreMessages.asStateFlow()
-    private val _isLoadingMoreMessages = MutableStateFlow(false)
-    val isLoadingMoreMessages: StateFlow<Boolean> = _isLoadingMoreMessages.asStateFlow()
-
-    // Tracks the sdk session id we're reconnecting to, so SessionStarted can load history
-    private val _pendingResumeSessionId = MutableStateFlow<String?>(null)
-
-    // The true JSONL/SDK session ID (distinct from local_id on reconnect).
-    // Used as resume_sdk_id when starting voice so history is always found.
-    private var _jsonlSessionId: String? = null
-
-    // Streaming message being built
-    private var streamingMessageId: String? = null
-    private val _streamingContent = MutableStateFlow("")
-    private var currentThinkingContent = ""
-    private var currentToolBlocks = mutableMapOf<String, MessageBlock.ToolUse>()
-
     /**
-     * Ensure a streaming message exists. Creates one if needed.
-     * Call this before any streaming content updates.
+     * Ensure a streaming message exists in the given bucket. Creates one if needed.
      */
-    private fun ensureStreamingMessage() {
-        if (streamingMessageId == null) {
-            streamingMessageId = UUID.randomUUID().toString()
+    private fun ensureStreamingMessage(b: ChatStateBucket) {
+        if (b.streamingMessageId == null) {
+            val newId = UUID.randomUUID().toString()
+            b.streamingMessageId = newId
             val newMessage = ChatMessage(
-                id = streamingMessageId!!,
+                id = newId,
                 role = MessageRole.ASSISTANT,
                 content = "",
                 blocks = emptyList(),
                 isStreaming = true
             )
-            _messages.update { it + newMessage }
+            b.messages.update { it + newMessage }
         }
     }
-
-    // Session status (matches web frontend)
-    private val _sessionStatus = MutableStateFlow("idle")
-    val sessionStatus: StateFlow<String> = _sessionStatus.asStateFlow()
 
     // Recording state
     private val _isRecording = MutableStateFlow(false)
@@ -212,7 +250,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 if (firstEmission) {
                     firstEmission = false
                     preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID]?.takeIf { it.isNotBlank() }?.let {
-                        _currentLocalId.value = it
+                        bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value = it
                     }
                 }
 
@@ -253,26 +291,37 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 if (serverUrlChanged) {
                     webSocketManager.disconnect()
                     _sessions.value = emptyList()
-                    _messages.value = emptyList()
                     _liveSessionIds.value = emptySet()
-                    _currentSessionId.value = null
-                    _currentLocalId.value = UUID.randomUUID().toString()
                     // The persisted id belongs to the previous server's pool — drop it
                     // so we don't try to reattach to a session that doesn't exist here.
                     clearOrchestratorLocalId()
-                    _pendingResumeSessionId.value = null
-                    _jsonlSessionId = null
                     _isOrchestratorSession.value = false
-                    _hasMoreMessages.value = false
                     sessionCache.clear()
+                    // Wipe both per-endpoint buckets.
+                    for (b in buckets.values) {
+                        b.messages.value = emptyList()
+                        b.currentSessionId.value = null
+                        b.currentLocalId.value = UUID.randomUUID().toString()
+                        b.pendingResumeSessionId.value = null
+                        b.jsonlSessionId = null
+                        b.hasMoreMessages.value = false
+                        b.currentSessionIdForPagination = null
+                        b.paginationStartIndex = 0
+                        b.streamingMessageId = null
+                        b.streamingContent.value = ""
+                        b.currentThinkingContent = ""
+                        b.currentToolBlocks.clear()
+                        b.sessionStatus.value = "idle"
+                    }
                 }
             }
         }
 
-        // Collect WebSocket events
+        // Collect WebSocket events — every event is tagged with the endpoint
+        // that emitted it so we can route into the correct per-tab bucket.
         viewModelScope.launch {
-            webSocketManager.events.collect { event ->
-                handleWebSocketEvent(event)
+            webSocketManager.events.collect { (endpoint, event) ->
+                handleWebSocketEvent(endpoint, event)
             }
         }
     }
@@ -306,6 +355,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun handleVoiceEvent(event: VoiceEvent) {
+        // Voice always belongs to the orchestrator bucket — even if the user is
+        // currently looking at a Claude Code session in the agent tab.
+        val b = bucket(WebSocketEndpoint.ORCHESTRATOR)
         when (event) {
             is VoiceEvent.UserTranscript -> {
                 // Add user voice transcript as a message
@@ -315,7 +367,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     content = "[voice] ${event.text}",
                     blocks = listOf(MessageBlock.Text("[voice] ${event.text}"))
                 )
-                _messages.update { it + userMessage }
+                b.messages.update { it + userMessage }
             }
             is VoiceEvent.TextComplete -> {
                 // Add assistant response as a message
@@ -326,7 +378,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         content = event.text,
                         blocks = listOf(MessageBlock.Text(event.text))
                     )
-                    _messages.update { it + assistantMessage }
+                    b.messages.update { it + assistantMessage }
                 }
             }
             is VoiceEvent.ToolUse -> {
@@ -338,7 +390,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             is VoiceEvent.TurnComplete -> {
                 // Turn completed
                 // Web frontend: optsRef.current.onTurnComplete?.()
-                _sessionStatus.value = "idle"
+                b.sessionStatus.value = "idle"
             }
             is VoiceEvent.Error -> {
                 Log.e(TAG, "Voice error: ${event.message}")
@@ -346,7 +398,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     role = MessageRole.SYSTEM,
                     content = "Voice error: ${event.message}"
                 )
-                _messages.update { it + errorMessage }
+                b.messages.update { it + errorMessage }
             }
             is VoiceEvent.SessionEnded -> {
                 _voiceState.value = VoiceState.Off
@@ -368,11 +420,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun handleWebSocketEvent(event: WebSocketEvent) {
+    private fun handleWebSocketEvent(endpoint: WebSocketEndpoint, event: WebSocketEvent) {
+        // Every chat-mutating event writes into THIS endpoint's bucket — never
+        // into whichever tab the user happens to be looking at. That's the core
+        // isolation guarantee.
+        val b = bucket(endpoint)
         when (event) {
             is WebSocketEvent.Connected -> {
-                val endpoint = try { WebSocketEndpoint.valueOf(event.endpoint) } catch (_: Exception) { return }
-
                 // Agent socket: the orchestrator-probe is irrelevant here. Just send the
                 // pending Start so the backend resumes/loads the requested Claude session.
                 if (endpoint == WebSocketEndpoint.AGENT) {
@@ -390,15 +444,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 }
 
                 // Orchestrator socket below.
+                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
                 // If newSession() armed a pending Start (because it had to connect first),
                 // honour it and skip the resume-existing lookup.
                 if (pendingNewSessionStart) {
                     pendingNewSessionStart = false
                     _noActiveOrchestrator.value = false
                     _isOrchestratorSession.value = true
-                    persistOrchestratorLocalId(_currentLocalId.value)
+                    persistOrchestratorLocalId(orchBucket.currentLocalId.value)
                     webSocketManager.send(
-                        WebSocketMessage.Start(localId = _currentLocalId.value),
+                        WebSocketMessage.Start(localId = orchBucket.currentLocalId.value),
                         endpoint = WebSocketEndpoint.ORCHESTRATOR
                     )
                     return
@@ -424,11 +479,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     if (existing != null) {
                         // Reuse the existing orchestrator's local_id so the backend
                         // recognises this as a reconnect (not a new/conflicting session)
-                        _currentLocalId.value = existing.localId
+                        orchBucket.currentLocalId.value = existing.localId
                         _isOrchestratorSession.value = true
                         persistOrchestratorLocalId(existing.localId)
                         // Also track the sdk session id so we can load history
-                        _pendingResumeSessionId.value = existing.sdkSessionId
+                        orchBucket.pendingResumeSessionId.value = existing.sdkSessionId
                         _noActiveOrchestrator.value = false
                         webSocketManager.send(
                             WebSocketMessage.Start(
@@ -439,7 +494,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     } else {
                         // No live orchestrator. Stay idle — UI will switch to History.
-                        _pendingResumeSessionId.value = null
+                        orchBucket.pendingResumeSessionId.value = null
                         _noActiveOrchestrator.value = true
                         // Make sure stale session list is loaded so History has something to show.
                         refreshSessions()
@@ -448,20 +503,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             }
 
             is WebSocketEvent.SessionStarted -> {
-                _currentSessionId.value = event.sessionId
-                _sessionStatus.value = "idle"
-                // Don't override _isOrchestratorSession here: SessionStarted arrives on
-                // both endpoints (orchestrator and agent). The flag is owned by the
-                // caller that initiated the session (loadSession / orchestrator-probe).
-                // Only clear noActiveOrchestrator if this is in fact an orchestrator session.
-                if (_isOrchestratorSession.value) {
+                b.currentSessionId.value = event.sessionId
+                b.sessionStatus.value = "idle"
+                // Only clear noActiveOrchestrator if THIS is the orchestrator endpoint —
+                // an agent SessionStarted shouldn't change the orchestrator's empty-state flag.
+                if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
                     _noActiveOrchestrator.value = false
                 }
 
                 // Track the true JSONL session ID for voice resume.
                 // On reconnect the backend returns local_id as session_id — use
                 // pendingResumeSessionId (the actual SDK/JSONL id) instead.
-                _jsonlSessionId = _pendingResumeSessionId.value ?: event.sessionId
+                b.jsonlSessionId = b.pendingResumeSessionId.value ?: event.sessionId
 
                 // If this is a voice session, forward the session.update payload to OpenAI
                 // This sends the system prompt + tool definitions so the voice session
@@ -473,52 +526,47 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // Load/refresh messages when reconnecting to an existing session.
                 // Always re-fetch from server so any messages that arrived while the
                 // WebSocket was disconnected are not lost.
-                val resumeId = _pendingResumeSessionId.value
+                val resumeId = b.pendingResumeSessionId.value
                 if (resumeId != null) {
                     viewModelScope.launch {
                         try {
                             val paginated = apiClient?.getMessagesPaginated(resumeId, limit = 50)
                                 ?: com.assistant.peripheral.network.PaginatedMessages(emptyList(), 0, false, 0)
                             // Always update — server is the source of truth
-                            currentSessionIdForPagination = resumeId
-                            paginationStartIndex = paginated.startIndex
-                            _hasMoreMessages.value = paginated.hasMore
-                            _messages.value = paginated.messages
+                            b.currentSessionIdForPagination = resumeId
+                            b.paginationStartIndex = paginated.startIndex
+                            b.hasMoreMessages.value = paginated.hasMore
+                            b.messages.value = paginated.messages
                         } catch (_: Exception) {
                             // Best-effort — keep existing messages if fetch fails
                         }
                     }
                 }
-                _pendingResumeSessionId.value = null
+                b.pendingResumeSessionId.value = null
                 refreshSessions()
             }
 
             is WebSocketEvent.SessionStopped -> {
-                _sessionStatus.value = "disconnected"
+                b.sessionStatus.value = "disconnected"
             }
 
             is WebSocketEvent.Status -> {
-                _sessionStatus.value = event.status
+                b.sessionStatus.value = event.status
             }
 
             is WebSocketEvent.Disconnected -> {
-                // Only clear chat-streaming state when the endpoint owning the
-                // currently-displayed session went down. The orchestrator socket
-                // staying up while the agent socket disconnects (or vice versa)
-                // shouldn't wipe the active chat's streaming state.
-                val endpoint = try { WebSocketEndpoint.valueOf(event.endpoint) } catch (_: Exception) { null }
-                if (endpoint == null || endpoint == currentEndpoint()) {
-                    streamingMessageId = null
-                    _streamingContent.value = ""
-                    _sessionStatus.value = "disconnected"
-                }
+                // Reset the disconnected endpoint's streaming scratchpad. Other
+                // endpoint's bucket is untouched.
+                b.streamingMessageId = null
+                b.streamingContent.value = ""
+                b.sessionStatus.value = "disconnected"
             }
 
             is WebSocketEvent.MessageStart -> {
-                streamingMessageId = event.messageId
-                _streamingContent.value = ""
-                currentThinkingContent = ""
-                currentToolBlocks.clear()
+                b.streamingMessageId = event.messageId
+                b.streamingContent.value = ""
+                b.currentThinkingContent = ""
+                b.currentToolBlocks.clear()
 
                 val newMessage = ChatMessage(
                     id = event.messageId,
@@ -527,70 +575,70 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     blocks = emptyList(),
                     isStreaming = true
                 )
-                _messages.update { it + newMessage }
-                _sessionStatus.value = "streaming"
+                b.messages.update { it + newMessage }
+                b.sessionStatus.value = "streaming"
             }
 
             is WebSocketEvent.TextDelta -> {
                 // Ensure streaming message exists (orchestrator doesn't send message_start)
-                ensureStreamingMessage()
-                _streamingContent.update { it + event.text }
-                updateStreamingMessage()
+                ensureStreamingMessage(b)
+                b.streamingContent.update { it + event.text }
+                updateStreamingMessage(b)
             }
 
             is WebSocketEvent.TextComplete -> {
-                ensureStreamingMessage()
-                _streamingContent.value = event.text
-                updateStreamingMessage()
+                ensureStreamingMessage(b)
+                b.streamingContent.value = event.text
+                updateStreamingMessage(b)
             }
 
             is WebSocketEvent.ThinkingDelta -> {
-                ensureStreamingMessage()
-                currentThinkingContent += event.text
-                updateStreamingMessage()
+                ensureStreamingMessage(b)
+                b.currentThinkingContent += event.text
+                updateStreamingMessage(b)
             }
 
             is WebSocketEvent.ThinkingComplete -> {
-                ensureStreamingMessage()
-                currentThinkingContent = event.text
-                updateStreamingMessage()
+                ensureStreamingMessage(b)
+                b.currentThinkingContent = event.text
+                updateStreamingMessage(b)
             }
 
             is WebSocketEvent.ToolUse -> {
-                ensureStreamingMessage()
-                currentToolBlocks[event.toolUseId] = MessageBlock.ToolUse(
+                ensureStreamingMessage(b)
+                b.currentToolBlocks[event.toolUseId] = MessageBlock.ToolUse(
                     toolUseId = event.toolUseId,
                     toolName = event.toolName,
                     toolInput = event.toolInput,
                     isExecuting = false,
                     isComplete = false
                 )
-                updateStreamingMessage()
-                _sessionStatus.value = "tool_use"
+                updateStreamingMessage(b)
+                b.sessionStatus.value = "tool_use"
             }
 
             is WebSocketEvent.ToolExecuting -> {
-                currentToolBlocks[event.toolUseId]?.let { block ->
-                    currentToolBlocks[event.toolUseId] = block.copy(isExecuting = true)
-                    updateStreamingMessage()
+                b.currentToolBlocks[event.toolUseId]?.let { block ->
+                    b.currentToolBlocks[event.toolUseId] = block.copy(isExecuting = true)
+                    updateStreamingMessage(b)
                 }
             }
 
             is WebSocketEvent.ToolResult -> {
-                currentToolBlocks[event.toolUseId]?.let { block ->
-                    currentToolBlocks[event.toolUseId] = block.copy(
+                b.currentToolBlocks[event.toolUseId]?.let { block ->
+                    b.currentToolBlocks[event.toolUseId] = block.copy(
                         result = event.output,
                         isError = event.isError,
                         isExecuting = false,
                         isComplete = true
                     )
-                    updateStreamingMessage()
+                    updateStreamingMessage(b)
                 }
             }
 
             is WebSocketEvent.MessageEnd, is WebSocketEvent.TurnComplete -> {
-                streamingMessageId?.let { messageId ->
-                    _messages.update { messages ->
+                b.streamingMessageId?.let { messageId ->
+                    b.messages.update { messages ->
                         messages.map { msg ->
                             if (msg.id == messageId) {
                                 msg.copy(isStreaming = false)
@@ -598,14 +646,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         }
                     }
                 }
-                streamingMessageId = null
-                _streamingContent.value = ""
-                currentThinkingContent = ""
-                currentToolBlocks.clear()
-                _sessionStatus.value = "idle"
+                b.streamingMessageId = null
+                b.streamingContent.value = ""
+                b.currentThinkingContent = ""
+                b.currentToolBlocks.clear()
+                b.sessionStatus.value = "idle"
 
-                // Update cache with new messages
-                saveCurrentSessionToCache()
+                // Update cache with new messages — only meaningful for the
+                // currently-displayed tab (cache is keyed by sdk session id).
+                if (endpoint == currentEndpoint()) {
+                    saveCurrentSessionToCache()
+                }
             }
 
             is WebSocketEvent.CompactComplete -> {
@@ -615,7 +666,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     content = "",
                     blocks = listOf(MessageBlock.Compact(event.summary))
                 )
-                _messages.update { it + compactMessage }
+                b.messages.update { it + compactMessage }
             }
 
             is WebSocketEvent.Error -> {
@@ -623,13 +674,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     role = MessageRole.SYSTEM,
                     content = "Error: ${event.message}${event.detail?.let { "\n$it" } ?: ""}"
                 )
-                _messages.update { it + errorMessage }
-                _sessionStatus.value = "error"
+                b.messages.update { it + errorMessage }
+                b.sessionStatus.value = "error"
+                // If the orchestrator rejected our Start because another orchestrator
+                // is already active (stale local_id), recover by refreshing the live
+                // pool and re-Starting against the actual pool key.
+                if (endpoint == WebSocketEndpoint.ORCHESTRATOR && event.message == "orchestrator_active") {
+                    recoverFromOrchestratorActive()
+                }
             }
 
             is WebSocketEvent.VoiceCommand -> {
-                // Forward voice_command from backend to OpenAI via VoiceManager
-                // Web frontend: case "voice_command": sendToOpenAI(event.command)
+                // Forward voice_command from backend to OpenAI via VoiceManager.
+                // Voice runs only on the orchestrator socket.
                 @Suppress("UNCHECKED_CAST")
                 val command = event.command as? Map<String, Any?> ?: return
                 voiceManager?.handleBackendCommand(command)
@@ -638,18 +695,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             is WebSocketEvent.VoiceStopped -> {
                 // AI-initiated clean end (end_voice_session tool) — mirror web frontend behaviour.
                 // Finalize any in-progress streaming message (TurnComplete never arrives in voice mode).
-                streamingMessageId?.let { messageId ->
-                    _messages.update { messages ->
+                b.streamingMessageId?.let { messageId ->
+                    b.messages.update { messages ->
                         messages.map { msg ->
                             if (msg.id == messageId) msg.copy(isStreaming = false) else msg
                         }
                     }
                 }
-                streamingMessageId = null
-                _streamingContent.value = ""
-                currentThinkingContent = ""
-                currentToolBlocks.clear()
-                _sessionStatus.value = "idle"
+                b.streamingMessageId = null
+                b.streamingContent.value = ""
+                b.currentThinkingContent = ""
+                b.currentToolBlocks.clear()
+                b.sessionStatus.value = "idle"
                 stopVoiceSession()
             }
 
@@ -664,30 +721,26 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun updateStreamingMessage() {
-        val messageId = streamingMessageId ?: return
+    private fun updateStreamingMessage(b: ChatStateBucket) {
+        val messageId = b.streamingMessageId ?: return
 
-        // Build blocks list
         val blocks = mutableListOf<MessageBlock>()
 
-        // Add thinking block if present
-        if (currentThinkingContent.isNotEmpty()) {
-            blocks.add(MessageBlock.Thinking(currentThinkingContent, isStreaming = true))
+        if (b.currentThinkingContent.isNotEmpty()) {
+            blocks.add(MessageBlock.Thinking(b.currentThinkingContent, isStreaming = true))
         }
 
-        // Add text block if present
-        if (_streamingContent.value.isNotEmpty()) {
-            blocks.add(MessageBlock.Text(_streamingContent.value, isStreaming = true))
+        if (b.streamingContent.value.isNotEmpty()) {
+            blocks.add(MessageBlock.Text(b.streamingContent.value, isStreaming = true))
         }
 
-        // Add tool blocks
-        blocks.addAll(currentToolBlocks.values)
+        blocks.addAll(b.currentToolBlocks.values)
 
-        _messages.update { messages ->
+        b.messages.update { messages ->
             messages.map { msg ->
                 if (msg.id == messageId) {
                     msg.copy(
-                        content = _streamingContent.value,
+                        content = b.streamingContent.value,
                         blocks = blocks
                     )
                 } else msg
@@ -695,9 +748,34 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * Backend rejected our orchestrator Start because the pool already has a
+     * different orchestrator. This happens when our local_id is stale (e.g.
+     * the live orchestrator was created from another client). Refresh the
+     * pool and re-Start with the live local_id.
+     */
+    private fun recoverFromOrchestratorActive() {
+        viewModelScope.launch {
+            val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
+            val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
+            orchBucket.currentLocalId.value = live.localId
+            orchBucket.pendingResumeSessionId.value = live.sdkSessionId
+            persistOrchestratorLocalId(live.localId)
+            webSocketManager.send(
+                WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
+                endpoint = WebSocketEndpoint.ORCHESTRATOR
+            )
+        }
+    }
+
     fun connect() {
         viewModelScope.launch {
-            webSocketManager.connect(_settings.value.serverUrl, _currentLocalId.value)
+            // The implicit "connect" is for the orchestrator socket — the agent
+            // socket is opened lazily in loadSession when the user picks a Claude session.
+            webSocketManager.connect(
+                _settings.value.serverUrl,
+                bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value
+            )
         }
     }
 
@@ -742,13 +820,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun sendMessage(text: String) {
         if (text.isBlank()) return
 
-        // Add user message to UI immediately
+        // Add user message to the active tab's bucket.
         val userMessage = ChatMessage(
             role = MessageRole.USER,
             content = text,
             blocks = listOf(MessageBlock.Text(text))
         )
-        _messages.update { it + userMessage }
+        activeBucket().messages.update { it + userMessage }
 
         // Send to server — route to whichever socket owns the current chat tab.
         webSocketManager.send(WebSocketMessage.Send(text), endpoint = currentEndpoint())
@@ -756,7 +834,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun interrupt() {
         webSocketManager.send(WebSocketMessage.Interrupt, endpoint = currentEndpoint())
-        _sessionStatus.value = "interrupted"
+        activeBucket().sessionStatus.value = "interrupted"
     }
 
     fun compact() {
@@ -825,16 +903,21 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             _liveSessionIds.update { it - sessionId }
             _sdkToLocalId.update { it - sessionId }
 
-            // If we just closed the current session, clear chat + drop persisted
-            // orchestrator id so we don't try to reattach to it on next launch.
-            if (currentSessionIdForPagination == sessionId || _currentLocalId.value == localId) {
-                _messages.value = emptyList()
-                _currentSessionId.value = null
-                currentSessionIdForPagination = null
-                _isOrchestratorSession.value = false
-                _hasMoreMessages.value = false
-                clearOrchestratorLocalId()
-                _currentLocalId.value = UUID.randomUUID().toString()
+            // If we just closed the current session in either bucket, clear that
+            // bucket's chat. If the closed session was the orchestrator, also drop
+            // the persisted local_id so we don't try to reattach on next launch.
+            for ((ep, b) in buckets) {
+                if (b.currentSessionIdForPagination == sessionId || b.currentLocalId.value == localId) {
+                    b.messages.value = emptyList()
+                    b.currentSessionId.value = null
+                    b.currentSessionIdForPagination = null
+                    b.hasMoreMessages.value = false
+                    b.currentLocalId.value = UUID.randomUUID().toString()
+                    if (ep == WebSocketEndpoint.ORCHESTRATOR) {
+                        clearOrchestratorLocalId()
+                        _isOrchestratorSession.value = false
+                    }
+                }
             }
             sessionCache.remove(sessionId)
 
@@ -843,26 +926,43 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun loadSession(sessionId: String, isOrchestrator: Boolean = false) {
+    /**
+     * Open a session in the appropriate tab. [liveLocalId] is the live pool's
+     * local_id for the session if it's currently running on the backend
+     * (passed from the History list, where SessionInfo.localId carries it).
+     * For orchestrator reconnect this is *required* — the backend's pool is
+     * keyed by local_id, so generating a fresh UUID here would be rejected
+     * with `orchestrator_active`.
+     */
+    fun loadSession(
+        sessionId: String,
+        isOrchestrator: Boolean = false,
+        liveLocalId: String? = null
+    ) {
         viewModelScope.launch {
             // Save current session to cache before switching
             saveCurrentSessionToCache()
 
             val endpoint = if (isOrchestrator) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
+            val b = bucket(endpoint)
+            // For orchestrator reattach we must reuse the live local_id; for agent
+            // sessions the local_id can be fresh per switch (the backend keys agent
+            // sessions by local_id but each switch is a new pool entry).
+            val localIdForStart = liveLocalId ?: UUID.randomUUID().toString()
 
             // Check if session is already cached
             val cached = sessionCache[sessionId]
             if (cached != null) {
                 // Restore from cache - instant switch!
-                currentSessionIdForPagination = sessionId
-                paginationStartIndex = cached.paginationStartIndex
-                _hasMoreMessages.value = cached.hasMoreMessages
-                _messages.value = cached.messages
+                b.currentSessionIdForPagination = sessionId
+                b.paginationStartIndex = cached.paginationStartIndex
+                b.hasMoreMessages.value = cached.hasMoreMessages
+                b.messages.value = cached.messages
+                b.currentLocalId.value = localIdForStart
                 _isOrchestratorSession.value = cached.isOrchestrator
                 if (isOrchestrator) _noActiveOrchestrator.value = false
 
-                _currentLocalId.value = UUID.randomUUID().toString()
-                openSessionOnEndpoint(endpoint, _currentLocalId.value, sessionId)
+                openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
                 return@launch
             }
 
@@ -872,17 +972,15 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
             if (paginated.totalCount > 0 || paginated.messages.isNotEmpty()) {
                 // Store pagination state for loading more
-                currentSessionIdForPagination = sessionId
-                paginationStartIndex = paginated.startIndex
-                _hasMoreMessages.value = paginated.hasMore
-                _messages.value = paginated.messages
-
-                // Generate new local ID for this session
-                _currentLocalId.value = UUID.randomUUID().toString()
+                b.currentSessionIdForPagination = sessionId
+                b.paginationStartIndex = paginated.startIndex
+                b.hasMoreMessages.value = paginated.hasMore
+                b.messages.value = paginated.messages
+                b.currentLocalId.value = localIdForStart
                 _isOrchestratorSession.value = isOrchestrator
                 if (isOrchestrator) _noActiveOrchestrator.value = false
 
-                openSessionOnEndpoint(endpoint, _currentLocalId.value, sessionId)
+                openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
             }
         }
     }
@@ -896,8 +994,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      *
      * If the target socket is already connected we re-Start it on the new
      * local_id immediately. Otherwise we queue the Start via pendingAgentResume
-     * (or pendingNewSessionStart for orchestrator) and the Connected handler
-     * sends it once the handshake completes.
+     * (or the bucket's pendingResumeSessionId for orchestrator) and the
+     * Connected handler sends it once the handshake completes.
      */
     private fun openSessionOnEndpoint(
         endpoint: WebSocketEndpoint,
@@ -919,37 +1017,34 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // The orchestrator-probe in the Connected handler will pick up
                 // the live orchestrator on the server and resume it. We don't
                 // need pendingNewSessionStart — that path is for fresh sessions.
-                _pendingResumeSessionId.value = resumeSdkId
+                bucket(WebSocketEndpoint.ORCHESTRATOR).pendingResumeSessionId.value = resumeSdkId
             }
         }
         webSocketManager.connect(_settings.value.serverUrl, localId, endpoint)
     }
 
     /**
-     * Save current session state to cache for quick restoration later.
+     * Save the *active* tab's session state to cache for quick restoration later.
      * Limits messages to prevent TransactionTooLargeException.
      */
     private fun saveCurrentSessionToCache() {
-        val sessionId = currentSessionIdForPagination ?: return
-        if (_messages.value.isEmpty()) return
+        val b = activeBucket()
+        val sessionId = b.currentSessionIdForPagination ?: return
+        if (b.messages.value.isEmpty()) return
 
-        // Limit messages to prevent memory issues
-        val messagesToCache = if (_messages.value.size > MAX_CACHED_MESSAGES_PER_SESSION) {
-            // Keep only the most recent messages
-            _messages.value.takeLast(MAX_CACHED_MESSAGES_PER_SESSION)
+        val messagesToCache = if (b.messages.value.size > MAX_CACHED_MESSAGES_PER_SESSION) {
+            b.messages.value.takeLast(MAX_CACHED_MESSAGES_PER_SESSION)
         } else {
-            _messages.value
+            b.messages.value
         }
 
         sessionCache[sessionId] = CachedSession(
             messages = messagesToCache,
             isOrchestrator = _isOrchestratorSession.value,
-            paginationStartIndex = paginationStartIndex,
-            // If we trimmed messages, mark as having more
-            hasMoreMessages = _hasMoreMessages.value || _messages.value.size > MAX_CACHED_MESSAGES_PER_SESSION
+            paginationStartIndex = b.paginationStartIndex,
+            hasMoreMessages = b.hasMoreMessages.value || b.messages.value.size > MAX_CACHED_MESSAGES_PER_SESSION
         )
 
-        // Evict oldest sessions if cache is too large
         while (sessionCache.size > MAX_CACHED_SESSIONS) {
             val oldestKey = sessionCache.keys.firstOrNull() ?: break
             sessionCache.remove(oldestKey)
@@ -961,8 +1056,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * Messages are prepended to the existing list.
      */
     fun loadMoreMessages() {
-        if (_isLoadingMoreMessages.value || !_hasMoreMessages.value) return
-        val sessionId = currentSessionIdForPagination ?: return
+        val b = activeBucket()
+        if (_isLoadingMoreMessages.value || !b.hasMoreMessages.value) return
+        val sessionId = b.currentSessionIdForPagination ?: return
 
         viewModelScope.launch {
             _isLoadingMoreMessages.value = true
@@ -970,14 +1066,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 val paginated = apiClient?.getMessagesPaginated(
                     sessionId,
                     limit = 50,
-                    beforeIndex = paginationStartIndex
+                    beforeIndex = b.paginationStartIndex
                 ) ?: return@launch
 
                 if (paginated.messages.isNotEmpty()) {
-                    // Prepend older messages to the list
-                    _messages.update { paginated.messages + it }
-                    paginationStartIndex = paginated.startIndex
-                    _hasMoreMessages.value = paginated.hasMore
+                    b.messages.update { paginated.messages + it }
+                    b.paginationStartIndex = paginated.startIndex
+                    b.hasMoreMessages.value = paginated.hasMore
                 }
             } finally {
                 _isLoadingMoreMessages.value = false
@@ -986,25 +1081,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun newSession() {
+        // newSession is orchestrator-only — operate on the orchestrator bucket.
+        val b = bucket(WebSocketEndpoint.ORCHESTRATOR)
+
         // Save current session to cache before starting new one
         saveCurrentSessionToCache()
 
-        // Generate new local ID
-        _currentLocalId.value = UUID.randomUUID().toString()
-        _messages.value = emptyList()
+        // Generate new local ID for the orchestrator's pool entry
+        b.currentLocalId.value = UUID.randomUUID().toString()
+        b.messages.value = emptyList()
+        b.currentSessionIdForPagination = null
+        b.paginationStartIndex = 0
+        b.hasMoreMessages.value = false
         _noActiveOrchestrator.value = false
 
-        // Reset pagination state
-        currentSessionIdForPagination = null
-        paginationStartIndex = 0
-        _hasMoreMessages.value = false
-
         // Persist so a later reconnect finds this same session instead of forking.
-        persistOrchestratorLocalId(_currentLocalId.value)
+        persistOrchestratorLocalId(b.currentLocalId.value)
 
-        // newSession is orchestrator-only — and so the new session lives on the
-        // orchestrator socket. Mark the flag now so any subsequent send() routes
-        // there too.
+        // Mark the active tab as orchestrator so subsequent send() routes there.
         _isOrchestratorSession.value = true
 
         // (Re)connect WebSocket and explicitly start the new session.
@@ -1012,7 +1106,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // Already connected — the Connected handler won't re-fire, so send Start ourselves.
             webSocketManager.send(WebSocketMessage.Stop, endpoint = WebSocketEndpoint.ORCHESTRATOR)
             webSocketManager.send(
-                WebSocketMessage.Start(localId = _currentLocalId.value),
+                WebSocketMessage.Start(localId = b.currentLocalId.value),
                 endpoint = WebSocketEndpoint.ORCHESTRATOR
             )
         } else {
@@ -1071,7 +1165,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     role = MessageRole.SYSTEM,
                     content = "Failed to start recording. Check microphone permission."
                 )
-                _messages.update { it + errorMessage }
+                activeBucket().messages.update { it + errorMessage }
             }
         }
     }
@@ -1082,13 +1176,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             _isRecording.value = false
 
             if (base64Audio != null) {
-                // Add user message placeholder
                 val userMessage = ChatMessage(
                     role = MessageRole.USER,
                     content = "[Voice message]",
                     blocks = listOf(MessageBlock.Text("[Voice message]"))
                 )
-                _messages.update { it + userMessage }
+                activeBucket().messages.update { it + userMessage }
 
                 // Send audio to server — route to whichever socket owns the current chat tab.
                 webSocketManager.send(
@@ -1117,15 +1210,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // by WebRTC and we don't want keywords triggering extra recordings or new sessions.
         AssistantService.pauseWakeWord(getApplication())
 
+        val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
         viewModelScope.launch {
-            // Send voice_start to backend — passes local_id AND the true JSONL session id
-            // so the orchestrator resumes from the correct history file.
-            // NOTE: _currentSessionId may be local_id on reconnect; _jsonlSessionId is always
+            // Send voice_start with the orchestrator bucket's local_id and the true
+            // JSONL session id so the backend resumes from the correct history file.
+            // currentSessionId may be local_id on reconnect; jsonlSessionId is always
             // the real SDK/JSONL id (matches web frontend's resumeSdkId behaviour).
             webSocketManager.send(
                 WebSocketMessage.VoiceStart(
-                    localId = _currentLocalId.value,
-                    resumeSdkId = _jsonlSessionId ?: _currentSessionId.value
+                    localId = orchBucket.currentLocalId.value,
+                    resumeSdkId = orchBucket.jsonlSessionId ?: orchBucket.currentSessionId.value
                 ),
                 endpoint = WebSocketEndpoint.ORCHESTRATOR
             )

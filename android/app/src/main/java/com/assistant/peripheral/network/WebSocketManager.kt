@@ -53,8 +53,14 @@ class WebSocketManager {
     fun connectionState(endpoint: WebSocketEndpoint): StateFlow<ConnectionState> =
         connections.getValue(endpoint).state.asStateFlow()
 
-    private val _events = MutableSharedFlow<WebSocketEvent>(extraBufferCapacity = 64)
-    val events: SharedFlow<WebSocketEvent> = _events.asSharedFlow()
+    /**
+     * Per-endpoint event stream. Every emission carries the endpoint that
+     * produced the event so consumers can route updates to the correct
+     * per-tab state bucket and never cross-contaminate (e.g. orchestrator
+     * voice text streaming into a Claude Code session view).
+     */
+    private val _events = MutableSharedFlow<Pair<WebSocketEndpoint, WebSocketEvent>>(extraBufferCapacity = 64)
+    val events: SharedFlow<Pair<WebSocketEndpoint, WebSocketEvent>> = _events.asSharedFlow()
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -91,18 +97,18 @@ class WebSocketManager {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "WebSocket connected ($endpoint)")
                 conn.state.value = ConnectionState.Connected
-                _events.tryEmit(WebSocketEvent.Connected(endpoint.name))
+                _events.tryEmit(endpoint to WebSocketEvent.Connected)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 Log.d(TAG, "Received text ($endpoint): $text")
-                parseMessage(text)
+                parseMessage(text, endpoint)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
                 val text = bytes.utf8()
                 Log.d(TAG, "Received binary ($endpoint): $text")
-                parseMessage(text)
+                parseMessage(text, endpoint)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -118,7 +124,7 @@ class WebSocketManager {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket failure ($endpoint): ${t.message}", t)
                 conn.state.value = ConnectionState.Error(t.message ?: "Connection failed")
-                _events.tryEmit(WebSocketEvent.Error(t.message ?: "Connection failed"))
+                _events.tryEmit(endpoint to WebSocketEvent.Error(t.message ?: "Connection failed"))
                 handleDisconnect(endpoint)
             }
         })
@@ -145,7 +151,7 @@ class WebSocketManager {
     private fun handleDisconnect(endpoint: WebSocketEndpoint) {
         val conn = connections.getValue(endpoint)
         conn.state.value = ConnectionState.Disconnected
-        _events.tryEmit(WebSocketEvent.Disconnected(endpoint.name))
+        _events.tryEmit(endpoint to WebSocketEvent.Disconnected)
 
         if (conn.shouldReconnect) {
             scope.launch {
@@ -232,10 +238,11 @@ class WebSocketManager {
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun parseMessage(text: String) {
+    private fun parseMessage(text: String, endpoint: WebSocketEndpoint) {
         try {
             val json = JSONObject(text)
             val type = json.optString("type", "")
+            fun emit(ev: WebSocketEvent) { _events.tryEmit(endpoint to ev) }
 
             when (type) {
                 // Session lifecycle
@@ -243,104 +250,83 @@ class WebSocketManager {
                     val sessionId = json.optString("session_id", "")
                     val voice = json.optBoolean("voice", false)
                     val voiceUpdate = json.optJSONObject("voice_session_update")?.let { jsonObjectToMap(it) }
-                    _events.tryEmit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
+                    emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
                 }
-                "session_stopped" -> {
-                    _events.tryEmit(WebSocketEvent.SessionStopped)
-                }
+                "session_stopped" -> emit(WebSocketEvent.SessionStopped)
 
                 // Status updates
-                "status" -> {
-                    val status = json.optString("status", "")
-                    _events.tryEmit(WebSocketEvent.Status(status))
-                }
+                "status" -> emit(WebSocketEvent.Status(json.optString("status", "")))
 
                 // Text streaming
                 "text_delta" -> {
                     val delta = json.optString("text", "")
                     val messageId = json.optString("message_id", null)
-                    _events.tryEmit(WebSocketEvent.TextDelta(delta, messageId))
+                    emit(WebSocketEvent.TextDelta(delta, messageId))
                 }
-                "text_complete" -> {
-                    val completeText = json.optString("text", "")
-                    _events.tryEmit(WebSocketEvent.TextComplete(completeText))
-                }
+                "text_complete" -> emit(WebSocketEvent.TextComplete(json.optString("text", "")))
 
                 // Thinking (extended thinking for o1 models)
-                "thinking_delta" -> {
-                    val delta = json.optString("text", "")
-                    _events.tryEmit(WebSocketEvent.ThinkingDelta(delta))
-                }
-                "thinking_complete" -> {
-                    val completeText = json.optString("text", "")
-                    _events.tryEmit(WebSocketEvent.ThinkingComplete(completeText))
-                }
+                "thinking_delta" -> emit(WebSocketEvent.ThinkingDelta(json.optString("text", "")))
+                "thinking_complete" -> emit(WebSocketEvent.ThinkingComplete(json.optString("text", "")))
 
                 // Tool events
                 "tool_use" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val toolName = json.optString("tool_name", "")
                     val toolInput = jsonObjectToMap(json.optJSONObject("tool_input"))
-                    _events.tryEmit(WebSocketEvent.ToolUse(toolUseId, toolName, toolInput))
+                    emit(WebSocketEvent.ToolUse(toolUseId, toolName, toolInput))
                 }
                 "tool_executing" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val toolName = json.optString("tool_name", "")
-                    _events.tryEmit(WebSocketEvent.ToolExecuting(toolUseId, toolName))
+                    emit(WebSocketEvent.ToolExecuting(toolUseId, toolName))
                 }
                 "tool_progress" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val message = json.optString("message", "")
-                    _events.tryEmit(WebSocketEvent.ToolProgress(toolUseId, message))
+                    emit(WebSocketEvent.ToolProgress(toolUseId, message))
                 }
                 "tool_result" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val output = json.optString("output", "")
                     val isError = json.optBoolean("is_error", false)
-                    _events.tryEmit(WebSocketEvent.ToolResult(toolUseId, output, isError))
+                    emit(WebSocketEvent.ToolResult(toolUseId, output, isError))
                 }
 
                 // Turn complete
                 "turn_complete" -> {
                     val inputTokens = json.optInt("input_tokens", 0)
                     val outputTokens = json.optInt("output_tokens", 0)
-                    _events.tryEmit(WebSocketEvent.TurnComplete(inputTokens, outputTokens))
+                    emit(WebSocketEvent.TurnComplete(inputTokens, outputTokens))
                 }
 
                 // Voice events
                 "voice_command" -> {
                     val command = jsonObjectToMap(json.optJSONObject("command"))
-                    _events.tryEmit(WebSocketEvent.VoiceCommand(command))
+                    emit(WebSocketEvent.VoiceCommand(command))
                 }
-                "voice_stopped" -> {
-                    _events.tryEmit(WebSocketEvent.VoiceStopped)
-                }
+                "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 
                 // Compact
-                "compact_complete" -> {
-                    val summary = json.optString("summary", "")
-                    _events.tryEmit(WebSocketEvent.CompactComplete(summary))
-                }
+                "compact_complete" -> emit(WebSocketEvent.CompactComplete(json.optString("summary", "")))
 
                 // Error
                 "error" -> {
                     val errorMsg = json.optString("error", "Unknown error")
                     val detail = json.optString("detail", null)
-                    _events.tryEmit(WebSocketEvent.Error(errorMsg, detail))
+                    emit(WebSocketEvent.Error(errorMsg, detail))
                 }
 
                 // Legacy compatibility - map old events to new ones
                 "content_block_delta" -> {
                     val delta = json.optString("delta", json.optString("text", ""))
-                    _events.tryEmit(WebSocketEvent.TextDelta(delta))
+                    emit(WebSocketEvent.TextDelta(delta))
                 }
                 "message_start" -> {
                     val messageId = json.optString("message_id", System.currentTimeMillis().toString())
-                    _events.tryEmit(WebSocketEvent.MessageStart(messageId))
+                    emit(WebSocketEvent.MessageStart(messageId))
                 }
-                "message_end", "message_stop" -> {
-                    _events.tryEmit(WebSocketEvent.MessageEnd)
-                }
+                "message_end", "message_stop" -> emit(WebSocketEvent.MessageEnd)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing message: ${e.message}", e)

@@ -306,8 +306,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         currentSessionId = currentSessionId,
                         liveSessionIds = liveSessionIds,
                         isLoading = sessionsLoading,
-                        onSessionClick = { sessionId, isOrchestrator ->
-                            viewModel.loadSession(sessionId, isOrchestrator)
+                        onSessionClick = { sessionId, isOrchestrator, liveLocalId ->
+                            viewModel.loadSession(sessionId, isOrchestrator, liveLocalId)
                             navController.navigate(Screen.Chat.route)
                         },
                         onNewSession = {
