@@ -496,6 +496,18 @@ class SessionManager:
 
         Safe to call from any task — the actual SDK disconnect is performed
         inside :meth:`_lifecycle`, which is the same task that connected.
+
+        The lifecycle task is :func:`asyncio.shield`-ed: if our caller
+        cancels us (e.g. ``pool.close()``'s 10 s ``wait_for`` fires while
+        the SDK is mid-disconnect), the cancellation must NOT propagate
+        into the lifecycle task — doing so cancels ``client.disconnect()``
+        mid-flight, which in turn fails to exit the SDK's internal anyio
+        task group cleanly and leaves a cancelled-but-never-awaited
+        ``_read_messages`` task that the event loop then reschedules in
+        a tight loop (98% CPU on the Jetson, 2026-04-26).  By shielding,
+        the lifecycle finishes its bounded cleanup (8 s disconnect +
+        0.5 s SIGTERM grace + SIGKILL → max ~9 s) on its own schedule
+        even if our caller has long since moved on.
         """
         if self._lifecycle_task is None:
             # Either start() failed or stop() is being called twice; in both
@@ -503,13 +515,24 @@ class SessionManager:
             self._status = SessionStatus.DISCONNECTED
             return
         self._stop_requested.set()
+        task = self._lifecycle_task
+        # Clear the slot *before* the await so a concurrent second stop()
+        # call sees lifecycle_task=None and short-circuits — without this,
+        # both callers race on the same Task and one of them ends up with
+        # a stale reference after the first finishes.
+        self._lifecycle_task = None
         try:
-            await self._lifecycle_task
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Our caller cancelled us — that's their right.  The lifecycle
+            # task keeps running thanks to shield(), so disconnect + the
+            # SIGKILL fallback still complete in the background.  Re-raise
+            # so the caller's cancellation semantics are preserved.
+            raise
         except Exception:
             logger.exception(
                 "Lifecycle task for session %s exited with error", self._local_id
             )
-        self._lifecycle_task = None
 
     async def interrupt(self) -> None:
         """Interrupt the current response.

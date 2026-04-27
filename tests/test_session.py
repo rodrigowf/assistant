@@ -288,6 +288,62 @@ class TestSessionManagerLifecycle:
             assert sm.status == SessionStatus.DISCONNECTED
 
     @pytest.mark.asyncio
+    async def test_caller_cancel_does_not_cancel_lifecycle(self):
+        """Regression for the 2026-04-26 hot-spin: when our caller wraps
+        ``stop()`` in a tight ``asyncio.wait_for`` and times out, the
+        cancellation must NOT propagate into the lifecycle task and
+        cancel the in-flight ``client.disconnect()``.  If it does, the
+        SDK's anyio task group fails to exit cleanly, leaving a
+        cancelled-but-never-awaited ``_read_messages`` task that pins
+        the event loop at ~98% CPU forever.
+
+        Verifies: lifecycle task is shielded from caller cancellation
+        and its disconnect + cleanup still complete in the background.
+        """
+        client = _make_mock_client(server_info={"session_id": "x"})
+
+        # disconnect() sleeps for 1.5s — longer than our caller's wait
+        disconnect_started = asyncio.Event()
+        disconnect_finished = asyncio.Event()
+
+        async def _slow_disconnect():
+            disconnect_started.set()
+            try:
+                await asyncio.sleep(1.5)
+            except asyncio.CancelledError:
+                # If this fires, the bug is back: shield isn't protecting
+                # the lifecycle task.  Mark for the assertion below.
+                disconnect_finished.set()  # signals it was cancelled
+                raise
+            disconnect_finished.set()
+
+        client.disconnect = AsyncMock(side_effect=_slow_disconnect)
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager(local_id="shielded")
+            await sm.start()
+
+            # Caller wraps stop() in a tight 0.3s timeout — way under
+            # disconnect's 1.5s.  This cancels stop(), which without
+            # shield() would also cancel the lifecycle's disconnect.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(sm.stop(), timeout=0.3)
+
+            # disconnect() actually started inside the lifecycle
+            assert disconnect_started.is_set()
+
+            # Now wait long enough for the lifecycle to finish naturally
+            # (it should — shield protected it from our cancel).
+            await asyncio.sleep(2.0)
+
+            # Verify the lifecycle's disconnect ran to completion, not
+            # cancelled.  The mock's call count proves it was awaited.
+            client.disconnect.assert_called_once()
+            assert disconnect_finished.is_set()
+            # And the session is properly torn down
+            assert sm.status == SessionStatus.DISCONNECTED
+
+    @pytest.mark.asyncio
     async def test_clean_disconnect_does_not_kill(self):
         """If client.disconnect() returns cleanly AND the subprocess exits
         on its own, kill_claude_subprocess must NOT be called.  Steady-
