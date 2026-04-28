@@ -3,6 +3,14 @@ import { ChatInput } from "./ChatInput";
 import { StatusBar } from "./StatusBar";
 import { VoiceControls } from "./VoiceControls";
 import type { ChatMessage, SessionStatus, ConnectionState, VoiceStatus } from "../types";
+import type { StallInfo } from "../hooks/useChatInstance";
+
+function formatStallElapsed(s: number): string {
+  if (s < 90) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s - m * 60);
+  return rem > 0 ? `${m}m${rem}s` : `${m}m`;
+}
 
 interface Props {
   messages: ChatMessage[];
@@ -11,6 +19,8 @@ interface Props {
   cost: number;
   turns: number;
   error: string | null;
+  /** Set when the backend reports the SDK is stuck on a tool. */
+  stall?: StallInfo | null;
   onSend: (text: string) => void;
   onSendAudio?: (audioBase64: string, format: string) => void;
   onInterrupt: () => void;
@@ -45,6 +55,7 @@ export function ChatPanel({
   cost,
   turns,
   error,
+  stall,
   onSend,
   onSendAudio,
   onInterrupt,
@@ -75,6 +86,22 @@ export function ChatPanel({
       <MessageList messages={messages} isActive={isActive} hasMoreMessages={hasMoreMessages} onLoadMore={onLoadMore} />
       {error && (
         <div className="error-banner">{error}</div>
+      )}
+      {stall && isStreaming && (
+        <div className="stall-banner">
+          <span className="stall-banner-text">
+            {stall.toolName
+              ? `${stall.toolName} has been running for ${formatStallElapsed(stall.elapsedSeconds)} with no response.`
+              : `No response from Claude for ${formatStallElapsed(stall.elapsedSeconds)}.`}
+          </span>
+          <button
+            type="button"
+            className="stall-banner-button"
+            onClick={onInterrupt}
+          >
+            Interrupt
+          </button>
+        </div>
       )}
       <div className="status-bar-container">
         <StatusBar

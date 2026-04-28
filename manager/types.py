@@ -98,6 +98,21 @@ class CompactComplete(Event):
     summary: str = ""  # The summary text generated during compaction
 
 
+@dataclass(frozen=True, slots=True)
+class SessionStalled(Event):
+    """Emitted when the SDK has produced no message for an extended period.
+
+    The underlying stream is *not* aborted — the watchdog is purely advisory
+    so the UI can surface a "this looks stuck" banner with an interrupt
+    affordance.  Repeated emissions while the stall persists carry the
+    cumulative ``elapsed_seconds`` since the last received message.
+    """
+
+    elapsed_seconds: float
+    last_tool_name: str | None = None
+    last_tool_use_id: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Session metadata — used by SessionStore
 # ---------------------------------------------------------------------------

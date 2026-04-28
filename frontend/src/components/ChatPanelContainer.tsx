@@ -139,6 +139,7 @@ function OrchestratorChatPanel({
       cost={instance.cost}
       turns={instance.turns}
       error={instance.error}
+      stall={instance.stall}
       onSend={instance.send}
       onSendAudio={instance.sendAudio}
       onInterrupt={instance.interrupt}
@@ -262,6 +263,7 @@ export function ChatPanelContainer({
                 cost={inst.cost}
                 turns={inst.turns}
                 error={inst.error}
+                stall={inst.stall}
                 onSend={inst.send}
                 onInterrupt={inst.interrupt}
                 onCompact={inst.compact}

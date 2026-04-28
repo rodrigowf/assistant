@@ -122,12 +122,21 @@ from .types import (
     SessionStatus,
     TextComplete,
     TextDelta,
+    SessionStalled,
     ThinkingComplete,
     ThinkingDelta,
     ToolResult,
     ToolUse,
     TurnComplete,
 )
+
+# Stall watchdog: the bundled `claude` subprocess occasionally goes silent
+# mid-tool (e.g. WebFetch waiting on an unresponsive HTTP endpoint with no
+# upstream timeout).  We don't abort — the user may legitimately want to
+# wait on a slow tool — but we do surface a SessionStalled event so the UI
+# can show a "this looks stuck" banner with an interrupt affordance.
+_STALL_FIRST_NOTICE_S = 120.0   # first warning after 2 min of silence
+_STALL_REPEAT_INTERVAL_S = 60.0  # re-emit every minute thereafter
 
 
 def _process_alive(pid: int) -> bool:
@@ -578,6 +587,11 @@ class SessionManager:
 
         Yields ``TextDelta`` for each streaming token, ``ToolUse`` / ``ToolResult``
         for tool interactions, and ``TurnComplete`` at the end.
+
+        While receiving, a stall watchdog yields :class:`SessionStalled`
+        events if the SDK goes silent for an extended period — the stream
+        is *not* aborted (the caller may want to keep waiting), but the UI
+        gets a chance to surface a "looks stuck, interrupt?" banner.
         """
         if self._client is None:
             raise RuntimeError("SessionManager is not connected — call start() first")
@@ -585,12 +599,85 @@ class SessionManager:
         self._status = SessionStatus.STREAMING
         await self._client.query(prompt)
 
-        async for msg in self._client.receive_response():
-            # Skip None messages (from patched parser ignoring unknown types)
-            if msg is None:
-                continue
-            async for event in self._process_message(msg):
-                yield event
+        # Last-tool tracking so the SessionStalled event can name the tool
+        # the SDK was waiting on (the most useful single piece of context
+        # for "what looks stuck").
+        last_tool_name: str | None = None
+        last_tool_use_id: str | None = None
+
+        # We run the SDK receiver in a dedicated task that pushes messages
+        # into a queue.  The watchdog reads from the queue with a short
+        # `wait_for`, which we can safely time out and retry without
+        # disturbing the generator (cancelling `__anext__` directly tears
+        # down the async generator).
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[object] = asyncio.Queue()
+        SENTINEL_DONE = object()
+
+        async def _drain() -> None:
+            try:
+                async for m in self._client.receive_response():
+                    await queue.put(m)
+            except BaseException as exc:  # noqa: BLE001
+                await queue.put(exc)
+            else:
+                await queue.put(SENTINEL_DONE)
+
+        drain_task = asyncio.create_task(_drain(), name="sdk-receive-drain")
+        last_msg_at = loop.time()
+        stall_notified_at: float | None = None
+
+        try:
+            while True:
+                now = loop.time()
+                if stall_notified_at is None:
+                    next_notice_in = max(0.0, _STALL_FIRST_NOTICE_S - (now - last_msg_at))
+                else:
+                    next_notice_in = max(
+                        0.0,
+                        _STALL_REPEAT_INTERVAL_S - (now - stall_notified_at),
+                    )
+
+                try:
+                    msg = await asyncio.wait_for(
+                        queue.get(), timeout=max(next_notice_in, 0.5),
+                    )
+                except asyncio.TimeoutError:
+                    now = loop.time()
+                    yield SessionStalled(
+                        elapsed_seconds=now - last_msg_at,
+                        last_tool_name=last_tool_name,
+                        last_tool_use_id=last_tool_use_id,
+                    )
+                    stall_notified_at = now
+                    continue
+
+                last_msg_at = loop.time()
+                stall_notified_at = None  # reset on any fresh activity
+
+                if msg is SENTINEL_DONE:
+                    break
+                if isinstance(msg, BaseException):
+                    raise msg
+                if msg is None:
+                    # Patched parser ignored an unknown message type.
+                    continue
+
+                async for event in self._process_message(msg):
+                    if isinstance(event, ToolUse):
+                        last_tool_name = event.tool_name
+                        last_tool_use_id = event.tool_use_id
+                    elif isinstance(event, (ToolResult, TurnComplete)):
+                        last_tool_name = None
+                        last_tool_use_id = None
+                    yield event
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+                try:
+                    await drain_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         self._status = SessionStatus.IDLE
 
@@ -918,20 +1005,35 @@ class SessionManager:
                     )
 
         elif isinstance(msg, UserMessage):
-            # User messages with tool_use_result contain tool output
+            # User messages with tool_use_result contain tool output.
+            # The SDK normally hands us a dict, but some tools (notably the
+            # bundled web search/fetch path on certain claude-cli versions)
+            # send the raw stdout as a plain string.  Treat that string as
+            # the output rather than dropping the result silently — losing
+            # a tool_result leaves the UI showing a perpetual spinner.
             if msg.tool_use_result:
                 result = msg.tool_use_result
-                if not isinstance(result, dict):
-                    logger.warning("UserMessage.tool_use_result is not a dict: %r", type(result))
-                    return
-                content = result.get("content", "")
-                if isinstance(content, list):
-                    content = json.dumps(content)
-                yield ToolResult(
-                    tool_use_id=result.get("tool_use_id", ""),
-                    output=str(content),
-                    is_error=result.get("is_error", False),
-                )
+                if isinstance(result, dict):
+                    content = result.get("content", "")
+                    if isinstance(content, list):
+                        content = json.dumps(content)
+                    yield ToolResult(
+                        tool_use_id=result.get("tool_use_id", "")
+                            or (msg.parent_tool_use_id or ""),
+                        output=str(content),
+                        is_error=result.get("is_error", False),
+                    )
+                elif isinstance(result, str):
+                    yield ToolResult(
+                        tool_use_id=msg.parent_tool_use_id or "",
+                        output=result,
+                        is_error=False,
+                    )
+                else:
+                    logger.warning(
+                        "UserMessage.tool_use_result is unsupported type: %r",
+                        type(result),
+                    )
 
         elif isinstance(msg, ResultMessage):
             self._turns += msg.num_turns

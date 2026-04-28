@@ -7,6 +7,7 @@ from typing import Any
 from manager.types import (
     CompactComplete,
     Event,
+    SessionStalled,
     TextComplete,
     TextDelta,
     ThinkingComplete,
@@ -62,6 +63,13 @@ def serialize_event(event: Event) -> dict[str, Any]:
         }
     if isinstance(event, CompactComplete):
         return {"type": "compact_complete", "trigger": event.trigger, "summary": event.summary}
+    if isinstance(event, SessionStalled):
+        return {
+            "type": "session_stalled",
+            "elapsed_seconds": event.elapsed_seconds,
+            "last_tool_name": event.last_tool_name,
+            "last_tool_use_id": event.last_tool_use_id,
+        }
     return {"type": "unknown"}
 
 

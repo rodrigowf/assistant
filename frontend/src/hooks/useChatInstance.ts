@@ -18,6 +18,15 @@ import { getMessagesPaginated } from "../api/rest";
 // Context window sizes (tokens) — used to compute usage percentage
 const CONTEXT_WINDOW = 200_000; // Claude models (conservative default)
 
+interface StallState {
+  /** Seconds since the SDK last produced a message in the active turn. */
+  elapsedSeconds: number;
+  /** Tool the SDK appears stuck on, if known. */
+  toolName: string | null;
+  /** Tool-use id the SDK appears stuck on, if known. */
+  toolUseId: string | null;
+}
+
 interface ChatState {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -26,6 +35,8 @@ interface ChatState {
   turns: number;
   error: string | null;
   contextTokens: number; // latest input_tokens count
+  /** Set when the backend has reported a stall on the in-flight turn. */
+  stall: StallState | null;
 }
 
 const INITIAL_STATE: ChatState = {
@@ -36,6 +47,7 @@ const INITIAL_STATE: ChatState = {
   turns: 0,
   error: null,
   contextTokens: 0,
+  stall: null,
 };
 
 // -------------------------------------------------------------------
@@ -57,6 +69,7 @@ type Action =
   | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string; inputTokens?: number }
   | { type: "COMPACT_COMPLETE"; summary: string }
   | { type: "STATUS"; status: SessionStatus }
+  | { type: "STALL"; elapsedSeconds: number; toolName: string | null; toolUseId: string | null }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
   | { type: "VOICE_ASSISTANT_DELTA"; text: string }
@@ -231,6 +244,7 @@ function reducer(state: ChatState, action: Action): ChatState {
       return {
         ...state,
         status: "tool_use",
+        stall: null,
         messages: updateLastAssistantBlock(state.messages, (blocks) => [
           ...blocks,
           {
@@ -246,6 +260,7 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "TOOL_RESULT":
       return {
         ...state,
+        stall: null,
         messages: updateLastAssistantBlock(state.messages, (blocks) =>
           blocks.map((b) =>
             b.type === "tool_use" && b.toolUseId === action.toolUseId
@@ -259,6 +274,7 @@ function reducer(state: ChatState, action: Action): ChatState {
       return {
         ...state,
         status: "idle",
+        stall: null,
         cost: state.cost + (action.cost ?? 0),
         turns: state.turns + action.turns,
         sessionId: action.sessionId || state.sessionId,
@@ -281,6 +297,16 @@ function reducer(state: ChatState, action: Action): ChatState {
 
     case "STATUS":
       return { ...state, status: action.status };
+
+    case "STALL":
+      return {
+        ...state,
+        stall: {
+          elapsedSeconds: action.elapsedSeconds,
+          toolName: action.toolName,
+          toolUseId: action.toolUseId,
+        },
+      };
 
     case "ERROR":
       return { ...state, error: action.error };
@@ -334,6 +360,15 @@ function reducer(state: ChatState, action: Action): ChatState {
 // Hook
 // -------------------------------------------------------------------
 
+export interface StallInfo {
+  /** Seconds since the SDK last produced a message in the active turn. */
+  elapsedSeconds: number;
+  /** Tool the SDK appears stuck on, if known. */
+  toolName: string | null;
+  /** Tool-use id the SDK appears stuck on, if known. */
+  toolUseId: string | null;
+}
+
 export interface ChatInstance {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -342,6 +377,8 @@ export interface ChatInstance {
   cost: number;
   turns: number;
   error: string | null;
+  /** Set when the backend reports a stall on the in-flight turn. */
+  stall: StallInfo | null;
   /** Context usage as a percentage of the context window (0–100). */
   contextUsage: number;
   /** Currently selected MCP server names */
@@ -495,6 +532,14 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "compact_complete":
         dispatch({ type: "COMPACT_COMPLETE", summary: (event.summary as string) || "" });
+        break;
+      case "session_stalled":
+        dispatch({
+          type: "STALL",
+          elapsedSeconds: (event as { elapsed_seconds?: number }).elapsed_seconds ?? 0,
+          toolName: (event as { last_tool_name?: string | null }).last_tool_name ?? null,
+          toolUseId: (event as { last_tool_use_id?: string | null }).last_tool_use_id ?? null,
+        });
         break;
       case "status":
         dispatch({ type: "STATUS", status: event.status as SessionStatus });
@@ -761,6 +806,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     cost: state.cost,
     turns: state.turns,
     error: state.error,
+    stall: state.stall,
     contextUsage,
     selectedMcps,
     hasMoreMessages,

@@ -10,6 +10,7 @@ from manager.config import ManagerConfig
 from manager.session import SessionManager
 from manager.types import (
     CompactComplete,
+    SessionStalled,
     SessionStatus,
     TextComplete,
     TextDelta,
@@ -576,6 +577,128 @@ class TestSessionManagerSend:
         tool_results = [e for e in events if isinstance(e, ToolResult)]
         assert len(tool_results) == 1
         assert tool_results[0].output == "command output"
+
+    @pytest.mark.asyncio
+    async def test_tool_result_from_user_message_string_content(self):
+        """UserMessage with a string tool_use_result still yields ToolResult.
+
+        Regression: some claude-cli versions hand the bundled web tools'
+        output back as a plain string rather than the documented dict.  The
+        old code logged a warning and dropped the message, leaving the UI
+        spinning forever.  Now we preserve the string as the tool output
+        and recover the tool_use_id from parent_tool_use_id.
+        """
+        from claude_agent_sdk import SystemMessage, UserMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        user_msg = UserMessage(
+            content="",
+            uuid="u1",
+            parent_tool_use_id="tool_xyz",
+            tool_use_result="raw stdout from web tool",
+        )
+        result = _mock_result()
+
+        async def fake_response():
+            yield user_msg
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            events = []
+            async for event in sm.send("run"):
+                events.append(event)
+
+        tool_results = [e for e in events if isinstance(e, ToolResult)]
+        assert len(tool_results) == 1
+        assert tool_results[0].output == "raw stdout from web tool"
+        assert tool_results[0].tool_use_id == "tool_xyz"
+        assert tool_results[0].is_error is False
+
+
+class TestSessionManagerStallWatchdog:
+    @pytest.mark.asyncio
+    async def test_stall_event_emitted_when_sdk_goes_silent(self):
+        """SessionStalled is yielded when receive_response stalls past the
+        first-notice threshold; the underlying stream is not aborted.
+
+        The SDK fixture below blocks indefinitely between a ToolUse and
+        the eventual ResultMessage.  We monkey-patch the threshold down
+        so the test runs in milliseconds rather than minutes.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            ToolUseBlock,
+        )
+        import manager.session as session_mod
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        tool_use_msg = AssistantMessage(
+            model="claude-test",
+            content=[
+                ToolUseBlock(
+                    id="toolu_stuck", name="WebFetch",
+                    input={"url": "https://hung.example.com"},
+                ),
+            ],
+            parent_tool_use_id=None,
+        )
+        result = _mock_result()
+
+        # Tiny thresholds so the watchdog fires in test time.
+        original_first = session_mod._STALL_FIRST_NOTICE_S
+        original_repeat = session_mod._STALL_REPEAT_INTERVAL_S
+        session_mod._STALL_FIRST_NOTICE_S = 0.1
+        session_mod._STALL_REPEAT_INTERVAL_S = 0.1
+
+        try:
+            unblock = asyncio.Event()
+
+            async def fake_response():
+                yield tool_use_msg
+                # Hold the stream open with no events — this is the stall.
+                # The test will set unblock once it has observed a stall.
+                await unblock.wait()
+                yield result
+
+            client = _make_mock_client([init_msg], fake_response)
+
+            with patch("manager.session.ClaudeSDKClient", return_value=client):
+                sm = SessionManager()
+                await sm.start()
+
+                stall_events: list[SessionStalled] = []
+                tool_uses: list[ToolUse] = []
+                turn_completes: list[TurnComplete] = []
+
+                async for event in sm.send("research"):
+                    if isinstance(event, ToolUse):
+                        tool_uses.append(event)
+                    elif isinstance(event, SessionStalled):
+                        stall_events.append(event)
+                        # Once we have at least one stall notice, unblock
+                        # the SDK so the turn can finish and the loop exits.
+                        if not unblock.is_set():
+                            unblock.set()
+                    elif isinstance(event, TurnComplete):
+                        turn_completes.append(event)
+        finally:
+            session_mod._STALL_FIRST_NOTICE_S = original_first
+            session_mod._STALL_REPEAT_INTERVAL_S = original_repeat
+
+        # We saw the in-flight tool, then at least one stall notice
+        # naming it, then the eventual TurnComplete.
+        assert len(tool_uses) == 1
+        assert len(stall_events) >= 1
+        assert stall_events[0].last_tool_name == "WebFetch"
+        assert stall_events[0].last_tool_use_id == "toolu_stuck"
+        assert stall_events[0].elapsed_seconds > 0
+        assert len(turn_completes) == 1
 
 
 class TestSessionManagerCostTracking:

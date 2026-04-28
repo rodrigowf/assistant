@@ -1704,6 +1704,38 @@ pre.field-value {
   border-top: 1px solid rgba(224, 92, 92, 0.18);
 }
 
+.stall-banner {
+  padding: 8px 16px;
+  background: rgba(214, 158, 46, 0.14);
+  color: #d69e2e;
+  font-size: 0.82rem;
+  border-top: 1px solid rgba(214, 158, 46, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stall-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.stall-banner-button {
+  padding: 4px 12px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.stall-banner-button:hover {
+  background: rgba(214, 158, 46, 0.18);
+}
+
 /* ============================================================
    Auth gate
    ============================================================ */

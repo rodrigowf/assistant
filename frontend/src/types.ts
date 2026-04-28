@@ -55,6 +55,7 @@ export type ServerEvent =
   | { type: "nested_session_event"; session_id: string; event_type: string; event_data: Record<string, unknown> }
   | { type: "turn_complete"; cost?: number | null; usage?: Record<string, unknown>; num_turns?: number; session_id?: string; is_error?: boolean; result?: string | null; input_tokens?: number; output_tokens?: number }
   | { type: "compact_complete"; trigger: string; summary?: string }
+  | { type: "session_stalled"; elapsed_seconds: number; last_tool_name: string | null; last_tool_use_id: string | null }
   | { type: "status"; status: string }
   | { type: "error"; error: string; detail?: string }
   | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }
