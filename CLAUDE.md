@@ -90,6 +90,19 @@ Start the frontend: `cd frontend && npm run dev`
 
 Or use `/debug-app` which handles both and provides browser automation.
 
+**Dual-Machine Setup:** The assistant runs on two machines with the same codebase but different paths:
+
+| Machine | Path | IP | Role |
+|---------|------|----|------|
+| **Laptop** (Desktop) | `/home/rodrigo/Projects/assistant/` | 192.168.0.28 | Primary development, heavier workloads |
+| **Jetson Nano** (Server) | `/home/rodrigo/assistant/` | 192.168.0.200 | 24/7 backend, serves all peripherals |
+
+You may be running on either machine at any given time. Determine which one by checking the working directory path. Both installations track the same git branch (`local`) and stay in sync. After making changes on one machine, sync to the other via git push/pull. The `context/` folder (conversations, memory, skills) is synced in real time via the `context-sync` systemd service (see below).
+
+**SSH Remote Execution:** The backend can spawn Claude Code sessions on a remote machine over SSH. When a working directory in `assistant_config.json` has `ssh_host`/`ssh_user` fields, `SessionManager` generates a shell wrapper script that SSHes into the remote machine, sets `CLAUDE_CONFIG_DIR`, and runs `claude` there. SSH multiplexing (`ControlMaster`) reuses connections. All SDK flags are single-quoted and expanded locally to avoid the SSH quoting bug (SSH space-joins arguments). See `context/memory/ssh-remote-execution.md` for the full design.
+
+**Context Sync:** The `context/` folder is synced in real time between Laptop and Jetson via the `context-sync` systemd user service (`inotifywait` + `rsync` over SSH). Changes on either side propagate within ~2 seconds. Both machines run the service simultaneously (last-write-wins). For versioned code changes (application code, memory, skills), commit and push via git manually, then pull on the other machine. See `sync/README.md` and `context/memory/server_hub_project.md`.
+
 ### Peripheral Frontends
 
 The assistant supports multiple frontend surfaces beyond the main web interface:
@@ -102,6 +115,21 @@ The assistant supports multiple frontend surfaces beyond the main web interface:
 - APK output: `app/build/outputs/apk/debug/app-debug.apk`
 - Use `/android-dev` for building, deploying, and debugging
 - See `context/memory/android_peripheral_project.md` for full documentation
+
+### Devices & Peripherals
+
+A variety of physical devices are integrated into the assistant environment, each with a specific role:
+
+| Device | Role | Details |
+|--------|------|---------|
+| **Jetson Nano Server** | Primary server hub | IP: 192.168.0.200. Hosts orchestrator, backend services, web frontend. Central node for all agent sessions. |
+| **Samsung Galaxy A300M** | Dedicated assistant terminal | Android 5.0.2. Runs AssistantPeripheral app for voice input/output, wake word detection, mic gain control. Permanent assistant interface. |
+| **iPad Mini 2** | Visual peripheral | Safari 12. Served by `/compat/` frontend. Stationary visual interaction device. Sends console logs to backend for remote debugging. |
+| **Fire TV Stick** | Large-screen display | Connected via ADB. Displays visualizations, launches apps, streams media. Controlled via `/tv-remote`, `/create-viz`, `/connect-tv`. |
+| **Primary Android Phone** | Mobile assistant access | User's personal device for on-the-go interaction. Has social media apps (Instagram, TikTok); automation requires explicit user intent. |
+| **iPhone** | Media capture device | Runs a local photo server (Pythonista) exposing the media library over the network. Accessible via `/iphone-photos`. |
+
+Full details: `context/memory/peripheral_devices.md` and related project files.
 
 ### Memory System
 
@@ -148,6 +176,17 @@ Both memory and conversation history are indexed for search via `/recall <query>
 - History: Indexed every 2 minutes (if changed)
 
 **Note**: `.claude_config/projects/<mangled>/` symlinks to `context/` for SDK compatibility.
+
+**Memory navigation:**
+
+Navigate the memory hierarchy recursively:
+- `MEMORY.md` → references detailed topic files
+- `context/memory/personal_projects_index.md` → lists all personal projects with dedicated memory files
+- Project memory file → may contain nested references to sub-topics
+
+When the user asks to remember something or retrieve memory, prefer **direct file lookup** over automated search. Read `MEMORY.md` to identify relevant files, then read those files directly. The `search_memory` / `/recall` tool is useful for broad searches but may not capture the full structured context. Use direct file reading as the primary approach and search as a supplement.
+
+**Server memory reference:** `context/memory/server_memory.md` consolidates the Jetson Nano setup, peripherals, Fire TV integration, and orchestrator tab roles. Refer to this file when reasoning about the server context.
 
 ### Voice Mode (Realtime)
 
@@ -242,6 +281,92 @@ Mock external dependencies with `unittest.mock`.
 ### Browser Automation
 
 Chrome DevTools MCP provides full browser control. Use `/debug-app` for integrated frontend testing.
+
+### Skills & Integrations
+
+**YouTube API Integration** — The `/youtube` skill provides full YouTube Data API access:
+- Search playlists, list subscriptions, manage videos
+- Execute any YouTube Data API operation via pre-built scripts or custom Python code
+- Scripts library in `context/scripts/` (e.g., `youtube_search_playlists.py`, `youtube_api.py`)
+- Can integrate with TV control to play videos on the television
+
+**Television Control** — Full Fire TV control via skills:
+- `/tv-remote` — Remote control: media controls, volume, navigation, launch/close apps, display web pages
+- `/connect-tv` — Automatic discovery and ADB connection to the TV (critical for connection setup)
+- `/create-viz` — Create and display interactive HTML visualizations on Fire TV
+
+The `/tv-dev` skill is primarily for advanced Fire TV app development (app debugging, deployment) and is secondary to core TV control.
+
+**Visualization Control** — Create dynamic infographics, charts, and interactive visuals via `/create-viz`. Can integrate with TV control to display visualizations directly on the Fire TV.
+
+**Photo Server Integrations:**
+- **iOS Photo Server**: Connect to the iPhone photo server (running via Pythonista) to list and download media. Use `/iphone-photos`.
+- **Android Photo Server**: Connect to the Android media server to access the device's photo and video library. See `context/memory/android_photo_server_project.md`.
+
+**Image Generation** — Generate images from text descriptions using Google's Nano Banana (Gemini Image) API via `/generate-image`.
+
+### Orchestration Behavior
+
+When delegating tasks to agent sessions, ensure the related skills and context are loaded:
+- **YouTube tasks**: Load the YouTube API Manager skill
+- **TV control tasks** (media playback, navigation): Load the TV remote control skill
+- **Visualization tasks**: Load the visualization skill
+- **Fire TV app debugging** (advanced): Load the TV dev skill
+- **Media library tasks** (iOS/Android photo servers): Reference the relevant project knowledge (`ios_photo_server_project.md` or `android_photo_server_project.md`)
+
+When handling TV requests: reuse an open session if relevant, search history for a past TV session to resume, or create a new one only if needed.
+
+### Tracked Projects
+
+Active projects with dedicated memory files:
+
+1. Television Integration Project
+2. Server Hub Project
+3. QVCM Hypothesis Project
+4. Home Automation Project
+5. Personal Biography Project
+6. Content Creation / Music Production Project
+7. iOS Photo Server Project — iPhone photo server exposing media library over local network
+8. Android Photo Server Project — Android photo server exposing media library over local network
+
+See `context/memory/personal_projects_index.md` for full details and dedicated memory files.
+
+### User Context
+
+Rodrigo Werneck Franco is the primary user: a senior full-stack web developer, AI researcher, and the creator of this assistant environment. He lives in Rio de Janeiro and works remotely for HotMike, a U.S. software-as-a-service company. Rodrigo has a computer science degree from UFRJ and is highly skilled in software engineering and AI. He prefers to remain in control of AI processes, directing models to achieve exact results. He has multiple parallel projects (coding, finance, political modeling, physics hypotheses) and treats the assistant as a collaborative partner and evolving digital companion.
+
+Detailed personal context: `context/memory/rodrigo_personal_context.md`.
+
+### Current App State (April 2026)
+
+| Component | Status |
+|-----------|--------|
+| **Android App** | WebRTC voice with software AEC, echo prevention via mic gain, auto-backend discovery, reconnect fixes |
+| **Main Frontend** | Legacy browser support, message pagination, low-end device detection, remote console debugging, UI polish |
+| **Compat Frontend** | React 18 build, Safari 12/iOS 12 compatible, shims for unsupported features, served at `/compat/`, remote logs to backend |
+
+**Recent Android App changes:**
+- Microphone gain control with Fibonacci steps (0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 100, 150, 200%)
+- Network scanner for automatic backend discovery on local network
+- Software-only AEC enabled, hardware AEC disabled
+- Session reconnection fixes: JSONL session ID tracking, voice session context restoration
+- Voice `session.update` passthrough for OpenAI voice context
+- UI polish: improved chat bubbles, input bar design, padding adjustments
+
+**Recent Main Frontend changes:**
+- Legacy browser support (Safari 12+, iOS 12+) with `@vitejs/plugin-legacy`
+- Remote console debugging: console logs sent to backend for devices without dev tools
+- Message pagination: scroll-to-load older messages with smooth scroll restoration
+- Low-end device detection: disables animations on devices with <=2 cores or <=1GB RAM
+- Voice button moved to chat input bar for cleaner layout
+- UI/UX polish: larger tabs, refined layout tokens, improved sidebar and top bar spacing
+
+**Recent Compat Frontend changes:**
+- New `frontend-compat/` directory: separate React 18 build for Safari 12/iOS 12
+- Shares core components from main frontend, with shims for unsupported features
+- Remote console debugging: intercepts console logs/warnings/errors and uncaught exceptions, sends to backend prefixed with `[compat]`
+
+**Comprehensive features summary:** `context/memory/features_and_integrations_summary.md`
 
 ### Compact Instructions
 

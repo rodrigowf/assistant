@@ -72,6 +72,22 @@ async def lifespan(app: FastAPI):
     prewarm_task = asyncio.create_task(_prewarm_sessions())
     app.state.prewarm_task = prewarm_task
 
+    # Pre-warm the search server so the embedding model is already loaded
+    # when the first search_memory/search_history call arrives (~100s on Jetson).
+    async def _prewarm_search_server() -> None:
+        try:
+            from orchestrator.tools.search import _ensure_server
+            proc = await _ensure_server()
+            if proc is not None:
+                logger.info("Search server pre-warmed (PID %d)", proc.pid)
+            else:
+                logger.warning("Search server pre-warm failed (will retry on first query)")
+        except Exception:
+            logger.exception("Search server pre-warm failed")
+
+    search_prewarm_task = asyncio.create_task(_prewarm_search_server())
+    app.state.search_prewarm_task = search_prewarm_task
+
     try:
         yield
     finally:
@@ -90,12 +106,20 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Error draining session pool on shutdown")
 
+        # Shut down the warm search server subprocess
+        try:
+            from orchestrator.tools.search import shutdown_server
+            await shutdown_server()
+        except Exception:
+            logger.exception("Error shutting down search server")
+
         memory_watcher.stop()
         history_indexer.stop()
         memory_task.cancel()
         history_task.cancel()
         prewarm_task.cancel()
-        for task in [memory_task, history_task, prewarm_task]:
+        search_prewarm_task.cancel()
+        for task in [memory_task, history_task, prewarm_task, search_prewarm_task]:
             try:
                 await task
             except asyncio.CancelledError:
