@@ -25,16 +25,35 @@ async def chat_ws(ws: WebSocket):
     # Task currently streaming a response (send/compact/command), if any
     stream_task: asyncio.Task | None = None
 
-    async def _cancel_stream() -> None:
-        """Cancel the active stream task and wait for it to finish."""
+    async def _cancel_stream() -> bool:
+        """Cancel the active stream task; return True if there was one to cancel."""
         nonlocal stream_task
-        if stream_task is not None and not stream_task.done():
+        had_task = stream_task is not None and not stream_task.done()
+        if had_task:
             stream_task.cancel()
             try:
                 await stream_task
             except (asyncio.CancelledError, Exception):
                 pass
         stream_task = None
+        return had_task
+
+    async def _interrupt_if_orphaned() -> None:
+        """If this WS was the last subscriber and a turn was in flight, send the
+        SDK a real interrupt so the bundled `claude` subprocess doesn't sit
+        burning CPU waiting for events nobody will consume.
+
+        Without this, a browser disconnect mid-turn (refresh, sleep, network
+        blip) leaves the SDK hung — it had been streaming events to a now-dead
+        consumer and never gets the signal that the turn should end.  Only
+        interrupts when subscriber_count drops to zero, so other tabs watching
+        the same session aren't disrupted.
+        """
+        if session_id and pool.subscriber_count(session_id) == 0:
+            try:
+                await pool.interrupt(session_id)
+            except Exception:
+                logger.exception("Failed to interrupt orphaned session %s", session_id)
 
     try:
         while True:
@@ -120,9 +139,11 @@ async def chat_ws(ws: WebSocket):
                 )
 
             elif msg_type == "stop":
-                await _cancel_stream()
+                had_stream = await _cancel_stream()
                 if session_id:
                     pool.unsubscribe(session_id, ws)
+                    if had_stream:
+                        await _interrupt_if_orphaned()
                 sm = None
                 session_id = None
                 await ws.send_bytes(orjson.dumps({"type": "session_stopped"}))
@@ -136,9 +157,11 @@ async def chat_ws(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        await _cancel_stream()
+        had_stream = await _cancel_stream()
         if session_id:
             pool.unsubscribe(session_id, ws)
+            if had_stream:
+                await _interrupt_if_orphaned()
 
 
 async def _handle_start(
