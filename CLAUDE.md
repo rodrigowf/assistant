@@ -97,7 +97,7 @@ Or use `/debug-app` which handles both and provides browser automation.
 | **Laptop** (Desktop) | `/home/rodrigo/Projects/assistant/` | 192.168.0.28 | Primary development, heavier workloads |
 | **Jetson Nano** (Server) | `/home/rodrigo/assistant/` | 192.168.0.200 | 24/7 backend, serves all peripherals |
 
-You may be running on either machine at any given time. Determine which one by checking the working directory path. Both installations track the same git branch (`local`) and stay in sync. After making changes on one machine, sync to the other via git push/pull. The `context/` folder (conversations, memory, skills) is synced in real time via the `context-sync` systemd service (see below).
+You may be running on either machine at any given time. Determine which one by checking the working directory path. Both installations stay in sync via git push/pull for code and via the `context-sync` systemd service for `context/` (conversations, memory, skills). The `local` branch is the default trunk both machines come back to after parallel feature work — but at any given moment either machine may be on a feature branch (`permissions`, etc.) for development. Always check `git branch --show-current` before assuming branch state; do not assume both machines are on the same branch.
 
 **SSH Remote Execution:** The backend can spawn Claude Code sessions on a remote machine over SSH. When a working directory in `assistant_config.json` has `ssh_host`/`ssh_user` fields, `SessionManager` generates a shell wrapper script that SSHes into the remote machine, sets `CLAUDE_CONFIG_DIR`, and runs `claude` there. SSH multiplexing (`ControlMaster`) reuses connections. All SDK flags are single-quoted and expanded locally to avoid the SSH quoting bug (SSH space-joins arguments). See `context/memory/ssh-remote-execution.md` for the full design.
 
@@ -270,6 +270,36 @@ Frontend WebSocket → api/routes/orchestrator.py → OrchestratorSession.send()
   → Events broadcast via SessionPool.broadcast_orchestrator()
 ```
 
+### Fire-and-Forget Agent Turns
+
+The orchestrator delegates work to chat sessions through `orchestrator/runner.py` (`BackgroundAgentRunner`) instead of awaiting `pool.send()` inline. The runner owns one `asyncio.Task` per in-flight agent turn, buffers events in a per-turn ring for `peek_agent_session`, and pushes one terminal `Notification` per turn (succeeded / failed / cancelled / timeout) onto a `NotificationQueue`. The orchestrator drains the queue at the top of each turn and prepends the notifications as `[SESSION xxx event: ...]` lines to the prompt the LLM sees, so the model can react to background completions even though it is not blocking on them.
+
+- `send_to_agent_session` returns immediately with `{turn_id, session_id, status: "running", started_at}`. Concurrent fan-out to multiple sessions is parallel; two calls to the same session serialize naturally inside `pool.send()`'s per-session lock.
+- `peek_agent_session` reads the live ring buffer of an in-flight turn (text deltas, tool_use, tool_result, permission events). `read_agent_session` reads the persisted JSONL — use peek for "is it making progress?" and read for the canonical record.
+- `interrupt_agent_session` cancels a running turn (with SDK interrupt so the bundled `claude` actually stops). `respond_to_agent_permission` answers a pending permission on a delegated session.
+- `OrchestratorSession._busy_lock` (exposed via the `is_busy` property) wraps every `send()` / `send_audio()` body. The wake callback installed by `api/routes/orchestrator.py` consults `is_busy` and schedules a synthetic empty-prompt turn only when the orchestrator is idle — so a notification arriving mid-turn just queues for the next drain. If you add a new wake source, gate it the same way. Voice mode skips the synthetic wake (notifications still drain on the next text turn).
+- Each drained notification is persisted as a `background_notification` JSONL entry tied to the originating `tool_use_id`, so a fire-and-forget run is replayable.
+
+### Permission Gating
+
+The bundled Claude Code CLI fires a permission gate for tools like `ExitPlanMode`. `SessionManager` wires the SDK `can_use_tool` callback: tools in `_DEFAULT_GATED_TOOLS` (currently `{"ExitPlanMode"}`) emit a `PermissionRequest` event into the active `send()` stream and await an `asyncio.Future`; anything else auto-allows. `permission_mode` is `"default"` so the SDK actually invokes the callback.
+
+**Conversational checkpoint design** — the popup is a backstop, not the primary mechanism. `manager/session.py` appends `_PERMISSION_GATING_PROMPT` to the bundled Claude Code system prompt instructing the agent to announce its intent in chat *before* calling a gated tool. The user (or orchestrator) guides with prose; the popup remains as the formal yes/no path.
+
+- Frontend (`useChatInstance` + `PermissionModal`): per-tab `pendingPermission` state. The user can Approve, Reject, or just type a chat message — typing resolves all pending permissions on that session as `deny` with the prose as the rejection reason (`api/routes/chat.py`), then sends the message normally. The agent receives both signals and refines.
+- Orchestrator: permission events are mirrored to `broadcast_orchestrator` as `nested_session_event`, and the orchestrator can answer via the `respond_to_agent_permission` tool. First write wins between user and orchestrator; the loser's modal closes via the broadcast.
+- The plan text from `ExitPlanMode` is pushed into the conversation as a normal assistant text block. `permission_request` / `permission_resolved` are broadcast over the WebSocket (driving modal lifecycle) but are not written as dedicated JSONL entries — the persisted record is the orchestrator's `background_notification` line plus the agent's own JSONL events.
+
+### Stall Watchdog
+
+When the bundled `claude` subprocess goes silent mid-tool (most often `WebFetch` waiting on an unresponsive endpoint), the SDK never emits a `ResultMessage`. `SessionManager.send()` drains the SDK receiver via a worker task and pulls from a queue with `asyncio.wait_for`; on timeout it yields a `SessionStalled` event naming the in-flight tool, then keeps waiting. First notice at 120s of silence, repeats every 60s. The frontend shows a yellow banner above the input with an Interrupt button while a stall is reported and the session is still streaming. `SessionStalled` is advisory — it does NOT abort the stream.
+
+The send loop also recovers from a related SDK bug: some `claude-cli` versions deliver bundled-tool output as a plain string instead of the documented dict. The old code dropped the `ToolResult` entirely and left the UI's tool block stuck on "running"; the loop now treats the string as the tool output and recovers `tool_use_id` from `parent_tool_use_id` on the `UserMessage`.
+
+### Warm Search Server
+
+Loading PyTorch + sentence-transformers + the embedding model takes ~100s on the Jetson, so `default-scripts/search-server.py` runs as a persistent subprocess that loads the model once and serves queries over stdin/stdout (JSON-line protocol). `orchestrator/tools/search.py` manages the singleton with auto-recovery and a cold fallback. The server is pre-warmed during API startup (`api/app.py`) so the first query is fast too. `default-scripts/run.sh` sets `LD_PRELOAD=libgomp.so.1` on aarch64 to fix the "cannot allocate memory in static TLS block" ImportError. Searches went from ~68–103s to ~1–3s.
+
 ### Testing
 
 Run the full suite: `context/scripts/run.sh -m pytest tests/ -v`
@@ -360,6 +390,7 @@ Detailed personal context: `context/memory/rodrigo_personal_context.md`.
 - Low-end device detection: disables animations on devices with <=2 cores or <=1GB RAM
 - Voice button moved to chat input bar for cleaner layout
 - UI/UX polish: larger tabs, refined layout tokens, improved sidebar and top bar spacing
+- `PermissionModal` component (`frontend/src/components/PermissionModal.tsx`): per-tab Approve/Reject popup for gated tools, driven by `pendingPermission` state in `useChatInstance`. See "Permission Gating".
 
 **Recent Compat Frontend changes:**
 - New `frontend-compat/` directory: separate React 18 build for Safari 12/iOS 12
