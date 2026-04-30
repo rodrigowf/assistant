@@ -140,6 +140,8 @@ function OrchestratorChatPanel({
       turns={instance.turns}
       error={instance.error}
       stall={instance.stall}
+      pendingPermission={instance.pendingPermission}
+      onRespondToPermission={instance.respondToPermission}
       onSend={instance.send}
       onSendAudio={instance.sendAudio}
       onInterrupt={instance.interrupt}
@@ -264,6 +266,8 @@ export function ChatPanelContainer({
                 turns={inst.turns}
                 error={inst.error}
                 stall={inst.stall}
+                pendingPermission={inst.pendingPermission}
+                onRespondToPermission={inst.respondToPermission}
                 onSend={inst.send}
                 onInterrupt={inst.interrupt}
                 onCompact={inst.compact}

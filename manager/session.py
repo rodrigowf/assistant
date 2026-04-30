@@ -115,10 +115,18 @@ def _patch_sdk_message_parser():
 
 _patch_sdk_message_parser()
 
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
+
 from .config import ManagerConfig
 from .types import (
     CompactComplete,
     Event,
+    PermissionRequest,
+    PermissionResolved,
     SessionStatus,
     TextComplete,
     TextDelta,
@@ -129,6 +137,12 @@ from .types import (
     ToolUse,
     TurnComplete,
 )
+
+# Tools that require explicit user (or orchestrator) approval before the SDK
+# is allowed to run them.  Everything else auto-allows in our `can_use_tool`
+# callback — equivalent to `bypassPermissions` for those tools, but with the
+# popup hook still wired so the set can grow without code changes.
+_DEFAULT_GATED_TOOLS: frozenset[str] = frozenset({"ExitPlanMode"})
 
 # Stall watchdog: the bundled `claude` subprocess occasionally goes silent
 # mid-tool (e.g. WebFetch waiting on an unresponsive HTTP endpoint with no
@@ -329,6 +343,16 @@ class SessionManager:
         # to None after a successful clean exit lets stop() distinguish
         # "process already gone" from "we should kill it".
         self._subprocess_pid: int | None = None
+        # Permission-gating state.  ``_pending_permissions`` holds an
+        # asyncio.Future per in-flight ``can_use_tool`` request; whichever
+        # responder (UI or orchestrator) wins resolves the future first and
+        # the loser is a no-op (first-write-wins).  ``_event_inbox`` is used
+        # by the SDK control task to inject ``PermissionRequest`` /
+        # ``PermissionResolved`` events into the active ``send()`` stream
+        # without racing the SDK receiver.
+        self._gated_tools: set[str] = set(_DEFAULT_GATED_TOOLS)
+        self._pending_permissions: dict[str, asyncio.Future[tuple[str, str | None, str]]] = {}
+        self._event_inbox: asyncio.Queue[Event] | None = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -612,6 +636,10 @@ class SessionManager:
         # down the async generator).
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[object] = asyncio.Queue()
+        # Expose the same queue to the can_use_tool callback so it can inject
+        # PermissionRequest / PermissionResolved events into the live stream
+        # without a second drain task or out-of-order delivery.
+        self._event_inbox = queue
         SENTINEL_DONE = object()
 
         async def _drain() -> None:
@@ -662,6 +690,10 @@ class SessionManager:
                 if msg is None:
                     # Patched parser ignored an unknown message type.
                     continue
+                if isinstance(msg, Event):
+                    # Out-of-band event injected by can_use_tool — yield as-is.
+                    yield msg
+                    continue
 
                 async for event in self._process_message(msg):
                     if isinstance(event, ToolUse):
@@ -678,6 +710,13 @@ class SessionManager:
                     await drain_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            # Stop accepting injected events; cancel any orphan permissions so
+            # the SDK doesn't leak a future that nothing will ever resolve.
+            self._event_inbox = None
+            for rid, fut in list(self._pending_permissions.items()):
+                if not fut.done():
+                    fut.set_result(("deny", "stream ended", "system"))
+                self._pending_permissions.pop(rid, None)
 
         self._status = SessionStatus.IDLE
 
@@ -736,11 +775,87 @@ class SessionManager:
     # Internals
     # ------------------------------------------------------------------
 
+    async def _can_use_tool(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        _context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """SDK permission callback — auto-allow everything except gated tools.
+
+        For gated tools (e.g. ``ExitPlanMode``) we emit a ``PermissionRequest``
+        event onto the active send-stream and await a Future resolved by
+        :meth:`resolve_permission`.  No active stream → auto-allow rather than
+        deadlock (an out-of-band tool call shouldn't be silently blocked).
+        """
+        if tool_name not in self._gated_tools:
+            return PermissionResultAllow()
+
+        inbox = self._event_inbox
+        if inbox is None:
+            logger.warning(
+                "can_use_tool fired for %s but no active send() stream — auto-allowing",
+                tool_name,
+            )
+            return PermissionResultAllow()
+
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, str | None, str]] = loop.create_future()
+        self._pending_permissions[request_id] = future
+
+        await inbox.put(
+            PermissionRequest(
+                request_id=request_id,
+                tool_name=tool_name,
+                tool_input=dict(tool_input),
+            )
+        )
+
+        try:
+            decision, message, responder = await future
+        finally:
+            self._pending_permissions.pop(request_id, None)
+
+        await inbox.put(
+            PermissionResolved(
+                request_id=request_id,
+                decision=decision,
+                responder=responder,
+                message=message,
+            )
+        )
+
+        if decision == "allow":
+            return PermissionResultAllow()
+        return PermissionResultDeny(message=message or "Denied", interrupt=False)
+
+    def resolve_permission(
+        self,
+        request_id: str,
+        decision: str,
+        *,
+        message: str | None = None,
+        responder: str = "user",
+    ) -> bool:
+        """Answer a pending ``PermissionRequest``. First call wins; later calls
+        return ``False`` so callers can detect they lost the race (the UI
+        should still close its modal in that case)."""
+        future = self._pending_permissions.get(request_id)
+        if future is None or future.done():
+            return False
+        future.set_result((decision, message, responder))
+        return True
+
+    def pending_permission_ids(self) -> list[str]:
+        return [rid for rid, fut in self._pending_permissions.items() if not fut.done()]
+
     def _build_options(self) -> ClaudeAgentOptions:
         """Build SDK options from our config."""
         kwargs: dict = {
             "include_partial_messages": True,
             "setting_sources": ["project", "local"],
+            "can_use_tool": self._can_use_tool,
         }
         if self._config.permission_mode:
             kwargs["permission_mode"] = self._config.permission_mode

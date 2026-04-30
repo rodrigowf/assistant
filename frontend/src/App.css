@@ -2014,6 +2014,51 @@ pre.field-value {
 }
 
 /* ============================================================
+   Permission Modal — generic Approve/Reject for can_use_tool
+   ============================================================ */
+
+.permission-modal {
+  max-width: 520px;
+}
+
+.permission-modal-input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin: 12px 0;
+  font-size: 0.78rem;
+  color: var(--text);
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.permission-modal-reason {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.permission-modal-reason input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 0.84rem;
+}
+
+.permission-modal-reason input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ============================================================
    MCP Selection Modal
    ============================================================ */
 

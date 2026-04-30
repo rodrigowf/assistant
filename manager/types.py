@@ -99,6 +99,32 @@ class CompactComplete(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionRequest(Event):
+    """The SDK is asking us whether a tool may run.
+
+    Emitted when the bundled CLI's permission gate fires (e.g. ``ExitPlanMode``).
+    The wrapper resolves these via :meth:`SessionManager.resolve_permission`;
+    until then the SDK is blocked waiting for our reply.
+    """
+
+    request_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionResolved(Event):
+    """A pending permission request was answered — emitted so subscribers can
+    close any open UI / orchestrator state. ``decision`` is "allow" or "deny";
+    ``responder`` identifies who answered ("user" | "orchestrator")."""
+
+    request_id: str
+    decision: str
+    responder: str
+    message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SessionStalled(Event):
     """Emitted when the SDK has produced no message for an extended period.
 

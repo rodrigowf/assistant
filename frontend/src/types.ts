@@ -56,6 +56,8 @@ export type ServerEvent =
   | { type: "turn_complete"; cost?: number | null; usage?: Record<string, unknown>; num_turns?: number; session_id?: string; is_error?: boolean; result?: string | null; input_tokens?: number; output_tokens?: number }
   | { type: "compact_complete"; trigger: string; summary?: string }
   | { type: "session_stalled"; elapsed_seconds: number; last_tool_name: string | null; last_tool_use_id: string | null }
+  | { type: "permission_request"; request_id: string; tool_name: string; tool_input: Record<string, unknown> }
+  | { type: "permission_resolved"; request_id: string; decision: "allow" | "deny"; responder: string; message?: string | null }
   | { type: "status"; status: string }
   | { type: "error"; error: string; detail?: string }
   | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }

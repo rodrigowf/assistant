@@ -27,6 +27,15 @@ interface StallState {
   toolUseId: string | null;
 }
 
+export interface PendingPermission {
+  /** Backend request_id — must be echoed back when answering. */
+  requestId: string;
+  /** Tool the SDK is asking permission to run. */
+  toolName: string;
+  /** Raw tool input — the modal renders a tool-specific view. */
+  toolInput: Record<string, unknown>;
+}
+
 interface ChatState {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -37,6 +46,8 @@ interface ChatState {
   contextTokens: number; // latest input_tokens count
   /** Set when the backend has reported a stall on the in-flight turn. */
   stall: StallState | null;
+  /** Set when the SDK is awaiting a permission decision (modal is open). */
+  pendingPermission: PendingPermission | null;
 }
 
 const INITIAL_STATE: ChatState = {
@@ -48,6 +59,7 @@ const INITIAL_STATE: ChatState = {
   error: null,
   contextTokens: 0,
   stall: null,
+  pendingPermission: null,
 };
 
 // -------------------------------------------------------------------
@@ -70,6 +82,8 @@ type Action =
   | { type: "COMPACT_COMPLETE"; summary: string }
   | { type: "STATUS"; status: SessionStatus }
   | { type: "STALL"; elapsedSeconds: number; toolName: string | null; toolUseId: string | null }
+  | { type: "PERMISSION_REQUEST"; requestId: string; toolName: string; toolInput: Record<string, unknown> }
+  | { type: "PERMISSION_RESOLVED"; requestId: string; decision: "allow" | "deny"; responder: string; message?: string | null }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
   | { type: "VOICE_ASSISTANT_DELTA"; text: string }
@@ -308,6 +322,58 @@ function reducer(state: ChatState, action: Action): ChatState {
         },
       };
 
+    case "PERMISSION_REQUEST": {
+      const pending = {
+        requestId: action.requestId,
+        toolName: action.toolName,
+        toolInput: action.toolInput,
+      };
+      // ExitPlanMode is special: render the plan as an assistant text block
+      // so the user sees it inline (the modal only carries Approve/Reject).
+      // Other gated tools just get the modal — their input is already shown
+      // by the regular tool_use rendering.
+      if (action.toolName === "ExitPlanMode") {
+        const planText = (action.toolInput?.plan as string) || "";
+        if (planText) {
+          return {
+            ...state,
+            pendingPermission: pending,
+            messages: updateLastAssistantBlock(state.messages, (blocks) => [
+              ...blocks,
+              { type: "text", content: planText, streaming: false },
+            ]),
+          };
+        }
+      }
+      return { ...state, pendingPermission: pending };
+    }
+
+    case "PERMISSION_RESOLVED": {
+      // Only clear if the resolved request matches the open one — a stale
+      // resolved event for a previous request shouldn't dismiss a newer
+      // modal.  Append a one-liner so the conversation history records what
+      // was decided and by whom.
+      const matches = state.pendingPermission?.requestId === action.requestId;
+      const decisionNote = (() => {
+        const who = action.responder === "orchestrator" ? "Orchestrator" : "User";
+        const what = action.decision === "allow" ? "approved" : "rejected";
+        const reason = action.message ? ` — ${action.message}` : "";
+        return `[${who} ${what} the request${reason}]`;
+      })();
+      return {
+        ...state,
+        pendingPermission: matches ? null : state.pendingPermission,
+        messages: [
+          ...state.messages,
+          {
+            id: nextId(),
+            role: "user" as const,
+            blocks: [{ type: "text", content: decisionNote, streaming: false }],
+          },
+        ],
+      };
+    }
+
     case "ERROR":
       return { ...state, error: action.error };
 
@@ -379,6 +445,11 @@ export interface ChatInstance {
   error: string | null;
   /** Set when the backend reports a stall on the in-flight turn. */
   stall: StallInfo | null;
+  /** Set when the SDK is awaiting a permission decision (modal is open). */
+  pendingPermission: PendingPermission | null;
+  /** Resolve the open permission request. First call wins; later calls are
+   * no-ops (the backend's permission_resolved broadcast closes the modal). */
+  respondToPermission: (decision: "allow" | "deny", message?: string) => void;
   /** Context usage as a percentage of the context window (0–100). */
   contextUsage: number;
   /** Currently selected MCP server names */
@@ -478,6 +549,11 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   // Track status changes and notify parent
   const prevStatusRef = useRef<{ status: SessionStatus; conn: ConnectionState } | null>(null);
 
+  // Mirror pendingPermission so respondToPermission (a stable useCallback)
+  // can read the latest request_id without rebuilding on every render.
+  const pendingPermissionRef = useRef<PendingPermission | null>(null);
+  pendingPermissionRef.current = state.pendingPermission;
+
   const handleEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
       case "session_started":
@@ -539,6 +615,23 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
           elapsedSeconds: (event as { elapsed_seconds?: number }).elapsed_seconds ?? 0,
           toolName: (event as { last_tool_name?: string | null }).last_tool_name ?? null,
           toolUseId: (event as { last_tool_use_id?: string | null }).last_tool_use_id ?? null,
+        });
+        break;
+      case "permission_request":
+        dispatch({
+          type: "PERMISSION_REQUEST",
+          requestId: event.request_id,
+          toolName: event.tool_name,
+          toolInput: event.tool_input,
+        });
+        break;
+      case "permission_resolved":
+        dispatch({
+          type: "PERMISSION_RESOLVED",
+          requestId: event.request_id,
+          decision: event.decision,
+          responder: event.responder,
+          message: event.message,
         });
         break;
       case "status":
@@ -796,6 +889,24 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     wsSend({ type: "compact" });
   }, [wsSend]);
 
+  const respondToPermission = useCallback(
+    (decision: "allow" | "deny", message?: string) => {
+      // Optimistically clear so the modal closes instantly even if our
+      // permission_resolved broadcast races behind another tab's render.
+      // If the orchestrator already won, the backend treats this as a no-op.
+      const pending = pendingPermissionRef.current;
+      if (!pending) return;
+      pendingPermissionRef.current = null;
+      wsSend({
+        type: "permission_response",
+        request_id: pending.requestId,
+        decision,
+        ...(message ? { message } : {}),
+      });
+    },
+    [wsSend]
+  );
+
   const contextUsage = Math.min(100, Math.round((state.contextTokens / CONTEXT_WINDOW) * 100));
 
   return {
@@ -807,6 +918,8 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     turns: state.turns,
     error: state.error,
     stall: state.stall,
+    pendingPermission: state.pendingPermission,
+    respondToPermission,
     contextUsage,
     selectedMcps,
     hasMoreMessages,

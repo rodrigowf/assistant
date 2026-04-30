@@ -2,8 +2,9 @@ import { MessageList } from "./MessageList";
 import { ChatInput } from "./ChatInput";
 import { StatusBar } from "./StatusBar";
 import { VoiceControls } from "./VoiceControls";
+import { PermissionModal } from "./PermissionModal";
 import type { ChatMessage, SessionStatus, ConnectionState, VoiceStatus } from "../types";
-import type { StallInfo } from "../hooks/useChatInstance";
+import type { StallInfo, PendingPermission } from "../hooks/useChatInstance";
 
 function formatStallElapsed(s: number): string {
   if (s < 90) return `${Math.round(s)}s`;
@@ -21,6 +22,9 @@ interface Props {
   error: string | null;
   /** Set when the backend reports the SDK is stuck on a tool. */
   stall?: StallInfo | null;
+  /** Set when the SDK is waiting for a permission decision (popup). */
+  pendingPermission?: PendingPermission | null;
+  onRespondToPermission?: (decision: "allow" | "deny", message?: string) => void;
   onSend: (text: string) => void;
   onSendAudio?: (audioBase64: string, format: string) => void;
   onInterrupt: () => void;
@@ -56,6 +60,8 @@ export function ChatPanel({
   turns,
   error,
   stall,
+  pendingPermission,
+  onRespondToPermission,
   onSend,
   onSendAudio,
   onInterrupt,
@@ -132,6 +138,12 @@ export function ChatPanel({
             <span className="voice-error-message">{voiceError}</span>
           )}
         </div>
+      )}
+      {pendingPermission && onRespondToPermission && (
+        <PermissionModal
+          pending={pendingPermission}
+          onRespond={onRespondToPermission}
+        />
       )}
       {/* Voice active controls */}
       {isOrchestrator && voiceActive && voiceStatus !== undefined && onVoiceStart && onVoiceStop && (

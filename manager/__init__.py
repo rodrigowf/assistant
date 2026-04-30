@@ -23,6 +23,8 @@ from .types import (
     CompactComplete,
     Event,
     MessagePreview,
+    PermissionRequest,
+    PermissionResolved,
     SessionDetail,
     SessionInfo,
     SessionStatus,
@@ -51,6 +53,8 @@ __all__ = [
     "ToolResult",
     "TurnComplete",
     "CompactComplete",
+    "PermissionRequest",
+    "PermissionResolved",
     # Data types
     "SessionInfo",
     "SessionDetail",

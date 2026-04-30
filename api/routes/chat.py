@@ -98,6 +98,27 @@ async def chat_ws(ws: WebSocket):
                     _handle_compact(ws, pool, session_id)
                 )
 
+            elif msg_type == "permission_response":
+                # Reply to a pending can_use_tool request.  Don't gate on
+                # session_id matching `sm` here — the WS still receives the
+                # `permission_resolved` broadcast that closes the modal even
+                # if this call lost the race to the orchestrator.
+                target_id = msg.get("session_id") or session_id
+                request_id = msg.get("request_id")
+                decision = msg.get("decision")
+                if not target_id or not request_id or decision not in ("allow", "deny"):
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "invalid_permission_response",
+                    }))
+                    continue
+                await pool.resolve_session_permission(
+                    target_id,
+                    request_id,
+                    decision,
+                    message=msg.get("message"),
+                    responder="user",
+                )
+
             elif msg_type == "stop":
                 await _cancel_stream()
                 if session_id:

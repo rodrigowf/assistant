@@ -263,6 +263,30 @@ class SessionPool:
         if sm is not None:
             await sm.interrupt()
 
+    async def resolve_session_permission(
+        self,
+        session_id: str,
+        request_id: str,
+        decision: str,
+        *,
+        message: str | None = None,
+        responder: str = "user",
+    ) -> bool:
+        """Resolve a pending permission request for a session.
+
+        Returns True if this call won the race (and the SDK was unblocked),
+        False if the request was already answered or doesn't exist.  When the
+        orchestrator answers first the UI's later call is a no-op — the
+        ``permission_resolved`` event the manager emits already tells the UI
+        to close its modal.
+        """
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            return False
+        return sm.resolve_permission(
+            request_id, decision, message=message, responder=responder,
+        )
+
     # ------------------------------------------------------------------
     # Agent session access
     # ------------------------------------------------------------------
@@ -531,6 +555,17 @@ class SessionPool:
             async for event in sm.send(text):
                 payload = serialize_event(event)
                 await self._broadcast_session(session_id, payload)
+                if payload.get("type") in ("permission_request", "permission_resolved"):
+                    # Mirror to the orchestrator so its UI can show a matching
+                    # banner and (for permission_request) so the orchestrator
+                    # agent can respond programmatically.  Same envelope as
+                    # nested_session_event so existing dispatch logic fits.
+                    await self.broadcast_orchestrator({
+                        "type": "nested_session_event",
+                        "session_id": session_id,
+                        "event_type": payload["type"],
+                        "event_data": payload,
+                    })
                 yield event
 
     async def compact(self, session_id: str) -> AsyncIterator[Event]:

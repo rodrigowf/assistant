@@ -370,6 +370,77 @@ async def interrupt_agent_session(context: dict[str, Any], session_id: str) -> s
 
 
 @registry.register(
+    name="respond_to_agent_permission",
+    description=(
+        "Approve or deny a pending permission request from an agent session. "
+        "When an agent calls a gated tool (currently only ExitPlanMode — the "
+        "transition out of plan mode into implementation), the SDK pauses and "
+        "the orchestrator and UI both receive a nested_session_event of type "
+        "'permission_request' carrying a request_id. Use this tool to answer "
+        "programmatically; the user can also click Approve/Reject in the UI. "
+        "First answer wins (the loser's call is a no-op)."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "The agent session that issued the permission request.",
+            },
+            "request_id": {
+                "type": "string",
+                "description": "The request_id from the permission_request event.",
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["allow", "deny"],
+                "description": "'allow' to let the tool run, 'deny' to block it.",
+            },
+            "message": {
+                "type": "string",
+                "description": (
+                    "Optional message returned to the agent. For 'deny' it "
+                    "becomes the rejection reason; for 'allow' it's purely "
+                    "informational and recorded in the conversation."
+                ),
+            },
+        },
+        "required": ["session_id", "request_id", "decision"],
+    },
+)
+async def respond_to_agent_permission(
+    context: dict[str, Any],
+    session_id: str,
+    request_id: str,
+    decision: str,
+    message: str | None = None,
+) -> str:
+    pool = context["pool"]
+    if decision not in ("allow", "deny"):
+        return json.dumps({"error": "decision must be 'allow' or 'deny'"})
+    won = await pool.resolve_session_permission(
+        session_id,
+        request_id,
+        decision,
+        message=message,
+        responder="orchestrator",
+    )
+    if not won:
+        return json.dumps({
+            "session_id": session_id,
+            "request_id": request_id,
+            "result": "no_op",
+            "detail": "request was already answered or no longer exists",
+        })
+    return json.dumps({
+        "session_id": session_id,
+        "request_id": request_id,
+        "decision": decision,
+        "result": "ok",
+    })
+
+
+@registry.register(
     name="list_history",
     description=(
         "List all past conversation sessions. Each session has a 'type' field: "
