@@ -144,6 +144,25 @@ from .types import (
 # popup hook still wired so the set can grow without code changes.
 _DEFAULT_GATED_TOOLS: frozenset[str] = frozenset({"ExitPlanMode"})
 
+
+# Appended to the bundled Claude Code system prompt at session start.  Turns
+# gated-tool permission popups into conversational checkpoints — see
+# _build_options for the wiring rationale.
+_PERMISSION_GATING_PROMPT = (
+    "\n\n## Gated Tools — Conversational Checkpoint\n"
+    "Before calling ExitPlanMode (or any other tool that triggers a permission "
+    "prompt), first send a normal user-facing message describing what you "
+    "intend to do and inviting the user (or orchestrator) to provide guidance, "
+    "ask questions, or approve.  Only after that message should you call the "
+    "gated tool.  The permission popup is a safety net — your conversational "
+    "announcement is the primary checkpoint.  If the user responds with prose "
+    "(\"go ahead, but skip migrations\"), incorporate that feedback into your "
+    "plan or actions before proceeding.  When the user types a chat message "
+    "while a permission is pending, the system auto-treats that as a denial "
+    "with their prose as the reason — refine your approach based on their "
+    "feedback and re-announce when ready."
+)
+
 # Stall watchdog: the bundled `claude` subprocess occasionally goes silent
 # mid-tool (e.g. WebFetch waiting on an unresponsive HTTP endpoint with no
 # upstream timeout).  We don't abort — the user may legitimately want to
@@ -856,6 +875,18 @@ class SessionManager:
             "include_partial_messages": True,
             "setting_sources": ["project", "local"],
             "can_use_tool": self._can_use_tool,
+            # Append a small policy onto the bundled Claude Code system prompt
+            # turning gated-tool permission popups into conversational
+            # checkpoints.  Without this nudge the agent fires ExitPlanMode
+            # cold and the user (or orchestrator) only ever sees a yes/no
+            # popup; with it, the agent first announces intent in chat,
+            # invites prose feedback ("yes but skip migrations"), and only
+            # then calls the gated tool.  The popup remains as a safety net.
+            "system_prompt": {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": _PERMISSION_GATING_PROMPT,
+            },
         }
         if self._config.permission_mode:
             kwargs["permission_mode"] = self._config.permission_mode

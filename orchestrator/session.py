@@ -11,6 +11,7 @@ fixed model for the session duration (WebRTC constraint).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -32,6 +33,7 @@ from orchestrator.config import (
 from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.providers.anthropic import AnthropicProvider
 from orchestrator.providers.openai_text import OpenAITextProvider, create_audio_message
+from orchestrator.runner import BackgroundAgentRunner, Notification, NotificationQueue
 from orchestrator.token_budget import (
     RECENT_VERBATIM_TOKENS,
     estimate_message_tokens,
@@ -50,6 +52,38 @@ from orchestrator.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _render_notifications(notes: list[Notification]) -> str:
+    """Render a batch of background-agent notifications as a status block.
+
+    Status lines only (per design choice): the orchestrator must call
+    read_agent_session or peek_agent_session to retrieve actual content.
+    Keeps the synthetic prompt cheap and forces explicit follow-up reads.
+    """
+    if not notes:
+        return ""
+    lines: list[str] = [f"[Background events — {len(notes)} update{'s' if len(notes) != 1 else ''}]"]
+    for n in notes:
+        sid_short = n.session_id[:8]
+        title_part = f' ("{n.session_title}")' if n.session_title else ""
+        bits = [
+            f"[SESSION {sid_short}{title_part}",
+            f"event: turn {n.turn_id[:8]} {n.status}",
+            f"duration={n.duration_seconds:.1f}s",
+        ]
+        if n.cost:
+            bits.append(f"cost=${n.cost:.4f}")
+        if n.turns:
+            bits.append(f"turns={n.turns}")
+        if n.error:
+            bits.append(f'error="{n.error}"')
+        lines.append(", ".join(bits) + "]")
+    lines.append(
+        "(Use read_agent_session(session_id) for persisted output, "
+        "peek_agent_session(session_id, turn_id) for live in-flight events.)"
+    )
+    return "\n".join(lines)
 
 
 class OrchestratorSession:
@@ -114,6 +148,28 @@ class OrchestratorSession:
         # Track current provider for model switching
         self._current_provider = None
 
+        # Background agent runner — owns fire-and-forget agent turns spawned
+        # by the send_to_agent_session tool.  Notifications drain at the top
+        # of every send() call; the route layer installs a wake_callback that
+        # synthesises an empty-prompt turn when one arrives while idle.
+        self._notifications = NotificationQueue()
+        store = context.get("store")
+        pool = context.get("pool")
+        if store is not None and pool is not None:
+            self._runner: BackgroundAgentRunner | None = BackgroundAgentRunner(
+                pool, store, self._notifications,
+            )
+            # Make the runner reachable from tools that get only the
+            # context dict (e.g. send_to_agent_session, peek_agent_session).
+            context["runner"] = self._runner
+            context["notifications"] = self._notifications
+        else:
+            self._runner = None
+        # Held while a send() / send_audio() / _run_agent is in flight.  The
+        # wake callback uses is_busy to decide whether to schedule a
+        # synthetic turn now or let the next user prompt drain notifications.
+        self._busy_lock = asyncio.Lock()
+
     @property
     def local_id(self) -> str:
         """The pool key — stable frontend tab UUID used for reconnection."""
@@ -127,6 +183,30 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def is_busy(self) -> bool:
+        """True while a send/send_audio/_run_agent turn holds the busy lock.
+
+        The wake callback (installed by the route layer) consults this to
+        decide whether to fire a synthetic-prompt turn for queued
+        notifications immediately or wait for the in-flight turn to finish.
+        """
+        return self._busy_lock.locked()
+
+    @property
+    def notifications(self) -> NotificationQueue:
+        """Queue of pending background-agent notifications.
+
+        Drained at the start of every text-mode turn; route layer installs
+        a wake_callback so that a notification arriving while idle triggers
+        a synthetic empty-prompt turn.
+        """
+        return self._notifications
+
+    @property
+    def runner(self) -> BackgroundAgentRunner | None:
+        return self._runner
 
     @property
     def current_model(self) -> str:
@@ -436,19 +516,69 @@ class OrchestratorSession:
         return commands
 
     async def send(self, prompt: str) -> AsyncIterator[OrchestratorEvent]:
-        """Send a text message and yield events. Persists to JSONL. (Text mode only)"""
+        """Send a text message and yield events. Persists to JSONL. (Text mode only)
+
+        Drains any queued background-agent notifications first.  An empty
+        prompt with no pending notifications is a spurious wake (e.g. the
+        wake-callback fired between is_busy check and notification arrival)
+        — short-circuit before grabbing the lock.
+
+        The whole turn is wrapped in self._busy_lock so the route layer's
+        wake_callback can reliably tell whether the orchestrator is mid-turn
+        and queue notifications for the next idle window instead.
+        """
         if self._agent is None:
             raise RuntimeError("Session not started")
 
-        # Persist user message
-        self._writer.append({
-            "type": "user",
-            "message": {"role": "user", "content": prompt},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        # Cheap pre-check: if there's nothing to do, don't even take the lock.
+        # (The deeper check is also done after the lock is held, in case a
+        # racing push() arrived in between.)
+        if not prompt and not self._notifications.has_pending():
+            return
 
-        async for event in self._run_agent(prompt):
-            yield event
+        async with self._busy_lock:
+            pending = self._notifications.drain()
+            if not prompt and not pending:
+                return  # racing wake; nothing to deliver
+            # Persist a JSONL line for each drained notification so the run
+            # is replayable (ties back to the originating tool_use_id).
+            for n in pending:
+                self._writer.append({
+                    "type": "background_notification",
+                    "notification_id": n.notification_id,
+                    "turn_id": n.turn_id,
+                    "session_id": n.session_id,
+                    "session_title": n.session_title,
+                    "origin_tool_use_id": n.origin_tool_use_id,
+                    "status": n.status,
+                    "cost": n.cost,
+                    "turns": n.turns,
+                    "duration_seconds": n.duration_seconds,
+                    "error": n.error,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            # Build the actual prompt the LLM sees.  Notifications go FIRST
+            # so the model reads them before anything the user typed.
+            rendered = _render_notifications(pending)
+            if rendered and prompt:
+                effective_prompt = rendered + "\n\n" + prompt
+            elif rendered:
+                effective_prompt = rendered
+            else:
+                effective_prompt = prompt
+
+            # Persist user message (the unmodified original; notification
+            # lines are recorded separately as background_notification entries
+            # above so the JSONL stays clean).
+            if prompt:
+                self._writer.append({
+                    "type": "user",
+                    "message": {"role": "user", "content": prompt},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+            async for event in self._run_agent(effective_prompt):
+                yield event
 
     async def send_audio(
         self,
@@ -472,6 +602,42 @@ class OrchestratorSession:
         if self._agent is None:
             raise RuntimeError("Session not started")
 
+        # Audio mode also drains notifications — prepend them to the audio's
+        # accompanying text prompt so the LLM sees them first in this turn.
+        async with self._busy_lock:
+            pending = self._notifications.drain()
+            if pending:
+                for n in pending:
+                    self._writer.append({
+                        "type": "background_notification",
+                        "notification_id": n.notification_id,
+                        "turn_id": n.turn_id,
+                        "session_id": n.session_id,
+                        "session_title": n.session_title,
+                        "origin_tool_use_id": n.origin_tool_use_id,
+                        "status": n.status,
+                        "cost": n.cost,
+                        "turns": n.turns,
+                        "duration_seconds": n.duration_seconds,
+                        "error": n.error,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                rendered = _render_notifications(pending)
+                text_prompt = (rendered + "\n\n" + text_prompt) if text_prompt else rendered
+
+            async for event in self._send_audio_inner(audio_data, audio_format, text_prompt):
+                yield event
+
+    async def _send_audio_inner(
+        self,
+        audio_data: bytes | str,
+        audio_format: str,
+        text_prompt: str | None,
+    ) -> AsyncIterator[OrchestratorEvent]:
+        """The original send_audio body, called inside the busy_lock.
+
+        Split out so the notification-drain wrapper above can stay readable.
+        """
         if not self._config.supports_audio:
             # Switch to audio-capable model automatically.
             # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview.
@@ -613,7 +779,18 @@ class OrchestratorSession:
         return {"tokens_before": tokens_before, "tokens_after": tokens_after}
 
     async def stop(self) -> None:
-        """Clean up the session."""
+        """Clean up the session.
+
+        Cancels every in-flight background-agent turn (with SDK interrupts so
+        the bundled ``claude`` subprocesses actually stop) and unsubscribes
+        the wake callback so notifications fired during shutdown go nowhere.
+        """
+        self._notifications.set_wake_callback(None)
+        if self._runner is not None:
+            try:
+                await self._runner.cancel_all()
+            except Exception:  # noqa: BLE001
+                logger.exception("BackgroundAgentRunner.cancel_all failed during stop")
         self._agent = None
         self._voice_provider = None
         self._current_provider = None

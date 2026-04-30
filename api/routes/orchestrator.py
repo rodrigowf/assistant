@@ -257,6 +257,32 @@ async def _handle_start(
     pool.set_orchestrator(session_id, session)
     pool.subscribe_orchestrator(session_id, ws)
 
+    # Install the wake callback for background-agent notifications.  When a
+    # fire-and-forget agent turn finishes while the orchestrator is idle, the
+    # callback fires a synthetic empty-prompt turn so the LLM gets a chance
+    # to react asynchronously.  Voice mode is skipped (notifications still
+    # queue and drain on the next text/audio turn) — wiring them through the
+    # OpenAI Realtime data channel is a future enhancement.
+    if not voice:
+        def _make_wake(_pool: SessionPool, _session: OrchestratorSession):
+            async def _wake() -> None:
+                if _session.is_busy:
+                    return
+                if not _session.notifications.has_pending():
+                    return
+                # Schedule, don't await — we must not block the runner's
+                # _drive task that pushed the notification.  The synthetic
+                # turn is a normal _handle_send with an empty prompt; the
+                # session.send() body short-circuits if the queue is also
+                # empty by the time it acquires the busy lock.
+                asyncio.create_task(
+                    _handle_send(_pool, _session, ""),
+                    name="orchestrator-wake",
+                )
+            return _wake
+
+        session.notifications.set_wake_callback(_make_wake(pool, session))
+
     started_payload: dict = {
         "type": "session_started",
         "session_id": session_id,

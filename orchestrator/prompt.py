@@ -165,15 +165,38 @@ The user interacts with you through a multi-tab web interface. Each agent sessio
 
 
 def _active_sessions_section(context: dict[str, Any]) -> str:
-    """Build the active sessions status section from the live pool."""
+    """Build the active sessions status section from the live pool.
+
+    Includes per-session title (from JSONL store), in-flight background
+    turns dispatched via send_to_agent_session, and pending permissions
+    awaiting an answer.  Lets the orchestrator's LLM see at a glance
+    which agents are busy and whether any need its attention.
+    """
     pool = context.get("pool")
     if pool is None:
         return "## Active Agent Sessions\nNo agent sessions are currently active."
 
     sessions = pool.list_sessions()
+    runner = context.get("runner")
+    notifications = context.get("notifications")
+
     if not sessions:
+        if notifications and notifications.has_pending():
+            n = notifications.pending_count()
+            return (
+                "## Active Agent Sessions\nNo agent sessions are currently active.\n"
+                f"\n_({n} background event{'s' if n != 1 else ''} pending — drained at "
+                "the start of your next turn.)_"
+            )
         return "## Active Agent Sessions\nNo agent sessions are currently active."
 
+    # Group in-flight runner handles by session_id for quick lookup.
+    in_flight: dict[str, list[Any]] = {}
+    if runner is not None:
+        for h in runner.list_in_flight():
+            in_flight.setdefault(h.session_id, []).append(h)
+
+    store = context.get("store")
     lines = ["## Active Agent Sessions"]
     for s in sessions:
         sid = s["session_id"]
@@ -181,8 +204,55 @@ def _active_sessions_section(context: dict[str, Any]) -> str:
         turns = s.get("turns", 0)
         cost = s.get("cost", 0.0)
         sdk_id = s.get("sdk_session_id", "")
+
+        # Title lookup (best-effort) — agents that just opened may not have a
+        # JSONL entry yet, in which case we just omit it.
+        title: str | None = None
+        if store is not None and sdk_id:
+            try:
+                info = store.get_session_info(sdk_id)
+                if info is not None:
+                    title = info.title
+            except Exception:  # noqa: BLE001
+                pass
+
+        title_part = f' ("{title}")' if title else ""
         sdk_note = f", sdk_id={sdk_id}" if sdk_id else ""
-        lines.append(f"- `{sid}`: status={status}, turns={turns}, cost=${cost:.4f}{sdk_note}")
+        lines.append(
+            f"- `{sid}`{title_part}: status={status}, turns={turns}, "
+            f"cost=${cost:.4f}{sdk_note}"
+        )
+
+        # Per-session detail: in-flight fire-and-forget turns + pending perms
+        for h in in_flight.get(sid, []):
+            elapsed = f"{h.elapsed_seconds:.1f}s"
+            lines.append(
+                f"    in-flight: turn {h.turn_id[:8]} "
+                f"running for {elapsed} (status={h.status})"
+            )
+            if h.pending_permission_ids:
+                rids = ", ".join(rid[:8] for rid in h.pending_permission_ids)
+                lines.append(f"        pending permission(s): {rids}")
+        # Pending permissions on the SessionManager itself (independent of
+        # an in-flight runner turn — could be triggered from the user's tab).
+        sm = pool.get(sid)
+        if sm is not None and hasattr(sm, "pending_permission_ids"):
+            try:
+                rids = list(sm.pending_permission_ids())
+            except Exception:  # noqa: BLE001
+                rids = []
+            if rids and not in_flight.get(sid):
+                lines.append(
+                    "    pending permission(s) (not from a runner turn): "
+                    + ", ".join(rid[:8] for rid in rids)
+                )
+
+    if notifications and notifications.has_pending():
+        n = notifications.pending_count()
+        lines.append(
+            f"\n_({n} background event{'s' if n != 1 else ''} pending — drained at "
+            "the start of your next turn.)_"
+        )
     return "\n".join(lines)
 
 
@@ -311,8 +381,14 @@ def _guidelines_section() -> str:
 
 ### Delegating to Agents
 - **Be specific**: Give clear, actionable instructions with enough context for independent work
-- **One thing at a time**: Wait for an agent's response before sending the next message
+- **Fire-and-forget**: `send_to_agent_session` returns IMMEDIATELY with a turn_id; the agent runs in the background. Do NOT loop calling it waiting for a response — results arrive as background events on your next turn.
+- **In parallel**: While a turn is in flight you can spawn other agents, peek at intermediate output (`peek_agent_session`), read persisted history (`read_agent_session`), respond to permission requests (`respond_to_agent_permission`), or talk to the user.
 - **Match MCPs to tasks**: Load only the MCPs an agent needs
+
+### Background Events
+- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — for actual content call `read_agent_session(session_id)` (persisted) or `peek_agent_session(session_id, turn_id)` (live, while still running).
+- Permission events also arrive as structured lines: `[SESSION xxx event: <user|orchestrator> <approved|denied> <ToolName> — "<message>"]`. Typically the user answered in their tab; only call `respond_to_agent_permission` when they're unavailable, the agent has explicitly asked you to decide, or you have a specific reason to overrule.
+- Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `peek_agent_session` output, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
 
 ### Session Management
 - **Open sessions only when needed**: Don't open sessions speculatively

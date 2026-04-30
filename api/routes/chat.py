@@ -80,10 +80,29 @@ async def chat_ws(ws: WebSocket):
                         "detail": "Send a 'start' message first",
                     }))
                     continue
+                # If a permission is pending on this session, treat the user's
+                # chat as a denial with their prose as the rejection reason.
+                # The agent receives this as a permission_resolved with
+                # responder=user, message=<chat text>; per the conversational-
+                # checkpoint policy in the agent's appended system prompt, it
+                # then refines its approach.  The modal in the UI closes via
+                # the broadcast.  Users who actually want to approve click
+                # the Approve button — the modal is the formal yes/no path.
+                text_payload = msg.get("text", "")
+                if session_id and text_payload:
+                    pending_ids = list(sm.pending_permission_ids())
+                    for rid in pending_ids:
+                        await pool.resolve_session_permission(
+                            session_id,
+                            rid,
+                            "deny",
+                            message=text_payload,
+                            responder="user",
+                        )
                 # Cancel any in-progress stream before starting a new one
                 await _cancel_stream()
                 stream_task = asyncio.create_task(
-                    _handle_send(ws, sm, pool, session_id, msg.get("text", ""))
+                    _handle_send(ws, sm, pool, session_id, text_payload)
                 )
 
             elif msg_type == "command":

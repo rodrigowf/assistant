@@ -238,9 +238,15 @@ async def read_agent_session(
 @registry.register(
     name="send_to_agent_session",
     description=(
-        "Send a message to an active Claude Code agent session and wait for the response. "
-        "Returns the agent's text response. Progress events are streamed to the orchestrator "
-        "so the frontend stays updated during long-running agent tasks."
+        "Send a message to an active Claude Code agent session. RETURNS IMMEDIATELY "
+        "with a turn_id; the agent runs in the background. The result will arrive "
+        "as a structured background event ('[SESSION xxx event: turn finished]') at "
+        "the start of your next turn — do NOT loop calling this tool waiting for a "
+        "response. While the turn is in flight you can: spawn other agents, peek at "
+        "live output via peek_agent_session, read persisted history via "
+        "read_agent_session, answer permission requests via "
+        "respond_to_agent_permission, or simply respond to the user. "
+        "Use interrupt_agent_session to stop a turn early."
     ),
     input_schema={
         "type": "object",
@@ -260,88 +266,94 @@ async def read_agent_session(
 async def send_to_agent_session(
     context: dict[str, Any], session_id: str, message: str
 ) -> str:
-    import asyncio
-    from api.serializers import serialize_event
-    from manager.types import SessionStatus, TextComplete, TurnComplete, TextDelta, ToolUse, ToolResult
-
     pool = context["pool"]
+    runner = context.get("runner")
+    if runner is None:
+        # Fallback safety: shouldn't happen — OrchestratorSession injects runner
+        # into context at __init__.  If it's missing we have a wiring bug.
+        return json.dumps({
+            "error": "BackgroundAgentRunner not available in context — orchestrator init bug",
+        })
 
     if not pool.has(session_id):
         return json.dumps({"error": f"No active session with ID {session_id}"})
 
-    # If a turn is already in flight on this session, interrupt it first so
-    # this new message can take effect immediately instead of queueing behind
-    # the per-session lock in pool.send().  This is what makes voice mode able
-    # to redirect a Claude session mid-turn — without it, the second voice
-    # command sits idle until the first turn completes naturally.
-    sm = pool.get(session_id)
-    if sm is not None and sm.status in (
-        SessionStatus.STREAMING,
-        SessionStatus.THINKING,
-        SessionStatus.TOOL_USE,
-    ):
-        try:
-            await pool.interrupt(session_id)
-        except Exception as e:
-            logger.warning("Failed to interrupt session %s before redirect: %s", session_id, e)
-
-    texts: list[str] = []
-    cost = 0.0
-    turns = 0
-
-    async def _collect() -> None:
-        nonlocal cost, turns
-        async for event in pool.send(session_id, message):
-            # Forward significant events to the orchestrator WebSocket as nested events
-            # This ensures the frontend sees progress during long-running agent tasks
-            if isinstance(event, (TextDelta, TextComplete, ToolUse, ToolResult)):
-                try:
-                    serialized = serialize_event(event)
-                    await pool.broadcast_orchestrator({
-                        "type": "nested_session_event",
-                        "session_id": session_id,
-                        "event_type": serialized.get("type", "unknown"),
-                        "event_data": serialized,
-                    })
-                except Exception as e:
-                    logger.debug("Failed to broadcast nested event: %s", e)
-
-            if isinstance(event, TextComplete):
-                texts.append(event.text)
-            elif isinstance(event, TurnComplete):
-                cost = event.cost or 0.0
-                turns = event.num_turns
-
     try:
-        # pool.send() acquires the per-session lock and broadcasts events
-        # to all WebSocket subscribers (e.g., the frontend agent tab).
-        # We also forward events to the orchestrator WebSocket as nested events
-        # so the frontend can show progress during agent execution.
-        # Timeout prevents the orchestrator from hanging indefinitely if
-        # the SDK subprocess dies or the lock is held too long.
-        await asyncio.wait_for(_collect(), timeout=300.0)
-    except asyncio.TimeoutError:
-        return json.dumps({
-            "error": f"Timed out waiting for response from session {session_id}. "
-            "The session may be busy with another request or unresponsive."
-        })
-    except Exception as e:
-        return json.dumps({"error": f"Failed to send message: {e}"})
+        handle = await runner.spawn(session_id, message)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
     return json.dumps({
+        "turn_id": handle.turn_id,
         "session_id": session_id,
-        "response": "\n".join(texts),
-        "cost": cost,
-        "turns": turns,
+        "session_title": handle.session_title,
+        "status": "running",
+        "started_at": handle.started_at,
+        "hint": (
+            "Result arrives as a background event next turn. "
+            "peek_agent_session for live output; read_agent_session for history."
+        ),
     })
+
+
+@registry.register(
+    name="peek_agent_session",
+    description=(
+        "Read live events from an in-flight agent turn (text deltas, tool calls, "
+        "permission requests).  Use this to monitor an agent's progress without "
+        "waiting for the turn to finish.  For completed turns prefer "
+        "read_agent_session which goes against persisted JSONL.  Pass since_seq "
+        "from a previous response's next_seq to read incrementally."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "The session whose turn to peek at.",
+            },
+            "turn_id": {
+                "type": "string",
+                "description": (
+                    "Optional. Defaults to the most recent turn for this session. "
+                    "Useful when an agent has had multiple turns dispatched."
+                ),
+            },
+            "since_seq": {
+                "type": "integer",
+                "description": "Return only events with seq > this. Default 0.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max events to return. Default 50.",
+            },
+        },
+        "required": ["session_id"],
+    },
+)
+async def peek_agent_session(
+    context: dict[str, Any],
+    session_id: str,
+    turn_id: str = "",
+    since_seq: int = 0,
+    limit: int = 50,
+) -> str:
+    runner = context.get("runner")
+    if runner is None:
+        return json.dumps({"error": "BackgroundAgentRunner not available in context"})
+    return json.dumps(
+        runner.peek(session_id, turn_id=turn_id or None, since_seq=since_seq, limit=limit)
+    )
 
 
 @registry.register(
     name="interrupt_agent_session",
     description=(
         "Interrupt an actively executing Claude Code agent session. "
-        "Use this to stop an agent that is running undesired actions or taking too long. "
-        "The agent will stop processing immediately."
+        "Use this to stop an agent that is running undesired actions or taking "
+        "too long.  The agent will stop processing immediately, and any "
+        "fire-and-forget turn driven by send_to_agent_session will produce a "
+        "'cancelled' background event next turn."
     ),
     input_schema={
         "type": "object",
@@ -373,12 +385,13 @@ async def interrupt_agent_session(context: dict[str, Any], session_id: str) -> s
     name="respond_to_agent_permission",
     description=(
         "Approve or deny a pending permission request from an agent session. "
-        "When an agent calls a gated tool (currently only ExitPlanMode — the "
-        "transition out of plan mode into implementation), the SDK pauses and "
-        "the orchestrator and UI both receive a nested_session_event of type "
-        "'permission_request' carrying a request_id. Use this tool to answer "
-        "programmatically; the user can also click Approve/Reject in the UI. "
-        "First answer wins (the loser's call is a no-op)."
+        "When an agent calls a gated tool (currently only ExitPlanMode), the SDK "
+        "pauses; the user gets a per-tab modal in the agent's tab and the "
+        "orchestrator gets a 'permission_request' nested event with the request_id. "
+        "Typically the user answers in their tab — only intervene if the user is "
+        "unavailable, you have specific reason to overrule, or the agent has "
+        "asked you in chat to decide.  First answer wins; the loser's call is a "
+        "no-op (this includes when the user clicks the modal before you respond)."
     ),
     input_schema={
         "type": "object",
