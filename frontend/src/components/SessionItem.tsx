@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import type { SessionInfo } from "../types";
+import { SessionMenu } from "./SessionMenu";
 
 interface Props {
   session: SessionInfo;
@@ -25,8 +26,8 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
     }
   }, [editing, session.title]);
 
-  function startEdit(e: React.MouseEvent) {
-    e.stopPropagation();
+  function startEdit(e?: React.MouseEvent) {
+    e?.stopPropagation();
     setEditing(true);
   }
 
@@ -98,6 +99,7 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
           >
             ×
           </button>
+          <SessionMenu onRename={() => startEdit()} onDelete={onDelete} />
         </>
       )}
     </div>

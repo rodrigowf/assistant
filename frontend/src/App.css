@@ -98,6 +98,20 @@
   font-weight: 500;
 }
 
+.tab-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  font-weight: 500;
+  background: var(--bg-input);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  color: var(--text-bright);
+  padding: 1px 6px;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
 .tab-close {
   width: 18px;
   height: 18px;
@@ -329,6 +343,76 @@
   padding: 2px 6px;
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+/* Kebab menu — hidden on desktop, shown on mobile */
+.session-menu {
+  display: none;
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+}
+
+.session-menu-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.session-menu-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.session-menu-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 160px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-menu-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.session-menu-item-danger {
+  color: var(--error);
+}
+
+.session-menu-item-danger:hover {
+  background: var(--error-bg);
+  color: var(--error);
 }
 
 /* ============================================================
@@ -1330,7 +1414,7 @@ pre.field-value {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 28px;
+  padding: 12px 32px 14px; /* Same as chat-input */
   max-width: 900px;
   width: 100%;
   margin: 0 auto;
@@ -2011,6 +2095,17 @@ pre.field-value {
 .modal-btn-primary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.modal-btn-danger {
+  background: var(--error);
+  color: white;
+}
+
+.modal-btn-danger:hover {
+  background: var(--error);
+  box-shadow: 0 0 12px var(--error-bg);
+  filter: brightness(1.1);
 }
 
 /* ============================================================
@@ -3001,10 +3096,18 @@ pre.field-value {
     font-size: 0.9rem;
   }
 
-  /* Always show rename/delete on mobile (no hover state) */
+  /* On mobile, swap hover-revealed icons for a kebab dropdown */
   .session-rename,
   .session-delete {
-    opacity: 1;
+    display: none;
+  }
+
+  .session-menu {
+    display: block;
+  }
+
+  .session-title {
+    padding-right: 40px;
   }
 }
 

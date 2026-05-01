@@ -48,6 +48,11 @@ def get_sessions_dir() -> Path:
     return get_context_dir()
 
 
+def get_trash_dir() -> Path:
+    """Soft-deleted sessions land here. Not scanned by the store or the SDK."""
+    return get_context_dir() / "trash"
+
+
 def get_index_dir() -> Path:
     """Get the vector index directory."""
     return PROJECT_ROOT / "index"

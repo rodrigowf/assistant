@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from utils.paths import get_sessions_dir, get_titles_path, get_session_path
+from utils.paths import get_sessions_dir, get_titles_path, get_session_path, get_trash_dir
 
 from .index_utils import remove_session_from_index
 from .types import ContentBlock, MessagePreview, SessionDetail, SessionInfo
@@ -279,22 +279,34 @@ class SessionStore:
         return True
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session's JSONL file and remove it from the vector index.
+        """Soft-delete a session: move its JSONL into context/trash/.
 
-        Returns True if deleted.
+        The trash directory lives outside the sessions glob and is ignored by
+        both the store and the Claude SDK, so the session disappears from the
+        UI but the file is still recoverable.
+
+        Returns True if a file was moved.
         """
         jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if jsonl_path.is_file():
-            jsonl_path.unlink()
-            # Also remove any custom title
-            titles = self._load_titles()
-            if session_id in titles:
-                del titles[session_id]
-                self._save_titles(titles)
-            # Remove from vector index
-            remove_session_from_index(session_id, collection_name="history")
-            return True
-        return False
+        if not jsonl_path.is_file():
+            return False
+
+        trash_dir = get_trash_dir()
+        trash_dir.mkdir(parents=True, exist_ok=True)
+
+        target = trash_dir / jsonl_path.name
+        if target.exists():
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            target = trash_dir / f"{jsonl_path.stem}.{ts}.jsonl"
+
+        jsonl_path.rename(target)
+
+        titles = self._load_titles()
+        if session_id in titles:
+            del titles[session_id]
+            self._save_titles(titles)
+        remove_session_from_index(session_id, collection_name="history")
+        return True
 
     @property
     def sessions_dir(self) -> Path:

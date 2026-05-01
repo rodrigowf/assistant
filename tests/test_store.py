@@ -344,8 +344,26 @@ class TestSessionStoreDeleteSession:
         with patch("utils.paths.PROJECT_ROOT", tmp_path):
             store = SessionStore(tmp_path)
 
-        assert store.delete_session("del") is True
-        assert not (context_dir / "del.jsonl").exists()
+            assert store.delete_session("del") is True
+            assert not (context_dir / "del.jsonl").exists()
+            assert (context_dir / "trash" / "del.jsonl").is_file()
+
+    def test_delete_collision_keeps_both(self, tmp_path):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        trash_dir = context_dir / "trash"
+        trash_dir.mkdir()
+        (trash_dir / "dup.jsonl").write_text("old")
+        (context_dir / "dup.jsonl").write_text("new")
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            assert store.delete_session("dup") is True
+
+        assert (trash_dir / "dup.jsonl").read_text() == "old"
+        moved = [p for p in trash_dir.iterdir() if p.name != "dup.jsonl"]
+        assert len(moved) == 1
+        assert moved[0].read_text() == "new"
 
     def test_delete_nonexistent(self, tmp_path):
         context_dir = tmp_path / "context"

@@ -5,6 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { ChatPanelContainer } from "./components/ChatPanelContainer";
 import { OrchestratorModal } from "./components/OrchestratorModal";
+import { ConfirmModal } from "./components/ConfirmModal";
 
 const ConfigPage = lazy(() => import("./components/ConfigPage").then(m => ({ default: m.ConfigPage })));
 import { TabsProvider, useTabsContext } from "./context/TabsContext";
@@ -27,13 +28,24 @@ function AppContent() {
     openTab(localId, "New session");
   }, [openTab]);
 
-  const handleDeleteSession = useCallback(
-    async (id: string) => {
-      await deleteSession(id);
-      closeTab(id);
+  // Pending delete: id awaiting user confirmation
+  const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
+
+  const requestDeleteSession = useCallback(
+    (id: string) => {
+      const session = sessions.find((s) => s.session_id === id);
+      setPendingDelete({ id, title: session?.title || "this conversation" });
     },
-    [deleteSession, closeTab]
+    [sessions]
   );
+
+  const confirmDeleteSession = useCallback(async () => {
+    if (!pendingDelete) return;
+    const { id } = pendingDelete;
+    setPendingDelete(null);
+    await deleteSession(id);
+    closeTab(id);
+  }, [pendingDelete, deleteSession, closeTab]);
 
   const closeOrchestratorTabs = useCallback(() => {
     for (const tab of tabs) {
@@ -102,7 +114,7 @@ function AppContent() {
     <>
       <Sidebar
         sessions={sessions}
-        onDelete={handleDeleteSession}
+        onDelete={requestDeleteSession}
         onRename={renameSession}
         onNew={handleNewSession}
         onNewOrchestrator={handleNewOrchestrator}
@@ -130,6 +142,22 @@ function AppContent() {
         <OrchestratorModal
           onProceed={handleOrchestratorProceed}
           onCancel={handleOrchestratorCancel}
+        />
+      )}
+      {pendingDelete && (
+        <ConfirmModal
+          title="Delete conversation?"
+          body={
+            <>
+              <strong>{pendingDelete.title}</strong> will be moved to trash and hidden from
+              the assistant. The file is kept on disk and can be recovered manually from
+              <code> context/trash/</code>.
+            </>
+          }
+          confirmLabel="Delete"
+          destructive
+          onConfirm={confirmDeleteSession}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
     </>
