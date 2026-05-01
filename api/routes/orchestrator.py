@@ -196,6 +196,7 @@ async def _handle_start(
     resume_id: str | None = msg.get("resume_sdk_id") or msg.get("session_id")
     voice_provider_req: str | None = msg.get("voice_provider") if voice else None
     voice_model_req: str | None = msg.get("voice_model") if voice else None
+    voice_name_req: str | None = msg.get("voice_name") if voice else None
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
@@ -244,14 +245,17 @@ async def _handle_start(
     config = OrchestratorConfig.load()
     project_dir = config.project_dir
 
-    # If voice mode and no provider/model in the start message, fall back to
-    # what's saved in assistant_config.json.
-    if voice and (voice_provider_req is None or voice_model_req is None):
+    # If voice mode and any of provider/model/voice missing from the start
+    # message, fall back to what's saved in assistant_config.json.
+    if voice and (
+        voice_provider_req is None or voice_model_req is None or voice_name_req is None
+    ):
         try:
             from api.routes.config import _load_config as _load_app_config
             app_cfg = _load_app_config()
             voice_provider_req = voice_provider_req or app_cfg.get("default_voice_provider")
             voice_model_req = voice_model_req or app_cfg.get("default_voice_model")
+            voice_name_req = voice_name_req or app_cfg.get("default_voice_name")
         except Exception:
             logger.exception("Failed to load voice defaults from assistant_config.json")
 
@@ -271,6 +275,7 @@ async def _handle_start(
         voice=voice,
         voice_provider=voice_provider_req,
         voice_model=voice_model_req,
+        voice_name=voice_name_req,
     )
 
     await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
@@ -339,6 +344,7 @@ async def _attach_voice_payload(
     """
     payload["voice_provider"] = session.voice_provider_id
     payload["voice_model"] = session.voice_model_id
+    payload["voice_name"] = session.voice_name_id
 
     session_update = await session.get_session_update()
     if session_update:

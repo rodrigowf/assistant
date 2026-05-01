@@ -117,6 +117,9 @@ export interface AssistantConfig {
   enabled_mcps: string[];
   chrome_extension: boolean;
   default_model: string;
+  default_voice_provider: string;
+  default_voice_model: string;
+  default_voice_name: string;
 }
 
 export interface ConfigUpdate {
@@ -125,6 +128,9 @@ export interface ConfigUpdate {
   enabled_mcps?: string[];
   chrome_extension?: boolean;
   default_model?: string;
+  default_voice_provider?: string;
+  default_voice_model?: string;
+  default_voice_name?: string;
 }
 
 export function getConfig(): Promise<AssistantConfig> {
@@ -159,6 +165,32 @@ export interface ModelsResponse {
 
 export function listModels(): Promise<ModelsResponse> {
   return json(`${BASE}/orchestrator/models`);
+}
+
+// Voice Provider Configuration
+
+export interface VoiceEntry {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export interface VoiceModelEntry {
+  id: string;
+  label: string;
+  voice: string;             // default voice
+  voices: VoiceEntry[];      // selectable voices
+  default: boolean;
+}
+
+export interface VoiceModelsResponse {
+  providers: Record<string, VoiceModelEntry[]>;
+  default_provider: string;
+  default_model: string;
+}
+
+export function listVoiceModels(): Promise<VoiceModelsResponse> {
+  return json(`${BASE}/orchestrator/voice/models`);
 }
 
 // Per-session config

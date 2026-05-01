@@ -34,7 +34,11 @@ ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "webm", "ogg", "m4a", "flac"}
 
 
 @router.post("/api/orchestrator/voice/session")
-async def create_voice_session(provider: str | None = None, model: str | None = None) -> dict:
+async def create_voice_session(
+    provider: str | None = None,
+    model: str | None = None,
+    voice: str | None = None,
+) -> dict:
     """Return ephemeral connection metadata for a voice provider.
 
     For backward compatibility (OpenAI WebRTC, default), the response shape
@@ -54,12 +58,12 @@ async def create_voice_session(provider: str | None = None, model: str | None = 
     the OpenAI-specific top-level fields.
     """
     try:
-        provider_id, model_entry = resolve_voice_target(provider, model)
+        provider_id, model_entry, voice_name = resolve_voice_target(provider, model, voice)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        provider_obj = instantiate_provider(provider_id, model_entry["id"])
+        provider_obj = instantiate_provider(provider_id, model_entry["id"], voice_name)
         info = await provider_obj.get_connection_info()
     except RuntimeError as e:
         # Missing API key or config

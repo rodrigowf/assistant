@@ -135,6 +135,7 @@ class OrchestratorSession:
         voice: bool = False,
         voice_provider: str | None = None,
         voice_model: str | None = None,
+        voice_name: str | None = None,
     ) -> None:
         self._config = config
         self._context = context
@@ -147,6 +148,7 @@ class OrchestratorSession:
         self._voice_provider = None  # Set in start() if voice=True
         self._voice_provider_id: str | None = voice_provider
         self._voice_model_id: str | None = voice_model
+        self._voice_name: str | None = voice_name
         self._voice_relay = None  # Set lazily for websocket providers
         self._history_summary: str | None = None
 
@@ -202,6 +204,13 @@ class OrchestratorSession:
         if self._voice_provider is not None:
             return self._voice_provider.model
         return self._voice_model_id
+
+    @property
+    def voice_name_id(self) -> str | None:
+        """Selected voice/speaker id when voice mode is active."""
+        if self._voice_provider is not None:
+            return self._voice_provider.voice
+        return self._voice_name
 
     @property
     def is_busy(self) -> bool:
@@ -260,12 +269,15 @@ class OrchestratorSession:
                 instantiate_provider,
                 resolve_voice_target,
             )
-            provider_id, model_entry = resolve_voice_target(
-                self._voice_provider_id, self._voice_model_id,
+            provider_id, model_entry, voice_name = resolve_voice_target(
+                self._voice_provider_id, self._voice_model_id, self._voice_name,
             )
             self._voice_provider_id = provider_id
             self._voice_model_id = model_entry["id"]
-            self._voice_provider = instantiate_provider(provider_id, model_entry["id"])
+            self._voice_name = voice_name
+            self._voice_provider = instantiate_provider(
+                provider_id, model_entry["id"], voice_name,
+            )
             provider = self._voice_provider
         else:
             provider = self._create_provider()

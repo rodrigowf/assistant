@@ -4,11 +4,19 @@ import {
   updateConfig,
   listMcpServers,
   listModels,
+  listVoiceModels,
   type AssistantConfig,
   type McpServerConfig,
   type ModelInfo,
+  type VoiceModelEntry,
 } from "../api/rest";
 import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
+
+const VOICE_PROVIDER_LABELS: Record<string, string> = {
+  openai: "OpenAI",
+  qwen: "Qwen (Alibaba)",
+  google: "Google Gemini",
+};
 
 interface Props {
   isOpen: boolean;
@@ -19,6 +27,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [config, setConfig] = useState<AssistantConfig | null>(null);
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [voiceProviders, setVoiceProviders] = useState<Record<string, VoiceModelEntry[]>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,14 +42,16 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, modelsRes] = await Promise.all([
+      const [cfg, mcpRes, modelsRes, voiceRes] = await Promise.all([
         getConfig(),
         listMcpServers(),
         listModels(),
+        listVoiceModels(),
       ]);
       setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setModels(modelsRes.models);
+      setVoiceProviders(voiceRes.providers);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -95,6 +106,15 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const selectedModel = models.find(m => m.model_id === config?.default_model);
   const selectedProvider = selectedModel?.provider ?? providers[0] ?? "";
   const providerModels = models.filter(m => m.provider === selectedProvider);
+
+  // Derived voice-provider/model/voice state for dropdowns
+  const voiceProviderIds = Object.keys(voiceProviders);
+  const selectedVoiceProvider = config?.default_voice_provider ?? voiceProviderIds[0] ?? "";
+  const voiceModels: VoiceModelEntry[] = voiceProviders[selectedVoiceProvider] ?? [];
+  const selectedVoiceModel: VoiceModelEntry | undefined =
+    voiceModels.find(m => m.id === config?.default_voice_model) ?? voiceModels[0];
+  const voiceVoices = selectedVoiceModel?.voices ?? [];
+  const selectedVoiceName = config?.default_voice_name ?? selectedVoiceModel?.voice ?? "";
 
   if (!isOpen) return null;
 
@@ -171,6 +191,74 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                             {m.display_name}
                             {m.supports_audio ? " 🎤" : ""}
                             {m.supports_vision ? " 👁" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              {/* ── Voice Model ───────────────────────────────── */}
+              <section className="config-section">
+                <h3 className="config-section-title">Voice Model</h3>
+                <p className="config-section-desc">
+                  Default provider, model, and voice for new realtime voice sessions.
+                  Cannot be changed mid-session.
+                </p>
+                {voiceProviderIds.length === 0 ? (
+                  <div className="config-empty">No voice providers available</div>
+                ) : (
+                  <div className="model-dropdowns">
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">Provider</label>
+                      <select
+                        className="model-dropdown-select"
+                        value={selectedVoiceProvider}
+                        disabled={saving}
+                        onChange={(e) =>
+                          save({ default_voice_provider: e.target.value })
+                            .catch(err => setError(String(err)))
+                        }
+                      >
+                        {voiceProviderIds.map(p => (
+                          <option key={p} value={p}>
+                            {VOICE_PROVIDER_LABELS[p] ?? p}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">Model</label>
+                      <select
+                        className="model-dropdown-select"
+                        value={selectedVoiceModel?.id ?? ""}
+                        disabled={saving || voiceModels.length === 0}
+                        onChange={(e) =>
+                          save({ default_voice_model: e.target.value })
+                            .catch(err => setError(String(err)))
+                        }
+                      >
+                        {voiceModels.map(m => (
+                          <option key={m.id} value={m.id}>{m.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">Voice</label>
+                      <select
+                        className="model-dropdown-select"
+                        value={selectedVoiceName}
+                        disabled={saving || voiceVoices.length === 0}
+                        onChange={(e) =>
+                          save({ default_voice_name: e.target.value })
+                            .catch(err => setError(String(err)))
+                        }
+                      >
+                        {voiceVoices.map(v => (
+                          <option key={v.id} value={v.id} title={v.description}>
+                            {v.label}
+                            {v.description ? ` — ${v.description}` : ""}
                           </option>
                         ))}
                       </select>
