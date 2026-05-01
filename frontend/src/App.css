@@ -345,6 +345,15 @@
   box-shadow: 0 0 0 3px var(--accent-subtle);
 }
 
+/* When the rename input is active, drop the title's text-overflow clipping so
+   the focused input (and its focus ring) renders in full instead of being
+   ellipsized like the static label. */
+.session-title:has(.session-rename-input) {
+  overflow: visible;
+  white-space: normal;
+  text-overflow: clip;
+}
+
 /* Kebab menu — hidden on desktop, shown on mobile */
 .session-menu {
   display: none;
