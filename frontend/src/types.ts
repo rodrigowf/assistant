@@ -41,8 +41,29 @@ export interface PaginatedMessages {
 
 // WebSocket event types (server → client)
 
+export interface VoiceConnectionInfoPayload {
+  connection_type: "webrtc" | "websocket";
+  endpoint: string;
+  ephemeral_token: string | null;
+  expires_at: number | null;
+  audio_in_format: { sample_rate: number; encoding: string };
+  audio_out_format: { sample_rate: number; encoding: string };
+  model: string;
+  voice: string;
+  audio_relay?: "backend";
+}
+
 export type ServerEvent =
-  | { type: "session_started"; session_id: string; voice?: boolean; voice_session_update?: Record<string, unknown> }
+  | {
+      type: "session_started";
+      session_id: string;
+      voice?: boolean;
+      voice_session_update?: Record<string, unknown>;
+      voice_provider?: string;
+      voice_model?: string;
+      voice_connection_info?: VoiceConnectionInfoPayload;
+      voice_connection_error?: string;
+    }
   | { type: "session_stopped" }
   | { type: "text_delta"; text: string }
   | { type: "text_complete"; text: string }
@@ -64,6 +85,8 @@ export type ServerEvent =
   | { type: "agent_session_closed"; session_id: string }
   | { type: "user_message"; text: string; source?: string }
   | { type: "voice_command"; command: Record<string, unknown> }
+  | { type: "voice_event"; event: RealtimeEvent }
+  | { type: "voice_audio_out"; audio: string }
   | { type: "voice_stopped" };
 
 // OpenAI Realtime API event types (subset used by voice integration)

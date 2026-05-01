@@ -1,47 +1,54 @@
 /**
- * useVoiceOrchestrator — self-contained hook that manages:
- *   1. A WebSocket to /api/orchestrator/chat (sends voice_start)
- *   2. A WebRTC connection to OpenAI Realtime (via useVoiceSession)
- *   3. Bidirectional event bridging between the two
+ * useVoiceOrchestrator — drives a voice conversation against any
+ * registered backend voice provider, dispatching on the
+ * ``connection_type`` advertised in the ``session_started`` payload.
  *
- * Events from OpenAI → mirrored to backend via voice_event WS message
- * voice_command from backend → forwarded to OpenAI via data channel
+ * Two transports are supported:
  *
- * Voice transcripts are dispatched to the message list via onEvent callbacks.
+ * - WebRTC (OpenAI today): browser holds a peer connection directly to
+ *   the provider; data-channel events are mirrored to the orchestrator
+ *   WS as ``voice_event`` payloads, and ``voice_command`` events from
+ *   the orchestrator are forwarded back to the provider via the data
+ *   channel. Audio bypasses the backend.
  *
- * This hook is activated only for orchestrator tabs in voice mode. It runs
- * alongside (not instead of) the normal text orchestrator if one exists.
- * Since only one orchestrator can be active at a time on the backend, the
- * caller must stop any active text session before starting voice.
+ * - WebSocket (Qwen, Gemini Live, future locals): backend owns the
+ *   upstream WS to the provider. The frontend captures mic at PCM16
+ *   via an AudioWorklet and ships chunks over the orchestrator WS as
+ *   ``voice_audio_in``; assistant audio arrives as ``voice_audio_out``
+ *   chunks queued in :class:`PCMPlayer`. Provider events are
+ *   delivered as ``voice_event`` server messages.
+ *
+ * The hook owns lifecycle + event normalisation; transports own the
+ * per-protocol plumbing (see ``frontend/src/voice/transports/``).
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { useVoiceSession, type VoiceSessionHandles } from "./useVoiceSession";
+import { fetchEphemeralToken } from "../api/voice";
 import { ChatSocket } from "../api/websocket";
-import type { RealtimeEvent, ServerEvent, VoiceStatus } from "../types";
+import { connectWebRTCVoiceSession } from "../voice/transports/webrtc";
+import { connectWebSocketVoiceSession } from "../voice/transports/websocket";
+import type {
+  AnyVoiceTransportHandles,
+  WebRTCVoiceTransportHandles,
+} from "../voice/transports/types";
+import type {
+  RealtimeEvent,
+  ServerEvent,
+  VoiceConnectionInfoPayload,
+  VoiceStatus,
+} from "../types";
 
 interface UseVoiceOrchestratorOptions {
-  /** The stable local_id of the orchestrator tab — used as pool key. */
   localId?: string;
-  /** The original session ID for JSONL continuity when resuming from history. */
   resumeSdkId?: string | null;
-  /** Called for each user transcript received (to add to message list). */
   onUserTranscript?: (text: string) => void;
-  /** Called for each assistant transcript delta. */
   onAssistantDelta?: (text: string) => void;
-  /** Called when assistant transcript is complete. */
   onAssistantComplete?: (text: string) => void;
-  /** Called when a tool call starts. */
   onToolUse?: (callId: string, toolName: string, toolInput: Record<string, unknown>) => void;
-  /** Called when turn completes. */
   onTurnComplete?: () => void;
-  /** Called when session starts. */
   onSessionStarted?: (sessionId: string) => void;
-  /** Called when voice status changes (for tab status sync). */
   onStatusChange?: (status: VoiceStatus) => void;
-  /** Called before voice starts — use to stop the text orchestrator session. */
   onBeforeStart?: () => void;
-  /** Called after voice stops — use to allow the text orchestrator to reconnect. */
   onAfterStop?: () => void;
 }
 
@@ -50,33 +57,29 @@ export interface VoiceOrchestratorResult {
   startVoice: () => Promise<void>;
   stopVoice: () => void;
   isActive: boolean;
-  /** Whether the microphone is muted. */
   isMuted: boolean;
-  /** Toggle microphone mute on/off. */
   toggleMute: () => void;
-  /** Whether the assistant audio is muted. */
   isAssistantMuted: boolean;
-  /** Toggle assistant audio mute on/off. */
   toggleAssistantMute: () => void;
-  /** Mic input audio level (0–1). */
   micLevel: number;
-  /** Remote speaker audio level (0–1). */
   speakerLevel: number;
-  /** Error message for display (e.g. session expired). Null when no error. */
   voiceError: string | null;
 }
 
 export function useVoiceOrchestrator(
-  options: UseVoiceOrchestratorOptions = {}
+  options: UseVoiceOrchestratorOptions = {},
 ): VoiceOrchestratorResult {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
   const [voiceError, setVoiceError] = useState<string | null>(null);
-  const voiceHandlesRef = useRef<VoiceSessionHandles | null>(null);
+  const transportRef = useRef<AnyVoiceTransportHandles | null>(null);
   const wsRef = useRef<ChatSocket | null>(null);
-  // Queue commands that arrive before data channel opens
+
+  // Queue WebRTC commands that arrive before the data channel is open.
   const pendingCommandsRef = useRef<RealtimeEvent[]>([]);
-  // Whether data channel is open
   const dcReadyRef = useRef(false);
+
+  // Connection info from session_started — drives transport choice.
+  const connInfoRef = useRef<VoiceConnectionInfoPayload | null>(null);
 
   // Mute state
   const [isMuted, setIsMuted] = useState(false);
@@ -88,7 +91,6 @@ export function useVoiceOrchestrator(
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Stable callback refs
   const optsRef = useRef(options);
   optsRef.current = options;
 
@@ -97,12 +99,17 @@ export function useVoiceOrchestrator(
     optsRef.current.onStatusChange?.(status);
   }, []);
 
-  // Send a raw event to OpenAI via data channel (or queue if not yet open)
-  const sendToOpenAI = useCallback((event: RealtimeEvent) => {
-    if (dcReadyRef.current && voiceHandlesRef.current) {
-      voiceHandlesRef.current.sendToOpenAI(event);
-    } else {
-      pendingCommandsRef.current.push(event);
+  // Send a raw provider event. WebRTC: data channel; WS: orchestrator WS mirror.
+  const sendProviderEvent = useCallback((event: RealtimeEvent) => {
+    const t = transportRef.current;
+    if (t?.kind === "webrtc") {
+      if (dcReadyRef.current) {
+        t.sendProviderEvent(event);
+      } else {
+        pendingCommandsRef.current.push(event);
+      }
+    } else if (t?.kind === "websocket") {
+      wsRef.current?.send({ type: "voice_event", event });
     }
   }, []);
 
@@ -119,34 +126,207 @@ export function useVoiceOrchestrator(
 
   const cleanup = useCallback(() => {
     stopAudioAnalysis();
-    voiceHandlesRef.current?.disconnect();
-    voiceHandlesRef.current = null;
+    transportRef.current?.disconnect();
+    transportRef.current = null;
     wsRef.current?.close();
     wsRef.current = null;
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
+    connInfoRef.current = null;
     setIsMuted(false);
     setIsAssistantMuted(false);
   }, [stopAudioAnalysis]);
 
-  // Handle server events from the orchestrator WebSocket
+  // Normalised provider-event handler — same logic for both transports.
+  const handleProviderEvent = useCallback((event: RealtimeEvent) => {
+    const eventType = event.type;
+
+    if (eventType === "error") {
+      const err = event.error as Record<string, unknown> | undefined;
+      const code = err?.code as string | undefined;
+      const message = err?.message as string | undefined;
+      if (code === "session_expired") {
+        setVoiceError(message || "Voice session expired — please restart");
+      } else {
+        setVoiceError(message || `Voice error: ${code || "unknown"}`);
+      }
+      cleanup();
+      updateStatus("error");
+      optsRef.current.onAfterStop?.();
+      return;
+    }
+
+    if (eventType === "response.created") {
+      updateStatus("speaking");
+    } else if (eventType === "response.done") {
+      updateStatus("active");
+      optsRef.current.onTurnComplete?.();
+    } else if (eventType === "response.output_item.added") {
+      const item = event.item as Record<string, unknown> | undefined;
+      if (item?.type === "function_call") updateStatus("tool_use");
+    } else if (eventType === "response.function_call_arguments.done") {
+      updateStatus("thinking");
+      const callId = (event.call_id as string) || "";
+      const name = (event.name as string) || "";
+      try {
+        const args = JSON.parse((event.arguments as string) || "{}");
+        optsRef.current.onToolUse?.(callId, name, args);
+      } catch {
+        optsRef.current.onToolUse?.(callId, name, {});
+      }
+    } else if (eventType === "input_audio_buffer.speech_started") {
+      updateStatus("active");
+      // Barge-in: drop queued assistant audio (WS providers).
+      const t = transportRef.current;
+      if (t?.kind === "websocket") t.flushAudioOut();
+    } else if (eventType === "input_audio_buffer.speech_stopped") {
+      updateStatus("thinking");
+    }
+
+    if (eventType === "conversation.item.input_audio_transcription.completed") {
+      const transcript = (event.transcript as string) || "";
+      if (transcript) optsRef.current.onUserTranscript?.(transcript);
+    }
+
+    if (eventType === "conversation.item.created") {
+      const item = event.item as Record<string, unknown> | undefined;
+      if (item?.role === "user") {
+        const content = (item.content as Array<Record<string, unknown>>) || [];
+        for (const c of content) {
+          if (c.type === "input_text" && c.text) {
+            optsRef.current.onUserTranscript?.(c.text as string);
+          }
+        }
+      }
+    }
+
+    if (eventType === "response.audio_transcript.delta" || eventType === "response.text.delta") {
+      optsRef.current.onAssistantDelta?.((event.delta as string) || "");
+    } else if (eventType === "response.audio_transcript.done") {
+      optsRef.current.onAssistantComplete?.((event.transcript as string) || "");
+    } else if (eventType === "response.text.done") {
+      optsRef.current.onAssistantComplete?.((event.text as string) || "");
+    }
+  }, [updateStatus, cleanup]);
+
+  // For WebRTC, every event also gets mirrored to the backend (so JSONL persistence works).
+  const handleWebRTCEvent = useCallback((event: RealtimeEvent) => {
+    wsRef.current?.send({ type: "voice_event", event });
+    handleProviderEvent(event);
+  }, [handleProviderEvent]);
+
+  const handleConnectionClosed = useCallback(() => {
+    if (transportRef.current) {
+      setVoiceError((prev) => prev ?? "Voice connection lost");
+      cleanup();
+      updateStatus("error");
+      optsRef.current.onAfterStop?.();
+    }
+  }, [cleanup, updateStatus]);
+
+  // WebRTC-only: mic + remote-stream RMS analyser.
+  const startWebRTCAudioAnalysis = useCallback((t: WebRTCVoiceTransportHandles) => {
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+
+    const micSource = ctx.createMediaStreamSource(t.micStream);
+    const micAnalyser = ctx.createAnalyser();
+    micAnalyser.fftSize = 256;
+    micSource.connect(micAnalyser);
+
+    let speakerAnalyser: AnalyserNode | null = null;
+    const micData = new Uint8Array(micAnalyser.frequencyBinCount);
+    let speakerData: Uint8Array | null = null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function rms(data: any): number {
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / data.length);
+    }
+
+    analyserIntervalRef.current = setInterval(() => {
+      micAnalyser.getByteTimeDomainData(micData);
+      setMicLevel(rms(micData));
+      if (!speakerAnalyser && t.remoteStream) {
+        try {
+          const speakerSource = ctx.createMediaStreamSource(t.remoteStream);
+          speakerAnalyser = ctx.createAnalyser();
+          speakerAnalyser.fftSize = 256;
+          speakerSource.connect(speakerAnalyser);
+          speakerData = new Uint8Array(speakerAnalyser.frequencyBinCount);
+        } catch { /* not ready yet */ }
+      }
+      if (speakerAnalyser && speakerData) {
+        speakerAnalyser.getByteTimeDomainData(speakerData as Uint8Array<ArrayBuffer>);
+        setSpeakerLevel(rms(speakerData));
+      }
+    }, 66);
+  }, []);
+
+  // WS-only: mic-only analyser; speaker level comes from PCMPlayer via setSpeakerLevel.
+  const startWSMicAnalysis = useCallback((micStream: MediaStream) => {
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+    const micSource = ctx.createMediaStreamSource(micStream);
+    const micAnalyser = ctx.createAnalyser();
+    micAnalyser.fftSize = 256;
+    micSource.connect(micAnalyser);
+    const micData = new Uint8Array(micAnalyser.frequencyBinCount);
+    analyserIntervalRef.current = setInterval(() => {
+      micAnalyser.getByteTimeDomainData(micData);
+      let sum = 0;
+      for (let i = 0; i < micData.length; i++) {
+        const v = (micData[i] - 128) / 128;
+        sum += v * v;
+      }
+      setMicLevel(Math.sqrt(sum / micData.length));
+    }, 66);
+  }, []);
+
+  // Orchestrator-WS server events.
   const handleServerEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
-      case "session_started":
+      case "session_started": {
         optsRef.current.onSessionStarted?.(event.session_id);
-        // Forward session.update to OpenAI as soon as data channel is open
-        if (event.voice_session_update) {
-          sendToOpenAI(event.voice_session_update as RealtimeEvent);
+        const info = event.voice_connection_info;
+        if (info) connInfoRef.current = info;
+        // For WebRTC, the frontend forwards session.update via the data channel.
+        // For WebSocket, the backend already sent it upstream — no-op for us.
+        if (event.voice_session_update && info?.connection_type === "webrtc") {
+          sendProviderEvent(event.voice_session_update as RealtimeEvent);
+        }
+        if (event.voice_connection_error) {
+          setVoiceError(event.voice_connection_error);
+          updateStatus("error");
+          optsRef.current.onAfterStop?.();
+        }
+        break;
+      }
+
+      case "voice_command":
+        // Backend → provider command. WebRTC: forward via data channel.
+        // WebSocket: the backend sends these directly; we ignore.
+        if (connInfoRef.current?.connection_type === "webrtc") {
+          sendProviderEvent(event.command as RealtimeEvent);
         }
         break;
 
-      case "voice_command":
-        // Backend is sending a command to forward to OpenAI (e.g. function_call_output)
-        sendToOpenAI(event.command as RealtimeEvent);
+      case "voice_event":
+        // Provider event mirrored from backend (WebSocket providers only).
+        handleProviderEvent(event.event);
         break;
 
+      case "voice_audio_out": {
+        const t = transportRef.current;
+        if (t?.kind === "websocket") t.pushAudioOut(event.audio);
+        break;
+      }
+
       case "voice_stopped":
-        // AI-initiated clean end (end_voice_session tool)
         cleanup();
         updateStatus("off");
         optsRef.current.onAfterStop?.();
@@ -163,8 +343,7 @@ export function useVoiceOrchestrator(
       }
 
       case "status":
-        // WebSocket disconnected while voice was active
-        if ((event as { status?: string }).status === "disconnected" && voiceHandlesRef.current) {
+        if ((event as { status?: string }).status === "disconnected" && transportRef.current) {
           setVoiceError((prev) => prev ?? "Server connection lost");
           cleanup();
           updateStatus("error");
@@ -172,187 +351,21 @@ export function useVoiceOrchestrator(
         }
         break;
     }
-  }, [sendToOpenAI, updateStatus, cleanup]);
-
-  // Handle connection closed (e.g. session expired, network drop)
-  const handleConnectionClosed = useCallback(() => {
-    // Only act if voice is currently active (avoid double-firing)
-    if (voiceHandlesRef.current) {
-      // If we don't already have a specific error, set a generic one
-      setVoiceError((prev) => prev ?? "Voice connection lost");
-      cleanup();
-      updateStatus("error");
-      optsRef.current.onAfterStop?.();
-    }
-  }, [cleanup, updateStatus]);
-
-  // Handle events from OpenAI data channel
-  const handleOpenAIEvent = useCallback((event: RealtimeEvent) => {
-    const eventType = event.type;
-
-    // Mirror every event to the backend
-    wsRef.current?.send({ type: "voice_event", event });
-
-    // Detect OpenAI error events (e.g. session_expired, rate_limit, etc.)
-    if (eventType === "error") {
-      const err = event.error as Record<string, unknown> | undefined;
-      const code = err?.code as string | undefined;
-      const message = err?.message as string | undefined;
-      if (code === "session_expired") {
-        console.warn("[voice-orchestrator] Session expired:", message);
-        setVoiceError(message || "Voice session expired — please restart");
-      } else {
-        console.error("[voice-orchestrator] OpenAI error:", code, message);
-        setVoiceError(message || `Voice error: ${code || "unknown"}`);
-      }
-      cleanup();
-      updateStatus("error");
-      optsRef.current.onAfterStop?.();
-      return; // Don't process further
-    }
-
-    // Update status and dispatch UI callbacks
-    if (eventType === "response.created") {
-      updateStatus("speaking");
-    } else if (eventType === "response.done") {
-      updateStatus("active");
-      optsRef.current.onTurnComplete?.();
-    } else if (eventType === "response.output_item.added") {
-      const item = event.item as Record<string, unknown> | undefined;
-      if (item?.type === "function_call") {
-        updateStatus("tool_use");
-      }
-    } else if (eventType === "response.function_call_arguments.done") {
-      updateStatus("thinking");
-      const callId = (event.call_id as string) || "";
-      const name = (event.name as string) || "";
-      try {
-        const args = JSON.parse((event.arguments as string) || "{}");
-        optsRef.current.onToolUse?.(callId, name, args);
-      } catch {
-        optsRef.current.onToolUse?.(callId, name, {});
-      }
-    } else if (eventType === "input_audio_buffer.speech_started") {
-      updateStatus("active");
-    } else if (eventType === "input_audio_buffer.speech_stopped") {
-      updateStatus("thinking");
-    }
-
-    // User speech transcript — arrives after transcription completes
-    if (eventType === "conversation.item.input_audio_transcription.completed") {
-      const transcript = (event.transcript as string) || "";
-      if (transcript) {
-        optsRef.current.onUserTranscript?.(transcript);
-      }
-    }
-
-    // User text input (typed text in voice session, if ever used)
-    if (eventType === "conversation.item.created") {
-      const item = event.item as Record<string, unknown> | undefined;
-      if (item?.role === "user") {
-        const content = (item.content as Array<Record<string, unknown>>) || [];
-        for (const c of content) {
-          if (c.type === "input_text" && c.text) {
-            optsRef.current.onUserTranscript?.(c.text as string);
-          }
-        }
-      }
-    }
-
-    // Assistant transcript streaming
-    if (eventType === "response.audio_transcript.delta") {
-      optsRef.current.onAssistantDelta?.((event.delta as string) || "");
-    } else if (eventType === "response.audio_transcript.done") {
-      optsRef.current.onAssistantComplete?.((event.transcript as string) || "");
-    }
-  }, [updateStatus, cleanup]);
-
-  // Data channel connected → drain queue
-  const handleVoiceConnected = useCallback(() => {
-    dcReadyRef.current = true;
-    updateStatus("active");
-    const pending = pendingCommandsRef.current.splice(0);
-    for (const cmd of pending) {
-      voiceHandlesRef.current?.sendToOpenAI(cmd);
-    }
-  }, [updateStatus]);
-
-  const { connect } = useVoiceSession({
-    onEvent: handleOpenAIEvent,
-    onConnected: handleVoiceConnected,
-    onError: (err) => {
-      console.error("[voice-orchestrator] WebRTC error:", err);
-      setVoiceError(err);
-      updateStatus("error");
-    },
-    onClose: handleConnectionClosed,
-  });
-
-  const startAudioAnalysis = useCallback((handles: VoiceSessionHandles) => {
-    const ctx = new AudioContext();
-    audioCtxRef.current = ctx;
-
-    // Mic analyser
-    const micSource = ctx.createMediaStreamSource(handles.micStream);
-    const micAnalyser = ctx.createAnalyser();
-    micAnalyser.fftSize = 256;
-    micSource.connect(micAnalyser);
-
-    // Speaker analyser (lazy — remote stream may arrive later)
-    let speakerAnalyser: AnalyserNode | null = null;
-
-    const micData = new Uint8Array(micAnalyser.frequencyBinCount);
-    let speakerData: Uint8Array | null = null;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    function computeRMS(data: any): number {
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) {
-        const v = (data[i] - 128) / 128;
-        sum += v * v;
-      }
-      return Math.sqrt(sum / data.length);
-    }
-
-    analyserIntervalRef.current = setInterval(() => {
-      // Mic level
-      micAnalyser.getByteTimeDomainData(micData);
-      setMicLevel(computeRMS(micData));
-
-      // Speaker level (lazy init when remote stream is available)
-      if (!speakerAnalyser && handles.remoteStream) {
-        try {
-          const speakerSource = ctx.createMediaStreamSource(handles.remoteStream);
-          speakerAnalyser = ctx.createAnalyser();
-          speakerAnalyser.fftSize = 256;
-          speakerSource.connect(speakerAnalyser);
-          speakerData = new Uint8Array(speakerAnalyser.frequencyBinCount);
-        } catch {
-          // Remote stream not ready yet
-        }
-      }
-      if (speakerAnalyser && speakerData) {
-        speakerAnalyser.getByteTimeDomainData(speakerData as Uint8Array<ArrayBuffer>);
-        setSpeakerLevel(computeRMS(speakerData));
-      }
-    }, 66); // ~15fps
-  }, []);
+  }, [sendProviderEvent, handleProviderEvent, updateStatus, cleanup]);
 
   const toggleMute = useCallback(() => {
-    const handles = voiceHandlesRef.current;
-    if (!handles) return;
+    const t = transportRef.current;
+    if (!t) return;
     const newMuted = !isMuted;
-    handles.micStream.getAudioTracks().forEach((track) => {
-      track.enabled = !newMuted;
-    });
+    t.setMicEnabled(!newMuted);
     setIsMuted(newMuted);
   }, [isMuted]);
 
   const toggleAssistantMute = useCallback(() => {
-    const handles = voiceHandlesRef.current;
-    if (!handles) return;
+    const t = transportRef.current;
+    if (!t) return;
     const newMuted = !isAssistantMuted;
-    handles.audioElement.muted = newMuted;
+    t.setOutputMuted(newMuted);
     setIsAssistantMuted(newMuted);
   }, [isAssistantMuted]);
 
@@ -364,75 +377,113 @@ export function useVoiceOrchestrator(
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
 
-    // Notify the text session it's about to be replaced (disconnects its WS).
-    // The backend handles the text→voice transition atomically — no need to
-    // wait for an explicit stop acknowledgment.
     optsRef.current.onBeforeStart?.();
 
-    // 1. Open orchestrator WebSocket in voice mode
+    // Open the orchestrator WS (used by both transports).
     const socket = new ChatSocket(handleServerEvent, "/api/orchestrator/chat");
     wsRef.current = socket;
+
     socket.connect(() => {
-      // WebSocket open → send voice_start with local_id (pool key) and
-      // resume_sdk_id (original JSONL session ID for history continuity).
       const lid = optsRef.current.localId;
       const resumeId = optsRef.current.resumeSdkId;
       const payload: Record<string, unknown> = { type: "voice_start", local_id: lid };
-      if (resumeId) {
-        payload.resume_sdk_id = resumeId;
-      }
+      if (resumeId) payload.resume_sdk_id = resumeId;
       socket.send(payload);
     });
 
-    // 2. Establish WebRTC connection with timeout
-    const CONNECTION_TIMEOUT_MS = 15_000;
-    let handles: VoiceSessionHandles | null = null;
-    try {
-      handles = await Promise.race([
-        connect(),
-        new Promise<null>((_, reject) =>
-          setTimeout(() => reject(new Error("Voice connection timed out")), CONNECTION_TIMEOUT_MS)
-        ),
-      ]);
-    } catch (err) {
-      setVoiceError(err instanceof Error ? err.message : "Voice connection timed out");
-      cleanup();
-      updateStatus("error");
-      return;
+    // Wait up to 10s for session_started (which populates connInfoRef).
+    const startedAt = Date.now();
+    while (!connInfoRef.current) {
+      if (Date.now() - startedAt > 10_000) {
+        setVoiceError("Voice session did not start (no connection_info from server)");
+        cleanup();
+        updateStatus("error");
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 50));
     }
-    if (!handles) {
-      // connect() returned null — onError already set voiceError
-      cleanup();
-      updateStatus("error");
-      return;
-    }
-    voiceHandlesRef.current = handles;
-    // Start audio level analysis
-    startAudioAnalysis(handles);
-    // Drain any pending commands that arrived before DC opened
-    if (dcReadyRef.current && pendingCommandsRef.current.length > 0) {
-      const pending = pendingCommandsRef.current.splice(0);
-      for (const cmd of pending) {
-        handles.sendToOpenAI(cmd);
+    const info = connInfoRef.current;
+
+    if (info.connection_type === "webrtc") {
+      // OpenAI: get an ephemeral token + the canonical /v1/realtime/calls URL.
+      let ephemeralKey: string;
+      let callUrl: string;
+      try {
+        const tokenData = await fetchEphemeralToken();
+        ephemeralKey = tokenData.client_secret.value;
+        callUrl = tokenData.connection_info?.endpoint ?? info.endpoint;
+      } catch (err) {
+        setVoiceError(err instanceof Error ? err.message : String(err));
+        cleanup();
+        updateStatus("error");
+        return;
+      }
+
+      try {
+        const t = await connectWebRTCVoiceSession({
+          ephemeralKey,
+          callUrl,
+          inputSampleRate: info.audio_in_format.sample_rate,
+          onProviderEvent: handleWebRTCEvent,
+          onConnected: () => {
+            dcReadyRef.current = true;
+            updateStatus("active");
+            const pending = pendingCommandsRef.current.splice(0);
+            for (const cmd of pending) t.sendProviderEvent(cmd);
+          },
+          onClose: handleConnectionClosed,
+          onError: (msg) => {
+            setVoiceError(msg);
+            updateStatus("error");
+          },
+        });
+        transportRef.current = t;
+        startWebRTCAudioAnalysis(t);
+      } catch (err) {
+        setVoiceError(err instanceof Error ? err.message : String(err));
+        cleanup();
+        updateStatus("error");
+      }
+    } else {
+      // WebSocket providers: backend relays audio. We just capture + play.
+      try {
+        const t = await connectWebSocketVoiceSession({
+          inputSampleRate: info.audio_in_format.sample_rate,
+          outputSampleRate: info.audio_out_format.sample_rate,
+          onAudioChunk: (b64) => {
+            wsRef.current?.send({ type: "voice_audio_in", audio: b64 });
+          },
+          onSpeakerLevel: setSpeakerLevel,
+        });
+        transportRef.current = t;
+        startWSMicAnalysis(t.micStream);
+        updateStatus("active");
+      } catch (err) {
+        setVoiceError(err instanceof Error ? err.message : String(err));
+        cleanup();
+        updateStatus("error");
       }
     }
-  }, [voiceStatus, connect, handleServerEvent, cleanup, updateStatus, startAudioAnalysis]);
+  }, [
+    voiceStatus,
+    handleServerEvent,
+    handleWebRTCEvent,
+    handleConnectionClosed,
+    startWebRTCAudioAnalysis,
+    startWSMicAnalysis,
+    cleanup,
+    updateStatus,
+  ]);
 
   const stopVoice = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.send({ type: "stop" });
-    }
+    if (wsRef.current) wsRef.current.send({ type: "stop" });
     cleanup();
     updateStatus("off");
-    // Allow text orchestrator to reconnect
     optsRef.current.onAfterStop?.();
   }, [cleanup, updateStatus]);
 
-  // Clean up on unmount
   useEffect(() => {
-    return () => {
-      cleanup();
-    };
+    return () => { cleanup(); };
   }, [cleanup]);
 
   return {
