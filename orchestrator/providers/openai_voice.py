@@ -238,12 +238,21 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
         vad: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the OpenAI ``session.update`` payload."""
+        voice_directives = (
+            "\n\n# Voice mode\n"
+            "- Speak at a natural conversational pace, slightly faster than default. "
+            "Crisp delivery, not slow.\n"
+            "- Keep responses short by default (1–3 sentences). Only go long when "
+            "explicitly asked.\n"
+            "- If the user starts speaking while you're talking, stop immediately and "
+            "listen.\n"
+        )
         return {
             "type": "session.update",
             "session": {
                 "model": self._model,
                 "voice": voice or self._voice,
-                "instructions": system,
+                "instructions": (system or "") + voice_directives,
                 "tools": tools,
                 "tool_choice": "auto",
                 "modalities": ["text", "audio"],

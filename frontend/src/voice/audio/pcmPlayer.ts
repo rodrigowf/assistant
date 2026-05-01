@@ -25,6 +25,8 @@ export class PCMPlayer {
   private analyserData: Uint8Array;
   private sampleRate: number;
   private destroyed = false;
+  // All scheduled-but-not-yet-finished sources, so flush() can stop them.
+  private active: Set<AudioBufferSourceNode> = new Set();
 
   constructor(opts: PCMPlayerOptions) {
     this.sampleRate = opts.sampleRate;
@@ -78,17 +80,25 @@ export class PCMPlayer {
     const startAt = Math.max(now, this.nextStartTime);
     src.start(startAt);
     this.nextStartTime = startAt + buf.duration;
+
+    // Track for flush(); auto-remove when finished.
+    this.active.add(src);
+    src.onended = () => { this.active.delete(src); };
   }
 
-  /** Drop any pending audio (used on barge-in interruption). */
+  /** Drop any pending audio (used on barge-in interruption).
+   *
+   * Stops every scheduled source — including the one currently playing —
+   * so the assistant goes silent immediately when the user starts talking.
+   * Without this, in-flight AudioBufferSourceNodes keep playing and chunks
+   * that were already scheduled at future startAt times still fire.
+   */
   flush(): void {
-    // We can't cancel already-scheduled AudioBufferSourceNodes individually
-    // without keeping refs to all of them, so reset the cursor — anything
-    // scheduled in the future will be replaced as new pushes arrive.
-    // For chunks already started, they'll finish naturally; for queued ones
-    // far in the future, this isn't great. In practice flush() is called
-    // when the user interrupts, and Qwen/Gemini stop sending audio, so
-    // the queue drains itself within ~the duration of one in-flight chunk.
+    for (const src of this.active) {
+      try { src.stop(); } catch { /* already stopped */ }
+      try { src.disconnect(); } catch { /* fine */ }
+    }
+    this.active.clear();
     this.nextStartTime = this.ctx.currentTime;
   }
 

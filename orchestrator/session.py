@@ -594,16 +594,28 @@ class OrchestratorSession:
                 # and ask for the next response.
                 commands.extend(self._voice_provider.format_tool_result(call_id, result))
 
-        # Assistant transcript complete — persist to JSONL
+        # Assistant transcript complete — STAGE it; we only persist if the
+        # turn ended in status="completed" (response.done below). Otherwise
+        # the transcript is a fragment cut off by barge-in or response.cancel
+        # and would pollute history with sentences like "Yeah, I think".
         elif event_type == "response.audio_transcript.done":
             transcript = event.get("transcript", "")
             if transcript:
+                self._pending_assistant_transcript = transcript
+
+        # Turn complete — decide whether to persist the staged transcript.
+        elif event_type == "response.done":
+            response = event.get("response", {})
+            status = response.get("status", "completed")
+            staged = getattr(self, "_pending_assistant_transcript", None)
+            if staged and status == "completed":
                 self._writer.append({
                     "type": "assistant",
-                    "message": {"role": "assistant", "content": transcript},
+                    "message": {"role": "assistant", "content": staged},
                     "source": "voice_response",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
+            self._pending_assistant_transcript = None
 
         # Barge-in interruption — mark in JSONL
         elif event_type == "input_audio_buffer.speech_started":

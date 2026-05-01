@@ -289,12 +289,24 @@ class QwenVoiceProvider(BaseVoiceProvider):
     ) -> dict[str, Any]:
         """Build the ``session.update`` payload."""
         fmt = _audio_formats_for(self._model)
+        # Voice-mode behavior tweaks. Qwen has no `speed` parameter — we
+        # have to ask the model. Same for "be concise so the user can
+        # interrupt comfortably".
+        voice_directives = (
+            "\n\n# Voice mode\n"
+            "- Speak at a natural conversational pace, slightly faster than default. "
+            "Crisp delivery, not slow.\n"
+            "- Keep responses short by default (1–3 sentences). Only go long when "
+            "explicitly asked.\n"
+            "- If the user starts speaking while you're talking, stop immediately and "
+            "listen.\n"
+        )
         return {
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
                 "voice": voice or self._voice,
-                "instructions": system,
+                "instructions": (system or "") + voice_directives,
                 "tools": tools,
                 # Plus reliably calls tools with "auto"; Flash needs "required".
                 # Compromise: leave "auto" so the model can also chat freely

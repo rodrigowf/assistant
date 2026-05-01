@@ -176,9 +176,17 @@ export function useVoiceOrchestrator(
       }
     } else if (eventType === "input_audio_buffer.speech_started") {
       updateStatus("active");
-      // Barge-in: drop queued assistant audio (WS providers).
+      // Barge-in: stop the player immediately so audio that's already
+      // queued (or currently playing) shuts up. Then ask the provider to
+      // cancel any in-flight response — Qwen's auto-interrupt does not
+      // reliably stop responses that have started streaming, so we send
+      // response.cancel ourselves. WebRTC providers (OpenAI) handle this
+      // server-side via their own VAD wiring.
       const t = transportRef.current;
-      if (t?.kind === "websocket") t.flushAudioOut();
+      if (t?.kind === "websocket") {
+        t.flushAudioOut();
+        sendProviderEvent({ type: "response.cancel" });
+      }
     } else if (eventType === "input_audio_buffer.speech_stopped") {
       updateStatus("thinking");
     }
