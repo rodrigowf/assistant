@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -147,6 +147,7 @@ class OrchestratorSession:
         self._voice_provider = None  # Set in start() if voice=True
         self._voice_provider_id: str | None = voice_provider
         self._voice_model_id: str | None = voice_model
+        self._voice_relay = None  # Set lazily for websocket providers
         self._history_summary: str | None = None
 
         # Track current provider for model switching
@@ -428,7 +429,69 @@ class OrchestratorSession:
         self._history_summary = summary
         return recent, summary
 
-    async def process_voice_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+    @property
+    def needs_voice_relay(self) -> bool:
+        """True for WS providers (Qwen/Gemini/locals) that relay through backend."""
+        return (
+            self._voice
+            and self._voice_provider is not None
+            and self._voice_provider.connection_type == "websocket"
+        )
+
+    async def start_voice_relay(
+        self,
+        on_audio_out: Callable[[str], Awaitable[None]],
+        on_event_for_frontend: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Open the upstream provider WS for non-WebRTC voice providers.
+
+        The handler layer wires the two callbacks so audio chunks become
+        ``voice_audio_out`` payloads on the orchestrator broadcast and
+        provider events are mirrored to subscribers.
+        """
+        if not self.needs_voice_relay:
+            return
+        from orchestrator.voice_relay import VoiceRelay
+        # Lazy-build the session.update payload that seeds the upstream WS.
+        session_update = await self.get_session_update()
+        if session_update is None:
+            raise RuntimeError("Voice provider did not produce a session.update payload")
+        relay = VoiceRelay(
+            self._voice_provider,
+            on_audio_out=on_audio_out,
+            on_event_for_frontend=on_event_for_frontend,
+        )
+        await relay.start(session_update)
+        self._voice_relay = relay
+
+    async def stop_voice_relay(self) -> None:
+        if self._voice_relay is not None:
+            await self._voice_relay.stop()
+            self._voice_relay = None
+
+    async def send_voice_audio_in(self, pcm_b64: str) -> None:
+        """Forward a frontend mic chunk upstream (WS providers only)."""
+        if self._voice_relay is None:
+            return
+        await self._voice_relay.send_audio(pcm_b64)
+
+    async def send_voice_event_upstream(self, event: dict[str, Any]) -> None:
+        """Forward a frontend control event to the upstream provider WS.
+
+        Used for tool results and any other commands the model expects to
+        receive from the client. WebRTC providers ignore this — the
+        frontend sends those directly via the data channel.
+        """
+        if self._voice_relay is None:
+            return
+        await self._voice_relay.send_event(event)
+
+    async def process_voice_event(
+        self,
+        event: dict[str, Any],
+        *,
+        inject: bool = True,
+    ) -> list[dict[str, Any]]:
         """Process a single mirrored OpenAI Realtime event.
 
         Injects the event into the VoiceProvider queue, then processes any
@@ -443,7 +506,8 @@ class OrchestratorSession:
 
         commands: list[dict[str, Any]] = []
 
-        await self._voice_provider.inject_event(event)
+        if inject:
+            await self._voice_provider.inject_event(event)
 
         event_type = event.get("type", "")
 
@@ -814,6 +878,10 @@ class OrchestratorSession:
                 await self._runner.cancel_all()
             except Exception:  # noqa: BLE001
                 logger.exception("BackgroundAgentRunner.cancel_all failed during stop")
+        try:
+            await self.stop_voice_relay()
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_voice_relay failed during session stop")
         self._agent = None
         self._voice_provider = None
         self._current_provider = None

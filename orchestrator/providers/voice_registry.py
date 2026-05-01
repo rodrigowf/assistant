@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from orchestrator.providers.openai_voice import OpenAIVoiceProvider
+from orchestrator.providers.qwen_voice import QwenVoiceProvider
 from orchestrator.providers.voice_base import BaseVoiceProvider
 
 
@@ -34,8 +35,8 @@ class VoiceModelEntry(TypedDict):
 
 VOICE_PROVIDERS: dict[str, type[BaseVoiceProvider]] = {
     "openai": OpenAIVoiceProvider,
+    "qwen": QwenVoiceProvider,
     # "google": GoogleVoiceProvider,   # added in Phase 2
-    # "qwen": QwenVoiceProvider,        # added in Phase 3
 }
 
 
@@ -44,16 +45,16 @@ VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
         {"id": "gpt-realtime", "label": "GPT Realtime", "voice": "cedar", "default": True},
         {"id": "gpt-realtime-mini", "label": "GPT Realtime Mini", "voice": "cedar", "default": False},
     ],
-    # Filled in by Phases 2/3:
+    "qwen": [
+        {"id": "qwen3.5-omni-plus-realtime", "label": "Qwen3.5-Omni Plus",
+         "voice": "Tina", "default": True},
+        {"id": "qwen3-omni-flash-realtime", "label": "Qwen3-Omni Flash",
+         "voice": "Cherry", "default": False},
+    ],
+    # Filled in by Phase 2:
     # "google": [
     #     {"id": "gemini-3.1-flash-live-preview", "label": "Gemini 3.1 Flash Live",
     #      "voice": "Aoede", "default": True},
-    # ],
-    # "qwen": [
-    #     {"id": "qwen3.5-omni-plus-realtime", "label": "Qwen3.5-Omni Plus",
-    #      "voice": "Tina", "default": True},
-    #     {"id": "qwen3-omni-flash-realtime", "label": "Qwen3-Omni Flash",
-    #      "voice": "Cherry", "default": False},
     # ],
 }
 

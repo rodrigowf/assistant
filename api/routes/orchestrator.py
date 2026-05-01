@@ -119,6 +119,24 @@ async def orchestrator_ws(ws: WebSocket):
                     continue
                 await _handle_voice_event(pool, session, msg.get("event", {}))
 
+            elif msg_type == "voice_audio_in":
+                # WS-provider mic chunk from the browser → forward upstream.
+                if session is None or not session.is_voice:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_voice_session",
+                        "detail": "No active voice session",
+                    }))
+                    continue
+                audio_b64 = msg.get("audio", "")
+                if audio_b64:
+                    try:
+                        await session.send_voice_audio_in(audio_b64)
+                    except Exception as e:
+                        logger.exception("Voice audio relay failed")
+                        await pool.broadcast_orchestrator({
+                            "type": "error", "error": "voice_audio_failed", "detail": str(e),
+                        })
+
             elif msg_type == "compact":
                 if session is None:
                     await ws.send_bytes(orjson.dumps({
@@ -312,11 +330,12 @@ async def _attach_voice_payload(
     session: OrchestratorSession,
 ) -> None:
     """Mutate ``payload`` to include voice provider metadata and the
-    provider-specific session.update + connection info.
+    provider-specific session.update + connection info, and start the
+    backend relay for WebSocket providers if it isn't already running.
 
-    Errors fetching the ephemeral token are swallowed and reported as
-    ``voice_connection_error`` so the frontend can surface them; the
-    session itself stays alive.
+    Errors fetching the ephemeral token or starting the relay are
+    swallowed and reported back as ``voice_connection_error`` so the
+    frontend can surface them; the session itself stays alive.
     """
     payload["voice_provider"] = session.voice_provider_id
     payload["voice_model"] = session.voice_model_id
@@ -331,6 +350,49 @@ async def _attach_voice_payload(
             payload["voice_connection_info"] = await provider_obj.get_connection_info()
         except Exception as e:
             logger.warning("Voice connection info fetch failed: %s", e)
+            payload["voice_connection_error"] = str(e)
+
+    # Start the backend relay for WS providers (Qwen / Gemini / locals).
+    # Idempotent: skipped if already running, no-op for WebRTC providers.
+    if session.needs_voice_relay and getattr(session, "_voice_relay", None) is None:
+        try:
+            pool = session._context.get("pool")
+            if pool is not None:
+                async def _on_audio_out(b64: str) -> None:
+                    await pool.broadcast_orchestrator({
+                        "type": "voice_audio_out",
+                        "audio": b64,
+                    })
+
+                async def _on_event_for_frontend(event: dict) -> None:
+                    # Mirror provider events to the frontend so the UI can
+                    # reflect transcripts, status, etc.
+                    await pool.broadcast_orchestrator({
+                        "type": "voice_event",
+                        "event": event,
+                    })
+                    # Tool calls go through _handle_voice_tool_call so the
+                    # tool_use / tool_result broadcasts fire and execution
+                    # happens off the relay-drain task.
+                    if event.get("type") == "response.function_call_arguments.done":
+                        asyncio.create_task(
+                            _handle_voice_tool_call(pool, session, event, inject=False),
+                            name="voice-tool-call",
+                        )
+                        return
+                    # All other events: run orchestrator-side processing
+                    # (persists transcripts, etc.).  inject=False because
+                    # the relay already pushed the event into the provider
+                    # queue before invoking this callback.
+                    try:
+                        commands = await session.process_voice_event(event, inject=False)
+                        await _dispatch_voice_commands(pool, session, commands)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Voice event processing failed in relay drain")
+
+                await session.start_voice_relay(_on_audio_out, _on_event_for_frontend)
+        except Exception as e:
+            logger.exception("Failed to start voice relay")
             payload["voice_connection_error"] = str(e)
 
 
@@ -453,11 +515,21 @@ async def _handle_compact(
 async def _handle_voice_event(
     pool: SessionPool, session: OrchestratorSession, event: dict,
 ) -> None:
-    """Process a mirrored OpenAI Realtime event and send back any voice commands.
+    """Process a mirrored realtime event and send back any voice commands.
 
-    Tool calls (response.function_call_arguments.done) are spawned as background
-    tasks so the WebSocket handler can continue processing other voice events
-    (transcripts, interruptions, etc.) without blocking.
+    For WebRTC providers (OpenAI), the events arrive mirrored from the
+    browser's data channel; commands generated by the backend are
+    broadcast as ``voice_command`` so the frontend forwards them.
+
+    For WebSocket providers (Qwen, Gemini, future locals), this also
+    accepts client-originated events to forward upstream — but inbound
+    provider events arrive through the backend relay rather than the
+    frontend, so this path is mostly for tool-result payloads injected by
+    the orchestrator itself.
+
+    Tool calls (response.function_call_arguments.done) are spawned as a
+    background task so the WS handler can continue processing other
+    voice events (transcripts, interruptions, etc.) without blocking.
     """
     try:
         event_type = event.get("type", "")
@@ -471,19 +543,57 @@ async def _handle_voice_event(
             )
             return
 
-        commands = await session.process_voice_event(event)
+        # For WS providers (Qwen / Gemini / locals), client-originated
+        # control events need to be forwarded upstream.  WebRTC providers
+        # (OpenAI) skip this path — the frontend talks to the provider
+        # directly via the data channel and only mirrors events here for
+        # backend persistence.
+        if session.needs_voice_relay:
+            try:
+                await session.send_voice_event_upstream(event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to forward client voice event upstream")
 
-        for cmd in commands:
-            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+        commands = await session.process_voice_event(event)
+        await _dispatch_voice_commands(pool, session, commands)
     except Exception as e:
         logger.exception("Voice event processing failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
 
 
+async def _dispatch_voice_commands(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    commands: list,
+) -> None:
+    """Send provider commands upstream (WS providers) or to frontend (WebRTC).
+
+    For WebRTC providers, the frontend owns the data channel to the
+    provider, so commands need to round-trip through the orchestrator WS
+    as ``voice_command`` payloads. For WS providers, the backend relay
+    holds the upstream connection and sends them directly.
+    """
+    if session.needs_voice_relay:
+        for cmd in commands:
+            try:
+                await session.send_voice_event_upstream(cmd)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to forward voice command upstream")
+    else:
+        for cmd in commands:
+            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+
+
 async def _handle_voice_tool_call(
     pool: SessionPool, session: OrchestratorSession, event: dict,
+    *,
+    inject: bool = True,
 ) -> None:
-    """Execute a voice tool call in the background without blocking the WS handler."""
+    """Execute a voice tool call in the background without blocking the WS handler.
+
+    ``inject=False`` when the relay drain already pushed the event into the
+    provider queue (avoids double-injection for WS providers).
+    """
     try:
         import json as _json
         call_id = event.get("call_id", "")
@@ -513,7 +623,7 @@ async def _handle_voice_tool_call(
             })
 
         # Execute the tool (this is the potentially long-running part)
-        commands = await session.process_voice_event(event)
+        commands = await session.process_voice_event(event, inject=inject)
 
         # Broadcast tool_result after execution completes
         for cmd in commands:
@@ -527,8 +637,7 @@ async def _handle_voice_tool_call(
                         "is_error": False,
                     })
 
-        for cmd in commands:
-            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+        await _dispatch_voice_commands(pool, session, commands)
     except Exception as e:
         logger.exception("Voice tool call execution failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
