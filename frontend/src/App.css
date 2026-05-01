@@ -2014,48 +2014,79 @@ pre.field-value {
 }
 
 /* ============================================================
-   Permission Modal — generic Approve/Reject for can_use_tool
+   Permission Bar — inline approve/reject above the chat input.
+   Sits between the messages list and the status/input bars so the
+   chat content (e.g. an ExitPlanMode plan) stays readable.  Typing
+   in the chat input while this is visible auto-rejects with the
+   typed text as the rejection reason (handled in chat.py).
    ============================================================ */
 
-.permission-modal {
-  max-width: 520px;
+.permission-bar {
+  flex-shrink: 0;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
 }
 
-.permission-modal-input {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px 12px;
-  margin: 12px 0;
-  font-size: 0.78rem;
-  color: var(--text);
-  max-height: 200px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
+.permission-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 10px 32px;
+  box-sizing: border-box;
 }
 
-.permission-modal-reason {
+.permission-bar-text {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin-top: 6px;
-  font-size: 0.78rem;
+  gap: 2px;
+}
+
+.permission-bar-label {
+  font-size: 0.88rem;
+  color: var(--text-bright);
+  font-weight: 500;
+}
+
+.permission-bar-hint {
+  font-size: 0.76rem;
   color: var(--text-muted);
 }
 
-.permission-modal-reason input {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 8px 10px;
-  color: var(--text);
-  font-size: 0.84rem;
+.permission-bar-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
-.permission-modal-reason input:focus {
-  outline: none;
+.permission-bar-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  font-size: 0.82rem;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.permission-bar-btn:hover {
+  background: var(--bg-surface);
+}
+
+.permission-bar-btn-primary {
+  background: var(--accent);
   border-color: var(--accent);
+  color: white;
+}
+
+.permission-bar-btn-primary:hover {
+  background: var(--accent-hover);
+  box-shadow: 0 0 12px var(--accent-glow);
 }
 
 /* ============================================================

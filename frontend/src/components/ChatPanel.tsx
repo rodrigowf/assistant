@@ -2,7 +2,7 @@ import { MessageList } from "./MessageList";
 import { ChatInput } from "./ChatInput";
 import { StatusBar } from "./StatusBar";
 import { VoiceControls } from "./VoiceControls";
-import { PermissionModal } from "./PermissionModal";
+import { PermissionBar } from "./PermissionBar";
 import type { ChatMessage, SessionStatus, ConnectionState, VoiceStatus } from "../types";
 import type { StallInfo, PendingPermission } from "../hooks/useChatInstance";
 
@@ -109,6 +109,12 @@ export function ChatPanel({
           </button>
         </div>
       )}
+      {pendingPermission && onRespondToPermission && (
+        <PermissionBar
+          pending={pendingPermission}
+          onRespond={onRespondToPermission}
+        />
+      )}
       <div className="status-bar-container">
         <StatusBar
           status={status}
@@ -138,12 +144,6 @@ export function ChatPanel({
             <span className="voice-error-message">{voiceError}</span>
           )}
         </div>
-      )}
-      {pendingPermission && onRespondToPermission && (
-        <PermissionModal
-          pending={pendingPermission}
-          onRespond={onRespondToPermission}
-        />
       )}
       {/* Voice active controls */}
       {isOrchestrator && voiceActive && voiceStatus !== undefined && onVoiceStart && onVoiceStop && (
