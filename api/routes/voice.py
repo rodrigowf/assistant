@@ -1,30 +1,32 @@
 """Voice and audio endpoints for the orchestrator.
 
 Provides:
-- POST /api/orchestrator/voice/session — ephemeral OpenAI tokens for WebRTC
-- POST /api/orchestrator/audio — upload audio file for multimodal processing
-- GET /api/orchestrator/models — list available models
+- POST /api/orchestrator/voice/session — ephemeral provider token (legacy: OpenAI only)
+- GET  /api/orchestrator/voice/models  — registry of voice providers and their models
+- POST /api/orchestrator/audio         — upload audio file for multimodal processing
+- GET  /api/orchestrator/models        — list available text/audio models
 """
 
 from __future__ import annotations
 
 import base64
 import logging
-import os
 from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from orchestrator.config import get_available_models, get_audio_capable_models
+from orchestrator.providers.voice_registry import (
+    DEFAULT_VOICE_MODEL,
+    DEFAULT_VOICE_PROVIDER,
+    instantiate_provider,
+    list_voice_models,
+    resolve_voice_target,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["voice"])
-
-# OpenAI Realtime API constants
-OPENAI_REALTIME_SESSIONS_URL = "https://api.openai.com/v1/realtime/sessions"
-VOICE_MODEL = "gpt-realtime"
-VOICE_NAME = "cedar"
 
 # Audio upload constraints
 MAX_AUDIO_SIZE_MB = 25  # OpenAI's limit is 25MB
@@ -32,43 +34,73 @@ ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "webm", "ogg", "m4a", "flac"}
 
 
 @router.post("/api/orchestrator/voice/session")
-async def create_voice_session() -> dict:
-    """Exchange the server-side OPENAI_API_KEY for a short-lived ephemeral token.
+async def create_voice_session(provider: str | None = None, model: str | None = None) -> dict:
+    """Return ephemeral connection metadata for a voice provider.
 
-    The ephemeral token (~60s TTL) is returned to the frontend, which uses it
-    to establish a WebRTC connection directly with the OpenAI Realtime API.
-    The actual OPENAI_API_KEY never reaches the browser.
+    For backward compatibility (OpenAI WebRTC, default), the response shape
+    matches the legacy contract used by the existing frontend / Android
+    clients::
+
+        {
+          "client_secret": {"value": "ek_...", "expires_at": 123456789},
+          "id": "...",
+          "model": "gpt-realtime",
+          "voice": "cedar",
+          "connection_info": { ... }   # provider-agnostic metadata for new clients
+        }
+
+    Newer clients should read ``connection_info`` (which includes
+    ``connection_type``, ``endpoint``, ``audio_in_format``, etc.) instead of
+    the OpenAI-specific top-level fields.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
-
-    payload = {
-        "model": VOICE_MODEL,
-        "voice": VOICE_NAME,
-    }
+    try:
+        provider_id, model_entry = resolve_voice_target(provider, model)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                OPENAI_REALTIME_SESSIONS_URL,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            response.raise_for_status()
-            return response.json()
+        provider_obj = instantiate_provider(provider_id, model_entry["id"])
+        info = await provider_obj.get_connection_info()
+    except RuntimeError as e:
+        # Missing API key or config
+        raise HTTPException(status_code=503, detail=str(e))
     except httpx.HTTPStatusError as e:
-        logger.error("OpenAI session creation failed: %s %s", e.response.status_code, e.response.text)
+        logger.error("Provider session creation failed: %s %s",
+                     e.response.status_code, e.response.text)
         raise HTTPException(
             status_code=502,
-            detail=f"OpenAI API error: {e.response.status_code}",
+            detail=f"{provider_id} API error: {e.response.status_code}",
         )
     except Exception as e:
-        logger.exception("Failed to create voice session")
+        logger.exception("Failed to create voice session for %s/%s",
+                         provider_id, model_entry["id"])
         raise HTTPException(status_code=502, detail=str(e))
+
+    response: dict = {"connection_info": info}
+    if provider_id == "openai":
+        # Legacy fields for existing OpenAI WebRTC clients.
+        response.update({
+            "client_secret": {
+                "value": info["ephemeral_token"],
+                "expires_at": info["expires_at"],
+            },
+            "model": info["model"],
+            "voice": info["voice"],
+        })
+    return response
+
+
+@router.get("/api/orchestrator/voice/models")
+async def list_voice_provider_models() -> dict:
+    """Return registered voice providers and their models.
+
+    Used by the settings UI to populate provider/model dropdowns.
+    """
+    return {
+        "providers": list_voice_models(),
+        "default_provider": DEFAULT_VOICE_PROVIDER,
+        "default_model": DEFAULT_VOICE_MODEL,
+    }
 
 
 @router.post("/api/orchestrator/audio")

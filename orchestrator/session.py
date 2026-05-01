@@ -133,6 +133,8 @@ class OrchestratorSession:
         session_id: str | None = None,
         local_id: str | None = None,
         voice: bool = False,
+        voice_provider: str | None = None,
+        voice_model: str | None = None,
     ) -> None:
         self._config = config
         self._context = context
@@ -143,6 +145,8 @@ class OrchestratorSession:
         self._writer: HistoryWriter | None = None
         self._voice = voice
         self._voice_provider = None  # Set in start() if voice=True
+        self._voice_provider_id: str | None = voice_provider
+        self._voice_model_id: str | None = voice_model
         self._history_summary: str | None = None
 
         # Track current provider for model switching
@@ -183,6 +187,20 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def voice_provider_id(self) -> str | None:
+        """Provider id (``openai`` | ``google`` | ``qwen``) when voice mode is active."""
+        if self._voice_provider is not None:
+            return self._voice_provider.provider_name
+        return self._voice_provider_id
+
+    @property
+    def voice_model_id(self) -> str | None:
+        """Model id when voice mode is active."""
+        if self._voice_provider is not None:
+            return self._voice_provider.model
+        return self._voice_model_id
 
     @property
     def is_busy(self) -> bool:
@@ -237,8 +255,16 @@ class OrchestratorSession:
         import orchestrator.tools.voice_control  # noqa: F401
 
         if self._voice:
-            from orchestrator.providers.openai_voice import OpenAIVoiceProvider
-            self._voice_provider = OpenAIVoiceProvider()
+            from orchestrator.providers.voice_registry import (
+                instantiate_provider,
+                resolve_voice_target,
+            )
+            provider_id, model_entry = resolve_voice_target(
+                self._voice_provider_id, self._voice_model_id,
+            )
+            self._voice_provider_id = provider_id
+            self._voice_model_id = model_entry["id"]
+            self._voice_provider = instantiate_provider(provider_id, model_entry["id"])
             provider = self._voice_provider
         else:
             provider = self._create_provider()
@@ -273,11 +299,14 @@ class OrchestratorSession:
                 "provider": self._config.provider.value,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            if self._voice:
-                from orchestrator.providers.openai_voice import VOICE_MODEL, VOICE_NAME
+            if self._voice and self._voice_provider is not None:
                 meta["voice"] = True
-                meta["openai_model"] = VOICE_MODEL
-                meta["voice_name"] = VOICE_NAME
+                meta["voice_provider"] = self._voice_provider.provider_name
+                meta["voice_model"] = self._voice_provider.model
+                meta["voice_name"] = self._voice_provider.voice
+                # Legacy field — kept for back-compat with older readers.
+                if self._voice_provider.provider_name == "openai":
+                    meta["openai_model"] = self._voice_provider.model
             self._writer.append(meta)
 
         return self._local_id
@@ -485,15 +514,9 @@ class OrchestratorSession:
                     "source": "voice",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
-                commands.append({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": result,
-                    },
-                })
-                commands.append({"type": "response.create"})
+                # Provider-specific command sequence to ship the result back
+                # and ask for the next response.
+                commands.extend(self._voice_provider.format_tool_result(call_id, result))
 
         # Assistant transcript complete — persist to JSONL
         elif event_type == "response.audio_transcript.done":

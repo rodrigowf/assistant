@@ -86,6 +86,11 @@ def _save_config(data: dict[str, Any]) -> None:
 
 
 def _default_config() -> dict[str, Any]:
+    from orchestrator.providers.voice_registry import (
+        DEFAULT_VOICE_MODEL,
+        DEFAULT_VOICE_PROVIDER,
+    )
+
     default_path = str(PROJECT_ROOT)
     default_entry = {"id": default_path, "path": default_path, "label": None, "ssh_host": None, "ssh_user": None, "ssh_key": None, "claude_config_dir": None}
     return {
@@ -94,6 +99,8 @@ def _default_config() -> dict[str, Any]:
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
         "chrome_extension": False,  # launch sessions with --chrome flag
         "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
+        "default_voice_provider": DEFAULT_VOICE_PROVIDER,
+        "default_voice_model": DEFAULT_VOICE_MODEL,
     }
 
 
@@ -127,6 +134,8 @@ class ConfigUpdate(BaseModel):
     enabled_mcps: list[str] | None = None
     chrome_extension: bool | None = None
     default_model: str | None = None  # default model for new orchestrator sessions
+    default_voice_provider: str | None = None  # default provider for voice sessions
+    default_voice_model: str | None = None     # default model for voice sessions
 
 
 # -----------------------------------------------------------------------
@@ -189,6 +198,18 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         if body.default_model not in AVAILABLE_MODELS:
             raise HTTPException(status_code=400, detail=f"Unknown model: {body.default_model}")
         config["default_model"] = body.default_model
+
+    if body.default_voice_provider is not None or body.default_voice_model is not None:
+        from orchestrator.providers.voice_registry import resolve_voice_target
+        try:
+            provider_id, model_entry = resolve_voice_target(
+                body.default_voice_provider or config.get("default_voice_provider"),
+                body.default_voice_model or config.get("default_voice_model"),
+            )
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        config["default_voice_provider"] = provider_id
+        config["default_voice_model"] = model_entry["id"]
 
     _save_config(config)
     return config

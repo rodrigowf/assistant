@@ -1,17 +1,32 @@
 /** Voice API client — fetches ephemeral tokens from the backend. */
 
 const VOICE_SESSION_URL = "/api/orchestrator/voice/session";
-const OPENAI_REALTIME_URL = "https://api.openai.com/v1/realtime";
 const VOICE_MODEL = "gpt-realtime";
 
+/** Connection metadata for any voice provider, returned alongside legacy
+ * client_secret fields for backward compatibility. New code should prefer
+ * connection_info.endpoint over the hardcoded URL below. */
+export interface VoiceConnectionInfo {
+  connection_type: "webrtc" | "websocket";
+  endpoint: string;
+  ephemeral_token: string | null;
+  expires_at: number | null;
+  audio_in_format: { sample_rate: number; encoding: string };
+  audio_out_format: { sample_rate: number; encoding: string };
+  model: string;
+  voice: string;
+}
+
 export interface EphemeralTokenResponse {
+  // Legacy OpenAI-shaped fields (still present for openai provider).
   client_secret: {
     value: string;
     expires_at: number;
   };
-  id: string;
   model: string;
   voice: string;
+  // Provider-agnostic metadata — preferred for new clients.
+  connection_info?: VoiceConnectionInfo;
 }
 
 /** Fetch a short-lived ephemeral token from the backend. */
@@ -24,9 +39,17 @@ export async function fetchEphemeralToken(): Promise<EphemeralTokenResponse> {
   return res.json();
 }
 
-/** Post an SDP offer to OpenAI Realtime API and return the SDP answer. */
-export async function exchangeSDP(ephemeralKey: string, offerSdp: string): Promise<string> {
-  const res = await fetch(`${OPENAI_REALTIME_URL}?model=${VOICE_MODEL}`, {
+/** Post an SDP offer to OpenAI Realtime API and return the SDP answer.
+ * Uses the canonical /v1/realtime/calls endpoint when callUrl is provided
+ * (from connection_info.endpoint), falling back to the legacy /v1/realtime URL.
+ */
+export async function exchangeSDP(
+  ephemeralKey: string,
+  offerSdp: string,
+  callUrl?: string,
+): Promise<string> {
+  const url = callUrl ?? `https://api.openai.com/v1/realtime/calls?model=${VOICE_MODEL}`;
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${ephemeralKey}`,

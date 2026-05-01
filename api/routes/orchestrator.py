@@ -176,6 +176,8 @@ async def _handle_start(
     """
     local_id: str | None = msg.get("local_id")
     resume_id: str | None = msg.get("resume_sdk_id") or msg.get("session_id")
+    voice_provider_req: str | None = msg.get("voice_provider") if voice else None
+    voice_model_req: str | None = msg.get("voice_model") if voice else None
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
@@ -195,9 +197,7 @@ async def _handle_start(
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
             }
-            session_update = await session.get_session_update()
-            if session_update:
-                reconnect_payload["voice_session_update"] = session_update
+            await _attach_voice_payload(reconnect_payload, session)
             await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
         else:
@@ -210,9 +210,7 @@ async def _handle_start(
                 "model_info": session.get_model_info(),
             }
             if current_voice:
-                session_update = await session.get_session_update()
-                if session_update:
-                    reconnect_payload["voice_session_update"] = session_update
+                await _attach_voice_payload(reconnect_payload, session)
             await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
 
@@ -228,6 +226,17 @@ async def _handle_start(
     config = OrchestratorConfig.load()
     project_dir = config.project_dir
 
+    # If voice mode and no provider/model in the start message, fall back to
+    # what's saved in assistant_config.json.
+    if voice and (voice_provider_req is None or voice_model_req is None):
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            app_cfg = _load_app_config()
+            voice_provider_req = voice_provider_req or app_cfg.get("default_voice_provider")
+            voice_model_req = voice_model_req or app_cfg.get("default_voice_model")
+        except Exception:
+            logger.exception("Failed to load voice defaults from assistant_config.json")
+
     context: dict = {
         "store": ws.app.state.store,
         "manager_config": ws.app.state.config,
@@ -242,6 +251,8 @@ async def _handle_start(
         session_id=resume_id,
         local_id=local_id,
         voice=voice,
+        voice_provider=voice_provider_req,
+        voice_model=voice_model_req,
     )
 
     await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
@@ -290,12 +301,37 @@ async def _handle_start(
         "model_info": session.get_model_info(),
     }
     if voice:
-        session_update = await session.get_session_update()
-        if session_update:
-            started_payload["voice_session_update"] = session_update
+        await _attach_voice_payload(started_payload, session)
 
     await ws.send_bytes(orjson.dumps(started_payload))
     return session, True
+
+
+async def _attach_voice_payload(
+    payload: dict,
+    session: OrchestratorSession,
+) -> None:
+    """Mutate ``payload`` to include voice provider metadata and the
+    provider-specific session.update + connection info.
+
+    Errors fetching the ephemeral token are swallowed and reported as
+    ``voice_connection_error`` so the frontend can surface them; the
+    session itself stays alive.
+    """
+    payload["voice_provider"] = session.voice_provider_id
+    payload["voice_model"] = session.voice_model_id
+
+    session_update = await session.get_session_update()
+    if session_update:
+        payload["voice_session_update"] = session_update
+
+    provider_obj = getattr(session, "_voice_provider", None)
+    if provider_obj is not None:
+        try:
+            payload["voice_connection_info"] = await provider_obj.get_connection_info()
+        except Exception as e:
+            logger.warning("Voice connection info fetch failed: %s", e)
+            payload["voice_connection_error"] = str(e)
 
 
 async def _handle_send(

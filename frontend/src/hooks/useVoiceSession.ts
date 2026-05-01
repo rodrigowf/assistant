@@ -131,8 +131,10 @@ export function useVoiceSession(options: UseVoiceSessionOptions): {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // 7. Exchange SDP with OpenAI
-      const answerSdp = await exchangeSDP(ephemeralKey, offer.sdp!);
+      // 7. Exchange SDP with OpenAI (use connection_info.endpoint if backend
+      // provides it — that's the canonical /v1/realtime/calls URL).
+      const callUrl = tokenData.connection_info?.endpoint;
+      const answerSdp = await exchangeSDP(ephemeralKey, offer.sdp!, callUrl);
       await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
 
       // Return handles for the caller
