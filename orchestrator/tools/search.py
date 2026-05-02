@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,8 @@ _RUN_SH = _PROJECT_DIR / "context" / "scripts" / "run.sh"
 
 # Singleton warm server process
 _server_proc: asyncio.subprocess.Process | None = None
-_server_lock = asyncio.Lock()
+_server_lock = asyncio.Lock()  # guards lifecycle (start/stop)
+_query_lock = asyncio.Lock()   # serializes stdin/stdout pairing across concurrent queries
 _server_ready = False
 
 
@@ -141,6 +143,15 @@ async def _do_search_cold(
 
     if proc.returncode != 0:
         stderr_text = stderr.decode().strip()
+        # Tail of stderr carries the actual exception; the head is just the
+        # traceback boilerplate ("Traceback (most recent call last)... in <module>").
+        tail = stderr_text[-800:]
+        print(
+            f"[search cold-fallback FAILED] rc={proc.returncode} collection={collection_name} "
+            f"query={query!r}\n--- stderr tail ---\n{tail}\n--- end ---",
+            file=sys.stderr,
+            flush=True,
+        )
         if proc.returncode < 0:
             return [{"error": f"Search crashed (signal {-proc.returncode})"}]
         if "No index found" in stderr_text:
@@ -150,7 +161,7 @@ async def _do_search_cold(
         elif "empty" in stderr_text.lower():
             return [{"error": f"Collection '{collection_name}' is empty."}]
         else:
-            return [{"error": f"Search failed: {stderr_text[:200]}"}]
+            return [{"error": f"Search failed: {tail}"}]
 
     stdout_text = stdout.decode().strip()
     if not stdout_text or stdout_text == "No results found.":
@@ -167,42 +178,98 @@ async def _do_search(
     collection_name: str,
     max_results: int,
 ) -> list[dict[str, Any]]:
-    """Search using the warm server, falling back to cold search."""
+    """Search using the warm server.
+
+    Cold fallback only fires when the warm server can't be started AT ALL.
+    Once the warm server is up, all queries go through it — chromadb's
+    PersistentClient is not safe for concurrent multi-process access against
+    the same path, so a cold subprocess opening the same index while the
+    warm server holds it crashes with "Failed to apply logs to the hnsw
+    segment writer".
+    """
     global _server_proc, _server_ready
 
     logger.info("Searching '%s' for: %s", collection_name, query)
 
-    # Try warm server
-    proc = await _ensure_server()
-    if proc is not None:
-        response = await _query_server(proc, {
-            "query": query,
-            "collection": collection_name,
-            "n_results": max_results,
-        })
+    request = {
+        "query": query,
+        "collection": collection_name,
+        "n_results": max_results,
+    }
 
-        if response is not None:
-            error = response.get("error")
-            if error:
-                logger.warning("Warm search error: %s", error)
-                return [{"error": error}]
-            results = response.get("results", [])
-            logger.info("Warm search returned %d results.", len(results))
-            return results
+    # Serialize concurrent queries — the warm server is single-threaded and
+    # request/response pairing on its stdio is positional.
+    async with _query_lock:
+        # First attempt
+        proc = await _ensure_server()
+        if proc is not None:
+            response = await _query_server(proc, request)
+            if response is not None:
+                error = response.get("error")
+                if error:
+                    msg = (
+                        f"[search warm-server ERROR] collection={collection_name} "
+                        f"query={query!r}: {error}"
+                    )
+                    logger.warning(msg)
+                    print(msg, file=sys.stderr, flush=True)
+                    return [{"error": error}]
+                results = response.get("results", [])
+                logger.info("Warm search returned %d results.", len(results))
+                return results
 
-        # Server seems dead — mark it and fall through to cold search
-        logger.warning("Warm server unresponsive, falling back to cold search")
-        _server_ready = False
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        _server_proc = None
+            # Warm path failed — restart and retry once.
+            rc = proc.returncode
+            msg = (
+                f"[search warm-server UNRESPONSIVE] pid={proc.pid} returncode={rc} "
+                f"collection={collection_name} query={query!r} — restarting and retrying"
+            )
+            logger.warning(msg)
+            print(msg, file=sys.stderr, flush=True)
+            await _restart_server()
 
-    # Fallback
+            proc = await _ensure_server()
+            if proc is not None:
+                response = await _query_server(proc, request)
+                if response is not None:
+                    error = response.get("error")
+                    if error:
+                        return [{"error": error}]
+                    results = response.get("results", [])
+                    logger.info("Warm search returned %d results (after restart).", len(results))
+                    return results
+                # Retry also failed — server keeps dying. Fall through.
+                msg = (
+                    f"[search warm-server FAILED AFTER RESTART] "
+                    f"collection={collection_name} query={query!r}"
+                )
+                logger.error(msg)
+                print(msg, file=sys.stderr, flush=True)
+
+    # Cold fallback only runs when the warm server cannot be brought up.
+    # This is mutually exclusive with a healthy warm server (so chromadb
+    # multi-process access is not an issue here).
     results = await _do_search_cold(query, collection_name, max_results)
     logger.info("Cold search returned %d results.", len(results))
     return results
+
+
+async def _restart_server() -> None:
+    """Tear down the warm server so the next _ensure_server starts fresh."""
+    global _server_proc, _server_ready
+    async with _server_lock:
+        proc = _server_proc
+        _server_ready = False
+        _server_proc = None
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
 
 async def shutdown_server() -> None:

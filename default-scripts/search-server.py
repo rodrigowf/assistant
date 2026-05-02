@@ -18,6 +18,7 @@ The model is loaded once on startup. Subsequent queries reuse it, avoiding the
 """
 import json
 import sys
+import traceback
 from pathlib import Path
 
 # Add project root to path for utils import
@@ -96,39 +97,49 @@ def main() -> None:
             send_error(f"Collection '{collection_name}' not found.")
             continue
 
-        count = collection.count()
-        if count == 0:
-            send_error(f"Collection '{collection_name}' is empty.")
-            continue
-
-        # Encode and search
-        query_embedding = model.encode([query])[0].tolist()
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(n_results, count),
-        )
-
-        # Format results with post-query filtering
-        formatted = []
-        for i, doc in enumerate(results["documents"][0]):
-            meta = results["metadatas"][0][i]
-            distance = results["distances"][0][i]
-
-            if distance > threshold:
-                continue
-            if file_filter and file_filter not in meta.get("file_path", ""):
+        try:
+            count = collection.count()
+            if count == 0:
+                send_error(f"Collection '{collection_name}' is empty.")
                 continue
 
-            formatted.append({
-                "text": doc,
-                "file_path": meta["file_path"],
-                "start_line": int(meta["start_line"]),
-                "end_line": int(meta["end_line"]),
-                "file_name": meta.get("file_name", ""),
-                "distance": round(distance, 4),
-            })
+            # Encode and search
+            query_embedding = model.encode([query])[0].tolist()
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=min(n_results, count),
+            )
 
-        send_response({"results": formatted, "error": None})
+            # Format results with post-query filtering
+            formatted = []
+            for i, doc in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i]
+                distance = results["distances"][0][i]
+
+                if distance > threshold:
+                    continue
+                if file_filter and file_filter not in meta.get("file_path", ""):
+                    continue
+
+                formatted.append({
+                    "text": doc,
+                    "file_path": meta["file_path"],
+                    "start_line": int(meta["start_line"]),
+                    "end_line": int(meta["end_line"]),
+                    "file_name": meta.get("file_name", ""),
+                    "distance": round(distance, 4),
+                })
+
+            send_response({"results": formatted, "error": None})
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(
+                f"[search-server query FAILED] collection={collection_name} "
+                f"query={query!r}\n{tb}",
+                file=sys.stderr,
+                flush=True,
+            )
+            send_error(f"{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
