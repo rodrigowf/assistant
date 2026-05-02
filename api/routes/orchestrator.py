@@ -197,6 +197,9 @@ async def _handle_start(
     voice_provider_req: str | None = msg.get("voice_provider") if voice else None
     voice_model_req: str | None = msg.get("voice_model") if voice else None
     voice_name_req: str | None = msg.get("voice_name") if voice else None
+    voice_lang_req: str | None = (
+        msg.get("voice_transcription_language") if voice else None
+    )
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
@@ -245,10 +248,13 @@ async def _handle_start(
     config = OrchestratorConfig.load()
     project_dir = config.project_dir
 
-    # If voice mode and any of provider/model/voice missing from the start
-    # message, fall back to what's saved in assistant_config.json.
+    # If voice mode and any of provider/model/voice/language missing from
+    # the start message, fall back to what's saved in assistant_config.json.
     if voice and (
-        voice_provider_req is None or voice_model_req is None or voice_name_req is None
+        voice_provider_req is None
+        or voice_model_req is None
+        or voice_name_req is None
+        or voice_lang_req is None
     ):
         try:
             from api.routes.config import _load_config as _load_app_config
@@ -256,6 +262,8 @@ async def _handle_start(
             voice_provider_req = voice_provider_req or app_cfg.get("default_voice_provider")
             voice_model_req = voice_model_req or app_cfg.get("default_voice_model")
             voice_name_req = voice_name_req or app_cfg.get("default_voice_name")
+            if voice_lang_req is None:
+                voice_lang_req = app_cfg.get("default_voice_transcription_language")
         except Exception:
             logger.exception("Failed to load voice defaults from assistant_config.json")
 
@@ -276,6 +284,7 @@ async def _handle_start(
         voice_provider=voice_provider_req,
         voice_model=voice_model_req,
         voice_name=voice_name_req,
+        voice_transcription_language=voice_lang_req,
     )
 
     await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
@@ -345,6 +354,7 @@ async def _attach_voice_payload(
     payload["voice_provider"] = session.voice_provider_id
     payload["voice_model"] = session.voice_model_id
     payload["voice_name"] = session.voice_name_id
+    payload["voice_transcription_language"] = session.voice_transcription_language
 
     session_update = await session.get_session_update()
     if session_update:

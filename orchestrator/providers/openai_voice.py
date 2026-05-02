@@ -70,9 +70,15 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
         self,
         model: str = VOICE_MODEL,
         voice: str = VOICE_NAME,
+        transcription_language: str = "",
     ) -> None:
         self._model = model
         self._voice = voice
+        # OpenAI Realtime supports a `language` hint on whisper-1 transcription
+        # (ISO-639-1 code).  Empty string = auto-detect.  Currently this isn't
+        # exposed in the UI for OpenAI sessions; the param exists for
+        # signature parity with QwenVoiceProvider.
+        self._transcription_language = transcription_language
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._current_transcript: str = ""
         self._pending_calls: dict[str, str] = {}        # call_id → tool_name
@@ -95,6 +101,11 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
     @property
     def voice(self) -> str:
         return self._voice
+
+    @property
+    def transcription_language(self) -> str:
+        """Language hint for the input ASR. Empty string = auto-detect."""
+        return self._transcription_language
 
     @property
     def pending_calls(self) -> dict[str, str]:
@@ -286,7 +297,11 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
                 "tool_choice": "auto",
                 "modalities": ["text", "audio"],
                 "turn_detection": vad or DEFAULT_VAD,
-                "input_audio_transcription": {"model": "whisper-1"},
+                "input_audio_transcription": (
+                    {"model": "whisper-1", "language": self._transcription_language}
+                    if self._transcription_language
+                    else {"model": "whisper-1"}
+                ),
             },
         }
 

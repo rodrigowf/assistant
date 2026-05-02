@@ -38,6 +38,7 @@ async def create_voice_session(
     provider: str | None = None,
     model: str | None = None,
     voice: str | None = None,
+    transcription_language: str | None = None,
 ) -> dict:
     """Return ephemeral connection metadata for a voice provider.
 
@@ -58,12 +59,16 @@ async def create_voice_session(
     the OpenAI-specific top-level fields.
     """
     try:
-        provider_id, model_entry, voice_name = resolve_voice_target(provider, model, voice)
+        provider_id, model_entry, voice_name, language = resolve_voice_target(
+            provider, model, voice, transcription_language,
+        )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        provider_obj = instantiate_provider(provider_id, model_entry["id"], voice_name)
+        provider_obj = instantiate_provider(
+            provider_id, model_entry["id"], voice_name, language,
+        )
         info = await provider_obj.get_connection_info()
     except RuntimeError as e:
         # Missing API key or config

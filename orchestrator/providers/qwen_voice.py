@@ -88,6 +88,19 @@ def _audio_formats_for(model: str) -> dict[str, Any]:
     return _MODEL_AUDIO_FORMATS["default"]
 
 
+def _build_transcription_config(language: str) -> dict[str, Any]:
+    """Build the ``input_audio_transcription`` block for ``session.update``.
+
+    Empty ``language`` means auto-detect — the ``language`` key is omitted
+    so Qwen3-ASR-Flash identifies the language per utterance.  Otherwise
+    we send the explicit ISO-639-1 code (e.g. ``"en"``, ``"pt"``).
+    """
+    cfg: dict[str, Any] = {"model": "qwen3-asr-flash-realtime"}
+    if language:
+        cfg["language"] = language
+    return cfg
+
+
 class QwenVoiceProvider(BaseVoiceProvider):
     """Qwen-Omni realtime voice provider (WebSocket).
 
@@ -102,9 +115,13 @@ class QwenVoiceProvider(BaseVoiceProvider):
         self,
         model: str = QWEN_VOICE_MODEL,
         voice: str = QWEN_VOICE_NAME,
+        transcription_language: str = "",
     ) -> None:
         self._model = model
         self._voice = voice
+        # Empty string = auto-detect (no `language` field sent to Qwen).
+        # Otherwise an ISO-639-1 code recognised by qwen3-asr-flash.
+        self._transcription_language = transcription_language
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._current_transcript: str = ""
         self._pending_calls: dict[str, str] = {}
@@ -127,6 +144,11 @@ class QwenVoiceProvider(BaseVoiceProvider):
     @property
     def voice(self) -> str:
         return self._voice
+
+    @property
+    def transcription_language(self) -> str:
+        """Language hint for the input ASR. Empty string = auto-detect."""
+        return self._transcription_language
 
     @property
     def pending_calls(self) -> dict[str, str]:
@@ -347,18 +369,16 @@ class QwenVoiceProvider(BaseVoiceProvider):
                 # Transcription is what gets persisted to JSONL — quality
                 # matters for cross-session memory.  `gummy-realtime-v1` is
                 # the only documented value but it's English-weak (drifts
-                # to Chinese on short fragments, the bug Rodrigo reported).
-                # Empirically verified that the WS accepts the higher-
-                # quality `qwen3-asr-flash-realtime` as the model name and
-                # honours a `language` hint, even though Alibaba's docs
-                # don't list either combination for this endpoint.
-                # Locking to English by default; Portuguese still
-                # transcribes (only "pt" not "pt-BR" is supported), and
-                # Chinese drift on short English fragments is gone.
-                "input_audio_transcription": {
-                    "model": "qwen3-asr-flash-realtime",
-                    "language": "en",
-                },
+                # to Chinese on short fragments).  Empirically verified
+                # that the WS accepts the higher-quality
+                # `qwen3-asr-flash-realtime` as the model name and honours
+                # a `language` hint, even though Alibaba's docs don't list
+                # either combination for this endpoint.  Empty
+                # ``transcription_language`` means auto-detect (omit the
+                # ``language`` field so the ASR identifies it per turn).
+                "input_audio_transcription": _build_transcription_config(
+                    self._transcription_language
+                ),
             },
         }
 

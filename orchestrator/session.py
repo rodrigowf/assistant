@@ -136,6 +136,7 @@ class OrchestratorSession:
         voice_provider: str | None = None,
         voice_model: str | None = None,
         voice_name: str | None = None,
+        voice_transcription_language: str | None = None,
     ) -> None:
         self._config = config
         self._context = context
@@ -149,6 +150,7 @@ class OrchestratorSession:
         self._voice_provider_id: str | None = voice_provider
         self._voice_model_id: str | None = voice_model
         self._voice_name: str | None = voice_name
+        self._voice_transcription_language: str | None = voice_transcription_language
         self._voice_relay = None  # Set lazily for websocket providers
         self._history_summary: str | None = None
 
@@ -213,6 +215,16 @@ class OrchestratorSession:
         return self._voice_name
 
     @property
+    def voice_transcription_language(self) -> str | None:
+        """Transcription language hint when voice mode is active.
+
+        Empty string ``""`` means auto-detect (no language hint sent).
+        """
+        if self._voice_provider is not None:
+            return getattr(self._voice_provider, "transcription_language", None)
+        return self._voice_transcription_language
+
+    @property
     def is_busy(self) -> bool:
         """True while a send/send_audio/_run_agent turn holds the busy lock.
 
@@ -269,14 +281,18 @@ class OrchestratorSession:
                 instantiate_provider,
                 resolve_voice_target,
             )
-            provider_id, model_entry, voice_name = resolve_voice_target(
-                self._voice_provider_id, self._voice_model_id, self._voice_name,
+            provider_id, model_entry, voice_name, language = resolve_voice_target(
+                self._voice_provider_id,
+                self._voice_model_id,
+                self._voice_name,
+                self._voice_transcription_language,
             )
             self._voice_provider_id = provider_id
             self._voice_model_id = model_entry["id"]
             self._voice_name = voice_name
+            self._voice_transcription_language = language
             self._voice_provider = instantiate_provider(
-                provider_id, model_entry["id"], voice_name,
+                provider_id, model_entry["id"], voice_name, language,
             )
             provider = self._voice_provider
         else:
@@ -317,6 +333,9 @@ class OrchestratorSession:
                 meta["voice_provider"] = self._voice_provider.provider_name
                 meta["voice_model"] = self._voice_provider.model
                 meta["voice_name"] = self._voice_provider.voice
+                lang = getattr(self._voice_provider, "transcription_language", None)
+                if lang is not None:
+                    meta["voice_transcription_language"] = lang or "auto"
                 # Legacy field — kept for back-compat with older readers.
                 if self._voice_provider.provider_name == "openai":
                     meta["openai_model"] = self._voice_provider.model

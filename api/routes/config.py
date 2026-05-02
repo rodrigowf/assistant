@@ -30,6 +30,24 @@ def _load_config() -> dict[str, Any]:
     try:
         with open(path) as f:
             data = json.load(f)
+        # Forward-compat: if default_voice_transcription_language was
+        # never written, resolve it from the saved provider+model's
+        # default rather than from the global registry default — those
+        # differ between providers (Qwen → "en", OpenAI → "" auto).
+        # We do this BEFORE the generic setdefault loop so the right
+        # value lands.
+        if "default_voice_transcription_language" not in data:
+            try:
+                from orchestrator.providers.voice_registry import resolve_voice_target
+                _, _, _, lang = resolve_voice_target(
+                    data.get("default_voice_provider"),
+                    data.get("default_voice_model"),
+                    data.get("default_voice_name"),
+                    None,  # → use that model's default_transcription_language
+                )
+                data["default_voice_transcription_language"] = lang
+            except Exception:
+                pass
         # Ensure all expected keys exist (forward-compat)
         defaults = _default_config()
         for k, v in defaults.items():
@@ -94,8 +112,10 @@ def _default_config() -> dict[str, Any]:
 
     default_path = str(PROJECT_ROOT)
     default_entry = {"id": default_path, "path": default_path, "label": None, "ssh_host": None, "ssh_user": None, "ssh_key": None, "claude_config_dir": None}
-    # Pull the default voice for the default model from the registry.
-    _, _, default_voice = resolve_voice_target(DEFAULT_VOICE_PROVIDER, DEFAULT_VOICE_MODEL, None)
+    # Pull the default voice + transcription language for the default model.
+    _, _, default_voice, default_lang = resolve_voice_target(
+        DEFAULT_VOICE_PROVIDER, DEFAULT_VOICE_MODEL, None, None,
+    )
     return {
         "working_directory": default_path,
         "working_directory_history": [default_entry],
@@ -105,6 +125,7 @@ def _default_config() -> dict[str, Any]:
         "default_voice_provider": DEFAULT_VOICE_PROVIDER,
         "default_voice_model": DEFAULT_VOICE_MODEL,
         "default_voice_name": default_voice,
+        "default_voice_transcription_language": default_lang,
     }
 
 
@@ -141,6 +162,7 @@ class ConfigUpdate(BaseModel):
     default_voice_provider: str | None = None  # default provider for voice sessions
     default_voice_model: str | None = None     # default model for voice sessions
     default_voice_name: str | None = None      # default voice/speaker for voice sessions
+    default_voice_transcription_language: str | None = None  # "" = auto-detect
 
 
 # -----------------------------------------------------------------------
@@ -208,28 +230,62 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         body.default_voice_provider is not None
         or body.default_voice_model is not None
         or body.default_voice_name is not None
+        or body.default_voice_transcription_language is not None
     ):
         from orchestrator.providers.voice_registry import resolve_voice_target
-        # Determine which fields the request actually changed.
+
+        # Cascade rule: changing a higher-level field snaps the dependents
+        # to the new model/provider's defaults. Changing a lower-level
+        # field alone preserves the higher-level fields exactly.
+        #
+        #   Provider changed → model + voice + language all snap to new
+        #   provider/model defaults.
+        #   Model changed (provider not) → voice + language snap to new
+        #   model defaults.
+        #   Voice changed (alone) → keep saved language.
+        #   Language changed (alone) → keep saved voice.
         provider_changed = body.default_voice_provider is not None
         model_changed = body.default_voice_model is not None
+        voice_changed = body.default_voice_name is not None
+        lang_changed = body.default_voice_transcription_language is not None
 
-        # When provider changes without a model, snap to that provider's
-        # default model. Likewise when model changes without a voice, snap
-        # to that model's default voice. Avoids the UI having to send all
-        # three fields just to switch one of them.
         provider_req = body.default_voice_provider or config.get("default_voice_provider")
-        model_req = body.default_voice_model if not provider_changed or model_changed else None
-        voice_req = body.default_voice_name if not (provider_changed or model_changed) else None
+
+        if provider_changed:
+            # Snap model/voice/lang to new provider's defaults unless
+            # the request also specified them.
+            model_req = body.default_voice_model
+            voice_req = body.default_voice_name
+            lang_req = body.default_voice_transcription_language
+        elif model_changed:
+            # Provider unchanged, model changed → snap voice/lang to new
+            # model defaults unless explicitly given.
+            model_req = body.default_voice_model
+            voice_req = body.default_voice_name
+            lang_req = body.default_voice_transcription_language
+        else:
+            # Provider + model unchanged. Reuse saved values for any
+            # field the request didn't explicitly set, so changing one
+            # doesn't reset the others.
+            model_req = config.get("default_voice_model")
+            voice_req = (
+                body.default_voice_name if voice_changed
+                else config.get("default_voice_name")
+            )
+            lang_req = (
+                body.default_voice_transcription_language if lang_changed
+                else config.get("default_voice_transcription_language")
+            )
         try:
-            provider_id, model_entry, voice_id = resolve_voice_target(
-                provider_req, model_req, voice_req,
+            provider_id, model_entry, voice_id, lang_id = resolve_voice_target(
+                provider_req, model_req, voice_req, lang_req,
             )
         except (ValueError, RuntimeError) as e:
             raise HTTPException(status_code=400, detail=str(e))
         config["default_voice_provider"] = provider_id
         config["default_voice_model"] = model_entry["id"]
         config["default_voice_name"] = voice_id
+        config["default_voice_transcription_language"] = lang_id
 
     _save_config(config)
     return config

@@ -120,6 +120,7 @@ export interface AssistantConfig {
   default_voice_provider: string;
   default_voice_model: string;
   default_voice_name: string;
+  default_voice_transcription_language: string;  // "" = auto-detect
 }
 
 export interface ConfigUpdate {
@@ -131,6 +132,7 @@ export interface ConfigUpdate {
   default_voice_provider?: string;
   default_voice_model?: string;
   default_voice_name?: string;
+  default_voice_transcription_language?: string;
 }
 
 export function getConfig(): Promise<AssistantConfig> {
@@ -175,11 +177,19 @@ export interface VoiceEntry {
   description: string;
 }
 
+export interface TranscriptionLanguageEntry {
+  id: string;          // ISO code, or "" for auto-detect
+  label: string;
+  description: string;
+}
+
 export interface VoiceModelEntry {
   id: string;
   label: string;
   voice: string;             // default voice
   voices: VoiceEntry[];      // selectable voices
+  transcription_languages: TranscriptionLanguageEntry[];
+  default_transcription_language: string;
   default: boolean;
 }
 

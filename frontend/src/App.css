@@ -2971,6 +2971,7 @@ pre.field-value {
 /* Model selector */
 .model-dropdowns {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
 }
 
@@ -2978,7 +2979,14 @@ pre.field-value {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  flex: 1;
+  flex: 1 1 calc(50% - 6px);  /* Two per row when there are 4 fields */
+  min-width: 0;
+}
+
+/* When there are exactly 2 or 3 fields, fit them on one row instead. */
+.model-dropdowns:has(> .model-dropdown-field:nth-child(3):last-child) > .model-dropdown-field,
+.model-dropdowns:has(> .model-dropdown-field:nth-child(2):last-child) > .model-dropdown-field {
+  flex: 1 1 0;
 }
 
 .model-dropdown-label {

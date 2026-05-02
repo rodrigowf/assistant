@@ -107,7 +107,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const selectedProvider = selectedModel?.provider ?? providers[0] ?? "";
   const providerModels = models.filter(m => m.provider === selectedProvider);
 
-  // Derived voice-provider/model/voice state for dropdowns
+  // Derived voice-provider/model/voice/language state for dropdowns
   const voiceProviderIds = Object.keys(voiceProviders);
   const selectedVoiceProvider = config?.default_voice_provider ?? voiceProviderIds[0] ?? "";
   const voiceModels: VoiceModelEntry[] = voiceProviders[selectedVoiceProvider] ?? [];
@@ -115,6 +115,10 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     voiceModels.find(m => m.id === config?.default_voice_model) ?? voiceModels[0];
   const voiceVoices = selectedVoiceModel?.voices ?? [];
   const selectedVoiceName = config?.default_voice_name ?? selectedVoiceModel?.voice ?? "";
+  const voiceLanguages = selectedVoiceModel?.transcription_languages ?? [];
+  const selectedVoiceLanguage =
+    config?.default_voice_transcription_language ??
+    selectedVoiceModel?.default_transcription_language ?? "";
 
   if (!isOpen) return null;
 
@@ -263,6 +267,30 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                         ))}
                       </select>
                     </div>
+                    {voiceLanguages.length > 0 && (
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">
+                          Transcription language
+                        </label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceLanguage}
+                          disabled={saving}
+                          onChange={(e) =>
+                            save({ default_voice_transcription_language: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                          title="Language hint for transcribing your voice into the conversation history. Auto-detect lets the ASR identify per turn — best for multilingual speakers, but more error-prone on short fragments."
+                        >
+                          {voiceLanguages.map(l => (
+                            <option key={l.id || "auto"} value={l.id} title={l.description}>
+                              {l.label}
+                              {l.description ? ` — ${l.description}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
                   </div>
                 )}
               </section>

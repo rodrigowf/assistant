@@ -28,11 +28,20 @@ class VoiceEntry(TypedDict):
     description: str    # optional one-line hint (gender, accent, etc.)
 
 
+class TranscriptionLanguageEntry(TypedDict):
+    id: str             # value the provider's transcription expects
+                        # (e.g. "en", "pt"); empty string means auto-detect
+    label: str          # human label for the dropdown
+    description: str    # optional hint
+
+
 class VoiceModelEntry(TypedDict):
     id: str
     label: str
     voice: str                # default speaker for this model
     voices: list[VoiceEntry]  # all selectable speakers for this model
+    transcription_languages: list[TranscriptionLanguageEntry]
+    default_transcription_language: str  # "" means auto-detect
     default: bool             # one entry per provider should be marked default
 
 
@@ -183,18 +192,64 @@ _QWEN_FLASH_VOICES: list[VoiceEntry] = [
 ]
 
 
+# Qwen3-ASR-Flash language hints — curated subset of the full list at
+# https://github.com/QwenLM/Qwen3-ASR (~30 languages supported).
+# Empty string = auto-detect (no `language` field sent).
+_QWEN_ASR_LANGUAGES: list[TranscriptionLanguageEntry] = [
+    {"id": "",   "label": "Auto-detect", "description": "Let the ASR pick (best for multilingual)"},
+    {"id": "en", "label": "English",     "description": ""},
+    {"id": "pt", "label": "Portuguese",  "description": "Includes Brazilian"},
+    {"id": "es", "label": "Spanish",     "description": ""},
+    {"id": "zh", "label": "Chinese",     "description": "Mandarin"},
+    {"id": "yue","label": "Cantonese",   "description": ""},
+    {"id": "ja", "label": "Japanese",    "description": ""},
+    {"id": "ko", "label": "Korean",      "description": ""},
+    {"id": "fr", "label": "French",      "description": ""},
+    {"id": "de", "label": "German",      "description": ""},
+    {"id": "it", "label": "Italian",     "description": ""},
+    {"id": "ru", "label": "Russian",     "description": ""},
+    {"id": "ar", "label": "Arabic",      "description": ""},
+    {"id": "hi", "label": "Hindi",       "description": ""},
+    {"id": "id", "label": "Indonesian",  "description": ""},
+    {"id": "ms", "label": "Malay",       "description": ""},
+    {"id": "vi", "label": "Vietnamese",  "description": ""},
+    {"id": "th", "label": "Thai",        "description": ""},
+    {"id": "tr", "label": "Turkish",     "description": ""},
+    {"id": "nl", "label": "Dutch",       "description": ""},
+    {"id": "pl", "label": "Polish",      "description": ""},
+]
+
+# OpenAI Realtime input transcription has its own language dropdown
+# (whisper-1 + gpt-4o-transcribe both honour `language` ISO codes), but
+# we don't yet expose it in the UI for OpenAI sessions.  Empty list
+# means the dropdown will be hidden when an OpenAI model is selected.
+_OPENAI_TRANSCRIPTION_LANGUAGES: list[TranscriptionLanguageEntry] = []
+
+
 VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
     "openai": [
         {"id": "gpt-realtime",      "label": "GPT Realtime",      "voice": "cedar",
-         "voices": _OPENAI_VOICES, "default": True},
+         "voices": _OPENAI_VOICES,
+         "transcription_languages": _OPENAI_TRANSCRIPTION_LANGUAGES,
+         "default_transcription_language": "",
+         "default": True},
         {"id": "gpt-realtime-mini", "label": "GPT Realtime Mini", "voice": "cedar",
-         "voices": _OPENAI_VOICES, "default": False},
+         "voices": _OPENAI_VOICES,
+         "transcription_languages": _OPENAI_TRANSCRIPTION_LANGUAGES,
+         "default_transcription_language": "",
+         "default": False},
     ],
     "qwen": [
         {"id": "qwen3.5-omni-plus-realtime", "label": "Qwen3.5-Omni Plus",
-         "voice": "Tina", "voices": _QWEN_PLUS_VOICES, "default": True},
+         "voice": "Tina", "voices": _QWEN_PLUS_VOICES,
+         "transcription_languages": _QWEN_ASR_LANGUAGES,
+         "default_transcription_language": "en",
+         "default": True},
         {"id": "qwen3-omni-flash-realtime",  "label": "Qwen3-Omni Flash",
-         "voice": "Cherry", "voices": _QWEN_FLASH_VOICES, "default": False},
+         "voice": "Cherry", "voices": _QWEN_FLASH_VOICES,
+         "transcription_languages": _QWEN_ASR_LANGUAGES,
+         "default_transcription_language": "en",
+         "default": False},
     ],
     # Filled in by Phase 2:
     # "google": [
@@ -238,12 +293,19 @@ def resolve_voice_target(
     provider: str | None,
     model: str | None,
     voice: str | None = None,
-) -> tuple[str, VoiceModelEntry, str]:
-    """Resolve a (provider, model, voice) request, falling back to defaults.
+    transcription_language: str | None = None,
+) -> tuple[str, VoiceModelEntry, str, str]:
+    """Resolve a (provider, model, voice, transcription_language) request.
 
-    Returns ``(provider_id, model_entry, voice_id)``. ``voice_id`` is
-    validated against the model's ``voices`` list when provided; unknown
-    voices fall back to the model's default.
+    Returns ``(provider_id, model_entry, voice_id, language_id)``.
+
+    - ``voice_id``: validated against the model's ``voices`` list; unknown
+      voices fall back to the model's default voice.
+    - ``language_id``: validated against the model's
+      ``transcription_languages`` list. Empty string ``""`` means
+      auto-detect (no ``language`` field sent to the provider).
+      ``None`` (caller didn't specify) falls back to the model's
+      ``default_transcription_language``. Unknown values also fall back.
     """
     p = provider or DEFAULT_VOICE_PROVIDER
     if p not in VOICE_PROVIDERS:
@@ -272,7 +334,20 @@ def resolve_voice_target(
     voices = selected.get("voices") or []
     voice_ids = {v["id"] for v in voices}
     chosen_voice = voice if voice and voice in voice_ids else selected["voice"]
-    return p, selected, chosen_voice
+
+    # Resolve transcription language. The valid set includes the
+    # explicit "" entry (auto-detect) so we can distinguish "user picked
+    # auto" from "user didn't choose anything".
+    lang_options = selected.get("transcription_languages") or []
+    valid_lang_ids = {entry["id"] for entry in lang_options}
+    if transcription_language is None:
+        chosen_language = selected.get("default_transcription_language", "")
+    elif transcription_language in valid_lang_ids:
+        chosen_language = transcription_language
+    else:
+        chosen_language = selected.get("default_transcription_language", "")
+
+    return p, selected, chosen_voice, chosen_language
 
 
 def list_voice_models() -> dict[str, list[VoiceModelEntry]]:
@@ -280,11 +355,25 @@ def list_voice_models() -> dict[str, list[VoiceModelEntry]]:
     return {p: list(models) for p, models in VOICE_MODELS.items()}
 
 
-def instantiate_provider(provider: str, model: str, voice: str | None = None) -> BaseVoiceProvider:
+def instantiate_provider(
+    provider: str,
+    model: str,
+    voice: str | None = None,
+    transcription_language: str | None = None,
+) -> BaseVoiceProvider:
     """Construct a provider instance from a (provider, model) pair."""
     cls = get_provider_class(provider)
     entry = get_model_entry(provider, model)
     voices = entry.get("voices") or []
     voice_ids = {v["id"] for v in voices}
     final_voice = voice if voice and voice in voice_ids else entry["voice"]
-    return cls(model=model, voice=final_voice)
+
+    lang_ids = {e["id"] for e in (entry.get("transcription_languages") or [])}
+    if transcription_language is None:
+        final_lang = entry.get("default_transcription_language", "")
+    elif transcription_language in lang_ids:
+        final_lang = transcription_language
+    else:
+        final_lang = entry.get("default_transcription_language", "")
+
+    return cls(model=model, voice=final_voice, transcription_language=final_lang)
