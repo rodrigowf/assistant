@@ -344,7 +344,21 @@ class QwenVoiceProvider(BaseVoiceProvider):
                 "input_audio_format": fmt["input_audio_format"],
                 "output_audio_format": fmt["output_audio_format"],
                 "turn_detection": vad or DEFAULT_VAD,
-                "input_audio_transcription": {"model": "gummy-realtime-v2"},
+                # Transcription is what gets persisted to JSONL — quality
+                # matters for cross-session memory.  `gummy-realtime-v1` is
+                # the only documented value but it's English-weak (drifts
+                # to Chinese on short fragments, the bug Rodrigo reported).
+                # Empirically verified that the WS accepts the higher-
+                # quality `qwen3-asr-flash-realtime` as the model name and
+                # honours a `language` hint, even though Alibaba's docs
+                # don't list either combination for this endpoint.
+                # Locking to English by default; Portuguese still
+                # transcribes (only "pt" not "pt-BR" is supported), and
+                # Chinese drift on short English fragments is gone.
+                "input_audio_transcription": {
+                    "model": "qwen3-asr-flash-realtime",
+                    "language": "en",
+                },
             },
         }
 
