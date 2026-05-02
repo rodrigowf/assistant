@@ -28,6 +28,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from api.pool import SessionPool
 from api.serializers import serialize_orchestrator_event
 from orchestrator.config import OrchestratorConfig, get_available_models
+from orchestrator.providers.discovery import list_orchestrator_models
 from orchestrator.session import OrchestratorSession
 
 logger = logging.getLogger(__name__)
@@ -515,8 +516,12 @@ async def _handle_get_model(ws: WebSocket, session: OrchestratorSession) -> None
 
 
 async def _handle_get_models(ws: WebSocket) -> None:
-    """Get list of all available models."""
-    models = get_available_models()
+    """Get list of all available models (live, with static fallback)."""
+    try:
+        models = await list_orchestrator_models()
+    except Exception:
+        logger.exception("Live model discovery failed; falling back to static")
+        models = get_available_models()
     await ws.send_bytes(orjson.dumps({
         "type": "models_list",
         "models": [m.to_dict() for m in models],

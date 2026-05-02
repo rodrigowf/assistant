@@ -17,6 +17,10 @@ import httpx
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from orchestrator.config import get_available_models, get_audio_capable_models
+from orchestrator.providers.discovery import (
+    list_orchestrator_models,
+    list_voice_models_live,
+)
 from orchestrator.providers.voice_registry import (
     DEFAULT_VOICE_MODEL,
     DEFAULT_VOICE_PROVIDER,
@@ -101,12 +105,19 @@ async def create_voice_session(
 
 @router.get("/api/orchestrator/voice/models")
 async def list_voice_provider_models() -> dict:
-    """Return registered voice providers and their models.
+    """Return live voice provider models, merged with the static registry.
 
-    Used by the settings UI to populate provider/model dropdowns.
+    Used by the settings UI to populate provider/model dropdowns. Falls
+    back to the static registry on API/network errors or when keys are
+    missing.
     """
+    try:
+        providers = await list_voice_models_live()
+    except Exception:
+        logger.exception("Live voice model discovery failed; falling back to static")
+        providers = list_voice_models()
     return {
-        "providers": list_voice_models(),
+        "providers": providers,
         "default_provider": DEFAULT_VOICE_PROVIDER,
         "default_model": DEFAULT_VOICE_MODEL,
     }
@@ -206,13 +217,18 @@ async def upload_audio(
 
 @router.get("/api/orchestrator/models")
 async def list_models() -> dict:
-    """List all available models for the orchestrator.
+    """List orchestrator models — fetched live from each provider.
 
-    Returns models grouped by provider with capability flags.
+    Falls back to the static registry on API/network errors or when keys
+    are missing.
     """
-    models = get_available_models()
-    audio_models = get_audio_capable_models()
+    try:
+        models = await list_orchestrator_models()
+    except Exception:
+        logger.exception("Live model discovery failed; falling back to static")
+        models = get_available_models()
 
+    audio_models = [m for m in models if m.supports_audio]
     return {
         "models": [m.to_dict() for m in models],
         "audio_capable_models": [m.model_id for m in audio_models],
@@ -222,8 +238,13 @@ async def list_models() -> dict:
 
 @router.get("/api/orchestrator/models/audio")
 async def list_audio_models() -> dict:
-    """List models that support audio input."""
-    models = get_audio_capable_models()
+    """List models that support audio input (live, with static fallback)."""
+    try:
+        all_models = await list_orchestrator_models()
+        models = [m for m in all_models if m.supports_audio]
+    except Exception:
+        logger.exception("Live audio model discovery failed; falling back to static")
+        models = get_audio_capable_models()
     return {
         "models": [m.to_dict() for m in models],
     }
