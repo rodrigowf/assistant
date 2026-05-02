@@ -26,6 +26,17 @@ enum class WebSocketEndpoint {
  */
 class WebSocketManager {
 
+    /**
+     * Cheap heuristic to skip logging audio frames.  Looks for the
+     * `voice_audio_in` / `voice_audio_out` type prefix near the start
+     * of the message — much faster than parsing JSON for every frame.
+     */
+    private fun isAudioPayload(text: String): Boolean {
+        if (text.length < 32) return false
+        val head = text.substring(0, minOf(64, text.length))
+        return head.contains("\"voice_audio_in\"") || head.contains("\"voice_audio_out\"")
+    }
+
     companion object {
         private const val TAG = "WebSocketManager"
         private const val RECONNECT_DELAY_MS = 3000L
@@ -101,13 +112,19 @@ class WebSocketManager {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "Received text ($endpoint): $text")
+                // Skip logging high-rate audio frames; they're 4 KB each
+                // at ~50 Hz and the logging cost alone causes UI freezes.
+                if (!isAudioPayload(text)) {
+                    Log.d(TAG, "Received text ($endpoint): $text")
+                }
                 parseMessage(text, endpoint)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
                 val text = bytes.utf8()
-                Log.d(TAG, "Received binary ($endpoint): $text")
+                if (!isAudioPayload(text)) {
+                    Log.d(TAG, "Received binary ($endpoint): $text")
+                }
                 parseMessage(text, endpoint)
             }
 
@@ -196,6 +213,12 @@ class WebSocketManager {
                 put("type", "voice_start")
                 message.localId?.let { put("local_id", it) }
                 message.resumeSdkId?.let { put("resume_sdk_id", it) }
+                // Voice provider/model/voice/language — when present,
+                // the backend overrides the configured defaults.
+                message.voiceProvider?.let { put("voice_provider", it) }
+                message.voiceModel?.let { put("voice_model", it) }
+                message.voiceName?.let { put("voice_name", it) }
+                message.voiceTranscriptionLanguage?.let { put("voice_transcription_language", it) }
             }
             is WebSocketMessage.VoiceStop -> JSONObject().apply {
                 put("type", "voice_stop")
@@ -203,6 +226,10 @@ class WebSocketManager {
             is WebSocketMessage.VoiceEvent -> JSONObject().apply {
                 put("type", "voice_event")
                 put("event", JSONObject(message.event))
+            }
+            is WebSocketMessage.VoiceAudioIn -> JSONObject().apply {
+                put("type", "voice_audio_in")
+                put("audio", message.audioBase64)
             }
             is WebSocketMessage.Send -> JSONObject().apply {
                 put("type", "send")
@@ -233,7 +260,12 @@ class WebSocketManager {
         }
 
         val jsonString = json.toString()
-        Log.d(TAG, "Sending ($endpoint): $jsonString")
+        // Don't log audio chunks — they fire ~50/s with ~4KB payloads
+        // each, which floods logcat and causes UI freezes via the
+        // logging subsystem alone.
+        if (message !is WebSocketMessage.VoiceAudioIn) {
+            Log.d(TAG, "Sending ($endpoint): $jsonString")
+        }
         connections.getValue(endpoint).webSocket?.send(jsonString)
     }
 
@@ -305,6 +337,40 @@ class WebSocketManager {
                     val command = jsonObjectToMap(json.optJSONObject("command"))
                     emit(WebSocketEvent.VoiceCommand(command))
                 }
+                "voice_event" -> {
+                    // Provider event mirrored from backend (WebSocket
+                    // providers only — for WebRTC the data channel
+                    // receives these directly).
+                    //
+                    // Drop high-frequency delta events HERE so the
+                    // entire downstream pipeline (Flow emit, ViewModel
+                    // dispatch, provider parse) doesn't wake up for
+                    // them.  Qwen streams ~50–100 deltas per assistant
+                    // response; we accumulate them in
+                    // response.audio_transcript.done anyway.
+                    val inner = json.optJSONObject("event")
+                    val innerType = inner?.optString("type", "")
+                    if (innerType == "response.audio_transcript.delta" ||
+                        innerType == "response.text.delta" ||
+                        innerType == "response.function_call_arguments.delta") {
+                        // No-op — neither the UI nor the provider needs
+                        // these.
+                    } else {
+                        // Use shallow conversion: top-level keys only,
+                        // nested JSONObject/JSONArray values stay as-is
+                        // and the provider casts them when it needs to.
+                        // Avoids walking the full event twice (once
+                        // here, once in the provider).
+                        emit(WebSocketEvent.VoiceProviderEvent(jsonObjectToShallowMap(inner)))
+                    }
+                }
+                "voice_audio_out" -> {
+                    // Speaker chunk for WebSocket voice providers.
+                    val audio = json.optString("audio", "")
+                    if (audio.isNotEmpty()) {
+                        emit(WebSocketEvent.VoiceAudioOut(audio))
+                    }
+                }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 
                 // Compact
@@ -346,6 +412,25 @@ class WebSocketManager {
                 JSONObject.NULL -> null
                 else -> value
             }
+        }
+        return map
+    }
+
+    /**
+     * Top-level-only conversion — nested JSONObject / JSONArray values
+     * are kept as-is.  Used for high-frequency events (voice provider
+     * events) where the consumer reads only flat scalars and casts the
+     * occasional nested object on demand.  ~3-5x faster than the
+     * recursive variant for typical voice events.
+     */
+    private fun jsonObjectToShallowMap(json: JSONObject?): Map<String, Any?> {
+        if (json == null) return emptyMap()
+        val map = mutableMapOf<String, Any?>()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = json.opt(key)
+            map[key] = if (value === JSONObject.NULL) null else value
         }
         return map
     }

@@ -20,6 +20,7 @@ import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
 import com.assistant.peripheral.voice.VoiceManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -319,7 +320,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
         // Collect WebSocket events — every event is tagged with the endpoint
         // that emitted it so we can route into the correct per-tab bucket.
-        viewModelScope.launch {
+        //
+        // Run the dispatch on Dispatchers.Default so JSON parsing,
+        // bucket updates, and provider event handling don't compete
+        // with the UI thread.  All bucket fields are MutableStateFlow,
+        // which Compose's collectAsState() observes safely from any
+        // thread — no Main hop is needed for the writes themselves.
+        viewModelScope.launch(Dispatchers.Default) {
             webSocketManager.events.collect { (endpoint, event) ->
                 handleWebSocketEvent(endpoint, event)
             }
@@ -348,6 +355,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // Voice runs on the orchestrator socket only.
                 webSocketManager.send(
                     WebSocketMessage.VoiceEvent(eventMap),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                )
+            }
+
+            // Set callback for forwarding mic chunks to backend (WebSocket
+            // voice providers — Qwen and friends).  WebRTC providers
+            // bypass this; their audio goes peer-to-peer.
+            vm.setMicChunkCallback { audioB64 ->
+                webSocketManager.send(
+                    WebSocketMessage.VoiceAudioIn(audioB64),
                     endpoint = WebSocketEndpoint.ORCHESTRATOR
                 )
             }
@@ -690,6 +707,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 @Suppress("UNCHECKED_CAST")
                 val command = event.command as? Map<String, Any?> ?: return
                 voiceManager?.handleBackendCommand(command)
+            }
+
+            is WebSocketEvent.VoiceProviderEvent -> {
+                // Provider event mirrored from backend (WebSocket
+                // voice providers — Qwen et al.).  The provider parses
+                // it and emits VoiceEvent on its own flow.
+                voiceManager?.handleProviderEvent(event.event)
+            }
+
+            is WebSocketEvent.VoiceAudioOut -> {
+                // Speaker chunk for WebSocket voice providers.
+                voiceManager?.pushSpeakerChunk(event.audioBase64)
             }
 
             is WebSocketEvent.VoiceStopped -> {
@@ -1212,19 +1241,31 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
         val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
         viewModelScope.launch {
+            // Fetch the backend's configured voice defaults — provider,
+            // model, voice, transcription language.  The Android app
+            // doesn't carry its own preferences; the source of truth is
+            // assistant_config.json (toggled from the web frontend).
+            val cfg = apiClient!!.getVoiceConfig()
+
             // Send voice_start with the orchestrator bucket's local_id and the true
             // JSONL session id so the backend resumes from the correct history file.
-            // currentSessionId may be local_id on reconnect; jsonlSessionId is always
-            // the real SDK/JSONL id (matches web frontend's resumeSdkId behaviour).
+            // The voice fields come from the backend config we just fetched —
+            // sending them explicitly keeps the WS handler and the REST endpoint
+            // pinned to the same values for this session.
             webSocketManager.send(
                 WebSocketMessage.VoiceStart(
                     localId = orchBucket.currentLocalId.value,
-                    resumeSdkId = orchBucket.jsonlSessionId ?: orchBucket.currentSessionId.value
+                    resumeSdkId = orchBucket.jsonlSessionId ?: orchBucket.currentSessionId.value,
+                    voiceProvider = cfg.provider,
+                    voiceModel = cfg.model,
+                    voiceName = cfg.voice,
+                    voiceTranscriptionLanguage = cfg.transcriptionLanguage,
                 ),
                 endpoint = WebSocketEndpoint.ORCHESTRATOR
             )
-            // Then start the actual WebRTC connection
-            vm.start()
+            // Then connect using the matching transport (WebRTC for OpenAI,
+            // WebSocket for Qwen, etc).
+            vm.start(cfg)
         }
     }
 

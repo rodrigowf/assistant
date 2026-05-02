@@ -56,6 +56,13 @@ _AUDIO_LOG_SAMPLE_EVERY = 50
 # alongside the api logs so /debug-app picks them up.
 _VOICE_LOG_DIR = PROJECT_ROOT / "logs" / "voice"
 
+# How often to send a tiny silent keepalive PCM chunk upstream when the
+# user is silent.  Qwen-Omni's transcription pipeline times out after a
+# few minutes of audio silence and crashes on the next real input with
+# a misleading "InvalidParameter" 400.  30s comfortably stays under
+# that threshold while keeping bandwidth negligible (~960B/30s).
+_KEEPALIVE_INTERVAL_S = 30.0
+
 
 class VoiceRelay:
     """Owns one upstream WS to the voice provider for the lifetime of a session.
@@ -93,6 +100,7 @@ class VoiceRelay:
 
         self._ws = None  # type: ignore[assignment]
         self._drain_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
         # Rings of recent frames in BOTH directions.  When the upstream
         # WS dies, dumping both side-by-side shows what we sent, what
@@ -115,6 +123,9 @@ class VoiceRelay:
         self._first_audio_out_at: float | None = None
         self._last_send_at: float = 0.0
         self._last_recv_at: float = 0.0
+        # Tracks the last REAL mic chunk separately from _last_send_at,
+        # so keepalive ticks don't reset the keepalive clock.
+        self._last_audio_in_at: float = 0.0
         self._audio_in_chunks = 0
         self._audio_out_chunks = 0
         self._audio_in_bytes = 0
@@ -235,6 +246,16 @@ class VoiceRelay:
 
         self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
 
+        # Keepalive task — only if the provider implements
+        # build_keepalive_chunk().  Sends silent PCM every 30s of audio
+        # silence to prevent Qwen's transcription pipeline from timing
+        # out and crashing on the next real input.
+        if hasattr(self._provider, "build_keepalive_chunk"):
+            self._keepalive_task = asyncio.create_task(
+                self._keepalive_loop(),
+                name=f"voice-keepalive-{self._provider.provider_name}",
+            )
+
     def _record_sent(self, event: dict[str, Any]) -> None:
         """Stash a sent control frame for post-mortem on upstream close.
 
@@ -290,7 +311,9 @@ class VoiceRelay:
             )
         try:
             await self._ws.send(json.dumps(format_audio_in(pcm_b64)))
-            self._last_send_at = time.monotonic()
+            now = time.monotonic()
+            self._last_send_at = now
+            self._last_audio_in_at = now
             self._audio_in_chunks += 1
             # base64 encodes 3 bytes → 4 chars; PCM byte size ≈ len * 3/4.
             self._audio_in_bytes += (len(pcm_b64) * 3) // 4
@@ -311,6 +334,12 @@ class VoiceRelay:
 
     async def stop(self) -> None:
         """Cancel the drain task and close the upstream WS."""
+        if self._keepalive_task is not None and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if self._drain_task is not None and not self._drain_task.done():
             self._drain_task.cancel()
             try:
@@ -371,6 +400,42 @@ class VoiceRelay:
         self._slog(summary)
 
     # --- drain loop -------------------------------------------------------
+
+    async def _keepalive_loop(self) -> None:
+        """Send a tiny silent PCM chunk every 30s of audio silence.
+
+        Background: Qwen-Omni's transcription pipeline times out after
+        ~3-5 minutes of no audio input; the next real chunk crashes the
+        upstream WS with a misleading "InvalidParameter" 400.  Empirically
+        a periodic silent chunk prevents the timeout without affecting
+        transcripts or VAD (silence stays well below the speech threshold).
+
+        Aborted on cancellation; logs each tick at debug level.
+        """
+        assert self._ws is not None
+        build = getattr(self._provider, "build_keepalive_chunk", None)
+        format_audio_in = getattr(self._provider, "format_audio_in", None)
+        if build is None or format_audio_in is None:
+            return  # provider doesn't support keepalive
+        try:
+            while not self._closed.is_set():
+                await asyncio.sleep(_KEEPALIVE_INTERVAL_S / 2)
+                if self._closed.is_set() or self._ws is None:
+                    break
+                # Skip if a real audio chunk went out within the interval.
+                idle = time.monotonic() - (self._last_audio_in_at or self._started_at)
+                if idle < _KEEPALIVE_INTERVAL_S:
+                    continue
+                try:
+                    chunk = build()
+                    await self._ws.send(json.dumps(format_audio_in(chunk)))
+                    self._last_send_at = time.monotonic()
+                    self._slog(f"keepalive sent (idle={idle:.1f}s)")
+                except Exception as e:  # noqa: BLE001
+                    self._slog(f"WARN keepalive failed: {e}")
+                    # Don't break — drain task will surface the close.
+        except asyncio.CancelledError:
+            raise
 
     async def _drain(self) -> None:
         """Pump upstream messages until the WS closes.

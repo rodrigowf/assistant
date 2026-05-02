@@ -2,6 +2,9 @@ package com.assistant.peripheral.network
 
 import android.util.Log
 import com.assistant.peripheral.data.*
+import com.assistant.peripheral.voice.VoiceConfig
+import com.assistant.peripheral.voice.VoiceConnectionInfo
+import com.assistant.peripheral.voice.VoiceConnectionType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -9,6 +12,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
@@ -21,10 +25,18 @@ class ApiClient(private val baseUrl: String) {
         private const val TAG = "ApiClient"
     }
 
-    private val client = OkHttpClient.Builder()
+    /**
+     * Shared OkHttp client used for all REST calls.  Exposed
+     * (read-only) so other components that need a one-shot HTTP
+     * request (e.g. [com.assistant.peripheral.voice.OpenAIVoiceProvider]
+     * for the SDP exchange) can reuse the same connection pool /
+     * thread pool instead of spinning up their own.
+     */
+    val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
+    private val client = httpClient
 
     private fun buildHttpUrl(path: String): String {
         var url = baseUrl
@@ -215,21 +227,82 @@ class ApiClient(private val baseUrl: String) {
     }
 
     /**
-     * Get voice session ephemeral token.
-     * POST /api/orchestrator/voice/session
+     * Fetch the global assistant config — the source of truth for
+     * default voice provider/model/voice/language. Used on session
+     * start so the Android app always picks up whatever is configured
+     * on the backend (toggled from the web frontend).
      *
-     * Response format from OpenAI:
-     * {
-     *   "client_secret": {
-     *     "value": "ek_...",
-     *     "expires_at": 1234567890
-     *   },
-     *   ...
-     * }
+     * `GET /api/config`
      */
-    suspend fun getVoiceToken(): VoiceTokenResponse? = withContext(Dispatchers.IO) {
+    suspend fun getVoiceConfig(): VoiceConfig = withContext(Dispatchers.IO) {
         try {
-            val url = buildHttpUrl("/api/orchestrator/voice/session")
+            val url = buildHttpUrl("/api/config")
+            Log.d(TAG, "GET $url")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.e(TAG, "getVoiceConfig failed: ${response.code}")
+                return@withContext VoiceConfig.DEFAULT
+            }
+            val body = response.body?.string() ?: return@withContext VoiceConfig.DEFAULT
+            val json = JSONObject(body)
+            VoiceConfig(
+                provider = json.optString("default_voice_provider", VoiceConfig.DEFAULT.provider),
+                model = json.optString("default_voice_model", VoiceConfig.DEFAULT.model),
+                voice = json.optString("default_voice_name", VoiceConfig.DEFAULT.voice),
+                transcriptionLanguage = json.optString("default_voice_transcription_language", ""),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "getVoiceConfig error: ${e.message}", e)
+            VoiceConfig.DEFAULT
+        }
+    }
+
+    /**
+     * Open a voice session and return its connection metadata.
+     *
+     * `POST /api/orchestrator/voice/session?provider=...&model=...&voice=...&transcription_language=...`
+     *
+     * The backend response always contains a `connection_info` object —
+     * the provider-agnostic shape covering both transports:
+     *
+     *   {
+     *     "connection_info": {
+     *       "connection_type": "webrtc" | "websocket",
+     *       "endpoint": "...",
+     *       "ephemeral_token": "ek_..." | null,
+     *       "expires_at": 123456789 | null,
+     *       "audio_in_format": {"sample_rate": 24000, "encoding": "pcm16"},
+     *       "audio_out_format": {"sample_rate": 24000, "encoding": "pcm16"},
+     *       "model": "...",
+     *       "voice": "..."
+     *     },
+     *     // legacy fields for OpenAI WebRTC clients:
+     *     "client_secret": {"value": "ek_...", "expires_at": ...},
+     *     "model": "...", "voice": "..."
+     *   }
+     *
+     * @param provider null = use backend default
+     * @param model null = use provider default
+     * @param voice null = use model default
+     * @param transcriptionLanguage null = use model default; "" = auto-detect
+     */
+    suspend fun startVoiceSession(
+        provider: String? = null,
+        model: String? = null,
+        voice: String? = null,
+        transcriptionLanguage: String? = null,
+    ): VoiceConnectionInfo? = withContext(Dispatchers.IO) {
+        try {
+            val q = mutableListOf<String>()
+            provider?.let { q.add("provider=${URLEncoder.encode(it, "UTF-8")}") }
+            model?.let { q.add("model=${URLEncoder.encode(it, "UTF-8")}") }
+            voice?.let { q.add("voice=${URLEncoder.encode(it, "UTF-8")}") }
+            transcriptionLanguage?.let {
+                q.add("transcription_language=${URLEncoder.encode(it, "UTF-8")}")
+            }
+            val qs = if (q.isEmpty()) "" else "?" + q.joinToString("&")
+            val url = buildHttpUrl("/api/orchestrator/voice/session$qs")
             Log.d(TAG, "POST $url")
 
             val request = Request.Builder()
@@ -239,40 +312,54 @@ class ApiClient(private val baseUrl: String) {
 
             val response = client.newCall(request).execute()
             if (!response.isSuccessful) {
-                Log.e(TAG, "getVoiceToken failed: ${response.code}")
+                Log.e(TAG, "startVoiceSession failed: ${response.code}")
                 return@withContext null
             }
 
             val body = response.body?.string() ?: return@withContext null
-            Log.d(TAG, "Voice token response: ${body.take(200)}...")
+            Log.d(TAG, "Voice session response: ${body.take(300)}...")
             val json = JSONObject(body)
 
-            // Extract token from client_secret.value (OpenAI format)
-            val clientSecret = json.optJSONObject("client_secret")
-            if (clientSecret == null) {
-                Log.e(TAG, "No client_secret in response")
-                return@withContext null
-            }
-
-            val token = clientSecret.optString("value", "")
-            if (token.isEmpty()) {
-                Log.e(TAG, "Empty token value in client_secret")
-                return@withContext null
-            }
-
-            val expiresAt = clientSecret.optLong("expires_at", 0)
-            val now = System.currentTimeMillis() / 1000
-            val expiresIn = if (expiresAt > 0) (expiresAt - now).toInt() else 60
-
-            Log.d(TAG, "Got ephemeral token, expires in ${expiresIn}s")
-            VoiceTokenResponse(
-                token = token,
-                expiresIn = expiresIn
-            )
+            val info = json.optJSONObject("connection_info")
+                ?: run {
+                    Log.e(TAG, "No connection_info in response")
+                    return@withContext null
+                }
+            parseConnectionInfo(info)
         } catch (e: Exception) {
-            Log.e(TAG, "getVoiceToken error: ${e.message}", e)
+            Log.e(TAG, "startVoiceSession error: ${e.message}", e)
             null
         }
+    }
+
+    /** Back-compat alias. Returns just the OpenAI ephemeral token + TTL. */
+    suspend fun getVoiceToken(): VoiceTokenResponse? {
+        val info = startVoiceSession() ?: return null
+        val token = info.ephemeralToken ?: return null
+        val expiresIn = info.expiresAt?.let {
+            val now = System.currentTimeMillis() / 1000
+            (it - now).toInt().coerceAtLeast(1)
+        } ?: 60
+        return VoiceTokenResponse(token = token, expiresIn = expiresIn)
+    }
+
+    private fun parseConnectionInfo(o: JSONObject): VoiceConnectionInfo {
+        val inFmt = o.optJSONObject("audio_in_format") ?: JSONObject()
+        val outFmt = o.optJSONObject("audio_out_format") ?: JSONObject()
+        return VoiceConnectionInfo(
+            connectionType = VoiceConnectionType.fromWire(
+                o.optString("connection_type", "webrtc")
+            ),
+            endpoint = o.optString("endpoint", ""),
+            ephemeralToken = o.optString("ephemeral_token", "").ifEmpty { null },
+            expiresAt = o.optLong("expires_at", 0L).takeIf { it > 0 },
+            model = o.optString("model", ""),
+            voice = o.optString("voice", ""),
+            audioInSampleRate = inFmt.optInt("sample_rate", 24000),
+            audioInEncoding = inFmt.optString("encoding", "pcm16"),
+            audioOutSampleRate = outFmt.optInt("sample_rate", 24000),
+            audioOutEncoding = outFmt.optString("encoding", "pcm16"),
+        )
     }
 
     /**

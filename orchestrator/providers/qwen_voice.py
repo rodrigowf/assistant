@@ -459,6 +459,28 @@ class QwenVoiceProvider(BaseVoiceProvider):
         """Wrap a PCM chunk for upstream send to Qwen WS."""
         return {"type": "input_audio_buffer.append", "audio": pcm_b64}
 
+    def build_keepalive_chunk(self) -> str:
+        """Build a tiny silent PCM chunk to keep the ASR pipeline warm.
+
+        Qwen-Omni's transcription model (qwen3-asr-flash-realtime) appears
+        to time out / die after a few minutes of audio silence — when the
+        next real audio arrives, the upstream WS closes with a misleading
+        ``InvalidParameter`` 400 (the same boilerplate they use for
+        malformed URL fields).  Sending a small silent chunk every ~30s
+        keeps the pipeline alive without triggering VAD (silence stays
+        below the speech threshold).
+
+        The chunk is 20ms of 16-bit signed PCM at the model's input rate,
+        all zeros, base64-encoded — too short for VAD to flag as speech
+        even at threshold 0.4.
+        """
+        import base64
+        fmt = _audio_formats_for(self._model)
+        sample_rate = fmt["in_sample_rate"]
+        # 20ms × sample_rate samples × 2 bytes/sample (16-bit PCM).
+        n_bytes = (sample_rate // 50) * 2
+        return base64.b64encode(b"\x00" * n_bytes).decode("ascii")
+
     @staticmethod
     def is_audio_out_event(raw_event: dict[str, Any]) -> bool:
         """True if the event carries provider audio bytes for the client."""
