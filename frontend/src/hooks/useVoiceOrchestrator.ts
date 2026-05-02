@@ -38,6 +38,27 @@ import type {
   VoiceStatus,
 } from "../types";
 
+// Voice debug logger — opt-in via URL flag (?debug=voice or ?debug=all).
+// Off by default so the console isn't flooded.  When on, every voice
+// state transition / sent / received event lands in the console with
+// a `[voice]` prefix and a millisecond timestamp.
+const VOICE_DEBUG: boolean = (() => {
+  if (typeof window === "undefined") return false;
+  try {
+    const dbg = new URLSearchParams(window.location.search).get("debug") || "";
+    return /\b(voice|all)\b/i.test(dbg);
+  } catch {
+    return false;
+  }
+})();
+const VOICE_DEBUG_T0 = Date.now();
+function vlog(...args: unknown[]): void {
+  if (!VOICE_DEBUG) return;
+  const t = ((Date.now() - VOICE_DEBUG_T0) / 1000).toFixed(2);
+  // eslint-disable-next-line no-console
+  console.log(`[voice t+${t}s]`, ...args);
+}
+
 interface UseVoiceOrchestratorOptions {
   localId?: string;
   resumeSdkId?: string | null;
@@ -81,6 +102,14 @@ export function useVoiceOrchestrator(
   // Connection info from session_started — drives transport choice.
   const connInfoRef = useRef<VoiceConnectionInfoPayload | null>(null);
 
+  // Tracks whether a provider response is currently in flight (between
+  // response.created and response.done). For Qwen we must NOT send
+  // response.cancel when nothing is active — DashScope rejects it with a
+  // 400 ("InvalidParameter: The provided URL does not appear to be valid"
+  // — misleading boilerplate for any malformed/unexpected request) and
+  // closes the upstream WS, killing the voice session.
+  const responseInFlightRef = useRef(false);
+
   // Mute state
   const [isMuted, setIsMuted] = useState(false);
   const [isAssistantMuted, setIsAssistantMuted] = useState(false);
@@ -95,6 +124,7 @@ export function useVoiceOrchestrator(
   optsRef.current = options;
 
   const updateStatus = useCallback((status: VoiceStatus) => {
+    vlog("status →", status);
     setVoiceStatus(status);
     optsRef.current.onStatusChange?.(status);
   }, []);
@@ -102,6 +132,7 @@ export function useVoiceOrchestrator(
   // Send a raw provider event. WebRTC: data channel; WS: orchestrator WS mirror.
   const sendProviderEvent = useCallback((event: RealtimeEvent) => {
     const t = transportRef.current;
+    vlog("send", event.type, "transport=", t?.kind);
     if (t?.kind === "webrtc") {
       if (dcReadyRef.current) {
         t.sendProviderEvent(event);
@@ -125,6 +156,7 @@ export function useVoiceOrchestrator(
   }, []);
 
   const cleanup = useCallback(() => {
+    vlog("cleanup (transport=", transportRef.current?.kind, ")");
     stopAudioAnalysis();
     transportRef.current?.disconnect();
     transportRef.current = null;
@@ -145,6 +177,7 @@ export function useVoiceOrchestrator(
       const err = event.error as Record<string, unknown> | undefined;
       const code = err?.code as string | undefined;
       const message = err?.message as string | undefined;
+      vlog("ERR upstream", { code, message });
       if (code === "session_expired") {
         setVoiceError(message || "Voice session expired — please restart");
       } else {
@@ -157,8 +190,10 @@ export function useVoiceOrchestrator(
     }
 
     if (eventType === "response.created") {
+      responseInFlightRef.current = true;
       updateStatus("speaking");
     } else if (eventType === "response.done") {
+      responseInFlightRef.current = false;
       updateStatus("active");
       optsRef.current.onTurnComplete?.();
     } else if (eventType === "response.output_item.added") {
@@ -182,10 +217,19 @@ export function useVoiceOrchestrator(
       // reliably stop responses that have started streaming, so we send
       // response.cancel ourselves. WebRTC providers (OpenAI) handle this
       // server-side via their own VAD wiring.
+      //
+      // Critical: only send response.cancel if a response is actually
+      // in flight. DashScope rejects a stray cancel with a misleading
+      // 400 ("InvalidParameter: The provided URL does not appear to be
+      // valid") and closes the upstream WS, killing the session. False
+      // speech_started events fire from background noise / pauses
+      // between turns, so this guard is required.
       const t = transportRef.current;
       if (t?.kind === "websocket") {
         t.flushAudioOut();
-        sendProviderEvent({ type: "response.cancel" });
+        if (responseInFlightRef.current) {
+          sendProviderEvent({ type: "response.cancel" });
+        }
       }
     } else if (eventType === "input_audio_buffer.speech_stopped") {
       updateStatus("thinking");
@@ -297,6 +341,17 @@ export function useVoiceOrchestrator(
 
   // Orchestrator-WS server events.
   const handleServerEvent = useCallback((event: ServerEvent) => {
+    // Log all non-frequent server events.  voice_audio_out (constant)
+    // and voice_event with high-rate transcript deltas would flood.
+    if (
+      event.type !== "voice_audio_out" &&
+      !(event.type === "voice_event" && (
+        (event.event as RealtimeEvent | undefined)?.type === "response.audio_transcript.delta"
+        || (event.event as RealtimeEvent | undefined)?.type === "response.text.delta"
+      ))
+    ) {
+      vlog("recv", event.type, event.type === "voice_event" ? (event.event as RealtimeEvent).type : "");
+    }
     switch (event.type) {
       case "session_started": {
         optsRef.current.onSessionStarted?.(event.session_id);

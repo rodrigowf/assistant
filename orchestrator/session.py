@@ -491,6 +491,7 @@ class OrchestratorSession:
             self._voice_provider,
             on_audio_out=on_audio_out,
             on_event_for_frontend=on_event_for_frontend,
+            session_id=self._local_id,
         )
         await relay.start(session_update)
         self._voice_relay = relay

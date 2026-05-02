@@ -26,15 +26,35 @@ import asyncio
 import base64
 import json
 import logging
+import time
+from collections import Counter, deque
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from orchestrator.providers.voice_base import BaseVoiceProvider
+from utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
 
 AudioOutCallback = Callable[[str], Awaitable[None]]
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+# How many recent non-audio frames to remember.  When the upstream WS
+# dies with DashScope's misleading "InvalidParameter" 400, the offending
+# frame is in here.  Audio chunks are excluded — they're frequent and
+# almost never the cause; logging them would drown the signal.
+_FRAME_HISTORY_SIZE = 24
+
+# Sample 1-in-N audio frames into the per-session log so we can see the
+# audio flow without flooding (audio inbound runs at ~50 Hz at 20ms
+# chunks).
+_AUDIO_LOG_SAMPLE_EVERY = 50
+
+# Where per-session voice logs land.  One file per session_id, written
+# alongside the api logs so /debug-app picks them up.
+_VOICE_LOG_DIR = PROJECT_ROOT / "logs" / "voice"
 
 
 class VoiceRelay:
@@ -60,6 +80,7 @@ class VoiceRelay:
         *,
         on_audio_out: AudioOutCallback,
         on_event_for_frontend: EventCallback,
+        session_id: str | None = None,
     ) -> None:
         if provider.connection_type != "websocket":
             raise ValueError(
@@ -68,14 +89,98 @@ class VoiceRelay:
         self._provider = provider
         self._on_audio_out = on_audio_out
         self._on_event_for_frontend = on_event_for_frontend
+        self._session_id = session_id or "anonymous"
 
         self._ws = None  # type: ignore[assignment]
         self._drain_task: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
+        # Rings of recent frames in BOTH directions.  When the upstream
+        # WS dies, dumping both side-by-side shows what we sent, what
+        # they sent back, and which way the close came from.
+        self._sent_history: deque[dict[str, Any]] = deque(maxlen=_FRAME_HISTORY_SIZE)
+        self._recv_history: deque[dict[str, Any]] = deque(maxlen=_FRAME_HISTORY_SIZE)
+        # Tracks whether a `response.created` has fired without a
+        # matching `response.done` yet.  Sending `response.create` while
+        # this is True triggers Qwen's "Conversation already has an
+        # active response" error and (empirically) closes the session.
+        # We defer queued response.create frames until the active one
+        # finishes.
+        self._response_active = asyncio.Event()
+        self._response_active.clear()
+        self._pending_response_create: list[dict[str, Any]] = []
+
+        # --- observability state ---
+        self._started_at: float = 0.0  # set in start()
+        self._first_audio_in_at: float | None = None
+        self._first_audio_out_at: float | None = None
+        self._last_send_at: float = 0.0
+        self._last_recv_at: float = 0.0
+        self._audio_in_chunks = 0
+        self._audio_out_chunks = 0
+        self._audio_in_bytes = 0
+        self._audio_out_bytes = 0
+        self._sent_counts: Counter[str] = Counter()
+        self._recv_counts: Counter[str] = Counter()
+
+        # Per-session log file — opened lazily in start().  All
+        # lifecycle / frame events for this session land here in one
+        # place so post-mortem is "open this one file."
+        self._log_file_path: Path | None = None
+        self._log_file = None  # type: ignore[assignment]
 
     @property
     def is_running(self) -> bool:
         return self._drain_task is not None and not self._drain_task.done()
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    # --- log helpers -------------------------------------------------------
+
+    def _now_rel(self) -> float:
+        """Seconds since :meth:`start` began."""
+        return time.monotonic() - self._started_at if self._started_at else 0.0
+
+    def _open_session_log(self) -> None:
+        """Create logs/voice/<session_id>.log and seed the header."""
+        try:
+            _VOICE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._log_file_path = _VOICE_LOG_DIR / f"{ts}_{self._session_id}.log"
+            self._log_file = open(self._log_file_path, "a", buffering=1, encoding="utf-8")
+            self._slog(
+                f"open provider={self._provider.provider_name}"
+                f" model={self._provider.model}"
+                f" voice={getattr(self._provider, 'voice', '?')}"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to open voice session log file")
+            self._log_file = None
+
+    def _slog(self, msg: str) -> None:
+        """Append a timestamped line to the per-session log file.
+
+        Best-effort — failures don't propagate.  The line is also
+        emitted at debug level on the main logger so it shows up in
+        `api_*.log` if you crank verbosity.
+        """
+        line = f"[t+{self._now_rel():7.2f}s] {msg}"
+        logger.debug("voice[%s] %s", self._session_id, line)
+        if self._log_file is None:
+            return
+        try:
+            self._log_file.write(line + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close_session_log(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._log_file = None
 
     async def start(self, session_config: dict[str, Any]) -> None:
         """Open the upstream WS and seed it with ``session.update``.
@@ -85,32 +190,97 @@ class VoiceRelay:
         it as the first message so the provider knows the system prompt,
         tools, voice, and VAD config before any audio arrives.
         """
+        self._started_at = time.monotonic()
+        self._open_session_log()
+        logger.info(
+            "voice_relay started session_id=%s provider=%s model=%s voice=%s",
+            self._session_id,
+            self._provider.provider_name,
+            self._provider.model,
+            getattr(self._provider, "voice", "?"),
+        )
+
         self._ws = await self._provider.open_upstream()
+        self._slog("upstream connected")
+
         # session.created is pushed by the server unprompted — drain it so
         # the drain task starts in a clean state.
         try:
             first = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
             first_event = json.loads(first)
+            self._record_recv(first_event)
+            self._slog(f"recv session.created in {self._now_rel():.2f}s")
+            logger.info(
+                "voice_relay session.created session_id=%s in %.2fs",
+                self._session_id, self._now_rel(),
+            )
             await self._provider.inject_event(first_event)
             await self._on_event_for_frontend(first_event)
         except asyncio.TimeoutError:
-            logger.warning("VoiceRelay: no session.created within 10s — proceeding anyway")
+            logger.warning(
+                "voice_relay no session.created within 10s session_id=%s",
+                self._session_id,
+            )
+            self._slog("WARN no session.created within 10s")
 
         # Push our session config upstream.
+        self._record_sent(session_config)
+        instr_size = len(session_config.get("session", {}).get("instructions", "") or "")
+        tools_count = len(session_config.get("session", {}).get("tools", []) or [])
+        self._slog(
+            f"send session.update instructions={instr_size}B tools={tools_count}"
+        )
         await self._ws.send(json.dumps(session_config))
+        self._last_send_at = time.monotonic()
 
         self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
 
+    def _record_sent(self, event: dict[str, Any]) -> None:
+        """Stash a sent control frame for post-mortem on upstream close.
+
+        Stores a truncated/redacted copy — full audio bodies and overly
+        long strings are clipped to keep the log readable.  Also bumps
+        the per-type counter and slogs a one-line summary.
+        """
+        self._sent_history.append(_redact_for_log(event))
+        evt_type = event.get("type", "?")
+        self._sent_counts[evt_type] += 1
+        size = len(json.dumps(event))
+        self._slog(f"send  type={evt_type} size={size}B")
+
+    def _record_recv(self, event: dict[str, Any]) -> None:
+        """Mirror of :meth:`_record_sent` for inbound frames."""
+        self._recv_history.append(_redact_for_log(event))
+        evt_type = event.get("type", "?")
+        self._recv_counts[evt_type] += 1
+        # Don't include size here — many recv events are huge audio chunks
+        # already accounted for separately.
+
     async def send_event(self, event: dict[str, Any]) -> None:
         """Forward a frontend control event upstream verbatim."""
-        if self._ws is None:
-            raise RuntimeError("VoiceRelay not started")
-        await self._ws.send(json.dumps(event))
+        if self._ws is None or self._closed.is_set():
+            return  # Drop silently — caller already saw an error event.
+
+        # Defer response.create until the active response (if any) finishes.
+        # Qwen rejects concurrent response.create with "Conversation already
+        # has an active response" and (empirically) closes the WS.
+        if event.get("type") == "response.create" and self._response_active.is_set():
+            self._slog("defer response.create (active response in flight)")
+            self._pending_response_create.append(event)
+            return
+
+        self._record_sent(event)
+        try:
+            await self._ws.send(json.dumps(event))
+            self._last_send_at = time.monotonic()
+        except Exception as e:  # noqa: BLE001
+            # Upstream is gone; the drain task already surfaced the error.
+            self._slog(f"WARN send dropped (upstream closed): type={event.get('type')} err={e}")
 
     async def send_audio(self, pcm_b64: str) -> None:
         """Forward a frontend mic chunk upstream as a provider-specific append."""
-        if self._ws is None:
-            raise RuntimeError("VoiceRelay not started")
+        if self._ws is None or self._closed.is_set():
+            return  # Drop silently after upstream close — frontend already notified.
         # Each provider knows the right wrapper (Qwen: input_audio_buffer.append;
         # Gemini: BidiGenerateContentRealtimeInput.audio).
         format_audio_in = getattr(self._provider, "format_audio_in", None)
@@ -118,7 +288,26 @@ class VoiceRelay:
             raise RuntimeError(
                 f"Provider {self._provider.provider_name} does not implement format_audio_in()"
             )
-        await self._ws.send(json.dumps(format_audio_in(pcm_b64)))
+        try:
+            await self._ws.send(json.dumps(format_audio_in(pcm_b64)))
+            self._last_send_at = time.monotonic()
+            self._audio_in_chunks += 1
+            # base64 encodes 3 bytes → 4 chars; PCM byte size ≈ len * 3/4.
+            self._audio_in_bytes += (len(pcm_b64) * 3) // 4
+            if self._first_audio_in_at is None:
+                self._first_audio_in_at = self._now_rel()
+                self._slog(f"first audio_in at t+{self._first_audio_in_at:.2f}s")
+                logger.info(
+                    "voice_relay first audio_in session_id=%s in %.2fs",
+                    self._session_id, self._first_audio_in_at,
+                )
+            elif self._audio_in_chunks % _AUDIO_LOG_SAMPLE_EVERY == 0:
+                self._slog(
+                    f"audio_in chunks={self._audio_in_chunks}"
+                    f" bytes={self._audio_in_bytes}"
+                )
+        except Exception as e:  # noqa: BLE001
+            self._slog(f"WARN audio_in dropped (upstream closed): err={e}")
 
     async def stop(self) -> None:
         """Cancel the drain task and close the upstream WS."""
@@ -134,6 +323,52 @@ class VoiceRelay:
             except Exception:  # noqa: BLE001
                 pass
         self._closed.set()
+        # Best-effort: emit a final summary on clean stop too (the drain
+        # task already does this on error close — guard against
+        # double-logging via a flag).
+        if not getattr(self, "_summary_logged", False):
+            self._log_close_summary("clean (stop called)")
+        self._close_session_log()
+
+    def _log_close_summary(self, reason: str) -> None:
+        """One-line structured summary of the entire session.
+
+        Called on both clean and error closes.  Idempotent — second
+        call is a no-op.
+        """
+        if getattr(self, "_summary_logged", False):
+            return
+        self._summary_logged = True
+
+        duration = self._now_rel()
+        last_send = (time.monotonic() - self._last_send_at) if self._last_send_at else None
+        last_recv = (time.monotonic() - self._last_recv_at) if self._last_recv_at else None
+        sent_d = dict(self._sent_counts)
+        recv_d = dict(self._recv_counts)
+
+        ws_close_code = None
+        ws_close_reason = None
+        if self._ws is not None:
+            ws_close_code = getattr(self._ws, "close_code", None)
+            ws_close_reason = getattr(self._ws, "close_reason", None)
+
+        summary = (
+            f"voice_session_closed session_id={self._session_id}"
+            f" provider={self._provider.provider_name}"
+            f" duration={duration:.1f}s"
+            f" reason={reason!r}"
+            f" ws_code={ws_close_code} ws_reason={ws_close_reason!r}"
+            f" sent={sent_d}"
+            f" recv={recv_d}"
+            f" audio_in=(chunks={self._audio_in_chunks},bytes={self._audio_in_bytes})"
+            f" audio_out=(chunks={self._audio_out_chunks},bytes={self._audio_out_bytes})"
+            f" first_audio_in={self._first_audio_in_at}"
+            f" first_audio_out={self._first_audio_out_at}"
+            f" last_send={last_send}s_ago"
+            f" last_recv={last_recv}s_ago"
+        )
+        logger.warning(summary)
+        self._slog(summary)
 
     # --- drain loop -------------------------------------------------------
 
@@ -149,10 +384,12 @@ class VoiceRelay:
         assert self._ws is not None
         try:
             async for raw in self._ws:
+                self._last_recv_at = time.monotonic()
                 try:
                     event = json.loads(raw)
                 except Exception:
                     logger.warning("VoiceRelay: non-JSON message dropped: %r", raw[:100])
+                    self._slog(f"WARN non-JSON recv (dropped) bytes={len(raw)}")
                     continue
 
                 # Audio out → ship to frontend. The provider-specific class
@@ -162,25 +399,125 @@ class VoiceRelay:
                     audio_b64 = extract_audio_out(event)
                     if audio_b64:
                         await self._on_audio_out(audio_b64)
+                        self._audio_out_chunks += 1
+                        self._audio_out_bytes += (len(audio_b64) * 3) // 4
+                        if self._first_audio_out_at is None:
+                            self._first_audio_out_at = self._now_rel()
+                            self._slog(f"first audio_out at t+{self._first_audio_out_at:.2f}s")
+                            logger.info(
+                                "voice_relay first audio_out session_id=%s in %.2fs",
+                                self._session_id, self._first_audio_out_at,
+                            )
+                        elif self._audio_out_chunks % _AUDIO_LOG_SAMPLE_EVERY == 0:
+                            self._slog(
+                                f"audio_out chunks={self._audio_out_chunks}"
+                                f" bytes={self._audio_out_bytes}"
+                            )
                         # Don't broadcast the audio event itself to the
                         # frontend — only the canonical audio_out payload.
                         # But still inject for any provider-internal state.
                         await self._provider.inject_event(event)
                         continue
 
+                # Non-audio control event — record for post-mortem,
+                # bump counters, and slog.
+                evt_type = event.get("type", "")
+                self._record_recv(event)
+                size = len(raw) if isinstance(raw, str) else len(raw or "")
+                self._slog(f"recv  type={evt_type} size={size}B")
+
+                # Track active-response state so we don't ship a
+                # `response.create` while another response is in flight.
+                if evt_type == "response.created":
+                    self._response_active.set()
+                elif evt_type == "response.done":
+                    self._response_active.clear()
+                    # Drain any response.create we queued while busy.
+                    if self._pending_response_create:
+                        queued = self._pending_response_create.pop(0)
+                        # Discard duplicates — only one is meaningful.
+                        self._pending_response_create.clear()
+                        await self.send_event(queued)
+
+                # Surface upstream errors prominently — they often
+                # precede a close with a more useful message than the
+                # bare 1007 we see when the WS dies.
+                if evt_type == "error":
+                    err = event.get("error", {})
+                    self._slog(f"ERR upstream error code={err.get('code')!r} msg={err.get('message')!r}")
+                    logger.warning(
+                        "voice_relay upstream error session_id=%s code=%s msg=%s",
+                        self._session_id,
+                        err.get("code"),
+                        err.get("message"),
+                    )
+
                 # Control events → orchestrator pipeline + frontend mirror.
                 await self._provider.inject_event(event)
                 await self._on_event_for_frontend(event)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("VoiceRelay drain failed for %s", self._provider.provider_name)
+        except Exception as e:  # noqa: BLE001
+            # DashScope sometimes closes with a misleading 1007 + "<400>
+            # InternalError.Algo.InvalidParameter: The provided URL does
+            # not appear to be valid" — that boilerplate is its generic
+            # validator response.  Dump BOTH sent + recv rings so we see
+            # the full conversation context at the time of the close.
+            self._closed.set()
+            logger.warning(
+                "VoiceRelay drain ended for %s: %s",
+                self._provider.provider_name,
+                e,
+            )
+            self._slog(f"DRAIN END err={e}")
+
+            sent_recent = list(self._sent_history)
+            for i, frame in enumerate(sent_recent):
+                offset = len(sent_recent) - i
+                logger.warning(
+                    "  sent[-%d] type=%s body=%s",
+                    offset,
+                    frame.get("type"),
+                    json.dumps(frame)[:500],
+                )
+                self._slog(f"  sent[-{offset}] type={frame.get('type')} body={json.dumps(frame)[:500]}")
+
+            recv_recent = list(self._recv_history)
+            for i, frame in enumerate(recv_recent):
+                offset = len(recv_recent) - i
+                logger.warning(
+                    "  recv[-%d] type=%s body=%s",
+                    offset,
+                    frame.get("type"),
+                    json.dumps(frame)[:500],
+                )
+                self._slog(f"  recv[-{offset}] type={frame.get('type')} body={json.dumps(frame)[:500]}")
+
+            self._log_close_summary(f"upstream drain failed: {e}")
+            self._close_session_log()
+
             await self._on_event_for_frontend({
                 "type": "error",
-                "error": {"code": "voice_relay_failed", "message": "Upstream WS error"},
+                "error": {
+                    "code": "voice_relay_failed",
+                    "message": f"Upstream {self._provider.provider_name} WS closed: {e}",
+                },
             })
 
 
 def b64_to_pcm(b64: str) -> bytes:
     """Decode a base64 PCM chunk for diagnostics."""
     return base64.b64decode(b64)
+
+
+def _redact_for_log(event: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy with audio + huge string fields trimmed for logging."""
+    def _clip(v: Any) -> Any:
+        if isinstance(v, str) and len(v) > 200:
+            return v[:200] + f"...[+{len(v) - 200}]"
+        if isinstance(v, dict):
+            return {k: _clip(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [_clip(x) for x in v[:10]]
+        return v
+    return _clip(event)

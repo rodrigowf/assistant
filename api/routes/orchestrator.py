@@ -163,10 +163,20 @@ async def orchestrator_ws(ws: WebSocket):
                     "detail": f"Unknown message type: {msg_type!r}",
                 }))
 
-    except WebSocketDisconnect:
-        logger.info("Orchestrator WS disconnected (client closed)")
+    except WebSocketDisconnect as e:
+        # Note what state we were in — a voice-mode disconnect with no
+        # `stop` command tends to indicate a frontend reconnect, which
+        # has consequences (the session.update fires fresh next time).
+        was_voice = bool(session is not None and session.is_voice)
+        logger.info(
+            "Orchestrator WS disconnected (client closed) code=%s reason=%r voice_active=%s",
+            getattr(e, "code", None),
+            getattr(e, "reason", None),
+            was_voice,
+        )
     except Exception:
-        logger.exception("Orchestrator WS error")
+        was_voice = bool(session is not None and getattr(session, "is_voice", False))
+        logger.exception("Orchestrator WS error voice_active=%s", was_voice)
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
@@ -200,6 +210,12 @@ async def _handle_start(
     voice_lang_req: str | None = (
         msg.get("voice_transcription_language") if voice else None
     )
+
+    if voice:
+        logger.info(
+            "voice_session start_requested local_id=%s resume_id=%s provider=%s model=%s voice=%s lang=%s",
+            local_id, resume_id, voice_provider_req, voice_model_req, voice_name_req, voice_lang_req,
+        )
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
@@ -549,6 +565,20 @@ async def _handle_voice_event(
     """
     try:
         event_type = event.get("type", "")
+
+        # Log all client-originated voice events except the high-frequency
+        # transcript deltas (those would flood).  This gives us a clean
+        # client→backend flow timeline for crash post-mortem.
+        if event_type not in (
+            "response.audio_transcript.delta",
+            "response.text.delta",
+            "input_audio_buffer.append",
+        ):
+            logger.info(
+                "voice_event_in session=%s type=%s",
+                session.local_id,
+                event_type,
+            )
 
         # Tool calls are long-running — spawn as background task to avoid
         # blocking the WebSocket handler loop.

@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -53,11 +54,49 @@ QWEN_VOICE_NAME = "Tina"
 
 QWEN_INTL_WS = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
 
+# DashScope's "InvalidParameter: The provided URL does not appear to be
+# valid" 400 is documented as a *URL-format validator* error, not a
+# size limit.  It fires when the omni multimodal pipeline scans a field
+# (including, apparently, `function_call_output.output`) and finds a
+# URL-shaped substring missing a recognised scheme.  Tool results that
+# contain bare hostnames, file paths, or `localhost:port` strings will
+# trigger it.  We rewrite those to a safe form before sending upstream.
+#
+# (See `_sanitize_for_qwen` below.)
+# Match scheme-less URL-shapes that DashScope's omni URL validator
+# misclassifies.  We only wrap *strongly* URL-shaped tokens:
+#   - localhost optionally with :port and/or /path
+#   - dotted IPv4 optionally with :port and/or /path
+#   - hostname with explicit :port (e.g. example.com:8080)
+# Plain dotted tokens like `file.txt` or `word.with.dots` are left alone:
+# the validator only fires on substrings the omni pipeline recognises as
+# URL-shaped, which (empirically) requires either a port, an IP, the
+# literal "localhost", or a path component.  Negative lookbehind skips
+# tokens already inside a well-formed `scheme://` URL.
+_URL_LIKE_RE = re.compile(
+    r"(?<![\w/:.-])"
+    r"(?:"
+    # localhost (optionally :port and/or /path)
+    r"localhost(?::\d+)?(?:/[^\s)\]\"']*)?"
+    # IPv4 (optionally :port and/or /path)
+    r"|\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:/[^\s)\]\"']*)?"
+    # hostname with explicit :port — at least one dot in the host
+    r"|(?:[a-zA-Z][\w\-]*\.)+[a-zA-Z]{2,}:\d+(?:/[^\s)\]\"']*)?"
+    r")"
+)
+
 DEFAULT_VAD = {
     "type": "server_vad",
-    "threshold": 0.5,
+    # 0.4 (vs Alibaba's 0.5 default) — slightly more permissive than the
+    # default so soft consonants and trailing "uhm"s still count as
+    # speech, but not so low that breathing and ambient noise trigger
+    # false speech_started events (which interrupt the model's audio).
+    "threshold": 0.4,
     "prefix_padding_ms": 300,
-    "silence_duration_ms": 800,
+    # 1800ms (vs Alibaba's 800 default) so the model doesn't cut in when
+    # the user pauses mid-sentence to think.  Qwen-Omni only supports
+    # server_vad — semantic_vad is rejected on this endpoint.
+    "silence_duration_ms": 1800,
     "create_response": True,
     "interrupt_response": True,
 }
@@ -289,6 +328,13 @@ class QwenVoiceProvider(BaseVoiceProvider):
         Verified empirically (2026-05-01): Qwen accepts the exact same
         ``conversation.item.create`` + ``response.create`` sequence that
         OpenAI Realtime uses for function-call results.
+
+        Output is sanitised before send: DashScope's omni pipeline
+        applies a URL-format validator to fields it scans, and a
+        scheme-less URL-shape (e.g. ``localhost:5432``, ``192.168.0.200``,
+        a bare ``foo.example.com/bar``) trips the misleading
+        "InvalidParameter: The provided URL does not appear to be valid"
+        400 that closes the WS.
         """
         return [
             {
@@ -296,7 +342,7 @@ class QwenVoiceProvider(BaseVoiceProvider):
                 "item": {
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": output,
+                    "output": _sanitize_for_qwen(output),
                 },
             },
             {"type": "response.create"},
@@ -463,3 +509,23 @@ class QwenVoiceProvider(BaseVoiceProvider):
             open_timeout=15,
             max_size=2**24,  # 16 MB — accommodate large audio frames
         )
+
+
+def _sanitize_for_qwen(text: str) -> str:
+    """Neutralise URL-shaped substrings that DashScope's omni URL
+    validator rejects.
+
+    The validator only accepts URLs with one of ``http://``, ``https://``,
+    ``data:``, ``file://`` schemes; scheme-less URL-shapes (bare hosts,
+    ``localhost:port``, IPs, dotted names) are rejected with the same
+    misleading "URL does not appear to be valid" 400 used for malformed
+    multimodal inputs.  Wrapping the matches in backticks (markdown code
+    span) makes the validator skip them while keeping them legible to
+    the model.
+    """
+    def _wrap(m: re.Match[str]) -> str:
+        token = m.group(0)
+        # Already inside backticks?  Leave alone (the prior char check is
+        # cheap and avoids stacking quotes when the model echoes back).
+        return f"`{token}`"
+    return _URL_LIKE_RE.sub(_wrap, text)
