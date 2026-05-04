@@ -102,6 +102,13 @@ class VoiceRelay:
         self._drain_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
+        # Serializes every write to the upstream WS. The websockets legacy
+        # protocol has a single drain waiter and asserts on concurrent
+        # writers; with three send paths (control events, mic audio, our
+        # silent keepalive) plus the library's own ping/pong, we MUST
+        # interlock or we'll occasionally tear the connection down with
+        # "Set changed size during iteration"-style asserts.
+        self._send_lock = asyncio.Lock()
         # Rings of recent frames in BOTH directions.  When the upstream
         # WS dies, dumping both side-by-side shows what we sent, what
         # they sent back, and which way the close came from.
@@ -241,7 +248,8 @@ class VoiceRelay:
         self._slog(
             f"send session.update instructions={instr_size}B tools={tools_count}"
         )
-        await self._ws.send(json.dumps(session_config))
+        async with self._send_lock:
+            await self._ws.send(json.dumps(session_config))
         self._last_send_at = time.monotonic()
 
         self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
@@ -292,7 +300,8 @@ class VoiceRelay:
 
         self._record_sent(event)
         try:
-            await self._ws.send(json.dumps(event))
+            async with self._send_lock:
+                await self._ws.send(json.dumps(event))
             self._last_send_at = time.monotonic()
         except Exception as e:  # noqa: BLE001
             # Upstream is gone; the drain task already surfaced the error.
@@ -310,7 +319,8 @@ class VoiceRelay:
                 f"Provider {self._provider.provider_name} does not implement format_audio_in()"
             )
         try:
-            await self._ws.send(json.dumps(format_audio_in(pcm_b64)))
+            async with self._send_lock:
+                await self._ws.send(json.dumps(format_audio_in(pcm_b64)))
             now = time.monotonic()
             self._last_send_at = now
             self._last_audio_in_at = now
@@ -428,7 +438,8 @@ class VoiceRelay:
                     continue
                 try:
                     chunk = build()
-                    await self._ws.send(json.dumps(format_audio_in(chunk)))
+                    async with self._send_lock:
+                        await self._ws.send(json.dumps(format_audio_in(chunk)))
                     self._last_send_at = time.monotonic()
                     self._slog(f"keepalive sent (idle={idle:.1f}s)")
                 except Exception as e:  # noqa: BLE001

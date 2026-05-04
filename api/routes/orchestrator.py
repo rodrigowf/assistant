@@ -138,6 +138,24 @@ async def orchestrator_ws(ws: WebSocket):
                             "type": "error", "error": "voice_audio_failed", "detail": str(e),
                         })
 
+            elif msg_type == "voice_recording_chunk":
+                # WebRTC recording chunk from browser — write to recorder.
+                if session is None or not session.is_voice:
+                    continue  # Silently drop if no session
+                recorder = session.audio_recorder
+                if recorder is not None and recorder.is_recording:
+                    channel = msg.get("channel", "user")
+                    audio_b64 = msg.get("audio", "")
+                    if audio_b64:
+                        if channel == "user":
+                            recorder.write_user_audio(audio_b64)
+                        elif channel == "assistant":
+                            recorder.write_assistant_audio(audio_b64)
+
+            elif msg_type == "voice_recording_end":
+                # WebRTC recording ended — handled by session.stop()
+                pass  # No action needed; the session stop handles cleanup
+
             elif msg_type == "compact":
                 if session is None:
                     await ws.send_bytes(orjson.dumps({
@@ -372,6 +390,8 @@ async def _attach_voice_payload(
     payload["voice_model"] = session.voice_model_id
     payload["voice_name"] = session.voice_name_id
     payload["voice_transcription_language"] = session.voice_transcription_language
+    # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
+    payload["voice_recording_enabled"] = session.audio_recorder is not None
 
     session_update = await session.get_session_update()
     if session_update:
@@ -386,12 +406,28 @@ async def _attach_voice_payload(
             payload["voice_connection_error"] = str(e)
 
     # Start the backend relay for WS providers (Qwen / Gemini / locals).
-    # Idempotent: skipped if already running, no-op for WebRTC providers.
-    if session.needs_voice_relay and getattr(session, "_voice_relay", None) is None:
+    # Idempotent for healthy relays; rebuilds if the previous drain crashed
+    # (relay object lingers but its drain task is done) so a reconnecting
+    # client recovers automatically.
+    existing_relay = getattr(session, "_voice_relay", None)
+    if existing_relay is not None and not getattr(existing_relay, "is_running", False):
+        logger.warning(
+            "Voice relay for session %s is dead; tearing down and rebuilding",
+            getattr(session, "local_id", "?"),
+        )
+        try:
+            await session.stop_voice_relay()
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_voice_relay during reconnect cleanup failed")
+        existing_relay = None
+
+    if session.needs_voice_relay and existing_relay is None:
         try:
             pool = session._context.get("pool")
             if pool is not None:
                 async def _on_audio_out(b64: str) -> None:
+                    # Record assistant audio if recorder is active
+                    session.record_assistant_audio(b64)
                     await pool.broadcast_orchestrator({
                         "type": "voice_audio_out",
                         "audio": b64,

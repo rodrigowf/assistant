@@ -63,6 +63,7 @@ export type ServerEvent =
       voice_model?: string;
       voice_connection_info?: VoiceConnectionInfoPayload;
       voice_connection_error?: string;
+      voice_recording_enabled?: boolean;
     }
   | { type: "session_stopped" }
   | { type: "text_delta"; text: string }

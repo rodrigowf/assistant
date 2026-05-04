@@ -362,12 +362,17 @@ class SessionPool:
         self._orchestrator_subs.discard(ws)
 
     async def broadcast_orchestrator(self, payload: dict) -> None:
-        """Broadcast a payload to all orchestrator subscribers."""
+        """Broadcast a payload to all orchestrator subscribers.
+
+        Iterates over a snapshot because ``await ws.send_bytes`` yields and
+        concurrent (un)subscribers would otherwise mutate the set mid-iteration
+        ("Set changed size during iteration"), tearing down the voice relay.
+        """
         if not self._orchestrator_subs:
             return
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        for ws in self._orchestrator_subs:
+        for ws in tuple(self._orchestrator_subs):
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_bytes(data)
@@ -598,7 +603,7 @@ class SessionPool:
             return
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        for ws in subs:
+        for ws in tuple(subs):
             if ws is exclude:
                 continue
             try:
@@ -612,7 +617,7 @@ class SessionPool:
     async def _notify_watchers(self, payload: dict[str, Any]) -> None:
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        for ws in self._watchers:
+        for ws in tuple(self._watchers):
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_bytes(data)

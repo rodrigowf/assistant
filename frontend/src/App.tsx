@@ -103,6 +103,11 @@ function AppContent() {
   // Config page visibility — toggled without unmounting chat instances
   const [showConfig, setShowConfig] = useState(false);
 
+  // Debug: expose setShowConfig on window for testing
+  useEffect(() => {
+    (window as unknown as { __setShowConfig?: (v: boolean) => void }).__setShowConfig = setShowConfig;
+  }, []);
+
   // Mobile sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false);
   useEffect(() => {

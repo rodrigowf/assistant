@@ -25,6 +25,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { fetchEphemeralToken } from "../api/voice";
 import { ChatSocket } from "../api/websocket";
+import { VoiceRecorder } from "../voice/AudioRecorder";
 import { connectWebRTCVoiceSession } from "../voice/transports/webrtc";
 import { connectWebSocketVoiceSession } from "../voice/transports/websocket";
 import type {
@@ -101,6 +102,10 @@ export function useVoiceOrchestrator(
 
   // Connection info from session_started — drives transport choice.
   const connInfoRef = useRef<VoiceConnectionInfoPayload | null>(null);
+  // Whether recording is enabled (from session_started)
+  const recordingEnabledRef = useRef(false);
+  // Voice recorder for WebRTC sessions (audio bypasses backend)
+  const recorderRef = useRef<VoiceRecorder | null>(null);
 
   // Tracks whether a provider response is currently in flight (between
   // response.created and response.done). For Qwen we must NOT send
@@ -157,6 +162,11 @@ export function useVoiceOrchestrator(
 
   const cleanup = useCallback(() => {
     vlog("cleanup (transport=", transportRef.current?.kind, ")");
+    // Stop audio recorder if active
+    if (recorderRef.current) {
+      recorderRef.current.stop();
+      recorderRef.current = null;
+    }
     stopAudioAnalysis();
     transportRef.current?.disconnect();
     transportRef.current = null;
@@ -165,6 +175,7 @@ export function useVoiceOrchestrator(
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
     connInfoRef.current = null;
+    recordingEnabledRef.current = false;
     setIsMuted(false);
     setIsAssistantMuted(false);
   }, [stopAudioAnalysis]);
@@ -357,6 +368,8 @@ export function useVoiceOrchestrator(
         optsRef.current.onSessionStarted?.(event.session_id);
         const info = event.voice_connection_info;
         if (info) connInfoRef.current = info;
+        // Capture recording flag for WebRTC (audio bypasses backend)
+        recordingEnabledRef.current = event.voice_recording_enabled ?? false;
         // For WebRTC, the frontend forwards session.update via the data channel.
         // For WebSocket, the backend already sent it upstream — no-op for us.
         if (event.voice_session_update && info?.connection_type === "webrtc") {
@@ -502,6 +515,23 @@ export function useVoiceOrchestrator(
         });
         transportRef.current = t;
         startWebRTCAudioAnalysis(t);
+
+        // Start audio recorder for WebRTC if recording is enabled
+        // (WebRTC audio bypasses backend, so we record on frontend)
+        if (recordingEnabledRef.current && wsRef.current) {
+          const sessionId = optsRef.current.localId || "unknown";
+          const recorder = new VoiceRecorder({
+            sessionId,
+            ws: wsRef.current,
+            micStream: t.micStream,
+            remoteStreamGetter: () => t.remoteStream,
+            sampleRate: info.audio_in_format.sample_rate,
+          });
+          recorderRef.current = recorder;
+          recorder.start().catch((err) => {
+            console.error("[voice-orchestrator] Failed to start recorder:", err);
+          });
+        }
       } catch (err) {
         setVoiceError(err instanceof Error ? err.message : String(err));
         cleanup();

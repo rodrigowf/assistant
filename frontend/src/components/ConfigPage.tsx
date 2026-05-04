@@ -153,146 +153,180 @@ export function ConfigPage({ isOpen, onClose }: Props) {
 
           {!loading && config && (
             <>
-              {/* ── Orchestrator Model ─────────────────────────── */}
+              {/* ── Orchestrator ──────────────────────────────── */}
               <section className="config-section">
-                <h3 className="config-section-title">Orchestrator Model</h3>
+                <h3 className="config-section-title">Orchestrator</h3>
                 <p className="config-section-desc">
-                  Default model for new orchestrator sessions. Can be changed mid-conversation.
+                  Defaults the orchestrator uses for new sessions. Text mode also drives
+                  history summarization.
                 </p>
-                {models.length === 0 ? (
-                  <div className="config-empty">No models available</div>
-                ) : (
-                  <div className="model-dropdowns">
-                    <div className="model-dropdown-field">
-                      <label className="model-dropdown-label">Provider</label>
-                      <select
-                        className="model-dropdown-select"
-                        value={selectedProvider}
-                        disabled={saving}
-                        onChange={(e) => {
-                          // When provider changes, auto-select first model of that provider
-                          const first = models.find(m => m.provider === e.target.value);
-                          if (first) save({ default_model: first.model_id }).catch(err => setError(String(err)));
-                        }}
-                      >
-                        {providers.map(p => (
-                          <option key={p} value={p}>
-                            {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="model-dropdown-field">
-                      <label className="model-dropdown-label">Model</label>
-                      <select
-                        className="model-dropdown-select"
-                        value={config.default_model}
-                        disabled={saving}
-                        onChange={(e) => save({ default_model: e.target.value }).catch(err => setError(String(err)))}
-                      >
-                        {providerModels.map(m => (
-                          <option key={m.model_id} value={m.model_id}>
-                            {m.display_name}
-                            {m.supports_audio ? " 🎤" : ""}
-                            {m.supports_vision ? " 👁" : ""}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                )}
-              </section>
 
-              {/* ── Voice Model ───────────────────────────────── */}
-              <section className="config-section">
-                <h3 className="config-section-title">Voice Model</h3>
-                <p className="config-section-desc">
-                  Default provider, model, and voice for new realtime voice sessions.
-                  Cannot be changed mid-session.
-                </p>
-                {voiceProviderIds.length === 0 ? (
-                  <div className="config-empty">No voice providers available</div>
-                ) : (
-                  <div className="model-dropdowns">
-                    <div className="model-dropdown-field">
-                      <label className="model-dropdown-label">Provider</label>
-                      <select
-                        className="model-dropdown-select"
-                        value={selectedVoiceProvider}
-                        disabled={saving}
-                        onChange={(e) =>
-                          save({ default_voice_provider: e.target.value })
-                            .catch(err => setError(String(err)))
-                        }
-                      >
-                        {voiceProviderIds.map(p => (
-                          <option key={p} value={p}>
-                            {VOICE_PROVIDER_LABELS[p] ?? p}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="model-dropdown-field">
-                      <label className="model-dropdown-label">Model</label>
-                      <select
-                        className="model-dropdown-select"
-                        value={selectedVoiceModel?.id ?? ""}
-                        disabled={saving || voiceModels.length === 0}
-                        onChange={(e) =>
-                          save({ default_voice_model: e.target.value })
-                            .catch(err => setError(String(err)))
-                        }
-                      >
-                        {voiceModels.map(m => (
-                          <option key={m.id} value={m.id}>{m.label}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="model-dropdown-field">
-                      <label className="model-dropdown-label">Voice</label>
-                      <select
-                        className="model-dropdown-select"
-                        value={selectedVoiceName}
-                        disabled={saving || voiceVoices.length === 0}
-                        onChange={(e) =>
-                          save({ default_voice_name: e.target.value })
-                            .catch(err => setError(String(err)))
-                        }
-                      >
-                        {voiceVoices.map(v => (
-                          <option key={v.id} value={v.id} title={v.description}>
-                            {v.label}
-                            {v.description ? ` — ${v.description}` : ""}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    {voiceLanguages.length > 0 && (
+                {/* Text mode */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Text mode</h4>
+                  <p className="config-subsection-desc">
+                    Used for typed conversations. Can be changed mid-conversation.
+                  </p>
+                  {models.length === 0 ? (
+                    <div className="config-empty">No models available</div>
+                  ) : (
+                    <div className="model-dropdowns">
                       <div className="model-dropdown-field">
-                        <label className="model-dropdown-label">
-                          Transcription language
-                        </label>
+                        <label className="model-dropdown-label">Provider</label>
                         <select
                           className="model-dropdown-select"
-                          value={selectedVoiceLanguage}
+                          value={selectedProvider}
                           disabled={saving}
-                          onChange={(e) =>
-                            save({ default_voice_transcription_language: e.target.value })
-                              .catch(err => setError(String(err)))
-                          }
-                          title="Language hint for transcribing your voice into the conversation history. Auto-detect lets the ASR identify per turn — best for multilingual speakers, but more error-prone on short fragments."
+                          onChange={(e) => {
+                            // When provider changes, auto-select first model of that provider
+                            const first = models.find(m => m.provider === e.target.value);
+                            if (first) save({ default_model: first.model_id }).catch(err => setError(String(err)));
+                          }}
                         >
-                          {voiceLanguages.map(l => (
-                            <option key={l.id || "auto"} value={l.id} title={l.description}>
-                              {l.label}
-                              {l.description ? ` — ${l.description}` : ""}
+                          {providers.map(p => (
+                            <option key={p} value={p}>
+                              {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
                             </option>
                           ))}
                         </select>
                       </div>
-                    )}
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Model</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={config.default_model}
+                          disabled={saving}
+                          onChange={(e) => save({ default_model: e.target.value }).catch(err => setError(String(err)))}
+                        >
+                          {providerModels.map(m => (
+                            <option key={m.model_id} value={m.model_id}>
+                              {m.display_name}
+                              {m.supports_audio ? " 🎤" : ""}
+                              {m.supports_vision ? " 👁" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Voice mode */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Voice mode</h4>
+                  <p className="config-subsection-desc">
+                    Used for realtime voice sessions. Cannot be changed mid-session.
+                  </p>
+                  {voiceProviderIds.length === 0 ? (
+                    <div className="config-empty">No voice providers available</div>
+                  ) : (
+                    <div className="model-dropdowns">
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Provider</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceProvider}
+                          disabled={saving}
+                          onChange={(e) =>
+                            save({ default_voice_provider: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                        >
+                          {voiceProviderIds.map(p => (
+                            <option key={p} value={p}>
+                              {VOICE_PROVIDER_LABELS[p] ?? p}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Model</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceModel?.id ?? ""}
+                          disabled={saving || voiceModels.length === 0}
+                          onChange={(e) =>
+                            save({ default_voice_model: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                        >
+                          {voiceModels.map(m => (
+                            <option key={m.id} value={m.id}>{m.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Voice</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceName}
+                          disabled={saving || voiceVoices.length === 0}
+                          onChange={(e) =>
+                            save({ default_voice_name: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                        >
+                          {voiceVoices.map(v => (
+                            <option key={v.id} value={v.id} title={v.description}>
+                              {v.label}
+                              {v.description ? ` — ${v.description}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {voiceLanguages.length > 0 && (
+                        <div className="model-dropdown-field">
+                          <label className="model-dropdown-label">
+                            Transcription language
+                          </label>
+                          <select
+                            className="model-dropdown-select"
+                            value={selectedVoiceLanguage}
+                            disabled={saving}
+                            onChange={(e) =>
+                              save({ default_voice_transcription_language: e.target.value })
+                                .catch(err => setError(String(err)))
+                            }
+                            title="Language hint for transcribing your voice into the conversation history. Auto-detect lets the ASR identify per turn — best for multilingual speakers, but more error-prone on short fragments."
+                          >
+                            {voiceLanguages.map(l => (
+                              <option key={l.id || "auto"} value={l.id} title={l.description}>
+                                {l.label}
+                                {l.description ? ` — ${l.description}` : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Voice recording */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Voice recording</h4>
+                  <p className="config-subsection-desc">
+                    Save raw audio from voice sessions for later playback and analysis.
+                    Recordings are stored in context/recordings/ and can be used by the
+                    orchestrator to analyze emotional states, tone, and pacing.
+                  </p>
+                  <div className="config-item-list">
+                    <label className={`config-item${config.voice_recording_enabled ? " enabled" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={config.voice_recording_enabled}
+                        onChange={() => save({ voice_recording_enabled: !config.voice_recording_enabled }).catch(e => setError(String(e)))}
+                        disabled={saving}
+                      />
+                      <div className="config-item-info">
+                        <span className="config-item-name">Enable voice recording</span>
+                        <span className="config-item-detail">
+                          Record both user and assistant audio streams during voice sessions
+                        </span>
+                      </div>
+                    </label>
                   </div>
-                )}
+                </div>
               </section>
 
               {/* ── Working Directories ───────────────────────── */}

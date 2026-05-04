@@ -126,6 +126,7 @@ def _default_config() -> dict[str, Any]:
         "default_voice_model": DEFAULT_VOICE_MODEL,
         "default_voice_name": default_voice,
         "default_voice_transcription_language": default_lang,
+        "voice_recording_enabled": False,  # save raw audio from voice sessions
     }
 
 
@@ -163,6 +164,7 @@ class ConfigUpdate(BaseModel):
     default_voice_model: str | None = None     # default model for voice sessions
     default_voice_name: str | None = None      # default voice/speaker for voice sessions
     default_voice_transcription_language: str | None = None  # "" = auto-detect
+    voice_recording_enabled: bool | None = None  # save raw audio from voice sessions
 
 
 # -----------------------------------------------------------------------
@@ -220,10 +222,11 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         config["chrome_extension"] = body.chrome_extension
 
     if body.default_model is not None:
-        # Validate model exists
-        from orchestrator.config import AVAILABLE_MODELS
-        if body.default_model not in AVAILABLE_MODELS:
-            raise HTTPException(status_code=400, detail=f"Unknown model: {body.default_model}")
+        # Accept any non-empty model ID. The orchestrator infers provider from
+        # the ID prefix; unknown/invalid IDs surface as upstream API errors at
+        # send time rather than being gated here.
+        if not body.default_model.strip():
+            raise HTTPException(status_code=400, detail="default_model cannot be empty")
         config["default_model"] = body.default_model
 
     if (
@@ -286,6 +289,9 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         config["default_voice_model"] = model_entry["id"]
         config["default_voice_name"] = voice_id
         config["default_voice_transcription_language"] = lang_id
+
+    if body.voice_recording_enabled is not None:
+        config["voice_recording_enabled"] = body.voice_recording_enabled
 
     _save_config(config)
     return config

@@ -142,9 +142,13 @@ class QwenVoiceProvider(
         gainBeforeSpeaking = null
 
         try {
+            // Set `running` BEFORE startMic — the mic capture loop
+            // checks `running.get()` in its condition, so flipping
+            // the flag after the coroutine launches can race and
+            // exit it immediately.
+            running.set(true)
             startSpeaker()
             startMic()
-            running.set(true)
             _state.value = VoiceState.Active
             _events.tryEmit(VoiceEvent.SessionCreated)
             Log.i(TAG, "Qwen voice session ready")
@@ -219,6 +223,11 @@ class QwenVoiceProvider(
                 _events.tryEmit(VoiceEvent.ToolUse(callId, name, args))
             }
             "input_audio_buffer.speech_started" -> {
+                // Server VAD detected user barge-in. Drop any speaker audio
+                // we've buffered (channel + AudioTrack hardware buffer) so the
+                // model's previous turn cuts immediately instead of playing
+                // the residue while the new turn waits.
+                flushSpeakerOutput()
                 _state.value = VoiceState.Active
                 _events.tryEmit(VoiceEvent.SpeechStarted)
             }
@@ -242,6 +251,38 @@ class QwenVoiceProvider(
             // are noise from the client's perspective — backend persists
             // them; we don't need to react.
         }
+    }
+
+    /**
+     * Drop all queued + in-flight speaker audio.
+     *
+     * Called on barge-in so the previous response cuts mid-sentence
+     * instead of finishing on top of the new turn.  Pause + flush + play
+     * is the documented dance for clearing the [AudioTrack] hardware
+     * buffer in [AudioTrack.MODE_STREAM].
+     *
+     * Safe to call from any thread; no-ops if not running.
+     */
+    private fun flushSpeakerOutput() {
+        if (!running.get()) return
+        var dropped = 0
+        while (true) {
+            val r = speakerQueue.tryReceive()
+            if (r.isFailure || r.isClosed) break
+            dropped++
+        }
+        try {
+            audioTrack?.let {
+                if (it.state == AudioTrack.STATE_INITIALIZED) {
+                    it.pause()
+                    it.flush()
+                    it.play()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "AudioTrack flush failed: ${e.message}")
+        }
+        if (dropped > 0) Log.d(TAG, "Barge-in: dropped $dropped queued speaker chunks")
     }
 
     override fun pushSpeakerChunk(audioB64: String) {
@@ -298,12 +339,10 @@ class QwenVoiceProvider(
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
-        // Buffer needs to absorb the worst-case gap in upstream chunk
-        // delivery so we don't underrun.  Empirically (Android logs
-        // 2026-05-02): inter-chunk gaps regularly hit 200–340ms during
-        // live Qwen sessions.  1.5s gives comfortable headroom; latency
-        // cost is acceptable for conversational voice (we already buffer
-        // hundreds of ms upstream).
+        // 1.5s hardware buffer — gives plenty of jitter headroom for
+        // the bursty Qwen delivery pattern.  Combined with the
+        // non-blocking write loop below, the buffer absorbs short
+        // bursts naturally; barge-in flush() clears it instantly.
         val bytesPerSecond = outSampleRate * 2  // mono PCM16
         val bufSize = max(minBuf * 4, (bytesPerSecond * 1.5).toInt())
 
@@ -348,19 +387,71 @@ class QwenVoiceProvider(
         // is the only thread that calls AudioTrack.write() — keeping
         // it off Main/WS threads is what prevents UI freezes during
         // playback.
+        //
+        // Mirrors the web's PCMPlayer model (frontend/src/voice/audio/
+        // pcmPlayer.ts) as closely as Android allows: chunks flow
+        // straight into the playback graph as fast as it can accept
+        // them, no artificial buffer fill, no silence padding.
+        //
+        // The hardware buffer (1.5s, see startSpeaker) plus the
+        // unbounded Channel act as the queue.  WRITE_NON_BLOCKING means
+        // a full hardware buffer doesn't stall this coroutine — we
+        // park the leftover and try again on the next loop tick after
+        // the AudioTrack drains a bit.  This keeps up with bursty
+        // Qwen delivery (chunks arriving faster than real-time
+        // playback): everything gets accepted into our queue and
+        // drains into the AudioTrack as fast as it physically can.
         playbackJob = scope.launch {
+            // Bytes from the previous chunk that didn't all fit yet.
+            // Held in user-space until the hardware buffer has room.
+            var pending: ByteArray? = null
             try {
-                for (pcm in speakerQueue) {
+                while (isActive) {
                     val t = audioTrack ?: break
                     if (t.state != AudioTrack.STATE_INITIALIZED) break
-                    try {
-                        // AudioTrack.write blocks while the playback
-                        // buffer is full — that's the natural
-                        // backpressure we want here, and we're off
-                        // the UI thread so it's harmless.
-                        t.write(pcm, 0, pcm.size)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "AudioTrack.write failed: ${e.message}")
+
+                    // If we have leftover bytes, finish those before
+                    // pulling another chunk — order matters.
+                    // Otherwise wait (suspending) for the next chunk
+                    // from the channel.  When the channel closes
+                    // (cleanup), receiveCatching returns isClosed and
+                    // we exit cleanly.
+                    val data: ByteArray = if (pending != null) {
+                        pending!!.also { pending = null }
+                    } else {
+                        val r = speakerQueue.receiveCatching()
+                        if (r.isClosed) break
+                        r.getOrNull() ?: continue
+                    }
+
+                    var offset = 0
+                    while (offset < data.size) {
+                        val written = try {
+                            t.write(
+                                data,
+                                offset,
+                                data.size - offset,
+                                AudioTrack.WRITE_NON_BLOCKING,
+                            )
+                        } catch (e: Exception) {
+                            Log.w(TAG, "AudioTrack.write failed: ${e.message}")
+                            -1
+                        }
+                        if (written < 0) {
+                            // Permanent error — drop the rest of this
+                            // chunk; next chunk may still play.
+                            break
+                        }
+                        if (written == 0) {
+                            // Hardware buffer is full.  Park the rest
+                            // and yield; the delay lets the buffer
+                            // drain a bit before we retry.  Without
+                            // this we'd busy-loop until space opens.
+                            pending = data.copyOfRange(offset, data.size)
+                            delay(10)
+                            break
+                        }
+                        offset += written
                     }
                 }
             } catch (e: CancellationException) {

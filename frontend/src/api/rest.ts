@@ -121,6 +121,7 @@ export interface AssistantConfig {
   default_voice_model: string;
   default_voice_name: string;
   default_voice_transcription_language: string;  // "" = auto-detect
+  voice_recording_enabled: boolean;              // save raw audio from voice sessions
 }
 
 export interface ConfigUpdate {
@@ -133,6 +134,7 @@ export interface ConfigUpdate {
   default_voice_model?: string;
   default_voice_name?: string;
   default_voice_transcription_language?: string;
+  voice_recording_enabled?: boolean;
 }
 
 export function getConfig(): Promise<AssistantConfig> {

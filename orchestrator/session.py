@@ -31,6 +31,7 @@ from orchestrator.config import (
     get_model_info,
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
+from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 from orchestrator.providers.anthropic import AnthropicProvider
 from orchestrator.providers.openai_text import OpenAITextProvider, create_audio_message
 from orchestrator.runner import BackgroundAgentRunner, Notification, NotificationQueue
@@ -153,6 +154,7 @@ class OrchestratorSession:
         self._voice_transcription_language: str | None = voice_transcription_language
         self._voice_relay = None  # Set lazily for websocket providers
         self._history_summary: str | None = None
+        self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
 
         # Track current provider for model switching
         self._current_provider = None
@@ -272,8 +274,9 @@ class OrchestratorSession:
         """
         # Import tools to ensure they're registered
         import orchestrator.tools.agent_sessions  # noqa: F401
-        import orchestrator.tools.search  # noqa: F401
+        import orchestrator.tools.audio_playback  # noqa: F401
         import orchestrator.tools.files  # noqa: F401
+        import orchestrator.tools.search  # noqa: F401
         import orchestrator.tools.voice_control  # noqa: F401
 
         if self._voice:
@@ -299,6 +302,9 @@ class OrchestratorSession:
             provider = self._create_provider()
 
         self._current_provider = provider
+
+        # Make the session accessible from tools via context
+        self._context["session"] = self
 
         self._agent = OrchestratorAgent(
             config=self._config,
@@ -340,6 +346,17 @@ class OrchestratorSession:
                 if self._voice_provider.provider_name == "openai":
                     meta["openai_model"] = self._voice_provider.model
             self._writer.append(meta)
+
+        # Start audio recorder if voice mode and recording is enabled
+        if self._voice and is_recording_enabled():
+            self._audio_recorder = AudioRecorder(
+                session_id=self._local_id,
+                provider=self._voice_provider_id or "",
+                model=self._voice_model_id or "",
+                voice=self._voice_name or "",
+            )
+            self._audio_recorder.start()
+            logger.info("Audio recorder started for session %s", self._local_id)
 
         return self._local_id
 
@@ -505,7 +522,20 @@ class OrchestratorSession:
         """Forward a frontend mic chunk upstream (WS providers only)."""
         if self._voice_relay is None:
             return
+        # Record user audio if recorder is active
+        if self._audio_recorder is not None and self._audio_recorder.is_recording:
+            self._audio_recorder.write_user_audio(pcm_b64)
         await self._voice_relay.send_audio(pcm_b64)
+
+    def record_assistant_audio(self, pcm_b64: str) -> None:
+        """Record assistant audio chunk (called from route layer for WS providers)."""
+        if self._audio_recorder is not None and self._audio_recorder.is_recording:
+            self._audio_recorder.write_assistant_audio(pcm_b64)
+
+    @property
+    def audio_recorder(self) -> AudioRecorder | None:
+        """The audio recorder instance, if recording is active."""
+        return self._audio_recorder
 
     async def send_voice_event_upstream(self, event: dict[str, Any]) -> None:
         """Forward a frontend control event to the upstream provider WS.
@@ -547,12 +577,29 @@ class OrchestratorSession:
         if event_type == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
             if transcript:
-                self._writer.append({
+                # Build message content with optional audio segment reference
+                segment = None
+                if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                    segment = self._audio_recorder.mark_user_turn_end(transcript)
+
+                if segment:
+                    # Include audio reference in the message text itself
+                    content = (
+                        f"[voice, recording: {self._local_id} user "
+                        f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+                    )
+                else:
+                    content = f"[voice] {transcript}"
+
+                entry: dict[str, Any] = {
                     "type": "user",
-                    "message": {"role": "user", "content": f"[voice] {transcript}"},
+                    "message": {"role": "user", "content": content},
                     "source": "voice_transcription",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                if segment:
+                    entry["audio_segment"] = segment
+                self._writer.append(entry)
 
         # User text input (typed messages in voice sessions, if applicable)
         elif event_type == "conversation.item.created":
@@ -629,12 +676,29 @@ class OrchestratorSession:
             status = response.get("status", "completed")
             staged = getattr(self, "_pending_assistant_transcript", None)
             if staged and status == "completed":
-                self._writer.append({
+                # Build message content with optional audio segment reference
+                segment = None
+                if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                    segment = self._audio_recorder.mark_assistant_turn_end(staged)
+
+                if segment:
+                    # Include audio reference in the message text itself
+                    content = (
+                        f"[voice, recording: {self._local_id} assistant "
+                        f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
+                    )
+                else:
+                    content = staged
+
+                entry: dict[str, Any] = {
                     "type": "assistant",
-                    "message": {"role": "assistant", "content": staged},
+                    "message": {"role": "assistant", "content": content},
                     "source": "voice_response",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                if segment:
+                    entry["audio_segment"] = segment
+                self._writer.append(entry)
             self._pending_assistant_transcript = None
 
         # Barge-in interruption — mark in JSONL
@@ -926,6 +990,14 @@ class OrchestratorSession:
             await self.stop_voice_relay()
         except Exception:  # noqa: BLE001
             logger.exception("stop_voice_relay failed during session stop")
+        # Stop audio recorder
+        if self._audio_recorder is not None:
+            try:
+                self._audio_recorder.stop()
+                logger.info("Audio recorder stopped for session %s", self._local_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("Audio recorder stop failed during session stop")
+            self._audio_recorder = None
         self._agent = None
         self._voice_provider = None
         self._current_provider = None
@@ -940,11 +1012,15 @@ class OrchestratorSession:
         messages: list[dict[str, Any]],
         max_tokens: int = 2048,
     ) -> str:
-        """Summarize older conversation messages using a fast Anthropic call.
+        """Summarize older conversation messages using the orchestrator's current model.
 
         Produces a structured digest so that when voice mode resumes the
         orchestrator can pick up the thread coherently. ``max_tokens`` scales
         with the prefix size (see ``scale_summary_max_tokens``).
+
+        Routes through whichever provider the orchestrator is currently using
+        (Anthropic or OpenAI) so summarization works regardless of which API
+        keys are configured in the environment.
         """
         if not messages or max_tokens <= 0:
             return ""
@@ -999,17 +1075,30 @@ class OrchestratorSession:
             f"Conversation:\n{transcript}"
         )
 
+        model = self._config.model
+        provider = self._config.provider
         try:
-            import anthropic
-            client = anthropic.AsyncAnthropic()
-            response = await client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": instructions}],
-            )
-            return response.content[0].text if response.content else ""
+            if provider == Provider.OPENAI:
+                import openai
+                client = openai.AsyncOpenAI()
+                response = await client.chat.completions.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": instructions}],
+                )
+                choice = response.choices[0] if response.choices else None
+                return (choice.message.content or "") if choice else ""
+            else:
+                import anthropic
+                client = anthropic.AsyncAnthropic()
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": instructions}],
+                )
+                return response.content[0].text if response.content else ""
         except Exception as e:
-            logger.warning("Failed to summarize history: %s", e)
+            logger.warning("Failed to summarize history with %s/%s: %s", provider.value, model, e)
             return ""
 
     def _get_jsonl_path(self) -> Path:
