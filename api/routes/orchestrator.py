@@ -422,47 +422,68 @@ async def _attach_voice_payload(
         existing_relay = None
 
     if session.needs_voice_relay and existing_relay is None:
-        try:
-            pool = session._context.get("pool")
-            if pool is not None:
-                async def _on_audio_out(b64: str) -> None:
-                    # Record assistant audio if recorder is active
-                    session.record_assistant_audio(b64)
+        pool = session._context.get("pool")
+        if pool is not None:
+            async def _on_audio_out(b64: str) -> None:
+                # Record assistant audio if recorder is active
+                session.record_assistant_audio(b64)
+                await pool.broadcast_orchestrator({
+                    "type": "voice_audio_out",
+                    "audio": b64,
+                })
+
+            async def _on_event_for_frontend(event: dict) -> None:
+                # Mirror provider events to the frontend so the UI can
+                # reflect transcripts, status, etc.
+                await pool.broadcast_orchestrator({
+                    "type": "voice_event",
+                    "event": event,
+                })
+                # Tool calls go through _handle_voice_tool_call so the
+                # tool_use / tool_result broadcasts fire and execution
+                # happens off the relay-drain task.
+                if event.get("type") == "response.function_call_arguments.done":
+                    asyncio.create_task(
+                        _handle_voice_tool_call(pool, session, event, inject=False),
+                        name="voice-tool-call",
+                    )
+                    return
+                # All other events: run orchestrator-side processing
+                # (persists transcripts, etc.).  inject=False because
+                # the relay already pushed the event into the provider
+                # queue before invoking this callback.
+                try:
+                    commands = await session.process_voice_event(event, inject=False)
+                    await _dispatch_voice_commands(pool, session, commands)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Voice event processing failed in relay drain")
+
+            # Kick off the relay startup in the background so we can return
+            # `session_started` to the frontend before the upstream WS
+            # handshake completes.  On the Jetson the upstream connect plus
+            # `session.created` round-trip can run several seconds; doing it
+            # inline blew the frontend's 10s start timeout (the visible
+            # symptom: "Voice session did not start (no connection_info
+            # from server)").  We pass the precomputed `session_update` so
+            # the relay does NOT re-summarize history — that's the second
+            # major cost on the Jetson.  Relay readiness is announced via
+            # the provider's own `session.created`/`session.updated`
+            # events, mirrored through `_on_event_for_frontend`.
+            async def _bg_start_relay() -> None:
+                try:
+                    await session.start_voice_relay(
+                        _on_audio_out,
+                        _on_event_for_frontend,
+                        session_update=session_update,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("Failed to start voice relay (bg)")
                     await pool.broadcast_orchestrator({
-                        "type": "voice_audio_out",
-                        "audio": b64,
+                        "type": "voice_connection_error",
+                        "detail": str(e),
                     })
 
-                async def _on_event_for_frontend(event: dict) -> None:
-                    # Mirror provider events to the frontend so the UI can
-                    # reflect transcripts, status, etc.
-                    await pool.broadcast_orchestrator({
-                        "type": "voice_event",
-                        "event": event,
-                    })
-                    # Tool calls go through _handle_voice_tool_call so the
-                    # tool_use / tool_result broadcasts fire and execution
-                    # happens off the relay-drain task.
-                    if event.get("type") == "response.function_call_arguments.done":
-                        asyncio.create_task(
-                            _handle_voice_tool_call(pool, session, event, inject=False),
-                            name="voice-tool-call",
-                        )
-                        return
-                    # All other events: run orchestrator-side processing
-                    # (persists transcripts, etc.).  inject=False because
-                    # the relay already pushed the event into the provider
-                    # queue before invoking this callback.
-                    try:
-                        commands = await session.process_voice_event(event, inject=False)
-                        await _dispatch_voice_commands(pool, session, commands)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("Voice event processing failed in relay drain")
-
-                await session.start_voice_relay(_on_audio_out, _on_event_for_frontend)
-        except Exception as e:
-            logger.exception("Failed to start voice relay")
-            payload["voice_connection_error"] = str(e)
+            asyncio.create_task(_bg_start_relay(), name="voice-relay-start")
 
 
 async def _handle_send(

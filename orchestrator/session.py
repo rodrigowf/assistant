@@ -490,18 +490,24 @@ class OrchestratorSession:
         self,
         on_audio_out: Callable[[str], Awaitable[None]],
         on_event_for_frontend: Callable[[dict[str, Any]], Awaitable[None]],
+        session_update: dict[str, Any] | None = None,
     ) -> None:
         """Open the upstream provider WS for non-WebRTC voice providers.
 
         The handler layer wires the two callbacks so audio chunks become
         ``voice_audio_out`` payloads on the orchestrator broadcast and
         provider events are mirrored to subscribers.
+
+        ``session_update`` may be passed in if the caller already built it
+        (e.g. to send to the frontend in the same handler) — saves a second
+        round-trip through the LLM-backed history summarizer, which on the
+        Jetson costs enough to blow the frontend's 10s start timeout.
         """
         if not self.needs_voice_relay:
             return
         from orchestrator.voice_relay import VoiceRelay
-        # Lazy-build the session.update payload that seeds the upstream WS.
-        session_update = await self.get_session_update()
+        if session_update is None:
+            session_update = await self.get_session_update()
         if session_update is None:
             raise RuntimeError("Voice provider did not produce a session.update payload")
         relay = VoiceRelay(

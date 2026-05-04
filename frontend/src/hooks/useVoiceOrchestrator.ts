@@ -467,10 +467,13 @@ export function useVoiceOrchestrator(
       socket.send(payload);
     });
 
-    // Wait up to 10s for session_started (which populates connInfoRef).
+    // Wait up to 30s for session_started (which populates connInfoRef).
+    // The backend may need to load the JSONL and run the history
+    // summarizer (one LLM round-trip) before answering — on the Jetson
+    // that can take 10–20s for large sessions.
     const startedAt = Date.now();
     while (!connInfoRef.current) {
-      if (Date.now() - startedAt > 10_000) {
+      if (Date.now() - startedAt > 30_000) {
         setVoiceError("Voice session did not start (no connection_info from server)");
         cleanup();
         updateStatus("error");
