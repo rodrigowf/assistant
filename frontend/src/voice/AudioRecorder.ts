@@ -11,9 +11,6 @@
 
 import type { ChatSocket } from "../api/websocket";
 
-// Audio context for capturing remote (speaker) stream
-let audioContext: AudioContext | null = null;
-
 interface RecordingOptions {
   sessionId: string;
   ws: ChatSocket;
