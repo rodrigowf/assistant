@@ -195,7 +195,13 @@ async def close_agent_session(context: dict[str, Any], session_id: str) -> str:
 
 @registry.register(
     name="read_agent_session",
-    description="Read recent messages from a Claude Code session's history.",
+    description=(
+        "Read messages from a Claude Code session's persisted history, "
+        "newest-first priority (returns the last N messages in chronological "
+        "order). Pass max_messages=null to load the full conversation — useful "
+        "when the most recent assistant reply is long and you need its full "
+        "content. Message text is returned verbatim (no truncation)."
+    ),
     input_schema={
         "type": "object",
         "properties": {
@@ -204,15 +210,20 @@ async def close_agent_session(context: dict[str, Any], session_id: str) -> str:
                 "description": "The session ID to read.",
             },
             "max_messages": {
-                "type": "integer",
-                "description": "Maximum number of messages to return (default: 20).",
+                "type": ["integer", "null"],
+                "description": (
+                    "How many of the most recent messages to return "
+                    "(default: 5). Use null to return the entire conversation."
+                ),
             },
         },
         "required": ["session_id"],
     },
 )
 async def read_agent_session(
-    context: dict[str, Any], session_id: str, max_messages: int = 20
+    context: dict[str, Any],
+    session_id: str,
+    max_messages: int | None = 5,
 ) -> str:
     pool = context["pool"]
     store = context["store"]
