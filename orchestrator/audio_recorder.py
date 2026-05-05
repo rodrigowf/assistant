@@ -286,6 +286,7 @@ class AudioRecorder:
         self._metadata.segments.append(segment.to_dict())
         self._current_user_segment_start = -1
         self._turn_index += 1
+        self._write_metadata()
         return segment.to_dict()
 
     def mark_assistant_turn_end(self, transcript: str = "") -> dict[str, Any] | None:
@@ -303,6 +304,7 @@ class AudioRecorder:
         self._metadata.segments.append(segment.to_dict())
         self._current_assistant_segment_start = -1
         self._turn_index += 1
+        self._write_metadata()
         return segment.to_dict()
 
     def stop(self) -> None:
