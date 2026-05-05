@@ -414,12 +414,22 @@ class QwenVoiceProvider(BaseVoiceProvider):
             "- No mirroring Rodrigo's speech patterns (pauses, repetitions, fillers) — be the clear communicator.\n"
             "- No empty flattery or performative agreement.\n"
         )
+        # Sanitise the full instructions string (system prompt + voice
+        # directives + any history snippets the orchestrator embedded).
+        # Same DashScope URL-validator hazard as ``function_call_output``:
+        # scheme-less URL-shapes (``localhost:5432``, ``192.168.0.200``,
+        # absolute paths like ``/home/rodrigo/Projects/...``) trip the
+        # ``InvalidParameter: provided URL`` 400, but lazily — the WS
+        # accepts ``session.update`` and ``session.updated`` echoes back,
+        # then the validator fires later when the omni pipeline scans
+        # the context, killing the session mid-conversation.
+        instructions = _sanitize_for_qwen((system or "") + voice_directives)
         return {
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
                 "voice": voice or self._voice,
-                "instructions": (system or "") + voice_directives,
+                "instructions": instructions,
                 "tools": tools,
                 # Plus reliably calls tools with "auto"; Flash needs "required".
                 # Compromise: leave "auto" so the model can also chat freely
