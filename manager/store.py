@@ -214,11 +214,18 @@ class SessionStore:
             messages=previews,
         )
 
-    def get_preview(self, session_id: str, max_messages: int = 5) -> list[MessagePreview]:
-        """Get a preview of the most recent messages from a session."""
+    def get_preview(
+        self, session_id: str, max_messages: int | None = 5
+    ) -> list[MessagePreview]:
+        """Get the most recent messages from a session.
+
+        ``max_messages=None`` returns the full conversation.
+        """
         detail = self.get_session(session_id)
         if detail is None:
             return []
+        if max_messages is None:
+            return detail.messages
         return detail.messages[-max_messages:]
 
     def get_messages_paginated(
@@ -492,7 +499,7 @@ class SessionStore:
 
             previews.append(MessagePreview(
                 role=role,
-                text=text[:500],
+                text=text,
                 blocks=blocks,
                 timestamp=timestamp,
             ))
