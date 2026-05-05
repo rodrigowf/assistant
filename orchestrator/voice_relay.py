@@ -39,6 +39,22 @@ logger = logging.getLogger(__name__)
 
 AudioOutCallback = Callable[[str], Awaitable[None]]
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+SessionUpdateBuilder = Callable[[], Awaitable[dict[str, Any]]]
+
+
+# Substrings in the WS close reason that mark a *recoverable* upstream
+# failure.  DashScope reuses the boilerplate "InvalidParameter: The
+# provided URL does not appear to be valid" 400 for unrelated internal
+# pipeline failures (verified empirically: it fires mid-session with no
+# offending frame on our side).  Reopening the WS with a fresh
+# session.update consistently brings the session back.  ``response_idle_timeout``
+# is the 5-min no-response watchdog — also recoverable, the user just
+# stepped away.
+_RECONNECTABLE_ERR_SUBSTRINGS = (
+    "InvalidParameter",
+    "The provided URL does not appear to be valid",
+    "response_idle_timeout",
+)
 
 
 # How many recent non-audio frames to remember.  When the upstream WS
@@ -88,6 +104,8 @@ class VoiceRelay:
         on_audio_out: AudioOutCallback,
         on_event_for_frontend: EventCallback,
         session_id: str | None = None,
+        rebuild_session_update: SessionUpdateBuilder | None = None,
+        max_reconnects: int = 2,
     ) -> None:
         if provider.connection_type != "websocket":
             raise ValueError(
@@ -97,6 +115,13 @@ class VoiceRelay:
         self._on_audio_out = on_audio_out
         self._on_event_for_frontend = on_event_for_frontend
         self._session_id = session_id or "anonymous"
+        # If supplied, the relay will attempt to reopen the upstream WS
+        # after recoverable failures (see ``_RECONNECTABLE_ERR_SUBSTRINGS``).
+        # The callback rebuilds a fresh ``session.update`` payload because
+        # history may have grown since the original start().
+        self._rebuild_session_update = rebuild_session_update
+        self._max_reconnects = max_reconnects
+        self._reconnect_count = 0
 
         self._ws = None  # type: ignore[assignment]
         self._drain_task: asyncio.Task[None] | None = None
@@ -218,6 +243,26 @@ class VoiceRelay:
             getattr(self._provider, "voice", "?"),
         )
 
+        await self._open_and_handshake(session_config)
+        self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
+
+        # Keepalive task — only if the provider implements
+        # build_keepalive_chunk().  Sends silent PCM every 30s of audio
+        # silence to prevent Qwen's transcription pipeline from timing
+        # out and crashing on the next real input.
+        if hasattr(self._provider, "build_keepalive_chunk"):
+            self._keepalive_task = asyncio.create_task(
+                self._keepalive_loop(),
+                name=f"voice-keepalive-{self._provider.provider_name}",
+            )
+
+    async def _open_and_handshake(self, session_config: dict[str, Any]) -> None:
+        """Open upstream WS, drain ``session.created``, send our config.
+
+        Shared by :meth:`start` and :meth:`_try_reconnect` — the latter
+        rebuilds the WS without restarting the drain task or the
+        keepalive (those are restarted by the caller).
+        """
         self._ws = await self._provider.open_upstream()
         self._slog("upstream connected")
 
@@ -251,18 +296,6 @@ class VoiceRelay:
         async with self._send_lock:
             await self._ws.send(json.dumps(session_config))
         self._last_send_at = time.monotonic()
-
-        self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
-
-        # Keepalive task — only if the provider implements
-        # build_keepalive_chunk().  Sends silent PCM every 30s of audio
-        # silence to prevent Qwen's transcription pipeline from timing
-        # out and crashing on the next real input.
-        if hasattr(self._provider, "build_keepalive_chunk"):
-            self._keepalive_task = asyncio.create_task(
-                self._keepalive_loop(),
-                name=f"voice-keepalive-{self._provider.provider_name}",
-            )
 
     def _record_sent(self, event: dict[str, Any]) -> None:
         """Stash a sent control frame for post-mortem on upstream close.
@@ -539,7 +572,6 @@ class VoiceRelay:
             # not appear to be valid" — that boilerplate is its generic
             # validator response.  Dump BOTH sent + recv rings so we see
             # the full conversation context at the time of the close.
-            self._closed.set()
             logger.warning(
                 "VoiceRelay drain ended for %s: %s",
                 self._provider.provider_name,
@@ -569,6 +601,22 @@ class VoiceRelay:
                 )
                 self._slog(f"  recv[-{offset}] type={frame.get('type')} body={json.dumps(frame)[:500]}")
 
+            # Try to recover transparently before giving up — DashScope's
+            # "InvalidParameter" 400 mid-session is almost always salvageable
+            # by reopening with a fresh session.update.
+            reconnected = await self._try_reconnect(e)
+            if reconnected:
+                # Drain task chains into itself after a successful reconnect:
+                # spin up a new drain so this one can return cleanly.  The
+                # keepalive task is unaffected — it polls _ws which now
+                # points at the new connection.
+                self._drain_task = asyncio.create_task(
+                    self._drain(),
+                    name=f"voice-relay-{self._provider.provider_name}-reconnect{self._reconnect_count}",
+                )
+                return
+
+            self._closed.set()
             self._log_close_summary(f"upstream drain failed: {e}")
             self._close_session_log()
 
@@ -579,6 +627,80 @@ class VoiceRelay:
                     "message": f"Upstream {self._provider.provider_name} WS closed: {e}",
                 },
             })
+
+    async def _try_reconnect(self, err: BaseException) -> bool:
+        """Attempt to transparently reopen the upstream WS.
+
+        Only fires for errors whose stringification contains one of the
+        recoverable substrings AND when the relay was constructed with a
+        ``rebuild_session_update`` callback AND we haven't exhausted
+        :attr:`_max_reconnects`.  On success the new WS is wired up and
+        ``_ws`` points at it; the caller restarts the drain task.
+
+        We deliberately do NOT mirror the upstream error frame to the
+        frontend on a successful reconnect — the user shouldn't see a
+        red banner that immediately heals.  If reconnect fails, the
+        normal error path resumes.
+        """
+        if self._rebuild_session_update is None:
+            return False
+        if self._reconnect_count >= self._max_reconnects:
+            self._slog(
+                f"reconnect skipped: hit max_reconnects={self._max_reconnects}"
+            )
+            return False
+        err_text = str(err)
+        if not any(s in err_text for s in _RECONNECTABLE_ERR_SUBSTRINGS):
+            self._slog(f"reconnect skipped: not a recoverable error class")
+            return False
+
+        self._reconnect_count += 1
+        self._slog(
+            f"reconnect attempt #{self._reconnect_count}/{self._max_reconnects}"
+        )
+        logger.warning(
+            "voice_relay reconnect attempt %d/%d session_id=%s after: %s",
+            self._reconnect_count, self._max_reconnects, self._session_id, err,
+        )
+
+        # Tear down the old WS.  We do NOT cancel keepalive — it shares
+        # the relay state and will resume on the new ``self._ws``.
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ws = None
+
+        # Provider-internal state: clear the response-active gate (the old
+        # session's response is gone) and the deferred response.create
+        # queue (those were tied to the old context).
+        self._response_active.clear()
+        self._pending_response_create.clear()
+
+        try:
+            session_config = await self._rebuild_session_update()
+        except Exception as e:  # noqa: BLE001
+            self._slog(f"reconnect failed: rebuild_session_update raised: {e}")
+            logger.exception("voice_relay rebuild_session_update failed")
+            return False
+
+        try:
+            await self._open_and_handshake(session_config)
+        except Exception as e:  # noqa: BLE001
+            self._slog(f"reconnect failed: open_and_handshake raised: {e}")
+            logger.warning(
+                "voice_relay reconnect open_and_handshake failed session_id=%s: %s",
+                self._session_id, e,
+            )
+            return False
+
+        self._slog(f"reconnect #{self._reconnect_count} succeeded")
+        logger.info(
+            "voice_relay reconnect #%d succeeded session_id=%s",
+            self._reconnect_count, self._session_id,
+        )
+        return True
 
 
 def b64_to_pcm(b64: str) -> bytes:

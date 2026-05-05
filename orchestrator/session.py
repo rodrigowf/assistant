@@ -517,11 +517,22 @@ class OrchestratorSession:
             session_update = await self.get_session_update()
         if session_update is None:
             raise RuntimeError("Voice provider did not produce a session.update payload")
+
+        async def _rebuild_session_update() -> dict[str, Any]:
+            # Used by the relay to recover from DashScope's misleading
+            # "InvalidParameter" close mid-session.  Rebuilds with the
+            # current history so the model picks up where it left off.
+            payload = await self.get_session_update()
+            if payload is None:
+                raise RuntimeError("rebuild_session_update returned None")
+            return payload
+
         relay = VoiceRelay(
             self._voice_provider,
             on_audio_out=on_audio_out,
             on_event_for_frontend=on_event_for_frontend,
             session_id=self._local_id,
+            rebuild_session_update=_rebuild_session_update,
         )
         await relay.start(session_update)
         self._voice_relay = relay
