@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +44,15 @@ class HistoryLoader:
         return history
 
     def _read_jsonl(self) -> list[dict[str, Any]]:
-        """Read all valid JSON lines from the JSONL file."""
+        """Read all valid JSON lines from the JSONL file.
+
+        Recovers from ``}{`` concatenations (a pre-fix bug where a process
+        crash before flush could leave a line missing its trailing newline,
+        so the next session's first object started on the same line) by
+        falling back to ``raw_decode`` and consuming objects sequentially.
+        """
         entries: list[dict[str, Any]] = []
+        decoder = json.JSONDecoder()
         try:
             with open(self._jsonl_path) as f:
                 for line_num, line in enumerate(f, start=1):
@@ -52,15 +60,28 @@ class HistoryLoader:
                     if not line:
                         continue
                     try:
-                        obj = json.loads(line)
+                        entries.append(json.loads(line))
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+                    # Fallback: consume concatenated objects one at a time.
+                    pos = 0
+                    recovered = 0
+                    while pos < len(line):
+                        try:
+                            obj, end = decoder.raw_decode(line, pos)
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                "Invalid JSON at %s:%d (col %d, recovered %d): %s",
+                                self._jsonl_path.name, line_num, pos, recovered, e,
+                            )
+                            break
                         entries.append(obj)
-                    except json.JSONDecodeError as e:
-                        logger.warning(
-                            "Invalid JSON at %s:%d: %s",
-                            self._jsonl_path.name,
-                            line_num,
-                            e,
-                        )
+                        recovered += 1
+                        pos = end
+                        # Skip whitespace between objects.
+                        while pos < len(line) and line[pos].isspace():
+                            pos += 1
         except Exception as e:
             logger.warning("Failed to read JSONL %s: %s", self._jsonl_path, e)
 
@@ -184,9 +205,21 @@ class HistoryWriter:
         self._jsonl_path = jsonl_path
 
     def append(self, data: dict[str, Any]) -> None:
-        """Append a single event to the JSONL file."""
+        """Append a single event to the JSONL file.
+
+        Uses ``os.write`` on an O_APPEND fd so the JSON object + trailing
+        newline land in a single atomic syscall.  Buffered ``open(...)`` +
+        ``f.write`` was losing the trailing ``\\n`` on abrupt process exit
+        (SIGKILL, OOM, restart) — the buffer was partially flushed and the
+        next process appended its first object directly after, producing
+        ``}{`` joins that break ``json.loads`` line-by-line.
+        """
+        line = (json.dumps(data) + "\n").encode("utf-8")
         try:
-            with open(self._jsonl_path, "a") as f:
-                f.write(json.dumps(data) + "\n")
+            fd = os.open(self._jsonl_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, line)
+            finally:
+                os.close(fd)
         except Exception as e:
             logger.warning("Failed to write to JSONL %s: %s", self._jsonl_path, e)
