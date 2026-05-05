@@ -453,6 +453,42 @@ class QwenVoiceProvider(BaseVoiceProvider):
     ) -> dict[str, Any]:
         return self.format_session_config(system, tools)
 
+    # --- listen_recording injection helpers ------------------------------
+
+    def session_update_disable_vad(self) -> dict[str, Any]:
+        """``session.update`` payload that disables server VAD.
+
+        Used by ``listen_recording`` so the injected audio is treated as
+        one item we explicitly commit, not a stream that VAD chops into
+        multiple speech_started/transcription cycles (each of which would
+        auto-create a response and interrupt the agent's reply).
+        """
+        return {
+            "type": "session.update",
+            "session": {"turn_detection": None},
+        }
+
+    def session_update_restore_vad(self) -> dict[str, Any]:
+        """``session.update`` payload that re-enables server VAD.
+
+        Restores the default (or whatever per-session override is in
+        place) after a ``listen_recording`` injection completes.
+        """
+        return {
+            "type": "session.update",
+            "session": {"turn_detection": DEFAULT_VAD},
+        }
+
+    def commit_input_audio(self) -> dict[str, Any]:
+        """Manual ``input_audio_buffer.commit`` for VAD-off injection.
+
+        With server VAD enabled, the provider auto-commits at speech
+        boundaries.  With it disabled (as we do during injection), nothing
+        commits the buffered audio and the model never sees it; this event
+        finalises the buffered chunks as one user turn.
+        """
+        return {"type": "input_audio_buffer.commit"}
+
     # --- audio relay helpers ---------------------------------------------
 
     def format_audio_in(self, pcm_b64: str) -> dict[str, Any]:

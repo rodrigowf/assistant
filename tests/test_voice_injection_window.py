@@ -199,6 +199,26 @@ async def test_send_voice_audio_in_skips_recorder_during_injection(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_qwen_provider_exposes_vad_toggle_helpers():
+    """Qwen provider must offer the disable/restore VAD + commit helpers
+    that listen_recording uses to bracket an injection."""
+    from orchestrator.providers.qwen_voice import QwenVoiceProvider, DEFAULT_VAD
+
+    provider = QwenVoiceProvider(model="qwen3.5-omni-plus-realtime", voice="Aiden")
+
+    disable = provider.session_update_disable_vad()
+    assert disable["type"] == "session.update"
+    assert disable["session"]["turn_detection"] is None
+
+    restore = provider.session_update_restore_vad()
+    assert restore["type"] == "session.update"
+    assert restore["session"]["turn_detection"] == DEFAULT_VAD
+
+    commit = provider.commit_input_audio()
+    assert commit == {"type": "input_audio_buffer.commit"}
+
+
+@pytest.mark.asyncio
 async def test_send_voice_audio_in_uses_recorder_outside_injection(tmp_path):
     """Sanity: the recorder still receives mic audio when not injecting."""
     session = _make_session(tmp_path)

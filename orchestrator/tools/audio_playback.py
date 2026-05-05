@@ -144,15 +144,34 @@ async def listen_recording(
     # Calculate actual duration
     actual_duration_ms = (len(audio_bytes) / 2 / sample_rate) * 1000
 
-    # Arm the injection window before sending the first byte.  See
-    # OrchestratorSession.is_injecting for what the window suppresses.
-    # The grace must outlast both the pacing AND the provider's own ASR
-    # completion delay — Qwen has been observed firing
-    # transcription.completed events ~10s after the last
+    # Arm the injection window — defence in depth against any phantom
+    # event that slips past the provider-side VAD-off (timing race, older
+    # provider, etc).  See OrchestratorSession.is_injecting.  The grace
+    # must outlast the provider's ASR completion delay — Qwen has been
+    # observed firing transcription.completed events ~10s after the last
     # input_audio_buffer.append.
     INJECTION_GRACE_SEC = 15.0
     audio_duration_sec = actual_duration_ms / 1000.0
     session.extend_injection_window(audio_duration_sec + INJECTION_GRACE_SEC)
+
+    # Disable server VAD for the duration of the injection.  Without this,
+    # Qwen's VAD chops the replayed audio at every natural pause and fires
+    # speech_started / transcription.completed (and an auto-created
+    # response) for each fragment — which then interrupts itself
+    # repeatedly because each new speech_started cancels the previous
+    # response.  By turning VAD off we make the provider treat the whole
+    # injection as one item that we explicitly commit at the end.
+    provider = getattr(session, "_voice_provider", None)
+    disable_vad = getattr(provider, "session_update_disable_vad", None) if provider else None
+    restore_vad = getattr(provider, "session_update_restore_vad", None) if provider else None
+    commit_buffer = getattr(provider, "commit_input_audio", None) if provider else None
+    vad_was_disabled = False
+    if disable_vad is not None:
+        try:
+            await session.send_voice_event_upstream(disable_vad())
+            vad_was_disabled = True
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to disable VAD before injection")
 
     # Stream chunks to the voice session
     chunks_sent = 0
@@ -186,6 +205,15 @@ async def listen_recording(
         # Final extension covers ASR catching up after the last chunk.
         session.extend_injection_window(INJECTION_GRACE_SEC)
 
+        # With VAD disabled, the provider auto-commit doesn't fire — send
+        # the commit ourselves so the model actually sees the buffered
+        # audio as one user item (and produces a single transcription).
+        if vad_was_disabled and commit_buffer is not None:
+            try:
+                await session.send_voice_event_upstream(commit_buffer())
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to commit input_audio_buffer after injection")
+
         logger.info(
             "listen_recording complete recording=%s channel=%s %d-%dms chunks=%d",
             session_id[:8],
@@ -217,3 +245,12 @@ async def listen_recording(
             "error": f"Audio injection failed: {str(e)}",
             "bytes_sent_before_failure": bytes_sent,
         })
+
+    finally:
+        # Always restore VAD, even on error — leaving it disabled would
+        # break the next user turn (Qwen would never fire speech_started).
+        if vad_was_disabled and restore_vad is not None:
+            try:
+                await session.send_voice_event_upstream(restore_vad())
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to restore VAD after injection")
