@@ -181,6 +181,13 @@ class OrchestratorSession:
         # synthetic turn now or let the next user prompt drain notifications.
         self._busy_lock = asyncio.Lock()
 
+        # Injection window — set by the listen_recording tool while it's
+        # pumping past audio into the live voice WS.  See the is_injecting
+        # property for the full list of behaviours this gates.
+        self._injection_until: float = 0.0
+        self._injection_active: bool = False
+        self._injection_watchdog: asyncio.Task[None] | None = None
+
     @property
     def local_id(self) -> str:
         """The pool key — stable frontend tab UUID used for reconnection."""
@@ -525,13 +532,86 @@ class OrchestratorSession:
             self._voice_relay = None
 
     async def send_voice_audio_in(self, pcm_b64: str) -> None:
-        """Forward a frontend mic chunk upstream (WS providers only)."""
+        """Forward a frontend mic chunk upstream (WS providers only).
+
+        While an injection window is active (``listen_recording`` is
+        replaying past audio into the WS), do NOT also write the chunk into
+        the audio recorder — the injected bytes are not the user's
+        microphone, and persisting them would corrupt the recording with
+        material that already exists elsewhere.
+        """
         if self._voice_relay is None:
             return
-        # Record user audio if recorder is active
-        if self._audio_recorder is not None and self._audio_recorder.is_recording:
+        if (
+            not self.is_injecting
+            and self._audio_recorder is not None
+            and self._audio_recorder.is_recording
+        ):
             self._audio_recorder.write_user_audio(pcm_b64)
         await self._voice_relay.send_audio(pcm_b64)
+
+    @property
+    def is_injecting(self) -> bool:
+        """True while listen_recording is replaying past audio into the WS.
+
+        Three call sites consult this flag, all backend-side:
+        - ``send_voice_audio_in`` skips writing the chunk into the audio
+          recorder (the bytes are a replay, not the user's mic).
+        - ``process_voice_event`` skips persisting voice_transcription /
+          voice_interrupted JSONL entries fired by the provider's VAD/ASR
+          chewing on the injected audio.
+        - The route-layer mirror (``_on_event_for_frontend``) skips
+          forwarding the corresponding ``input_audio_buffer.*`` and
+          ``transcription.completed`` events to the frontend, so the UI
+          never tries to barge-in on a replay it didn't actually hear.
+        """
+        return self._injection_active
+
+    def extend_injection_window(self, seconds: float) -> None:
+        """Mark the injection window as active for at least ``seconds`` more.
+
+        Idempotent and safe to call repeatedly: the deadline only ever
+        moves forward.  A single watchdog task watches the deadline and
+        clears the flag when it expires; calling
+        ``extend_injection_window`` again from the tool keeps pushing the
+        deadline out, so a long playback (or one with a generous
+        ASR-completion grace window) stays suppressed.
+
+        Must be called from inside the asyncio loop.
+        """
+        loop = asyncio.get_running_loop()
+        new_deadline = loop.time() + max(0.1, seconds)
+        if new_deadline > self._injection_until:
+            self._injection_until = new_deadline
+        if not self._injection_active:
+            self._injection_active = True
+        if self._injection_watchdog is None or self._injection_watchdog.done():
+            self._injection_watchdog = asyncio.create_task(
+                self._injection_watchdog_loop(),
+                name="voice-injection-watchdog",
+            )
+
+    async def _injection_watchdog_loop(self) -> None:
+        """Sleep until the injection deadline, then clear the flag.
+
+        Re-checks the deadline on each wake so an extension done while we
+        were sleeping just reschedules the next check rather than ending
+        suppression early.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            while True:
+                remaining = self._injection_until - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            self._injection_active = False
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("injection watchdog crashed")
+            # Fail closed: clear the flag so suppression doesn't leak.
+            self._injection_active = False
 
     def record_assistant_audio(self, pcm_b64: str) -> None:
         """Record assistant audio chunk (called from route layer for WS providers)."""
@@ -579,8 +659,15 @@ class OrchestratorSession:
 
         event_type = event.get("type", "")
 
-        # User speech transcript — arrives when Whisper transcription completes
-        if event_type == "conversation.item.input_audio_transcription.completed":
+        # User speech transcript — arrives when Whisper transcription completes.
+        # Skip while listen_recording is replaying past audio into the WS:
+        # the provider's ASR is transcribing those bytes and firing this
+        # event for each fragment, and persisting them as user turns would
+        # corrupt history with phantom messages that the user never spoke.
+        if (
+            event_type == "conversation.item.input_audio_transcription.completed"
+            and not self.is_injecting
+        ):
             transcript = event.get("transcript", "")
             if transcript:
                 # Build message content with optional audio segment reference
@@ -707,12 +794,16 @@ class OrchestratorSession:
                 self._writer.append(entry)
             self._pending_assistant_transcript = None
 
-        # Barge-in interruption — mark in JSONL
+        # Barge-in interruption — mark in JSONL.  While injecting past
+        # audio via listen_recording, the provider's VAD fires this event
+        # for every chunk it detects in the replay; those are not real
+        # interruptions and must not be persisted.
         elif event_type == "input_audio_buffer.speech_started":
-            self._writer.append({
-                "type": "voice_interrupted",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            if not self.is_injecting:
+                self._writer.append({
+                    "type": "voice_interrupted",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
 
         return commands
 
@@ -996,6 +1087,16 @@ class OrchestratorSession:
             await self.stop_voice_relay()
         except Exception:  # noqa: BLE001
             logger.exception("stop_voice_relay failed during session stop")
+        # Cancel the injection watchdog if it's still scheduled
+        if self._injection_watchdog is not None and not self._injection_watchdog.done():
+            self._injection_watchdog.cancel()
+            try:
+                await self._injection_watchdog
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._injection_watchdog = None
+        self._injection_active = False
+        self._injection_until = 0.0
         # Stop audio recorder
         if self._audio_recorder is not None:
             try:

@@ -432,13 +432,30 @@ async def _attach_voice_payload(
                     "audio": b64,
                 })
 
+            # Provider events fired by audio that listen_recording injected
+            # into the WS must not reach the frontend: the UI's barge-in
+            # handler would respond to a speech_started by sending
+            # response.cancel, killing the agent's reply mid-stream — the
+            # feedback loop we're guarding against.  Backend still
+            # processes them (for the writer gates in process_voice_event).
+            _INJECTION_SUPPRESSED_TYPES = frozenset({
+                "input_audio_buffer.speech_started",
+                "input_audio_buffer.speech_stopped",
+                "input_audio_buffer.committed",
+                "conversation.item.input_audio_transcription.completed",
+            })
+
             async def _on_event_for_frontend(event: dict) -> None:
                 # Mirror provider events to the frontend so the UI can
                 # reflect transcripts, status, etc.
-                await pool.broadcast_orchestrator({
-                    "type": "voice_event",
-                    "event": event,
-                })
+                if not (
+                    session.is_injecting
+                    and event.get("type") in _INJECTION_SUPPRESSED_TYPES
+                ):
+                    await pool.broadcast_orchestrator({
+                        "type": "voice_event",
+                        "event": event,
+                    })
                 # Tool calls go through _handle_voice_tool_call so the
                 # tool_use / tool_result broadcasts fire and execution
                 # happens off the relay-drain task.

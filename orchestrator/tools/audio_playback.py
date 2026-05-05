@@ -144,12 +144,25 @@ async def listen_recording(
     # Calculate actual duration
     actual_duration_ms = (len(audio_bytes) / 2 / sample_rate) * 1000
 
+    # Arm the injection window before sending the first byte.  See
+    # OrchestratorSession.is_injecting for what the window suppresses.
+    # The grace must outlast both the pacing AND the provider's own ASR
+    # completion delay — Qwen has been observed firing
+    # transcription.completed events ~10s after the last
+    # input_audio_buffer.append.
+    INJECTION_GRACE_SEC = 15.0
+    audio_duration_sec = actual_duration_ms / 1000.0
+    session.extend_injection_window(audio_duration_sec + INJECTION_GRACE_SEC)
+
     # Stream chunks to the voice session
     chunks_sent = 0
     bytes_sent = 0
 
     try:
         offset = 0
+        # Re-extend the window periodically during long playbacks so the
+        # deadline always sits comfortably ahead of the pacing.
+        chunks_per_extension = max(1, int(2000 / chunk_duration_ms))  # every ~2s
         while offset < len(audio_bytes):
             chunk = audio_bytes[offset:offset + chunk_size_bytes]
             if not chunk:
@@ -162,8 +175,16 @@ async def listen_recording(
             bytes_sent += len(chunk)
             offset += chunk_size_bytes
 
+            if chunks_sent % chunks_per_extension == 0:
+                remaining_bytes = max(0, len(audio_bytes) - offset)
+                remaining_sec = (remaining_bytes / 2 / sample_rate)
+                session.extend_injection_window(remaining_sec + INJECTION_GRACE_SEC)
+
             # Pace at ~80% real-time to avoid overwhelming the stream
             await asyncio.sleep(chunk_duration_ms * 0.0008)
+
+        # Final extension covers ASR catching up after the last chunk.
+        session.extend_injection_window(INJECTION_GRACE_SEC)
 
         logger.info(
             "listen_recording complete recording=%s channel=%s %d-%dms chunks=%d",
@@ -185,6 +206,12 @@ async def listen_recording(
         })
 
     except Exception as e:
+        # Even on failure, hold the suppression window briefly so any
+        # already-in-flight transcription events don't slip through.
+        try:
+            session.extend_injection_window(5.0)
+        except Exception:  # noqa: BLE001
+            pass
         logger.exception("Failed to inject audio")
         return json.dumps({
             "error": f"Audio injection failed: {str(e)}",
