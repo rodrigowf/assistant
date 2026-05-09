@@ -350,7 +350,8 @@ class WebSocketManager {
                     // response.audio_transcript.done anyway.
                     val inner = json.optJSONObject("event")
                     val innerType = inner?.optString("type", "")
-                    if (innerType == "response.audio_transcript.delta" ||
+                    if (innerType == "response.output_audio_transcript.delta" ||
+                        innerType == "response.audio_transcript.delta" ||
                         innerType == "response.text.delta" ||
                         innerType == "response.function_call_arguments.delta") {
                         // No-op — neither the UI nor the provider needs

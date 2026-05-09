@@ -560,7 +560,9 @@ class OpenAIVoiceProvider(
             val json = JSONObject(message)
             val eventType = json.optString("type", "")
 
-            val isNoisyEvent = eventType == "response.audio.delta" || eventType == "response.audio_transcript.delta"
+            val isNoisyEvent = eventType == "response.audio.delta"
+                || eventType == "response.output_audio_transcript.delta"
+                || eventType == "response.audio_transcript.delta"
             if (!isNoisyEvent) {
                 Log.d(TAG, "[VOICE_EVENT] ${t()} type=$eventType state=${_state.value} agentPlaying=$agentAudioPlaying gain=$micGainLevel gainSaved=$gainBeforeSpeaking")
             }
@@ -634,9 +636,14 @@ class OpenAIVoiceProvider(
                     Log.i(TAG, "[VOICE_EVENT] ${t()} USER_TRANSCRIPT: \"$transcript\"")
                     if (transcript.isNotEmpty()) _events.tryEmit(VoiceEvent.UserTranscript(transcript))
                 }
+                // GA gpt-realtime emits ``response.output_audio_transcript.*``;
+                // legacy beta gpt-4o-realtime-preview models still emit
+                // ``response.audio_transcript.*``.  Accept both.
+                "response.output_audio_transcript.delta",
                 "response.audio_transcript.delta" -> {
                     _events.tryEmit(VoiceEvent.TextDelta(json.optString("delta", "")))
                 }
+                "response.output_audio_transcript.done",
                 "response.audio_transcript.done" -> {
                     val transcript = json.optString("transcript", "")
                     Log.i(TAG, "[VOICE_EVENT] ${t()} AGENT_TRANSCRIPT: \"$transcript\"")
