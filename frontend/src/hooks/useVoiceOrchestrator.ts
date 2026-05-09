@@ -135,6 +135,16 @@ export function useVoiceOrchestrator(
   }, []);
 
   // Send a raw provider event. WebRTC: data channel; WS: orchestrator WS mirror.
+  //
+  // Critically, ``session_started`` (which carries the backend-built
+  // ``voice_session_update``) arrives BEFORE ``connectWebRTCVoiceSession``
+  // returns and assigns ``transportRef.current``.  So when the orchestrator
+  // hands us the session.update payload, the transport is still null —
+  // dropping the event here would leave the OpenAI session running with
+  // its defaults (no system prompt, no tools, no input transcription),
+  // which is exactly the "voice mode is isolated from my architecture"
+  // bug.  Queue when the transport isn't ready yet (or the data channel
+  // isn't open yet) and let the WebRTC ``onConnected`` flush the queue.
   const sendProviderEvent = useCallback((event: RealtimeEvent) => {
     const t = transportRef.current;
     vlog("send", event.type, "transport=", t?.kind);
@@ -146,6 +156,10 @@ export function useVoiceOrchestrator(
       }
     } else if (t?.kind === "websocket") {
       wsRef.current?.send({ type: "voice_event", event });
+    } else {
+      // Transport not yet created.  Queue; ``onConnected`` (WebRTC) or the
+      // WS-transport startup path will drain it.
+      pendingCommandsRef.current.push(event);
     }
   }, []);
 
@@ -263,9 +277,18 @@ export function useVoiceOrchestrator(
       }
     }
 
-    if (eventType === "response.audio_transcript.delta" || eventType === "response.text.delta") {
+    // GA gpt-realtime uses ``response.output_audio_transcript.*``;
+    // legacy beta models and Qwen still use ``response.audio_transcript.*``.
+    if (
+      eventType === "response.output_audio_transcript.delta"
+      || eventType === "response.audio_transcript.delta"
+      || eventType === "response.text.delta"
+    ) {
       optsRef.current.onAssistantDelta?.((event.delta as string) || "");
-    } else if (eventType === "response.audio_transcript.done") {
+    } else if (
+      eventType === "response.output_audio_transcript.done"
+      || eventType === "response.audio_transcript.done"
+    ) {
       optsRef.current.onAssistantComplete?.((event.transcript as string) || "");
     } else if (eventType === "response.text.done") {
       optsRef.current.onAssistantComplete?.((event.text as string) || "");
@@ -357,7 +380,8 @@ export function useVoiceOrchestrator(
     if (
       event.type !== "voice_audio_out" &&
       !(event.type === "voice_event" && (
-        (event.event as RealtimeEvent | undefined)?.type === "response.audio_transcript.delta"
+        (event.event as RealtimeEvent | undefined)?.type === "response.output_audio_transcript.delta"
+        || (event.event as RealtimeEvent | undefined)?.type === "response.audio_transcript.delta"
         || (event.event as RealtimeEvent | undefined)?.type === "response.text.delta"
       ))
     ) {
@@ -553,6 +577,13 @@ export function useVoiceOrchestrator(
         });
         transportRef.current = t;
         startWSMicAnalysis(t.micStream);
+        // Drain any provider events that were queued while the transport
+        // was being set up (e.g. session.update arriving on session_started
+        // before connectWebSocketVoiceSession resolved).
+        const pending = pendingCommandsRef.current.splice(0);
+        for (const cmd of pending) {
+          wsRef.current?.send({ type: "voice_event", event: cmd });
+        }
         updateStatus("active");
       } catch (err) {
         setVoiceError(err instanceof Error ? err.message : String(err));

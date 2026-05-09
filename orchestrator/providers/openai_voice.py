@@ -158,7 +158,10 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
                 if call_id in self._pending_args:
                     self._pending_args[call_id] += event.get("delta", "")
 
-            elif event_type == "response.audio_transcript.delta":
+            elif event_type in (
+                "response.output_audio_transcript.delta",
+                "response.audio_transcript.delta",
+            ):
                 self._current_transcript += event.get("delta", "")
 
             translated = self.translate_event(event)
@@ -178,11 +181,21 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
         """
         event_type = raw_event.get("type", "")
 
-        if event_type == "response.audio_transcript.delta":
+        # GA gpt-realtime emits ``response.output_audio_transcript.*``;
+        # legacy beta gpt-4o-realtime-preview models still emit
+        # ``response.audio_transcript.*``.  Accept both so the same
+        # provider keeps working across model versions.
+        if event_type in (
+            "response.output_audio_transcript.delta",
+            "response.audio_transcript.delta",
+        ):
             text = raw_event.get("delta", "")
             return TextDelta(text=text) if text else None
 
-        if event_type == "response.audio_transcript.done":
+        if event_type in (
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.done",
+        ):
             return TextComplete(text=raw_event.get("transcript", ""))
 
         if event_type == "response.function_call_arguments.done":
@@ -248,22 +261,42 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
         voice: str | None = None,
         vad: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Build the OpenAI ``session.update`` payload."""
+        """Build the OpenAI ``session.update`` payload (GA Realtime schema).
+
+        The GA ``gpt-realtime`` model rejects the legacy beta shape
+        (``modalities``, flat ``voice``/``input_audio_transcription``,
+        ``turn_detection``).  It uses ``output_modalities``, an ``audio``
+        object split into ``input`` and ``output`` sub-objects, and the
+        session itself must declare ``type: "realtime"``.  Sending the
+        legacy shape causes the model to silently keep its defaults
+        (no system prompt, no tools, no input transcription) — which is
+        exactly what masquerades as "voice mode is isolated from my
+        architecture".  Schema verified against the ``session.created``
+        echo from a live connection.
+        """
+        transcription: dict[str, Any] = {"model": "whisper-1"}
+        if self._transcription_language:
+            transcription["language"] = self._transcription_language
         return {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "model": self._model,
-                "voice": voice or self._voice,
                 "instructions": system,
                 "tools": tools,
                 "tool_choice": "auto",
-                "modalities": ["text", "audio"],
-                "turn_detection": vad or DEFAULT_VAD,
-                "input_audio_transcription": (
-                    {"model": "whisper-1", "language": self._transcription_language}
-                    if self._transcription_language
-                    else {"model": "whisper-1"}
-                ),
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": transcription,
+                        "turn_detection": vad or DEFAULT_VAD,
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": voice or self._voice,
+                    },
+                },
             },
         }
 

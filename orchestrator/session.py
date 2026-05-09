@@ -769,7 +769,12 @@ class OrchestratorSession:
         # turn ended in status="completed" (response.done below). Otherwise
         # the transcript is a fragment cut off by barge-in or response.cancel
         # and would pollute history with sentences like "Yeah, I think".
-        elif event_type == "response.audio_transcript.done":
+        # GA OpenAI gpt-realtime emits ``response.output_audio_transcript.done``;
+        # legacy beta models and Qwen still emit ``response.audio_transcript.done``.
+        elif event_type in (
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.done",
+        ):
             transcript = event.get("transcript", "")
             if transcript:
                 self._pending_assistant_transcript = transcript

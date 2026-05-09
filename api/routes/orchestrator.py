@@ -649,6 +649,7 @@ async def _handle_voice_event(
         # transcript deltas (those would flood).  This gives us a clean
         # client→backend flow timeline for crash post-mortem.
         if event_type not in (
+            "response.output_audio_transcript.delta",
             "response.audio_transcript.delta",
             "response.text.delta",
             "input_audio_buffer.append",
