@@ -687,9 +687,10 @@ class OrchestratorSession:
                     segment = self._audio_recorder.mark_user_turn_end(transcript)
 
                 if segment:
-                    # Include audio reference in the message text itself
+                    # Include audio reference in the message text itself.
+                    # Wall-clock range — pass straight to listen_recording.
                     content = (
-                        f"[voice, recording: {self._local_id} user "
+                        f"[voice, recording: {self._local_id} "
                         f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
                     )
                 else:
@@ -791,9 +792,10 @@ class OrchestratorSession:
                     segment = self._audio_recorder.mark_assistant_turn_end(staged)
 
                 if segment:
-                    # Include audio reference in the message text itself
+                    # Include audio reference in the message text itself.
+                    # Wall-clock range — pass straight to listen_recording.
                     content = (
-                        f"[voice, recording: {self._local_id} assistant "
+                        f"[voice, recording: {self._local_id} "
                         f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
                     )
                 else:

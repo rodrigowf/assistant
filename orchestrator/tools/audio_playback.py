@@ -18,7 +18,7 @@ import logging
 
 from orchestrator.audio_recorder import (
     get_recording,
-    get_recording_audio,
+    get_recording_audio_by_wall_clock,
 )
 from orchestrator.tools import registry
 
@@ -28,66 +28,63 @@ logger = logging.getLogger(__name__)
 @registry.register(
     name="listen_recording",
     description=(
-        "Inject audio from a past voice session INTO the active real-time conversation. "
-        "Use this to 'hear' speech from previous conversations.\n\n"
-        "The conversation history contains audio_segment entries with timestamps "
-        "(start_ms, end_ms, channel) pointing into stored recordings. Pass the "
-        "session_id and timestamps from those entries to replay that audio.\n\n"
+        "Replay a wall-clock time range from a past voice session INTO the active "
+        "real-time conversation, so the model can 'hear' both sides of a previous "
+        "conversation in their natural chronological order.\n\n"
+        "Conversation history contains markers like "
+        "[voice, recording: <session_id> <start_ms>-<end_ms>ms]. Pass those values "
+        "to replay that range. Both user and assistant audio are included, "
+        "interleaved exactly as they happened. Silences between turns were never "
+        "recorded (VAD-stripped), so playback is dense — no padding.\n\n"
+        "To replay a full conversation, pass start_ms=0 and end_ms set high enough "
+        "to cover the whole recording (use peek_history or the recording's metadata "
+        "to find the duration).\n\n"
         "REQUIREMENTS:\n"
-        "- There must be an active voice session using a WebSocket provider\n"
-        "- The voice relay must be running\n\n"
-        "The audio is streamed into the voice input buffer. The real-time model "
-        "will process it as if someone had spoken it."
+        "- Active voice session using a WebSocket provider (Qwen, Gemini)\n"
+        "- The voice relay must be running"
     ),
     input_schema={
         "type": "object",
         "properties": {
             "session_id": {
                 "type": "string",
-                "description": "The session ID of the stored recording (from audio_segment in history)",
-            },
-            "channel": {
-                "type": "string",
-                "enum": ["user", "assistant"],
-                "description": "Which channel: 'user' for user speech, 'assistant' for assistant speech",
+                "description": "The session ID of the stored recording (from the history marker)",
             },
             "start_ms": {
                 "type": "integer",
-                "description": "Start position in milliseconds (from audio_segment.start_ms)",
+                "description": "Wall-clock start in milliseconds (ms since session start)",
                 "minimum": 0,
             },
             "end_ms": {
                 "type": "integer",
-                "description": "End position in milliseconds (from audio_segment.end_ms)",
+                "description": "Wall-clock end in milliseconds (ms since session start)",
                 "minimum": 0,
             },
         },
-        "required": ["session_id", "channel", "start_ms", "end_ms"],
+        "required": ["session_id", "start_ms", "end_ms"],
     },
 )
 async def listen_recording(
     context: dict,
     session_id: str,
-    channel: str,
     start_ms: int,
     end_ms: int,
 ) -> str:
     """Inject stored audio into the active voice session.
 
     Feeds past recordings into the live WebSocket stream so the real-time
-    model can hear them.
+    model can hear them. Both channels (user + assistant) play back
+    interleaved in wall-clock order.
     """
-    # Validate channel
-    if channel not in ("user", "assistant"):
-        return json.dumps({"error": f"Invalid channel: {channel}. Must be 'user' or 'assistant'."})
-
     # Validate time range
     if end_ms <= start_ms:
         return json.dumps({"error": "end_ms must be greater than start_ms."})
 
     duration_ms = end_ms - start_ms
-    if duration_ms > 60000:
-        return json.dumps({"error": "Maximum duration is 60 seconds (60000ms)."})
+    # 5-minute cap. Recording is silence-stripped already, so even a long
+    # wall-clock window stays well under this in actual bytes.
+    if duration_ms > 300000:
+        return json.dumps({"error": "Maximum range is 5 minutes (300000ms)."})
 
     # Get the orchestrator session from context
     session = context.get("session")
@@ -127,13 +124,20 @@ async def listen_recording(
     if not recording.get("has_audio", False):
         return json.dumps({"error": "Recording has no audio file."})
 
-    # Get the audio bytes
-    audio_bytes = get_recording_audio(session_id, channel, start_ms, duration_ms)
+    # Get the audio bytes — both channels in wall-clock order.
+    audio_bytes = get_recording_audio_by_wall_clock(session_id, start_ms, end_ms)
     if audio_bytes is None:
         return json.dumps({"error": "Failed to read audio data."})
 
     if len(audio_bytes) == 0:
-        return json.dumps({"error": "Audio segment is empty."})
+        return json.dumps({
+            "error": "No audio in that range.",
+            "hint": (
+                "The range may fall in a silence between turns "
+                "(silences are not recorded), or be outside the recording's "
+                "duration."
+            ),
+        })
 
     # Get sample rate and calculate chunk size
     sample_rate = recording.get("sample_rate", 24000)
@@ -215,9 +219,8 @@ async def listen_recording(
                 logger.exception("Failed to commit input_audio_buffer after injection")
 
         logger.info(
-            "listen_recording complete recording=%s channel=%s %d-%dms chunks=%d",
+            "listen_recording complete recording=%s %d-%dms chunks=%d",
             session_id[:8],
-            channel,
             start_ms,
             end_ms,
             chunks_sent,
@@ -226,10 +229,9 @@ async def listen_recording(
         return json.dumps({
             "success": True,
             "session_id": session_id,
-            "channel": channel,
             "start_ms": start_ms,
             "end_ms": end_ms,
-            "duration_ms": actual_duration_ms,
+            "audio_duration_ms": actual_duration_ms,
             "bytes_sent": bytes_sent,
         })
 

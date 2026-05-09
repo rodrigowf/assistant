@@ -53,11 +53,17 @@ class AudioChunk:
 
 @dataclass
 class AudioSegment:
-    """A segment of audio with timing info, linked to a conversation turn."""
+    """A segment of audio with timing info, linked to a conversation turn.
+
+    ``start_ms`` and ``end_ms`` are **wall-clock** offsets (ms since
+    session start), aligned with ``AudioChunk.timestamp_ms``. Use them
+    directly with ``listen_recording`` to replay both speakers in
+    chronological order.
+    """
 
     channel: str  # "user" or "assistant"
-    start_ms: int  # Offset into the channel's audio stream
-    end_ms: int  # End offset
+    start_ms: int  # Wall-clock start (ms since session start)
+    end_ms: int  # Wall-clock end (ms since session start)
     transcript: str = ""  # Text transcript if available
     turn_index: int = 0  # Which turn in the conversation
 
@@ -212,9 +218,9 @@ class AudioRecorder:
         if not self._started or self._audio_file is None:
             return
         try:
-            # Track segment start if this is first chunk of a new segment
+            # Stamp the wall-clock start of a new segment on its first chunk.
             if self._current_user_segment_start < 0:
-                self._current_user_segment_start = self._metadata.user_duration_ms
+                self._current_user_segment_start = self._elapsed_ms()
 
             pcm_bytes = base64.b64decode(pcm_b64)
             byte_offset = self._metadata.total_bytes
@@ -244,9 +250,9 @@ class AudioRecorder:
         if not self._started or self._audio_file is None:
             return
         try:
-            # Track segment start if this is first chunk of a new segment
+            # Stamp the wall-clock start of a new segment on its first chunk.
             if self._current_assistant_segment_start < 0:
-                self._current_assistant_segment_start = self._metadata.assistant_duration_ms
+                self._current_assistant_segment_start = self._elapsed_ms()
 
             pcm_bytes = base64.b64decode(pcm_b64)
             byte_offset = self._metadata.total_bytes
@@ -279,7 +285,7 @@ class AudioRecorder:
         segment = AudioSegment(
             channel="user",
             start_ms=self._current_user_segment_start,
-            end_ms=self._metadata.user_duration_ms,
+            end_ms=self._elapsed_ms(),
             transcript=transcript,
             turn_index=self._turn_index,
         )
@@ -297,7 +303,7 @@ class AudioRecorder:
         segment = AudioSegment(
             channel="assistant",
             start_ms=self._current_assistant_segment_start,
-            end_ms=self._metadata.assistant_duration_ms,
+            end_ms=self._elapsed_ms(),
             transcript=transcript,
             turn_index=self._turn_index,
         )
@@ -359,6 +365,64 @@ def get_recording(session_id: str) -> dict[str, Any] | None:
         return meta
     except Exception:
         return None
+
+
+def get_recording_audio_by_wall_clock(
+    session_id: str,
+    start_ms: int,
+    end_ms: int,
+) -> bytes | None:
+    """Read raw PCM audio across both channels for a wall-clock time range.
+
+    Walks the chunk index and concatenates every chunk whose
+    ``timestamp_ms`` (ms since session start) falls in
+    ``[start_ms, end_ms)``, in disk/arrival order. Because audio.pcm is
+    already chronological and silence-stripped (VAD never sent the
+    silent moments upstream, so they were never recorded), the result
+    is the natural conversation flow — user and assistant chunks
+    interleaved exactly as they happened, with no silence padding.
+
+    Args:
+        session_id: The session to read from
+        start_ms: Wall-clock start (ms since session start)
+        end_ms: Wall-clock end (ms since session start)
+
+    Returns:
+        Raw PCM16 bytes for the requested range, or None on error.
+    """
+    session_dir = RECORDINGS_DIR / session_id
+    audio_file = session_dir / "audio.pcm"
+    index_file = session_dir / "index.json"
+
+    if not audio_file.exists() or not index_file.exists():
+        return None
+
+    try:
+        with open(index_file) as f:
+            meta = json.load(f)
+    except Exception:
+        return None
+
+    chunks = meta.get("chunks", [])
+    if not chunks:
+        return None
+
+    result = bytearray()
+    try:
+        with open(audio_file, "rb") as f:
+            for chunk in chunks:
+                ts = chunk["timestamp_ms"]
+                if ts < start_ms:
+                    continue
+                if ts >= end_ms:
+                    break
+                f.seek(chunk["byte_offset"])
+                result.extend(f.read(chunk["byte_length"]))
+    except Exception:
+        logger.exception("Failed to read audio from %s", audio_file)
+        return None
+
+    return bytes(result)
 
 
 def get_recording_audio(
