@@ -390,14 +390,32 @@ class OpenAIVoiceProvider(
                 when (state) {
                     PeerConnection.IceConnectionState.CONNECTED -> Log.d(TAG, "ICE connected")
                     PeerConnection.IceConnectionState.DISCONNECTED -> {
-                        Log.w(TAG, "ICE disconnected")
-                        handleConnectionClosed()
+                        // DISCONNECTED is transient — ICE may recover on its own
+                        // (network blip, NAT rebinding).  Tearing down here
+                        // synchronously from the signaling-thread callback
+                        // disposed the PeerConnection from inside its own
+                        // callback and crashed the signaling thread on the
+                        // next mutex lock ("FORTIFY: pthread_mutex_lock called
+                        // on a destroyed mutex").  Just observe; FAILED is
+                        // the actual terminal state we react to.
+                        Log.w(TAG, "ICE disconnected (transient — waiting for FAILED before teardown)")
                     }
                     PeerConnection.IceConnectionState.FAILED -> {
                         Log.e(TAG, "ICE connection failed")
                         _state.value = VoiceState.Error("Connection failed")
                         _events.tryEmit(VoiceEvent.Error("Connection failed"))
+                        // disconnect() is a suspend that does the cleanup —
+                        // running it through scope.launch keeps it OFF the
+                        // signaling thread, which is essential: disposing the
+                        // peer connection / factory from inside their own
+                        // callback corrupts the mutex they're about to lock
+                        // as control returns up the stack.
                         scope.launch { disconnect() }
+                    }
+                    PeerConnection.IceConnectionState.CLOSED -> {
+                        // CLOSED is reached after our own disconnect() — the
+                        // VoiceManager will tear the provider down separately.
+                        Log.d(TAG, "ICE closed")
                     }
                     else -> {}
                 }
