@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from manager.session import SessionAbandoned
 from manager.types import (
     PermissionRequest,
     PermissionResolved,
@@ -472,13 +473,38 @@ class BackgroundAgentRunner:
                     record.cost = event.cost or 0.0
                     record.turns = event.num_turns or 0
 
+        async def _consume_with_retry() -> None:
+            """Run _consume; if it raises SessionAbandoned, interrupt the SDK
+            and retry once.  Single retry only — repeated abandonment means
+            the network path is durably broken, not a transient blip."""
+            try:
+                await _consume()
+            except SessionAbandoned as exc:
+                logger.warning(
+                    "Turn %s abandoned after %.0fs (no SDK messages); retrying once",
+                    record.turn_id, exc.elapsed_seconds,
+                )
+                self._buffer(record, "retry", {
+                    "reason": "abandoned",
+                    "elapsed_seconds": exc.elapsed_seconds,
+                })
+                # Interrupt the wedged SDK turn so the bundled `claude`
+                # subprocess isn't left stuck on the original query.
+                try:
+                    await self._pool.interrupt(record.session_id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to interrupt abandoned turn %s", record.turn_id)
+                # Brief pause so the SDK can settle before the retry.
+                await asyncio.sleep(1.0)
+                await _consume()
+
         # The try/except below sets a specific status; the outer finally is a
         # safety net for the case where the task is cancelled BEFORE the body
         # runs at all (asyncio can do that — cancel-before-start) so _finalise
         # would otherwise never run and a Notification would leak.
         try:
             try:
-                await asyncio.wait_for(_consume(), timeout=timeout)
+                await asyncio.wait_for(_consume_with_retry(), timeout=timeout)
             except asyncio.TimeoutError:
                 try:
                     await self._pool.interrupt(record.session_id)
@@ -488,6 +514,11 @@ class BackgroundAgentRunner:
             except asyncio.CancelledError:
                 self._finalise(record, status="cancelled", error="cancelled by orchestrator")
                 raise
+            except SessionAbandoned as exc:
+                # Retry already happened inside _consume_with_retry and
+                # also failed — give up and surface the failure.
+                logger.error("Turn %s abandoned twice (%.0fs); giving up", record.turn_id, exc.elapsed_seconds)
+                self._finalise(record, status="failed", error=f"upstream wedged after retry: {exc}")
             except Exception as exc:  # noqa: BLE001
                 logger.exception("BackgroundAgentRunner._drive failed for turn %s", record.turn_id)
                 self._finalise(record, status="failed", error=str(exc))

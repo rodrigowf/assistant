@@ -171,6 +171,28 @@ _PERMISSION_GATING_PROMPT = (
 _STALL_FIRST_NOTICE_S = 120.0   # first warning after 2 min of silence
 _STALL_REPEAT_INTERVAL_S = 60.0  # re-emit every minute thereafter
 
+# Abandoned-turn detection: distinct from a mid-tool stall.  If the SDK has
+# produced *zero* messages in this turn after this many seconds, the request
+# almost certainly never reached Anthropic (e.g. the kernel TCP path to the
+# API silently wedged with retransmits — observed once with cwnd:1
+# backoff:10 lastrcv:8min).  Raise SessionAbandoned so callers can give up
+# cleanly and (in the orchestrator's case) retry once.
+_TURN_ABANDON_S = 240.0
+
+
+class SessionAbandoned(Exception):
+    """Raised by SessionManager.send when a turn produced zero events for so
+    long we conclude the upstream request never landed.  Distinct from a
+    mid-tool stall: by the time this fires, ``last_tool_name`` is None and
+    ``messages_received == 0`` — no progress has been made at all."""
+
+    def __init__(self, elapsed_seconds: float):
+        super().__init__(
+            f"Turn produced no SDK messages after {elapsed_seconds:.0f}s "
+            "(upstream request appears wedged)"
+        )
+        self.elapsed_seconds = elapsed_seconds
+
 
 def _process_alive(pid: int) -> bool:
     """Return True if a process with *pid* exists and we can signal it.
@@ -671,8 +693,10 @@ class SessionManager:
                 await queue.put(SENTINEL_DONE)
 
         drain_task = asyncio.create_task(_drain(), name="sdk-receive-drain")
-        last_msg_at = loop.time()
+        turn_started_at = loop.time()
+        last_msg_at = turn_started_at
         stall_notified_at: float | None = None
+        messages_received = 0
 
         try:
             while True:
@@ -691,6 +715,12 @@ class SessionManager:
                     )
                 except asyncio.TimeoutError:
                     now = loop.time()
+                    # If we've never received a single message and we've been
+                    # waiting longer than _TURN_ABANDON_S, the upstream request
+                    # never landed.  Give up so the caller can retry instead
+                    # of hanging forever.
+                    if messages_received == 0 and (now - turn_started_at) >= _TURN_ABANDON_S:
+                        raise SessionAbandoned(now - turn_started_at)
                     yield SessionStalled(
                         elapsed_seconds=now - last_msg_at,
                         last_tool_name=last_tool_name,
@@ -701,6 +731,7 @@ class SessionManager:
 
                 last_msg_at = loop.time()
                 stall_notified_at = None  # reset on any fresh activity
+                messages_received += 1
 
                 if msg is SENTINEL_DONE:
                     break

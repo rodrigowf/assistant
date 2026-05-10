@@ -306,11 +306,37 @@ async def _handle_send(
 
     The session_id is the stable local_id and never changes.
     """
-    try:
-        async for event in pool.send(session_id, text, source_ws=ws):
+    from manager.session import SessionAbandoned
+
+    async def _stream_once() -> None:
+        async for _event in pool.send(session_id, text, source_ws=ws):
             pass  # Events already broadcast by pool
+
+    try:
+        try:
+            await _stream_once()
+        except SessionAbandoned as exc:
+            # First attempt: the upstream request never produced any events.
+            # Interrupt the wedged turn and retry exactly once.
+            logger.warning("Turn abandoned for session %s after %.0fs; retrying once", session_id, exc.elapsed_seconds)
+            await ws.send_bytes(orjson.dumps({
+                "type": "status", "status": "retrying",
+                "detail": f"upstream silent for {exc.elapsed_seconds:.0f}s, retrying",
+            }))
+            try:
+                await pool.interrupt(session_id)
+            except Exception:
+                logger.exception("Failed to interrupt abandoned turn for %s", session_id)
+            await asyncio.sleep(1.0)
+            await _stream_once()
     except asyncio.CancelledError:
         raise  # Let the task cancel propagate cleanly
+    except SessionAbandoned as exc:
+        # Retry also gave up — surface the failure so the user sees something.
+        await ws.send_bytes(orjson.dumps({
+            "type": "error", "error": "upstream_wedged",
+            "detail": f"Anthropic upstream did not respond after retry ({exc.elapsed_seconds:.0f}s). Try again in a moment.",
+        }))
     except Exception as e:
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "send_failed",

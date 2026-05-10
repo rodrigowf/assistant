@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from manager.config import ManagerConfig
-from manager.session import SessionManager
+from manager.session import SessionAbandoned, SessionManager
 from manager.types import (
     CompactComplete,
     SessionStalled,
@@ -699,6 +699,122 @@ class TestSessionManagerStallWatchdog:
         assert stall_events[0].last_tool_use_id == "toolu_stuck"
         assert stall_events[0].elapsed_seconds > 0
         assert len(turn_completes) == 1
+
+    @pytest.mark.asyncio
+    async def test_abandoned_when_zero_messages_received(self):
+        """SessionAbandoned is raised when the SDK produces no messages
+        for longer than the abandon threshold — distinct from a mid-tool
+        stall, where some progress has already been made.
+
+        This models the wedged-TCP-to-Anthropic case: the request is
+        sent but the upstream silently never replies.  Caller (the
+        orchestrator) should retry once instead of hanging forever.
+        """
+        from claude_agent_sdk import SystemMessage
+        import manager.session as session_mod
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+
+        original_first = session_mod._STALL_FIRST_NOTICE_S
+        original_repeat = session_mod._STALL_REPEAT_INTERVAL_S
+        original_abandon = session_mod._TURN_ABANDON_S
+        session_mod._STALL_FIRST_NOTICE_S = 0.05
+        session_mod._STALL_REPEAT_INTERVAL_S = 0.05
+        session_mod._TURN_ABANDON_S = 0.2
+
+        try:
+            never = asyncio.Event()  # never set
+
+            async def fake_response():
+                # SDK never produces any message — models a wedged TCP path
+                # where the request body never reaches Anthropic.
+                await never.wait()
+                yield  # unreachable; satisfies async generator
+
+            client = _make_mock_client([init_msg], fake_response)
+
+            with patch("manager.session.ClaudeSDKClient", return_value=client):
+                sm = SessionManager()
+                await sm.start()
+
+                with pytest.raises(SessionAbandoned) as exc_info:
+                    async for _ in sm.send("hi"):
+                        pass
+
+                assert exc_info.value.elapsed_seconds >= 0.2
+        finally:
+            session_mod._STALL_FIRST_NOTICE_S = original_first
+            session_mod._STALL_REPEAT_INTERVAL_S = original_repeat
+            session_mod._TURN_ABANDON_S = original_abandon
+
+    @pytest.mark.asyncio
+    async def test_no_abandon_after_first_message_received(self):
+        """If the SDK has produced at least one message, a subsequent stall
+        does NOT raise SessionAbandoned — that path is reserved for the
+        upstream-never-responded case.  A mid-tool stall stays advisory.
+
+        Sets ``_TURN_ABANDON_S`` to a value that *would* trigger if the
+        abandon path ignored progress, then verifies the turn completes
+        cleanly anyway with no exception.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            ToolUseBlock,
+        )
+        import manager.session as session_mod
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        tool_use_msg = AssistantMessage(
+            model="claude-test",
+            content=[
+                ToolUseBlock(
+                    id="toolu_x", name="Bash",
+                    input={"command": "sleep 99"},
+                ),
+            ],
+            parent_tool_use_id=None,
+        )
+        result = _mock_result()
+
+        original_first = session_mod._STALL_FIRST_NOTICE_S
+        original_abandon = session_mod._TURN_ABANDON_S
+        session_mod._STALL_FIRST_NOTICE_S = 0.05
+        session_mod._TURN_ABANDON_S = 0.2
+
+        try:
+            unblock = asyncio.Event()
+
+            async def fake_response():
+                yield tool_use_msg  # progress: messages_received >= 1
+                await unblock.wait()  # then stall well past abandon threshold
+                yield result
+
+            client = _make_mock_client([init_msg], fake_response)
+
+            with patch("manager.session.ClaudeSDKClient", return_value=client):
+                sm = SessionManager()
+                await sm.start()
+
+                # Drive a watcher task that unblocks after 0.4s (>2x abandon).
+                async def _release():
+                    await asyncio.sleep(0.4)
+                    unblock.set()
+                releaser = asyncio.create_task(_release())
+
+                events: list = []
+                try:
+                    async for event in sm.send("go"):
+                        events.append(event)
+                finally:
+                    releaser.cancel()
+        finally:
+            session_mod._STALL_FIRST_NOTICE_S = original_first
+            session_mod._TURN_ABANDON_S = original_abandon
+
+        # The key invariant: turn completed cleanly (no SessionAbandoned
+        # raised) even though the silent gap exceeded _TURN_ABANDON_S.
+        assert any(isinstance(e, TurnComplete) for e in events)
 
 
 class TestSessionManagerCostTracking:
