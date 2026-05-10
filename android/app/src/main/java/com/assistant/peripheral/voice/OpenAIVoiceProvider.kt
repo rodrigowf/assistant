@@ -149,8 +149,15 @@ class OpenAIVoiceProvider(
         rmsLogCounter = 0
         _state.value = VoiceState.Connecting
         dcReady = false
-        pendingCommands.clear()
-        Log.i(TAG, "[VM] ===== SESSION START ===== epochMs=$sessionStartMs endpoint=${this@OpenAIVoiceProvider.sdpEndpoint}")
+        // Do NOT clear pendingCommands here — VoiceManager.start() drains
+        // its pre-provider queue into us *before* calling connect(), so by
+        // this point pendingCommands may already hold the session.update
+        // payload that the backend echoed back on session_started.
+        // cleanup() handles the end-of-session clear; here we'd just be
+        // throwing away the very payload that wires the OpenAI session
+        // (canonical 8424f0f / 8eb6dd3 race: lost session.update => default
+        // OpenAI session, no system prompt, no tools, no transcription).
+        Log.i(TAG, "[VM] ===== SESSION START ===== epochMs=$sessionStartMs endpoint=${this@OpenAIVoiceProvider.sdpEndpoint} pendingCommands=${pendingCommands.size}")
 
         try {
             val success = withTimeoutOrNull(CONNECTION_TIMEOUT_MS) {
