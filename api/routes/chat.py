@@ -1,8 +1,21 @@
-"""WebSocket chat endpoint — real-time streaming via SessionManager."""
+"""WebSocket chat endpoint — real-time streaming via SessionManager.
+
+Architecture: WebSockets are pure observers.  Sending a prompt spawns a
+session-owned task in the pool (``pool.start_turn``) that drives the turn
+to completion regardless of whether the originating WS stays connected.
+A page reload merely unsubscribes from broadcasts; the next ``start``
+message re-subscribes and the in-flight events flow naturally to the new
+WS.  Explicit cancellation (user clicks Interrupt, or sends a new prompt
+mid-turn) goes through ``pool.cancel_turn`` which sends the SDK
+interrupt and awaits clean unwind.
+
+Slash commands (``/help``, ``/compact``) intentionally bypass this model
+— their output is short, single-WS, and rarely worth resuming after a
+disconnect.  See ``_handle_command``.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import orjson
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -22,38 +35,6 @@ async def chat_ws(ws: WebSocket):
 
     sm: SessionManager | None = None
     session_id: str | None = None
-    # Task currently streaming a response (send/compact/command), if any
-    stream_task: asyncio.Task | None = None
-
-    async def _cancel_stream() -> bool:
-        """Cancel the active stream task; return True if there was one to cancel."""
-        nonlocal stream_task
-        had_task = stream_task is not None and not stream_task.done()
-        if had_task:
-            stream_task.cancel()
-            try:
-                await stream_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        stream_task = None
-        return had_task
-
-    async def _interrupt_if_orphaned() -> None:
-        """If this WS was the last subscriber and a turn was in flight, send the
-        SDK a real interrupt so the bundled `claude` subprocess doesn't sit
-        burning CPU waiting for events nobody will consume.
-
-        Without this, a browser disconnect mid-turn (refresh, sleep, network
-        blip) leaves the SDK hung — it had been streaming events to a now-dead
-        consumer and never gets the signal that the turn should end.  Only
-        interrupts when subscriber_count drops to zero, so other tabs watching
-        the same session aren't disrupted.
-        """
-        if session_id and pool.subscriber_count(session_id) == 0:
-            try:
-                await pool.interrupt(session_id)
-            except Exception:
-                logger.exception("Failed to interrupt orphaned session %s", session_id)
 
     try:
         while True:
@@ -74,7 +55,7 @@ async def chat_ws(ws: WebSocket):
                     continue
 
             elif msg_type == "send":
-                if sm is None:
+                if sm is None or session_id is None:
                     await ws.send_bytes(orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
@@ -82,14 +63,10 @@ async def chat_ws(ws: WebSocket):
                     continue
                 # If a permission is pending on this session, treat the user's
                 # chat as a denial with their prose as the rejection reason.
-                # The agent receives this as a permission_resolved with
-                # responder=user, message=<chat text>; per the conversational-
-                # checkpoint policy in the agent's appended system prompt, it
-                # then refines its approach.  The modal in the UI closes via
-                # the broadcast.  Users who actually want to approve click
-                # the Approve button — the modal is the formal yes/no path.
+                # See the conversational-checkpoint policy in
+                # manager.session._PERMISSION_GATING_PROMPT.
                 text_payload = msg.get("text", "")
-                if session_id and text_payload:
+                if text_payload:
                     pending_ids = list(sm.pending_permission_ids())
                     for rid in pending_ids:
                         await pool.resolve_session_permission(
@@ -99,11 +76,17 @@ async def chat_ws(ws: WebSocket):
                             message=text_payload,
                             responder="user",
                         )
-                # Cancel any in-progress stream before starting a new one
-                await _cancel_stream()
-                stream_task = asyncio.create_task(
-                    _handle_send(ws, sm, pool, session_id, text_payload)
-                )
+                # start_turn handles the "interrupt + new" semantics
+                # internally (cancels any in-flight turn first), so we
+                # don't need to call cancel_turn here.
+                try:
+                    await pool.start_turn(session_id, text_payload, source_ws=ws)
+                except Exception as e:
+                    logger.exception("start_turn failed for session %s", session_id)
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "send_failed",
+                        "detail": str(e),
+                    }))
 
             elif msg_type == "command":
                 if sm is None:
@@ -111,16 +94,17 @@ async def chat_ws(ws: WebSocket):
                         "type": "error", "error": "not_started",
                     }))
                     continue
-                await _cancel_stream()
-                stream_task = asyncio.create_task(
-                    _handle_command(ws, sm, msg.get("text", ""))
-                )
+                # Slash commands bypass the session-owned turn model
+                # deliberately — their output is single-WS by design.
+                # If a chat turn is in flight, interrupt it first so the
+                # SDK is free to accept the slash command.
+                if session_id:
+                    await pool.cancel_turn(session_id)
+                await _handle_command(ws, sm, msg.get("text", ""))
 
             elif msg_type == "interrupt":
-                if sm is not None and session_id:
-                    # Cancel the stream task first so the SDK interrupt is effective
-                    await _cancel_stream()
-                    await pool.interrupt(session_id)
+                if session_id is not None:
+                    await pool.cancel_turn(session_id)
                     await ws.send_bytes(orjson.dumps({
                         "type": "status", "status": "interrupted",
                     }))
@@ -131,10 +115,8 @@ async def chat_ws(ws: WebSocket):
                         "type": "error", "error": "not_started",
                     }))
                     continue
-                await _cancel_stream()
-                stream_task = asyncio.create_task(
-                    _handle_compact(ws, pool, session_id)
-                )
+                await pool.cancel_turn(session_id)
+                await _handle_compact(ws, pool, session_id)
 
             elif msg_type == "permission_response":
                 # Reply to a pending can_use_tool request.  Don't gate on
@@ -158,11 +140,13 @@ async def chat_ws(ws: WebSocket):
                 )
 
             elif msg_type == "stop":
-                had_stream = await _cancel_stream()
+                # User explicitly detaches from this session.  Do NOT cancel
+                # the in-flight turn — the user said "stop watching", not
+                # "stop the agent".  Other tabs may still be observing; if
+                # not, the session keeps thinking until completion or
+                # explicit user delete.
                 if session_id:
                     pool.unsubscribe(session_id, ws)
-                    if had_stream:
-                        await _interrupt_if_orphaned()
                 sm = None
                 session_id = None
                 await ws.send_bytes(orjson.dumps({"type": "session_stopped"}))
@@ -176,11 +160,13 @@ async def chat_ws(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        had_stream = await _cancel_stream()
+        # Page reload, network blip, browser close — all hit this path.
+        # Just unsubscribe.  The in-flight turn (if any) keeps running
+        # under pool ownership and the next WS that subscribes will pick
+        # up the broadcast stream.  Orphaned subprocesses are handled
+        # separately by the pool's orphan reaper, not here.
         if session_id:
             pool.unsubscribe(session_id, ws)
-            if had_stream:
-                await _interrupt_if_orphaned()
 
 
 async def _handle_start(
@@ -192,6 +178,8 @@ async def _handle_start(
     ``resume_sdk_id`` (Claude Code SDK session ID for resuming from history).
     Optionally includes ``mcp_servers`` dict to specify which MCPs to load.
     """
+    import asyncio
+
     local_id = msg.get("local_id")
     resume_sdk_id = msg.get("resume_sdk_id") or msg.get("session_id")
     fork = msg.get("fork", False)
@@ -295,64 +283,20 @@ async def _handle_start(
     return sm, session_id
 
 
-async def _handle_send(
-    ws: WebSocket,
-    sm: SessionManager,
-    pool: SessionPool,
-    session_id: str | None,
-    text: str,
-) -> str | None:
-    """Stream events to the WebSocket via pool broadcast.
-
-    The session_id is the stable local_id and never changes.
-    """
-    from manager.session import SessionAbandoned
-
-    async def _stream_once() -> None:
-        async for _event in pool.send(session_id, text, source_ws=ws):
-            pass  # Events already broadcast by pool
-
-    try:
-        try:
-            await _stream_once()
-        except SessionAbandoned as exc:
-            # First attempt: the upstream request never produced any events.
-            # Interrupt the wedged turn and retry exactly once.
-            logger.warning("Turn abandoned for session %s after %.0fs; retrying once", session_id, exc.elapsed_seconds)
-            await ws.send_bytes(orjson.dumps({
-                "type": "status", "status": "retrying",
-                "detail": f"upstream silent for {exc.elapsed_seconds:.0f}s, retrying",
-            }))
-            try:
-                await pool.interrupt(session_id)
-            except Exception:
-                logger.exception("Failed to interrupt abandoned turn for %s", session_id)
-            await asyncio.sleep(1.0)
-            await _stream_once()
-    except asyncio.CancelledError:
-        raise  # Let the task cancel propagate cleanly
-    except SessionAbandoned as exc:
-        # Retry also gave up — surface the failure so the user sees something.
-        await ws.send_bytes(orjson.dumps({
-            "type": "error", "error": "upstream_wedged",
-            "detail": f"Anthropic upstream did not respond after retry ({exc.elapsed_seconds:.0f}s). Try again in a moment.",
-        }))
-    except Exception as e:
-        await ws.send_bytes(orjson.dumps({
-            "type": "error", "error": "send_failed",
-            "detail": str(e),
-        }))
-    return session_id
-
-
 async def _handle_compact(ws: WebSocket, pool: SessionPool, session_id: str) -> None:
-    """Trigger conversation compaction, broadcasting events to all subscribers."""
+    """Trigger conversation compaction, broadcasting events to all subscribers.
+
+    Compaction is short and uses pool.compact()'s built-in broadcast, so the
+    iteration runs inline here rather than as a session-owned task.  If a
+    user reloads the page mid-compact, the operation completes but the new
+    WS won't see the events — acceptable for an operation that's typically
+    sub-second and idempotent (re-issuing /compact is safe).
+    """
     try:
-        async for event in pool.compact(session_id):
+        async for _event in pool.compact(session_id):
             pass  # Events already broadcast by pool
-    except asyncio.CancelledError:
-        raise
     except Exception as e:
+        logger.exception("compact failed for session %s", session_id)
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "compact_failed",
             "detail": str(e),
@@ -360,14 +304,18 @@ async def _handle_compact(ws: WebSocket, pool: SessionPool, session_id: str) -> 
 
 
 async def _handle_command(ws: WebSocket, sm: SessionManager, text: str) -> None:
-    """Stream events from sm.command() to the WebSocket."""
+    """Stream events from sm.command() to the WebSocket.
+
+    Slash commands are a single-WS path: the user who issued ``/help`` sees
+    the help text, not other observers.  Output goes directly to ``ws`` via
+    serialize_event rather than through pool broadcast.
+    """
     try:
         async for event in sm.command(text):
             payload = serialize_event(event)
             await ws.send_bytes(orjson.dumps(payload))
-    except asyncio.CancelledError:
-        raise
     except Exception as e:
+        logger.exception("command failed")
         await ws.send_bytes(orjson.dumps({
             "type": "error", "error": "command_failed",
             "detail": str(e),

@@ -78,6 +78,14 @@ class SessionPool:
         self._closed_session_pids: dict[str, tuple[int, float]] = {}
         self._reaper_task: asyncio.Task[None] | None = None
 
+        # Session-owned in-flight turn task.  Decouples turn lifetime from
+        # the WebSocket that initiated it: a page reload (or any momentary
+        # disconnect) merely unsubscribes from broadcasts; the task keeps
+        # running and the new WS picks up the stream when it subscribes.
+        # Keyed by session_id; absent / done means "no turn running".
+        # See start_turn() / cancel_turn() for the public API.
+        self._turn_tasks: dict[str, asyncio.Task[None]] = {}
+
     # ------------------------------------------------------------------
     # Agent session lifecycle
     # ------------------------------------------------------------------
@@ -227,6 +235,17 @@ class SessionPool:
         sm = self._sessions.pop(session_id, None)
         if sm is None:
             return
+
+        # Cancel any in-flight session-owned turn before tearing down the SDK
+        # client — otherwise the driver task continues iterating sm.send()
+        # against a half-disconnected session and emits scary tracebacks.
+        turn_task = self._turn_tasks.pop(session_id, None)
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
+            try:
+                await turn_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Notify while subscribers/watchers are still registered
         await self._broadcast_session(session_id, {"type": "session_stopped"})
@@ -586,6 +605,164 @@ class SessionPool:
                 payload = serialize_event(event)
                 await self._broadcast_session(session_id, payload)
                 yield event
+
+    # ------------------------------------------------------------------
+    # Session-owned turn API (chat.py uses this; orchestrator runner
+    # has its own task management on top of pool.send()).
+    # ------------------------------------------------------------------
+
+    def has_active_turn(self, session_id: str) -> bool:
+        """True if a session-owned turn task is currently running."""
+        task = self._turn_tasks.get(session_id)
+        return task is not None and not task.done()
+
+    async def start_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        source_ws: WebSocket | None = None,
+    ) -> None:
+        """Spawn a session-owned task that drives the turn to completion.
+
+        The task is owned by the pool, NOT by the caller's task.  This is
+        the key invariant: the turn outlives the WebSocket that sent the
+        prompt, so a page reload (or any transient disconnect) doesn't
+        kill the in-flight work.  Subscribers (current and future) receive
+        events via ``_broadcast_session`` as they're produced.
+
+        If a turn is already in flight on this session, it is cancelled
+        first ("interrupt + new" semantics — the bundled CLI doesn't
+        accept overlapping queries, so the new prompt always supersedes
+        the old).  This makes start_turn safe to call without a
+        prior cancel_turn, and atomic against the rare race where two
+        WSes send prompts to the same session simultaneously.
+
+        Returns once the task is created.  Errors during the turn are
+        logged and broadcast to subscribers; they do NOT propagate to
+        the caller.
+        """
+        if session_id not in self._sessions:
+            raise ValueError(f"No session with ID {session_id}")
+
+        # Atomic interrupt + spawn.  If another caller is mid-cancel_turn,
+        # the second cancel_turn here is a no-op (task already done) so
+        # this remains correct under concurrent calls.
+        await self.cancel_turn(session_id)
+
+        task = asyncio.create_task(
+            self._drive_turn(session_id, text, source_ws),
+            name=f"turn-{session_id[:8]}",
+        )
+        self._turn_tasks[session_id] = task
+
+    async def _drive_turn(
+        self,
+        session_id: str,
+        text: str,
+        source_ws: WebSocket | None,
+    ) -> None:
+        """Body of the session-owned turn task.
+
+        Iterates ``self.send()`` (the existing async-gen API that handles
+        per-session locking, broadcasting, and orchestrator mirroring) and
+        catches everything so a stray exception doesn't show up as
+        ``Task exception was never retrieved`` in the logs.  Subscribers
+        already see the events via the broadcast inside ``send()``; this
+        loop just consumes the iterator to completion.
+
+        Owns the SessionAbandoned retry: if the upstream request never
+        produced any messages (TCP path silently wedged), interrupt the
+        wedged turn and retry once.  This logic used to live in
+        ``api.routes.chat._handle_send`` — moved here because the WS task
+        no longer owns the iteration and so couldn't observe the exception.
+
+        The reason we don't surface exceptions to a caller is that THERE
+        IS NO CALLER once the turn starts — the WebSocket that initiated
+        it is just one of N possible subscribers, and may already be gone
+        by the time the turn finishes.  Broadcast and logs are the right
+        channels for telling everyone what happened.
+        """
+        # Imported lazily to keep pool.py importable in environments where
+        # the SDK isn't available (some unit tests).
+        from manager.session import SessionAbandoned
+
+        async def _stream_once() -> None:
+            async for _event in self.send(session_id, text, source_ws=source_ws):
+                pass
+
+        try:
+            try:
+                await _stream_once()
+            except SessionAbandoned as exc:
+                logger.warning(
+                    "Turn abandoned for session %s after %.0fs; retrying once",
+                    session_id, exc.elapsed_seconds,
+                )
+                await self._broadcast_session(session_id, {
+                    "type": "status", "status": "retrying",
+                    "detail": f"upstream silent for {exc.elapsed_seconds:.0f}s, retrying",
+                })
+                try:
+                    await self.interrupt(session_id)
+                except Exception:
+                    logger.exception("Failed to interrupt abandoned turn for %s", session_id)
+                await asyncio.sleep(1.0)
+                await _stream_once()
+        except asyncio.CancelledError:
+            raise
+        except SessionAbandoned as exc:
+            await self._broadcast_session(session_id, {
+                "type": "error", "error": "upstream_wedged",
+                "detail": (
+                    f"Anthropic upstream did not respond after retry "
+                    f"({exc.elapsed_seconds:.0f}s). Try again in a moment."
+                ),
+            })
+        except Exception as exc:
+            logger.exception(
+                "Session-owned turn for %s raised; broadcasting error",
+                session_id,
+            )
+            try:
+                await self._broadcast_session(session_id, {
+                    "type": "error", "error": "send_failed",
+                    "detail": str(exc),
+                })
+            except Exception:
+                logger.exception("Failed to broadcast send_failed for %s", session_id)
+
+    async def cancel_turn(self, session_id: str) -> bool:
+        """Stop the in-flight turn for *session_id*.
+
+        Sends an SDK interrupt (so the bundled ``claude`` subprocess
+        actually halts the current request — cancelling the asyncio task
+        alone wouldn't reach across the process boundary), then awaits
+        the task so the caller knows the turn has fully unwound (lock
+        released, drain task torn down, finally blocks run) before they
+        proceed.  Returns True if a turn was actually cancelled, False
+        if no turn was running.
+        """
+        task = self._turn_tasks.get(session_id)
+        if task is None or task.done():
+            return False
+
+        # Issue the SDK interrupt FIRST.  That's the proper way to stop
+        # the bundled-claude turn; cancelling our reader task alone leaves
+        # the subprocess still working and emitting messages into a
+        # buffer no one is reading.
+        try:
+            await self.interrupt(session_id)
+        except Exception:
+            logger.exception("interrupt() failed during cancel_turn for %s", session_id)
+
+        # Now cancel the driver task and wait for it to unwind.
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return True
 
     # ------------------------------------------------------------------
     # Internal helpers
