@@ -817,6 +817,111 @@ class TestSessionManagerStallWatchdog:
         assert any(isinstance(e, TurnComplete) for e in events)
 
 
+class TestSessionManagerStaleMessageDrain:
+    """Tests for the cross-turn-contamination guard in send().
+
+    The bundled `claude` CLI keeps emitting messages for a brief window
+    after we issue an interrupt — including a synthesized terminal
+    ResultMessage — and those messages land in the SDK's per-client buffer.
+    Without the drain in send(), the next turn's receive_response() picks up
+    that stale ResultMessage and exits before the real turn produces any
+    output.  Symptom: status flips to IDLE, a fake turn_complete reaches the
+    UI, and the actual prompt processes silently with no Python reader.
+    """
+
+    @pytest.mark.asyncio
+    async def test_drain_discards_stale_messages_before_new_turn(self):
+        """Pre-existing messages in the SDK buffer are drained, not
+        consumed by the new turn's receive_response()."""
+        from claude_agent_sdk import SystemMessage
+        import anyio
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            # The real turn's events — only these should reach the caller.
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        # Inject a real anyio stream into client._query and pre-load it
+        # with stale messages from the "previous, cancelled turn".
+        send_stream, receive_stream = anyio.create_memory_object_stream(
+            max_buffer_size=100
+        )
+        client._query = MagicMock()
+        client._query._message_receive = receive_stream
+
+        stale_result = {"type": "result", "session_id": "s0", "is_error": True}
+        stale_assistant = {"type": "assistant", "session_id": "s0"}
+        await send_stream.send(stale_assistant)
+        await send_stream.send(stale_result)
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            events = []
+            async for event in sm.send("turn 2 prompt"):
+                events.append(event)
+
+        # The fresh ResultMessage from fake_response — not the stale one —
+        # is what produced the TurnComplete.
+        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_completes) == 1
+        assert turn_completes[0].session_id == "s1"
+
+        # Buffer was drained (statistics reports current_buffer_used == 0).
+        # If the drain didn't run, the two pre-loaded items would still be
+        # sitting in the buffer.
+        assert receive_stream.statistics().current_buffer_used == 0
+
+    @pytest.mark.asyncio
+    async def test_drain_no_op_on_clean_buffer(self):
+        """When the buffer is empty (the steady-state case), the drain is a
+        no-op and the turn proceeds normally with no extra warnings."""
+        from claude_agent_sdk import SystemMessage
+        import anyio
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+        # Real but empty stream.
+        _send, recv = anyio.create_memory_object_stream(max_buffer_size=100)
+        client._query = MagicMock()
+        client._query._message_receive = recv
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            events = []
+            async for event in sm.send("clean turn"):
+                events.append(event)
+
+        assert any(isinstance(e, TurnComplete) for e in events)
+        assert recv.statistics().current_buffer_used == 0
+
+    @pytest.mark.asyncio
+    async def test_drain_helper_returns_zero_on_mock_query(self):
+        """Defensive: if the SDK refactors and _message_receive isn't an
+        actual MemoryObjectReceiveStream, the drain returns 0 instead of
+        raising or spinning the cap loop against a MagicMock."""
+        client = _make_mock_client(server_info={"session_id": "s1"})
+
+        with patch("manager.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            drained = await sm._drain_stale_sdk_messages()
+            assert drained == 0
+
+
 class TestSessionManagerCostTracking:
     @pytest.mark.asyncio
     async def test_cost_accumulates(self):

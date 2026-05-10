@@ -661,6 +661,44 @@ class SessionManager:
         if self._client is None:
             raise RuntimeError("SessionManager is not connected — call start() first")
 
+        # Drain any stale messages left in the SDK's per-client receive buffer
+        # before kicking off this turn.  Background:
+        #
+        # The SDK keeps a single shared ``anyio.MemoryObjectStream`` (size 100)
+        # for ALL messages from the bundled ``claude`` CLI.  ``receive_response()``
+        # is just "iterate until you see ANY ResultMessage, then return" — it
+        # has no per-turn fence.  If the previous turn was interrupted while
+        # the CLI was mid-stream (e.g. the WS tab reloaded, our drain task got
+        # cancelled, ``_interrupt_if_orphaned`` fired), the CLI may continue
+        # to emit messages — including a synthesized terminal ResultMessage —
+        # *after* our drain task has already been torn down.  Those messages
+        # then sit in the SDK's buffer and get picked up by the NEXT turn's
+        # ``receive_response()``, which sees the leftover ResultMessage and
+        # exits immediately.  Status flips to IDLE, the frontend gets a fake
+        # turn_complete with no content, and the CLI happily processes the
+        # actual prompt with no Python reader watching.
+        #
+        # The buffer is bounded (size 100), so this drain is fast.  We also
+        # log a warning on non-zero drain counts — that's the smoking gun for
+        # the cross-turn-contamination bug class.
+        #
+        # First drain pass catches messages already buffered.  We then yield
+        # the loop briefly so any in-flight sends from the read-task
+        # (cancelled but not yet awaited at the prior turn's tear-down) can
+        # complete and land in the buffer; a second drain catches those.
+        # The 50 ms is empirical: enough for one or two anyio task switches
+        # without adding meaningful latency to a normal send().
+        stale_drained = await self._drain_stale_sdk_messages()
+        await asyncio.sleep(0.05)
+        stale_drained += await self._drain_stale_sdk_messages()
+        if stale_drained:
+            logger.warning(
+                "Drained %d stale SDK message(s) for session %s before turn "
+                "(prior turn left messages in the SDK buffer)",
+                stale_drained,
+                self._local_id,
+            )
+
         self._status = SessionStatus.STREAMING
         await self._client.query(prompt)
 
@@ -899,6 +937,78 @@ class SessionManager:
 
     def pending_permission_ids(self) -> list[str]:
         return [rid for rid, fut in self._pending_permissions.items() if not fut.done()]
+
+    async def _drain_stale_sdk_messages(self) -> int:
+        """Discard any messages sitting in the SDK's per-client receive buffer.
+
+        Called at the top of every ``send()`` to prevent leftover messages
+        from a previously-cancelled turn from being consumed by the new
+        turn's ``receive_response()``.  See the comment in ``send()`` for the
+        full rationale.
+
+        Reaches into ``client._query._message_receive`` because the SDK has
+        no public drain API.  Wrapped in defensive ``getattr``s so a future
+        SDK refactor degrades to "drain doesn't run" rather than crashing
+        the session — at worst we regress to the pre-fix behavior for one
+        turn until the user files a bug.
+
+        Returns the number of messages drained.  Always 0 on a healthy
+        session; non-zero indicates the cross-turn-contamination bug
+        condition just triggered (and was prevented).
+        """
+        client = self._client
+        if client is None:
+            return 0
+        query = getattr(client, "_query", None)
+        if query is None:
+            return 0
+        receive_stream = getattr(query, "_message_receive", None)
+        if receive_stream is None:
+            return 0
+
+        # Be strict about the type — defensive against future SDK refactors and
+        # against tests that pass a MagicMock client (whose auto-mocked
+        # ``receive_nowait`` would never raise ``WouldBlock`` and would spin
+        # the drain loop until the cap, polluting logs).
+        from anyio import WouldBlock, EndOfStream
+        from anyio.streams.memory import MemoryObjectReceiveStream
+
+        if not isinstance(receive_stream, MemoryObjectReceiveStream):
+            return 0
+
+        drained = 0
+        # Hard cap matches the SDK's buffer size (100) plus a safety margin —
+        # if the buffer somehow grows past that, breaking out instead of
+        # spinning forever is the right call.
+        for _ in range(200):
+            try:
+                msg = receive_stream.receive_nowait()
+            except (WouldBlock, EndOfStream):
+                break
+            except Exception:
+                logger.exception(
+                    "Unexpected error draining SDK buffer for session %s",
+                    self._local_id,
+                )
+                break
+            drained += 1
+            # Be loud about what we threw away — if a user later asks "where
+            # did my message go?", this log answers it.
+            if isinstance(msg, dict):
+                msg_type = msg.get("type", "?")
+                logger.warning(
+                    "Discarded stale SDK message type=%s for session %s "
+                    "(from a previously-cancelled turn)",
+                    msg_type,
+                    self._local_id,
+                )
+            else:
+                logger.warning(
+                    "Discarded stale SDK message %r for session %s",
+                    type(msg).__name__,
+                    self._local_id,
+                )
+        return drained
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build SDK options from our config."""
