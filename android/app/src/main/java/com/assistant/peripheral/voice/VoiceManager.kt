@@ -59,6 +59,26 @@ class VoiceManager(
     private var currentProvider: VoiceProvider? = null
     private var providerJob: Job? = null   // collects state + events into our flows
 
+    // --- Pre-provider command queue --------------------------------------
+    // The backend replies to ``voice_start`` with a ``session_started``
+    // payload that carries the system-prompt / tools / voice config in
+    // ``voice_session_update``.  In the Android lifecycle, the WS reply
+    // races ahead of provider creation: ``ViewModel.startVoiceSession``
+    // sends the WS message first, then awaits ``apiClient.startVoiceSession``
+    // (HTTP) before constructing the provider.  The ``session_started``
+    // mirror arrives during that window, when ``currentProvider`` is
+    // null — silently dropping the update there left the OpenAI session
+    // running with its bare defaults (canned 505-char instructions, no
+    // tools, no input transcription) and produced "voice mode is
+    // isolated from the assistant" symptoms (no system prompt, hallucinated
+    // history, no user transcripts persisted to JSONL).
+    //
+    // We queue here and drain in ``start()`` immediately after the
+    // provider is wired but before ``provider.connect`` opens the data
+    // channel, so the provider's own ``pendingCommands`` queue receives
+    // the update and flushes it on data-channel-open.
+    private val pendingBackendCommands = mutableListOf<Map<String, Any?>>()
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // --- Public flows the ViewModel observes ------------------------------
@@ -173,6 +193,18 @@ class VoiceManager(
             }
         }
 
+        // 4b. Drain any backend commands that arrived before the provider
+        // was created (typically the session.update payload that races
+        // the HTTP fetch in step 1).  The provider has its own
+        // pendingCommands queue keyed on the data channel state, so
+        // these will sit there until DC_OPEN and flush atomically.
+        if (pendingBackendCommands.isNotEmpty()) {
+            val drained = pendingBackendCommands.toList()
+            pendingBackendCommands.clear()
+            Log.i(TAG, "start: draining ${drained.size} pre-provider backend command(s)")
+            for (cmd in drained) provider.handleBackendCommand(cmd)
+        }
+
         // 5. Acquire OS-level audio resources (focus, routing) and connect.
         requestAudioFocus()
         provider.connect(
@@ -200,6 +232,9 @@ class VoiceManager(
         currentProvider = null
         providerJob?.cancel()
         providerJob = null
+        // Drop any backend commands queued for a provider that never
+        // started — they belong to a session we just tore down.
+        pendingBackendCommands.clear()
         releaseAudioFocus()
         _state.value = VoiceState.Off
     }
@@ -214,7 +249,15 @@ class VoiceManager(
     // --- Backend command + audio routing pass-through --------------------
 
     fun handleBackendCommand(command: Map<String, Any?>) {
-        currentProvider?.handleBackendCommand(command)
+        val provider = currentProvider
+        if (provider != null) {
+            provider.handleBackendCommand(command)
+        } else {
+            // Queue until start() wires the provider; drained below.
+            val cmdType = command["type"] as? String ?: "?"
+            Log.d(TAG, "handleBackendCommand: no provider yet, queueing type=$cmdType")
+            pendingBackendCommands.add(command)
+        }
     }
 
     fun toggleMute(): Boolean {
