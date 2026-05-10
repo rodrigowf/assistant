@@ -317,13 +317,11 @@ class SessionPool:
         subs = self._subscribers.get(session_id)
         if subs is not None:
             subs.add(ws)
-            logger.info("[REPRO] subscribe session=%s ws=%s total_subs=%d", session_id, id(ws), len(subs))
 
     def unsubscribe(self, session_id: str, ws: WebSocket) -> None:
         subs = self._subscribers.get(session_id)
         if subs is not None:
             subs.discard(ws)
-            logger.info("[REPRO] unsubscribe session=%s ws=%s total_subs=%d", session_id, id(ws), len(subs))
 
     def subscriber_count(self, session_id: str) -> int:
         subs = self._subscribers.get(session_id)
@@ -553,9 +551,6 @@ class SessionPool:
 
         lock = self._locks[session_id]
 
-        sub_count_at_start = len(self._subscribers.get(session_id) or ())
-        logger.info("[REPRO] pool.send ENTER session=%s subs=%d text=%r", session_id, sub_count_at_start, text[:60])
-        event_count = 0
         async with lock:
             await self._broadcast_session(
                 session_id,
@@ -563,9 +558,7 @@ class SessionPool:
                 exclude=source_ws,
             )
             async for event in sm.send(text):
-                event_count += 1
                 payload = serialize_event(event)
-                logger.info("[REPRO] pool.send EVENT #%d session=%s subs=%d type=%s", event_count, session_id, len(self._subscribers.get(session_id) or ()), payload.get("type"))
                 await self._broadcast_session(session_id, payload)
                 if payload.get("type") in ("permission_request", "permission_resolved"):
                     # Mirror to the orchestrator so its UI can show a matching
@@ -579,7 +572,6 @@ class SessionPool:
                         "event_data": payload,
                     })
                 yield event
-        logger.info("[REPRO] pool.send EXIT session=%s total_events=%d", session_id, event_count)
 
     async def compact(self, session_id: str) -> AsyncIterator[Event]:
         """Trigger compaction with per-session lock, broadcasting to all subscribers."""
@@ -608,29 +600,17 @@ class SessionPool:
     ) -> None:
         subs = self._subscribers.get(session_id)
         if not subs:
-            logger.info("[REPRO] _broadcast_session NO_SUBS session=%s type=%s", session_id, payload.get("type"))
             return
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        sent = 0
-        skipped_excluded = 0
-        skipped_state = 0
         for ws in tuple(subs):
             if ws is exclude:
-                skipped_excluded += 1
                 continue
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_bytes(data)
-                    sent += 1
-                else:
-                    skipped_state += 1
-                    logger.info("[REPRO] _broadcast_session SKIP_STATE session=%s ws_state=%s", session_id, ws.client_state)
-            except Exception as e:
-                logger.info("[REPRO] _broadcast_session SEND_FAIL session=%s err=%s", session_id, e)
+            except Exception:
                 dead.append(ws)
-        if payload.get("type") in ("text_delta", "user_message", "turn_complete", "tool_use"):
-            logger.info("[REPRO] _broadcast_session session=%s type=%s sent=%d excluded=%d skipped=%d dead=%d total_subs=%d", session_id, payload.get("type"), sent, skipped_excluded, skipped_state, len(dead), len(subs))
         for ws in dead:
             subs.discard(ws)
 

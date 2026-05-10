@@ -30,9 +30,6 @@ export class ChatSocket {
         : new TextDecoder().decode(e.data);
       try {
         const event: ServerEvent = JSON.parse(data);
-        // [REPRO] log every WS event so we can compare backend-sent vs frontend-received
-        // eslint-disable-next-line no-console
-        console.log("[REPRO-WS]", this._url.split("/").pop(), event.type ?? "(no-type)", event);
         this.handler(event);
       } catch {
         // ignore malformed frames
