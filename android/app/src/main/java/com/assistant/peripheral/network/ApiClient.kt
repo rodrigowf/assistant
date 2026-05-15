@@ -84,7 +84,8 @@ class ApiClient(private val baseUrl: String) {
                     startedAt = json.optString("started_at", ""),
                     lastActivity = json.optString("last_activity", ""),
                     messageCount = json.optInt("message_count", 0),
-                    isOrchestrator = json.optBoolean("is_orchestrator", false)
+                    isOrchestrator = json.optBoolean("is_orchestrator", false),
+                    provider = json.optString("provider", "claude")
                 )
             }
         } catch (e: Exception) {
@@ -123,7 +124,8 @@ class ApiClient(private val baseUrl: String) {
                 startedAt = json.optString("started_at", ""),
                 lastActivity = json.optString("last_activity", ""),
                 messageCount = json.optInt("message_count", 0),
-                isOrchestrator = json.optBoolean("is_orchestrator", false)
+                isOrchestrator = json.optBoolean("is_orchestrator", false),
+                provider = json.optString("provider", "claude")
             )
 
             val messagesArray = json.optJSONArray("messages") ?: JSONArray()

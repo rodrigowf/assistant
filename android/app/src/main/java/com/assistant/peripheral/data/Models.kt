@@ -62,7 +62,10 @@ data class SessionInfo(
     val startedAt: String,
     val lastActivity: String,
     val messageCount: Int,
-    val isOrchestrator: Boolean = false
+    val isOrchestrator: Boolean = false,
+    // Which agent harness backed this session — "claude" or "qwen".
+    // Orchestrator sessions don't go through either CLI; ignore for them.
+    val provider: String = "claude"
 )
 
 /**

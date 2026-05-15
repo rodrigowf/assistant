@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.assistant.peripheral.data.SessionInfo
 import java.text.SimpleDateFormat
 import java.util.*
@@ -288,7 +289,8 @@ private fun SessionItem(
                         )
 
                         // Labels row
-                        if (session.isOrchestrator || isOpen) {
+                        val showProviderTag = !session.isOrchestrator
+                        if (session.isOrchestrator || isOpen || showProviderTag) {
                             Spacer(modifier = Modifier.width(8.dp))
 
                             if (isOpen) {
@@ -317,6 +319,35 @@ private fun SessionItem(
                                         color = MaterialTheme.colorScheme.onTertiaryContainer,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                     )
+                                }
+                            }
+
+                            if (showProviderTag) {
+                                if (isOpen) Spacer(modifier = Modifier.width(4.dp))
+                                val isQwen = session.provider == "qwen"
+                                val bg = if (isQwen) {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                }
+                                val fg = if (isQwen) {
+                                    MaterialTheme.colorScheme.onSecondaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                                Surface(
+                                    shape = CircleShape,
+                                    color = bg,
+                                    modifier = Modifier.size(16.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = if (isQwen) "Q" else "C",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                            color = fg,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
                         }

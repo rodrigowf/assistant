@@ -444,10 +444,11 @@ private fun ThinkingBlock(block: MessageBlock.Thinking) {
 private fun ToolUseBlock(block: MessageBlock.ToolUse) {
     var expanded by remember { mutableStateOf(false) }
 
-    val category = getToolCategory(block.toolName)
+    val toolName = normalizeToolName(block.toolName)
+    val category = getToolCategory(toolName)
     val toolColor = ToolPalette.colorFor(category, block.isError)
     val toolBg = ToolPalette.backgroundFor(category, block.isError)
-    val summary = formatToolSummary(block.toolName, block.toolInput)
+    val summary = formatToolSummary(toolName, block.toolInput)
 
     // Left-border-only style matching web .tool-block
     Column(
@@ -473,7 +474,7 @@ private fun ToolUseBlock(block: MessageBlock.ToolUse) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = getToolIcon(block.toolName, block.isError, block.isComplete),
+                imageVector = getToolIcon(toolName, block.isError, block.isComplete),
                 contentDescription = null,
                 modifier = Modifier.size(15.dp),
                 tint = toolColor
@@ -820,6 +821,31 @@ fun ChatInputBar(
 // the alpha for backgrounds matches the web's `hsla(..., 0.07)` -> ~0x12.
 
 private enum class ToolCategory { READ, WRITE, EXECUTE, SCRIPT, NAVIGATE, CAPTURE, INTERACT, TODO, TASK, AGENT, SEARCH, SYSTEM }
+
+// Qwen Code emits snake_case tool names (read_file, run_shell_command, edit,
+// ...) while the helpers below key off Claude's PascalCase names. Normalize at
+// the entry point so Qwen sessions get the same icons, summaries, and colours
+// as Claude. Source: packages/core/src/tools/tool-names.ts in @qwen-code.
+private val QWEN_TO_CLAUDE_TOOL = mapOf(
+    "read_file" to "Read",
+    "write_file" to "Write",
+    "edit" to "Edit",
+    "run_shell_command" to "Bash",
+    "grep_search" to "Grep",
+    "glob" to "Glob",
+    "web_fetch" to "WebFetch",
+    "todo_write" to "TodoWrite",
+    "agent" to "Task",
+    "ask_user_question" to "AskUserQuestion",
+    "exit_plan_mode" to "ExitPlanMode",
+    "save_memory" to "SaveMemory",
+    "tool_search" to "ToolSearch",
+    "list_directory" to "ListFiles",
+    "read_many_files" to "ReadManyFiles",
+)
+
+private fun normalizeToolName(toolName: String): String =
+    QWEN_TO_CLAUDE_TOOL[toolName] ?: toolName
 
 private fun getToolCategory(toolName: String): ToolCategory {
     // Read/inspect tools (passive observation)
