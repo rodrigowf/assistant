@@ -335,6 +335,8 @@ The `/tv-dev` skill is primarily for advanced Fire TV app development (app debug
 
 **Image Generation** — Generate images from text descriptions using Google's Nano Banana (Gemini Image) API via `/generate-image`.
 
+**Music Video Editing** — The `/music-video-editor` skill handles the multitrack-to-composite workflow: sync separately-recorded video takes to a master audio mix, then build a Remotion composition with split-screen, picture-in-picture, slide-up, or other layouts/transitions. Sync is computed via cross-correlation in `context/scripts/music_video/audio_sync.py` and persisted as `sync.json`, which the Remotion composition consumes directly. The `music1` project at `projects/music1/` is the reference implementation.
+
 ### Orchestration Behavior
 
 When delegating tasks to agent sessions, ensure the related skills and context are loaded:
@@ -343,6 +345,7 @@ When delegating tasks to agent sessions, ensure the related skills and context a
 - **Visualization tasks**: Load the visualization skill
 - **Fire TV app debugging** (advanced): Load the TV dev skill
 - **Media library tasks** (iOS/Android photo servers): Reference the relevant project knowledge (`ios_photo_server_project.md` or `android_photo_server_project.md`)
+- **Music video editing** (multitrack performance recordings → composited video): Load the music-video-editor skill
 
 When handling TV requests: reuse an open session if relevant, search history for a past TV session to resume, or create a new one only if needed.
 
