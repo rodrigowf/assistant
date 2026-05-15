@@ -333,3 +333,163 @@ def test_registry_resolves_google_to_gemini_provider():
     default = next(m for m in google_models if m["default"])
     assert default["voice"] == "Puck"
     assert default["voices"]
+
+
+# --- JSON Schema sanitization ----------------------------------------------
+#
+# Gemini's Live API uses OpenAPI 3.0 Schema, a strict subset of JSON
+# Schema Draft 7. The orchestrator's tool registry produces Draft-7
+# schemas (used by Anthropic/OpenAI), so we sanitize before sending.
+# These tests pin the conversion rules — without them, Gemini rejects
+# the setup with HTTP 1007 / "Invalid JSON payload" and the session
+# never starts.
+
+
+def test_sanitize_passes_through_simple_schema():
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string", "description": "Query string"},
+        },
+        "required": ["q"],
+    }
+    out = _sanitize_schema_for_gemini(src)
+    assert out == src
+    # And it returned a copy, not the same object.
+    assert out is not src
+
+
+def test_sanitize_collapses_type_array_with_null_to_nullable():
+    """The exact bug that failed the first live Gemini smoke test."""
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "type": "object",
+        "properties": {
+            "max_messages": {
+                "type": ["integer", "null"],
+                "description": "How many",
+            },
+        },
+    }
+    out = _sanitize_schema_for_gemini(src)
+    mm = out["properties"]["max_messages"]
+    assert mm["type"] == "integer"
+    assert mm["nullable"] is True
+    assert mm["description"] == "How many"
+
+
+def test_sanitize_strips_disallowed_keywords():
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": False,
+        "patternProperties": {".*": {"type": "string"}},
+        "properties": {"x": {"type": "string"}},
+    }
+    out = _sanitize_schema_for_gemini(src)
+    assert "$schema" not in out
+    assert "additionalProperties" not in out
+    assert "patternProperties" not in out
+    assert out["properties"] == {"x": {"type": "string"}}
+
+
+def test_sanitize_flattens_optional_anyof_pattern():
+    """anyOf:[{...}, {"type": "null"}] → flatten + nullable."""
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "anyOf": [
+            {"type": "string", "enum": ["a", "b"]},
+            {"type": "null"},
+        ]
+    }
+    out = _sanitize_schema_for_gemini(src)
+    assert out.get("type") == "string"
+    assert out.get("enum") == ["a", "b"]
+    assert out.get("nullable") is True
+    assert "anyOf" not in out
+
+
+def test_sanitize_recurses_into_items():
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "type": "array",
+        "items": {
+            "type": ["string", "null"],
+        },
+    }
+    out = _sanitize_schema_for_gemini(src)
+    assert out["type"] == "array"
+    assert out["items"]["type"] == "string"
+    assert out["items"]["nullable"] is True
+
+
+def test_sanitize_collapses_tuple_form_items():
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "type": "array",
+        "items": [{"type": "string"}, {"type": "integer"}],
+    }
+    out = _sanitize_schema_for_gemini(src)
+    # Best-effort: keep the first.
+    assert out["items"] == {"type": "string"}
+
+
+def test_sanitize_nested_properties_recurse():
+    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
+
+    src = {
+        "type": "object",
+        "properties": {
+            "nested": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "leaf": {"type": ["string", "null"]},
+                },
+            },
+        },
+    }
+    out = _sanitize_schema_for_gemini(src)
+    nested = out["properties"]["nested"]
+    assert "additionalProperties" not in nested
+    leaf = nested["properties"]["leaf"]
+    assert leaf["type"] == "string"
+    assert leaf["nullable"] is True
+
+
+def test_session_config_sanitizes_tool_schemas_end_to_end():
+    """The user-visible smoke test — read_agent_session's max_messages
+    is the exact schema that broke Gemini Live in the first attempt."""
+    p = _make_provider()
+    tools = [
+        {
+            "name": "read_agent_session",
+            "description": "Read the persisted history of an agent session.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "max_messages": {
+                        "type": ["integer", "null"],
+                        "description": "How many",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        }
+    ]
+    cfg = p.format_session_config(system="x", tools=tools)
+    fn = cfg["setup"]["tools"][0]["functionDeclarations"][0]
+    mm = fn["parameters"]["properties"]["max_messages"]
+    assert mm["type"] == "integer"
+    assert mm["nullable"] is True
+    # Sanity: the un-affected property is unchanged.
+    assert fn["parameters"]["properties"]["session_id"] == {"type": "string"}

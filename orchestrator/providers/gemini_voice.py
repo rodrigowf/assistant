@@ -316,13 +316,15 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
                 function_declarations.append({
                     "name": fn.get("name"),
                     "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
+                    "parameters": _sanitize_schema_for_gemini(fn.get("parameters", {})),
                 })
             elif "name" in t:
                 function_declarations.append({
                     "name": t.get("name"),
                     "description": t.get("description", ""),
-                    "parameters": t.get("input_schema") or t.get("parameters") or {},
+                    "parameters": _sanitize_schema_for_gemini(
+                        t.get("input_schema") or t.get("parameters") or {}
+                    ),
                 })
 
         setup: dict[str, Any] = {
@@ -433,3 +435,114 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
             open_timeout=15,
             max_size=2**24,  # 16 MB — accommodate large audio frames
         )
+
+
+# JSON Schema keywords Gemini's OpenAPI 3.0 Schema doesn't accept on
+# function-declaration parameters. Stripping rather than rejecting:
+# we want to send the best schema we can, not refuse to call the tool.
+_GEMINI_SCHEMA_STRIP_KEYS = frozenset({
+    "$schema",
+    "$id",
+    "$ref",
+    "$defs",
+    "definitions",
+    "additionalProperties",
+    "patternProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "if",
+    "then",
+    "else",
+    "not",
+    "dependencies",
+    "dependentSchemas",
+    "dependentRequired",
+})
+
+
+def _sanitize_schema_for_gemini(schema: dict[str, Any]) -> dict[str, Any]:
+    """Convert a JSON Schema to the subset Gemini's Live API accepts.
+
+    Gemini's ``functionDeclarations[].parameters`` follows OpenAPI 3.0
+    Schema, which is a strict subset of JSON Schema Draft 7.
+    Mismatches the orchestrator's tool schemas tend to hit:
+
+    - ``"type": ["X", "null"]`` (union types) → split into
+      ``"type": "X", "nullable": true``.
+    - ``anyOf`` / ``oneOf`` / ``allOf`` containing exactly one schema
+      and one ``{"type": "null"}`` (the OpenAPI pattern for optionals)
+      → flatten to the non-null branch + ``nullable: true``.
+    - ``additionalProperties``, ``$schema``, ``$ref``, etc. → strip.
+
+    Everything else (``type``, ``description``, ``properties``,
+    ``required``, ``items``, ``enum``, ``format``, ``minimum``,
+    ``maximum``, ``nullable``) passes through. Recurses into
+    ``properties``, ``items``, ``anyOf``/``oneOf``/``allOf``.
+
+    Returns a new dict — does not mutate the input.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    out: dict[str, Any] = {}
+    nullable = False
+
+    # Handle anyOf/oneOf/allOf with a null branch (optional pattern).
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        if combinator in schema:
+            branches = schema[combinator]
+            if isinstance(branches, list):
+                non_null = [b for b in branches if not (isinstance(b, dict) and b.get("type") == "null")]
+                has_null = len(non_null) < len(branches)
+                if has_null:
+                    nullable = True
+                if len(non_null) == 1:
+                    # Pattern: anyOf:[{...}, {type: null}] → merge the
+                    # single non-null branch directly into ``out`` and
+                    # drop the combinator (Gemini still rejects raw
+                    # anyOf even of length 1 in practice).
+                    out.update(_sanitize_schema_for_gemini(non_null[0]))
+                elif len(non_null) > 1:
+                    # Multi-branch union — keep as anyOf with each
+                    # branch sanitized. Gemini accepts anyOf in some
+                    # cases; if it still rejects, the caller will see
+                    # the error and refine.
+                    out[combinator] = [_sanitize_schema_for_gemini(b) for b in non_null]
+                # Mark this combinator handled.
+                # (Falls through — we don't break since multiple combinators
+                # are rare; we sanitize each.)
+
+    for k, v in schema.items():
+        if k in _GEMINI_SCHEMA_STRIP_KEYS:
+            continue
+        if k in ("anyOf", "oneOf", "allOf"):
+            # Already handled above.
+            continue
+        if k == "type":
+            if isinstance(v, list):
+                # ["X", "null"] → "X" + nullable=True; ["X", "Y"] →
+                # keep first non-null (best-effort — Gemini wants a
+                # scalar type).
+                non_null = [t for t in v if t != "null"]
+                nullable = nullable or ("null" in v)
+                out["type"] = non_null[0] if non_null else "string"
+            else:
+                out["type"] = v
+        elif k == "properties" and isinstance(v, dict):
+            out["properties"] = {
+                pname: _sanitize_schema_for_gemini(pschema)
+                for pname, pschema in v.items()
+            }
+        elif k == "items" and isinstance(v, dict):
+            out["items"] = _sanitize_schema_for_gemini(v)
+        elif k == "items" and isinstance(v, list):
+            # Tuple-form items — Gemini doesn't support; collapse to
+            # the first entry as a best-effort.
+            if v:
+                out["items"] = _sanitize_schema_for_gemini(v[0])
+        else:
+            out[k] = v
+
+    if nullable:
+        out["nullable"] = True
+    return out
