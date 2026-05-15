@@ -43,10 +43,18 @@ DEV_MODE=false
 SKIP_PREREQS=false
 NEW_CONTEXT=false
 IMPORT_CONTEXT=""
-# Provider selection — leave empty so the interactive prompt asks.
-# --with-claude / --with-qwen pin one or both non-interactively.
+# Two independent axes — leave empty so the interactive prompts ask:
+#   Harness: which session-backing CLI(s) to set up (claude / qwen / both)
+#   Orchestrator: which API SDK(s) to install (anthropic / openai / both)
+# --with-X / --without-X pin them non-interactively.
 WITH_CLAUDE=""
 WITH_QWEN=""
+WITH_ANTHROPIC=""
+WITH_OPENAI=""
+# Shortcut: --qwen-only sets harness=qwen-only and orchestrator=openai-only
+# (Qwen models are served through the OpenAI-compatible endpoint, so the
+# `openai` SDK is what you want — `anthropic` is not needed).
+QWEN_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -82,26 +90,62 @@ while [[ $# -gt 0 ]]; do
             WITH_QWEN=false
             shift
             ;;
+        --with-anthropic)
+            WITH_ANTHROPIC=true
+            shift
+            ;;
+        --with-openai)
+            WITH_OPENAI=true
+            shift
+            ;;
+        --without-anthropic)
+            WITH_ANTHROPIC=false
+            shift
+            ;;
+        --without-openai)
+            WITH_OPENAI=false
+            shift
+            ;;
+        --qwen-only)
+            QWEN_ONLY=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: ./install.sh [OPTIONS]"
-            echo ""
-            echo "Options:"
-            echo "  --dev                Install development dependencies"
-            echo "  --skip-prereqs       Skip prerequisite checks"
-            echo "  --new-context        Create a fresh context (non-interactive)"
-            echo "  --import-context URL Import existing context repository"
-            echo "  --with-claude        Set up Claude Code (skips the prompt)"
-            echo "  --with-qwen          Set up Qwen Code  (skips the prompt)"
-            echo "  --without-claude     Skip Claude Code setup (skips the prompt)"
-            echo "  --without-qwen       Skip Qwen Code setup  (skips the prompt)"
-            echo "  -h, --help           Show this help message"
-            echo ""
-            echo "Examples:"
-            echo "  ./install.sh                           # Interactive (will prompt for providers)"
-            echo "  ./install.sh --with-claude             # Claude only, no prompt"
-            echo "  ./install.sh --with-claude --with-qwen # Both providers, no prompt"
-            echo "  ./install.sh --new-context             # Fresh install with new context"
-            echo "  ./install.sh --import-context git@github.com:user/context.git"
+            cat <<'HELP'
+Usage: ./install.sh [OPTIONS]
+
+Options:
+  --dev                  Install development dependencies (ruff, mypy)
+  --skip-prereqs         Skip prerequisite checks
+  --new-context          Create a fresh context (non-interactive)
+  --import-context URL   Import existing context repository
+  -h, --help             Show this help message
+
+Session harness (which agent CLI runs your chats):
+  --with-claude          Set up Claude Code
+  --with-qwen            Set up Qwen Code
+  --without-claude       Skip Claude Code setup
+  --without-qwen         Skip Qwen Code setup
+
+Orchestrator backends (which API SDKs to install):
+  --with-anthropic       Install the `anthropic` SDK (for Claude models in the orchestrator)
+  --with-openai          Install the `openai` SDK (for GPT, Qwen, Gemini — all use the OpenAI-compatible endpoint)
+  --without-anthropic    Skip the `anthropic` SDK
+  --without-openai       Skip the `openai` SDK
+
+Shortcuts:
+  --qwen-only            Equivalent to --with-qwen --without-claude
+                         --with-openai --without-anthropic (a complete
+                         Qwen-only install in one flag)
+
+Examples:
+  ./install.sh                           # Interactive (will prompt for both axes)
+  ./install.sh --qwen-only               # Fully Qwen-backed setup, no Anthropic
+  ./install.sh --with-claude --with-anthropic --with-openai
+                                         # Default-power-user setup, no prompts
+  ./install.sh --new-context             # Fresh install with new context
+  ./install.sh --import-context git@github.com:user/context.git
+HELP
             exit 0
             ;;
         *)
@@ -109,6 +153,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Apply --qwen-only after parsing so it can override or be overridden by
+# explicit per-axis flags depending on argv order.  We treat it as a
+# shorthand that only fills in blanks; explicit --with-claude etc. wins.
+if [ "$QWEN_ONLY" = true ]; then
+    WITH_CLAUDE="${WITH_CLAUDE:-false}"
+    WITH_QWEN="${WITH_QWEN:-true}"
+    WITH_ANTHROPIC="${WITH_ANTHROPIC:-false}"
+    WITH_OPENAI="${WITH_OPENAI:-true}"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Header
@@ -123,43 +177,78 @@ echo "A transparent, hackable AI assistant that evolves with you."
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 0: Pick which agent provider(s) to set up
+# Step 0a: Session harness — which agent CLI(s) to set up
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Code and Qwen Code are both optional.  The wrapper supports either
 # (or both) — the UI's "Session provider" selector picks which one new chats
 # use.  We ask up front so we only do the relevant per-provider setup work
 # (SDK config symlinks, credential links, CLI install hints) below.
 if [ -z "$WITH_CLAUDE" ] && [ -z "$WITH_QWEN" ]; then
-    echo -e "${BOLD}Pick which agent provider(s) you want to set up:${NC}"
+    echo -e "${BOLD}── Session harness ──${NC}"
+    echo "Which agent CLI(s) should run your chats?"
     echo ""
-    echo "  ${BOLD}1)${NC} Claude Code only (Anthropic — recommended default)"
+    echo "  ${BOLD}1)${NC} Claude Code only (Anthropic — current default)"
     echo "  ${BOLD}2)${NC} Qwen Code only (Alibaba — open weights, OAuth or DashScope key)"
     echo "  ${BOLD}3)${NC} Both — pick at runtime in the Configuration panel"
     echo ""
     ask "Choice [1/2/3] (default 1): "
-    read -r PROVIDER_CHOICE
-    case "${PROVIDER_CHOICE:-1}" in
+    read -r HARNESS_CHOICE
+    case "${HARNESS_CHOICE:-1}" in
         1) WITH_CLAUDE=true;  WITH_QWEN=false ;;
         2) WITH_CLAUDE=false; WITH_QWEN=true  ;;
         3) WITH_CLAUDE=true;  WITH_QWEN=true  ;;
-        *) error "Invalid choice: ${PROVIDER_CHOICE}. Expected 1, 2, or 3." ;;
+        *) error "Invalid choice: ${HARNESS_CHOICE}. Expected 1, 2, or 3." ;;
     esac
     echo ""
 fi
-# Anything still empty defaults to false — explicit --with-X opts the user in.
 WITH_CLAUDE="${WITH_CLAUDE:-false}"
 WITH_QWEN="${WITH_QWEN:-false}"
 
 if [ "$WITH_CLAUDE" = false ] && [ "$WITH_QWEN" = false ]; then
-    error "Refusing to install with neither provider — pick at least one (--with-claude and/or --with-qwen)."
+    error "Refusing to install with neither harness — pick at least one (--with-claude and/or --with-qwen)."
 fi
 
-if [ "$WITH_CLAUDE" = true ]; then info "Will set up Claude Code"; fi
-if [ "$WITH_QWEN"  = true ]; then info "Will set up Qwen Code";   fi
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 0b: Orchestrator backends — which API SDK(s) to install
+# ─────────────────────────────────────────────────────────────────────────────
+# The orchestrator (text + voice modes) is independent of the session
+# harness.  Anthropic SDK powers Claude models in the orchestrator;
+# OpenAI SDK powers GPT, Qwen (via OpenAI-compatible endpoint), Gemini,
+# and OpenAI Realtime voice.  A pure Qwen setup wants OpenAI only.
+if [ -z "$WITH_ANTHROPIC" ] && [ -z "$WITH_OPENAI" ]; then
+    echo -e "${BOLD}── Orchestrator backends ──${NC}"
+    echo "Which API SDK(s) should the orchestrator use?"
+    echo ""
+    echo "  ${BOLD}1)${NC} OpenAI only (GPT models, Qwen, Gemini, voice mode — recommended default for Qwen-only setups)"
+    echo "  ${BOLD}2)${NC} Anthropic only (Claude models in the orchestrator picker)"
+    echo "  ${BOLD}3)${NC} Both"
+    echo "  ${BOLD}4)${NC} Neither (orchestrator disabled — chats only)"
+    echo ""
+    ask "Choice [1/2/3/4] (default 3): "
+    read -r ORCH_CHOICE
+    case "${ORCH_CHOICE:-3}" in
+        1) WITH_ANTHROPIC=false; WITH_OPENAI=true ;;
+        2) WITH_ANTHROPIC=true;  WITH_OPENAI=false ;;
+        3) WITH_ANTHROPIC=true;  WITH_OPENAI=true ;;
+        4) WITH_ANTHROPIC=false; WITH_OPENAI=false ;;
+        *) error "Invalid choice: ${ORCH_CHOICE}. Expected 1, 2, 3, or 4." ;;
+    esac
+    echo ""
+fi
+WITH_ANTHROPIC="${WITH_ANTHROPIC:-false}"
+WITH_OPENAI="${WITH_OPENAI:-false}"
+
+if [ "$WITH_CLAUDE" = true ]; then info "Will set up Claude Code harness"; fi
+if [ "$WITH_QWEN"  = true ]; then info "Will set up Qwen Code harness"; fi
+if [ "$WITH_ANTHROPIC" = true ]; then info "Will install anthropic SDK (orchestrator)"; fi
+if [ "$WITH_OPENAI"    = true ]; then info "Will install openai SDK (orchestrator + voice)"; fi
+if [ "$WITH_ANTHROPIC" = false ] && [ "$WITH_OPENAI" = false ]; then
+    warn "No orchestrator backend selected — the orchestrator tab will be disabled."
+fi
 echo ""
 
-# Default provider written into assistant_config.json — whichever the user
-# enabled "first" (Claude wins if both, since it's the historical default).
+# Default provider written into assistant_config.json.  Claude wins if both
+# are installed (historical default); otherwise Qwen.
 if [ "$WITH_CLAUDE" = true ]; then
     DEFAULT_PROVIDER="claude"
 else
@@ -485,27 +574,54 @@ if [ "$WITH_QWEN" = true ]; then
 
     QWEN_HOME="$HOME/.qwen"
     QWEN_PROJECT_DIR="$QWEN_HOME/projects/$MANGLED"
+    EXPECTED_LINK_TARGET="$SCRIPT_DIR/context"
 
     mkdir -p "$QWEN_HOME/projects"
 
     if [ -L "$QWEN_PROJECT_DIR" ]; then
-        info "Qwen project symlink already exists"
+        # Verify the existing symlink points at OUR context, not a sibling
+        # project's.  If it's pointing elsewhere we leave it alone and warn —
+        # blowing away an unrelated project's symlink would be a bad time.
+        CURRENT_TARGET="$(readlink -f "$QWEN_PROJECT_DIR" 2>/dev/null || true)"
+        EXPECTED_RESOLVED="$(readlink -f "$EXPECTED_LINK_TARGET" 2>/dev/null || true)"
+        if [ "$CURRENT_TARGET" = "$EXPECTED_RESOLVED" ]; then
+            info "Qwen project symlink already points to context/"
+        else
+            warn "Qwen project symlink points to $CURRENT_TARGET (not this project) — leaving alone"
+        fi
     elif [ -d "$QWEN_PROJECT_DIR" ]; then
         # Qwen already created a real directory (a previous direct run, etc.).
-        # Migrate any chats into context/chats/ and replace with the symlink.
+        # Migrate any chats into context/chats/ then replace with our symlink.
+        # We back up the original directory under context/qwen-backup-<ts>/
+        # before nuking it so a botched migration is recoverable.
         warn "Found real directory at $QWEN_PROJECT_DIR — migrating to symlink"
         mkdir -p context/chats
-        if [ -d "$QWEN_PROJECT_DIR/chats" ]; then
-            cp -rn "$QWEN_PROJECT_DIR/chats/." context/chats/ 2>/dev/null || true
+        BACKUP_DIR="context/qwen-backup-$(date +%Y%m%dT%H%M%S)"
+        cp -r "$QWEN_PROJECT_DIR" "$BACKUP_DIR" 2>/dev/null || true
+        if [ -d "$BACKUP_DIR" ]; then
+            info "Backed up original Qwen project dir → $BACKUP_DIR"
+        fi
+        # Pull any JSONL chats into context/chats/ (Qwen's expected layout
+        # once the symlink is in place).  We use cp -n to avoid overwriting
+        # files that already exist in context/chats/.
+        if [ -d "$QWEN_PROJECT_DIR/chats" ] && \
+           compgen -G "$QWEN_PROJECT_DIR/chats/*.jsonl" > /dev/null; then
+            cp -n "$QWEN_PROJECT_DIR/chats/"*.jsonl context/chats/ 2>/dev/null || true
+            # Also lift any .runtime.json sibling files so Qwen can resume.
+            cp -n "$QWEN_PROJECT_DIR/chats/"*.runtime.json context/chats/ 2>/dev/null || true
             info "Migrated Qwen chats into context/chats/"
         fi
         rm -rf "$QWEN_PROJECT_DIR"
-        ln -s "$SCRIPT_DIR/context" "$QWEN_PROJECT_DIR"
-        info "Replaced directory with Qwen project symlink"
+        ln -s "$EXPECTED_LINK_TARGET" "$QWEN_PROJECT_DIR"
+        info "Replaced directory with Qwen project symlink → context/"
     else
-        ln -s "$SCRIPT_DIR/context" "$QWEN_PROJECT_DIR"
+        ln -s "$EXPECTED_LINK_TARGET" "$QWEN_PROJECT_DIR"
         info "Created Qwen project symlink → context/"
     fi
+
+    # Ensure context/chats/ exists so the SessionStore picks up Qwen sessions
+    # from day one (even before the first Qwen turn runs).
+    mkdir -p context/chats
 
     # Qwen reads project skills from ~/.qwen/skills (global) — mirror our pattern.
     if [ ! -L "$QWEN_HOME/skills" ]; then
@@ -576,13 +692,30 @@ info "pip upgraded"
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 6: Install Python dependencies
 # ─────────────────────────────────────────────────────────────────────────────
+# Core deps always go in.  Provider-specific SDKs (claude-agent-sdk,
+# anthropic, openai) install only if the matching axis was selected, so a
+# pure Qwen + OpenAI-orchestrator deployment doesn't pull Anthropic packages
+# (and vice versa).
 step "Installing Python dependencies..."
 if [ "$DEV_MODE" = true ]; then
     .venv/bin/pip install -r requirements-dev.txt --quiet
-    info "Installed requirements-dev.txt"
+    info "Installed requirements-dev.txt (core + dev tools)"
 else
     .venv/bin/pip install -r requirements.txt --quiet
-    info "Installed requirements.txt"
+    info "Installed requirements.txt (core)"
+fi
+
+if [ "$WITH_CLAUDE" = true ]; then
+    .venv/bin/pip install -r requirements-claude.txt --quiet
+    info "Installed requirements-claude.txt (claude-agent-sdk)"
+fi
+if [ "$WITH_ANTHROPIC" = true ]; then
+    .venv/bin/pip install -r requirements-anthropic.txt --quiet
+    info "Installed requirements-anthropic.txt (anthropic SDK)"
+fi
+if [ "$WITH_OPENAI" = true ]; then
+    .venv/bin/pip install -r requirements-openai.txt --quiet
+    info "Installed requirements-openai.txt (openai SDK)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -685,15 +818,37 @@ step "Verifying installation..."
 
 VERIFICATION_FAILED=false
 
-# Check Python packages.  claude-agent-sdk is a hard dependency of the
-# wrapper regardless of which provider the user picks at runtime, because
-# the BaseSessionManager subclasses share imports at module load time.
-# That's a tradeoff favoring code simplicity over a smaller Qwen-only install.
-if .venv/bin/python -c "import fastapi, uvicorn, chromadb, sentence_transformers, claude_agent_sdk" 2>/dev/null; then
-    info "Python packages OK"
+# Check core Python packages — these are required regardless of which
+# axes were selected.  Provider SDKs are checked separately below so a
+# missing optional SDK doesn't fail verification.
+if .venv/bin/python -c "import fastapi, uvicorn, chromadb, sentence_transformers" 2>/dev/null; then
+    info "Core Python packages OK"
 else
-    error "Python package verification failed"
+    error "Core Python package verification failed"
     VERIFICATION_FAILED=true
+fi
+
+# Optional-SDK presence checks — only complain about SDKs we just tried
+# to install.  Each lazy-loads at first use, so a missing SDK is silent
+# at backend startup; we surface it here so the user gets actionable
+# feedback instead of a confusing 400 the first time they pick that
+# provider in the UI.
+check_optional_sdk() {
+    local sdk="$1" axis="$2" reqfile="$3"
+    if .venv/bin/python -c "import $sdk" 2>/dev/null; then
+        info "$sdk SDK present"
+    else
+        warn "$sdk SDK not importable despite $axis being selected (try: pip install -r $reqfile)"
+    fi
+}
+if [ "$WITH_CLAUDE" = true ]; then
+    check_optional_sdk "claude_agent_sdk" "--with-claude" "requirements-claude.txt"
+fi
+if [ "$WITH_ANTHROPIC" = true ]; then
+    check_optional_sdk "anthropic" "--with-anthropic" "requirements-anthropic.txt"
+fi
+if [ "$WITH_OPENAI" = true ]; then
+    check_optional_sdk "openai" "--with-openai" "requirements-openai.txt"
 fi
 
 # Check frontend build capability
