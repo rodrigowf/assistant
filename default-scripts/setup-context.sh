@@ -164,61 +164,22 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 step "Checking template files..."
 
-# Create MEMORY.md if missing
-if [ ! -f "context/memory/MEMORY.md" ]; then
-    cat > context/memory/MEMORY.md << 'EOF'
-# Assistant Memory Index
-
-Reference index to detailed memory files. Keep this under 200 lines.
-
-## Getting Started
-
-Welcome to your personal assistant! This memory file helps the AI remember
-important context across sessions.
-
-### How Memory Works
-
-- This file (`MEMORY.md`) is an index - keep it under 200 lines
-- Store detailed content in separate `.md` files in this folder
-- Add one-line references here: `- filename.md - Brief description`
-
-## Quick Reference
-
-### Running the Assistant
-
-1. Start the backend:
-   ```bash
-   context/scripts/run.sh -m uvicorn api.app:create_app --factory --port 8765
-   ```
-
-2. Start the frontend (new terminal):
-   ```bash
-   cd frontend && npm run dev
-   ```
-
-3. Open https://localhost:5432
-EOF
-    info "Created context/memory/MEMORY.md"
+# Seed template files from install/ if missing.  install/ holds the
+# canonical fresh-install templates — see install/README.md.
+if [ ! -f "context/memory/MEMORY.md" ] && [ -f "install/MEMORY.md" ]; then
+    cp install/MEMORY.md context/memory/MEMORY.md
+    info "Created context/memory/MEMORY.md from install/MEMORY.md"
 fi
 
-# Create .env from .env.example if missing
-if [ ! -f "context/.env" ] && [ -f "context/.env.example" ]; then
-    cp context/.env.example context/.env
-    info "Created context/.env from template"
+if [ ! -f "context/.env" ] && [ -f "install/context.env" ]; then
+    cp install/context.env context/.env
+    info "Created context/.env from install/context.env"
     warn "Remember to edit context/.env with your API keys!"
-elif [ ! -f "context/.env" ]; then
-    cat > context/.env << 'EOF'
-# Personal Assistant Environment Configuration
-# Edit this file with your API keys
+fi
 
-# OpenAI API key (required for voice mode)
-OPENAI_API_KEY=
-
-# Realtime voice model
-REALTIME_MODEL=gpt-realtime
-EOF
-    info "Created context/.env template"
-    warn "Remember to edit context/.env with your API keys!"
+if [ ! -f "context/AGENTS.md" ] && [ -f "install/AGENTS.md" ]; then
+    cp install/AGENTS.md context/AGENTS.md
+    info "Created context/AGENTS.md from install/AGENTS.md"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

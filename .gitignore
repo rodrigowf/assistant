@@ -11,12 +11,10 @@ __pycache__/
 # Environment
 .env
 
-# Manager local config
-.manager.json
-assistant_config.json
-
-# Instance-specific assistant config (not shared)
-assistant_config.json
+# Manager local config (only the runtime copy at the repo root; the
+# install/ template is checked in).
+/.manager.json
+/assistant_config.json
 
 # Frontend build output
 frontend/dist/

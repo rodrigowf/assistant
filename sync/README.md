@@ -60,13 +60,15 @@ bash install.sh
 sync/
 ├── context-sync.sh          # Main sync script (same on both machines)
 ├── config.env               # Local machine config (gitignored)
-├── config.env.example       # Template — copy and edit
 ├── config.jetson.env        # Jetson config (copy to Jetson as config.env)
 ├── context-sync.service     # systemd unit for Desktop
 ├── context-sync.jetson.service  # systemd unit for Jetson
 ├── install.sh               # Installer script
 └── README.md                # This file
 ```
+
+The template for `config.env` lives at the repo root as `install/sync.env` —
+copy it into `sync/config.env` and fill it in.
 
 ## Managing the Service
 
