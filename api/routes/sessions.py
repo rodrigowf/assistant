@@ -70,6 +70,7 @@ def list_sessions(
             title=s.title,
             message_count=s.message_count,
             is_orchestrator=s.is_orchestrator,
+            provider=s.provider,
             local_id=sdk_to_local.get(s.session_id),
         )
         for s in store_sessions
@@ -81,6 +82,7 @@ def list_sessions(
     for s in pool.list_sessions():
         sdk_id = s.get("sdk_session_id")
         local_id = s.get("session_id")
+        provider = s.get("provider", "claude")
         if sdk_id and sdk_id not in store_sdk_ids:
             # Session is live but has no local history — show it with minimal metadata
             result.insert(0, SessionInfoResponse(
@@ -90,6 +92,7 @@ def list_sessions(
                 title="(active session)",
                 message_count=s.get("turns", 0),
                 is_orchestrator=False,
+                provider=provider,
                 local_id=local_id,
             ))
         elif not sdk_id and local_id:
@@ -104,6 +107,7 @@ def list_sessions(
                 title="(active session)",
                 message_count=s.get("turns", 0),
                 is_orchestrator=False,
+                provider=provider,
                 local_id=local_id,
             ))
 
@@ -186,6 +190,8 @@ def get_session(session_id: str, store: SessionStore = Depends(get_store)):
         last_activity=detail.last_activity.isoformat(),
         title=detail.title,
         message_count=detail.message_count,
+        is_orchestrator=detail.is_orchestrator,
+        provider=detail.provider,
         messages=[
             MessagePreviewResponse(
                 role=m.role,

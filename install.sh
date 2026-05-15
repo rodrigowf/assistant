@@ -43,6 +43,10 @@ DEV_MODE=false
 SKIP_PREREQS=false
 NEW_CONTEXT=false
 IMPORT_CONTEXT=""
+# Provider selection — leave empty so the interactive prompt asks.
+# --with-claude / --with-qwen pin one or both non-interactively.
+WITH_CLAUDE=""
+WITH_QWEN=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -62,6 +66,22 @@ while [[ $# -gt 0 ]]; do
             IMPORT_CONTEXT="$2"
             shift 2
             ;;
+        --with-claude)
+            WITH_CLAUDE=true
+            shift
+            ;;
+        --with-qwen)
+            WITH_QWEN=true
+            shift
+            ;;
+        --without-claude)
+            WITH_CLAUDE=false
+            shift
+            ;;
+        --without-qwen)
+            WITH_QWEN=false
+            shift
+            ;;
         -h|--help)
             echo "Usage: ./install.sh [OPTIONS]"
             echo ""
@@ -70,10 +90,16 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-prereqs       Skip prerequisite checks"
             echo "  --new-context        Create a fresh context (non-interactive)"
             echo "  --import-context URL Import existing context repository"
+            echo "  --with-claude        Set up Claude Code (skips the prompt)"
+            echo "  --with-qwen          Set up Qwen Code  (skips the prompt)"
+            echo "  --without-claude     Skip Claude Code setup (skips the prompt)"
+            echo "  --without-qwen       Skip Qwen Code setup  (skips the prompt)"
             echo "  -h, --help           Show this help message"
             echo ""
             echo "Examples:"
-            echo "  ./install.sh                           # Interactive installation"
+            echo "  ./install.sh                           # Interactive (will prompt for providers)"
+            echo "  ./install.sh --with-claude             # Claude only, no prompt"
+            echo "  ./install.sh --with-claude --with-qwen # Both providers, no prompt"
             echo "  ./install.sh --new-context             # Fresh install with new context"
             echo "  ./install.sh --import-context git@github.com:user/context.git"
             exit 0
@@ -95,6 +121,50 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo -e "${NC}"
 echo "A transparent, hackable AI assistant that evolves with you."
 echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 0: Pick which agent provider(s) to set up
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude Code and Qwen Code are both optional.  The wrapper supports either
+# (or both) — the UI's "Session provider" selector picks which one new chats
+# use.  We ask up front so we only do the relevant per-provider setup work
+# (SDK config symlinks, credential links, CLI install hints) below.
+if [ -z "$WITH_CLAUDE" ] && [ -z "$WITH_QWEN" ]; then
+    echo -e "${BOLD}Pick which agent provider(s) you want to set up:${NC}"
+    echo ""
+    echo "  ${BOLD}1)${NC} Claude Code only (Anthropic — recommended default)"
+    echo "  ${BOLD}2)${NC} Qwen Code only (Alibaba — open weights, OAuth or DashScope key)"
+    echo "  ${BOLD}3)${NC} Both — pick at runtime in the Configuration panel"
+    echo ""
+    ask "Choice [1/2/3] (default 1): "
+    read -r PROVIDER_CHOICE
+    case "${PROVIDER_CHOICE:-1}" in
+        1) WITH_CLAUDE=true;  WITH_QWEN=false ;;
+        2) WITH_CLAUDE=false; WITH_QWEN=true  ;;
+        3) WITH_CLAUDE=true;  WITH_QWEN=true  ;;
+        *) error "Invalid choice: ${PROVIDER_CHOICE}. Expected 1, 2, or 3." ;;
+    esac
+    echo ""
+fi
+# Anything still empty defaults to false — explicit --with-X opts the user in.
+WITH_CLAUDE="${WITH_CLAUDE:-false}"
+WITH_QWEN="${WITH_QWEN:-false}"
+
+if [ "$WITH_CLAUDE" = false ] && [ "$WITH_QWEN" = false ]; then
+    error "Refusing to install with neither provider — pick at least one (--with-claude and/or --with-qwen)."
+fi
+
+if [ "$WITH_CLAUDE" = true ]; then info "Will set up Claude Code"; fi
+if [ "$WITH_QWEN"  = true ]; then info "Will set up Qwen Code";   fi
+echo ""
+
+# Default provider written into assistant_config.json — whichever the user
+# enabled "first" (Claude wins if both, since it's the historical default).
+if [ "$WITH_CLAUDE" = true ]; then
+    DEFAULT_PROVIDER="claude"
+else
+    DEFAULT_PROVIDER="qwen"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1: Check prerequisites
@@ -358,41 +428,129 @@ fi
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Set up Claude SDK config symlink
+# Step 3: Set up Claude SDK config symlink (only if --with-claude)
 # ─────────────────────────────────────────────────────────────────────────────
-step "Setting up Claude SDK configuration..."
-
-# Create .claude_config structure
-mkdir -p .claude_config/projects
-
-# The Claude SDK stores session data in .claude_config/projects/<mangled-path>/
-# where <mangled-path> is the absolute project path with / replaced by -.
-# We symlink this to context/ so all session data lives in one place.
+# MANGLED is shared with the Qwen setup step below — compute it unconditionally.
 MANGLED=$(echo "$SCRIPT_DIR" | sed 's|/|-|g')
-SYMLINK_PATH=".claude_config/projects/$MANGLED"
 
-if [ -L "$SYMLINK_PATH" ]; then
-    info "SDK symlink already exists"
-elif [ -d "$SYMLINK_PATH" ]; then
-    # SDK created a real directory (e.g. from a previous run without the symlink).
-    # Move any session files into context/ and replace with the symlink.
-    warn "Found real directory at $SYMLINK_PATH — migrating to symlink"
-    if ls "$SYMLINK_PATH"/*.jsonl &>/dev/null; then
-        cp -n "$SYMLINK_PATH"/*.jsonl context/ 2>/dev/null || true
-        info "Migrated session files to context/"
+if [ "$WITH_CLAUDE" = true ]; then
+    step "Setting up Claude SDK configuration..."
+
+    # Create .claude_config structure
+    mkdir -p .claude_config/projects
+
+    # The Claude SDK stores session data in .claude_config/projects/<mangled-path>/
+    # where <mangled-path> is the absolute project path with / replaced by -.
+    # We symlink this to context/ so all session data lives in one place.
+    SYMLINK_PATH=".claude_config/projects/$MANGLED"
+
+    if [ -L "$SYMLINK_PATH" ]; then
+        info "SDK symlink already exists"
+    elif [ -d "$SYMLINK_PATH" ]; then
+        # SDK created a real directory (e.g. from a previous run without the symlink).
+        # Move any session files into context/ and replace with the symlink.
+        warn "Found real directory at $SYMLINK_PATH — migrating to symlink"
+        if ls "$SYMLINK_PATH"/*.jsonl &>/dev/null; then
+            cp -n "$SYMLINK_PATH"/*.jsonl context/ 2>/dev/null || true
+            info "Migrated session files to context/"
+        fi
+        rm -rf "$SYMLINK_PATH"
+        ln -s "../../context" "$SYMLINK_PATH"
+        info "Replaced directory with SDK symlink"
+    else
+        ln -s "../../context" "$SYMLINK_PATH"
+        info "Created SDK symlink"
     fi
-    rm -rf "$SYMLINK_PATH"
-    ln -s "../../context" "$SYMLINK_PATH"
-    info "Replaced directory with SDK symlink"
+
+    # Also create skills symlink for SDK discovery
+    if [ ! -L ".claude_config/skills" ]; then
+        ln -sf "../context/skills" ".claude_config/skills"
+        info "Created skills discovery symlink"
+    fi
+
+    echo ""
 else
-    ln -s "../../context" "$SYMLINK_PATH"
-    info "Created SDK symlink"
+    info "Skipping Claude SDK setup (--without-claude)"
+    echo ""
 fi
 
-# Also create skills symlink for SDK discovery
-if [ ! -L ".claude_config/skills" ]; then
-    ln -sf "../context/skills" ".claude_config/skills"
-    info "Created skills discovery symlink"
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3b: Set up Qwen Code config symlink (only if --with-qwen)
+# ─────────────────────────────────────────────────────────────────────────────
+# Qwen Code stores per-project state under ~/.qwen/projects/<mangled-path>/.
+# Symlink it to context/ (same approach as Claude) so Qwen sessions land at
+# context/chats/<session>.jsonl alongside Claude sessions.
+if [ "$WITH_QWEN" = true ]; then
+    step "Setting up Qwen Code configuration..."
+
+    QWEN_HOME="$HOME/.qwen"
+    QWEN_PROJECT_DIR="$QWEN_HOME/projects/$MANGLED"
+
+    mkdir -p "$QWEN_HOME/projects"
+
+    if [ -L "$QWEN_PROJECT_DIR" ]; then
+        info "Qwen project symlink already exists"
+    elif [ -d "$QWEN_PROJECT_DIR" ]; then
+        # Qwen already created a real directory (a previous direct run, etc.).
+        # Migrate any chats into context/chats/ and replace with the symlink.
+        warn "Found real directory at $QWEN_PROJECT_DIR — migrating to symlink"
+        mkdir -p context/chats
+        if [ -d "$QWEN_PROJECT_DIR/chats" ]; then
+            cp -rn "$QWEN_PROJECT_DIR/chats/." context/chats/ 2>/dev/null || true
+            info "Migrated Qwen chats into context/chats/"
+        fi
+        rm -rf "$QWEN_PROJECT_DIR"
+        ln -s "$SCRIPT_DIR/context" "$QWEN_PROJECT_DIR"
+        info "Replaced directory with Qwen project symlink"
+    else
+        ln -s "$SCRIPT_DIR/context" "$QWEN_PROJECT_DIR"
+        info "Created Qwen project symlink → context/"
+    fi
+
+    # Qwen reads project skills from ~/.qwen/skills (global) — mirror our pattern.
+    if [ ! -L "$QWEN_HOME/skills" ]; then
+        if [ -e "$QWEN_HOME/skills" ]; then
+            warn "$QWEN_HOME/skills exists and is not a symlink — leaving alone"
+        else
+            ln -s "$SCRIPT_DIR/context/skills" "$QWEN_HOME/skills"
+            info "Created Qwen skills discovery symlink"
+        fi
+    fi
+
+    echo ""
+else
+    info "Skipping Qwen Code setup (--without-qwen)"
+    echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3c: Wire AGENTS.md as the shared project-instructions file
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENTS.md is the canonical project-instructions file in the repo root.
+# Claude Code reads CLAUDE.md, Qwen Code reads QWEN.md — point both at AGENTS.md
+# via symlinks so the agents see identical instructions.
+step "Wiring AGENTS.md as the shared project-instructions file..."
+
+if [ ! -f "AGENTS.md" ] && [ -f "CLAUDE.md" ] && [ ! -L "CLAUDE.md" ]; then
+    # Legacy layout: real CLAUDE.md, no AGENTS.md.  Promote CLAUDE.md to be
+    # the canonical AGENTS.md and replace it with a symlink.
+    mv CLAUDE.md AGENTS.md
+    info "Promoted CLAUDE.md → AGENTS.md"
+fi
+
+if [ -f "AGENTS.md" ]; then
+    for shadow in CLAUDE.md QWEN.md; do
+        if [ -L "$shadow" ]; then
+            continue  # already a symlink — leave it alone
+        elif [ -f "$shadow" ]; then
+            warn "$shadow exists and is not a symlink — leaving alone (delete to enable AGENTS.md sharing)"
+        else
+            ln -s AGENTS.md "$shadow"
+            info "Created $shadow → AGENTS.md symlink"
+        fi
+    done
+else
+    warn "No AGENTS.md found — skipping CLAUDE.md/QWEN.md symlinks"
 fi
 
 echo ""
@@ -449,13 +607,13 @@ mkdir -p index logs
 info "Created index/, logs/"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 9: Link Claude Code credentials into .claude_config/
+# Step 9: Link Claude Code credentials into .claude_config/ (only if --with-claude)
 # ─────────────────────────────────────────────────────────────────────────────
 # run.sh sets CLAUDE_CONFIG_DIR=$PROJECT_DIR/.claude_config, so the SDK reads
 # OAuth credentials from there — NOT from ~/.claude/. Symlink (rather than
 # copy) so OAuth token refreshes by any Claude Code instance propagate
 # automatically. A stale copy here causes 401s once the cached token expires.
-if [ -f "$HOME/.claude/.credentials.json" ]; then
+if [ "$WITH_CLAUDE" = true ] && [ -f "$HOME/.claude/.credentials.json" ]; then
     if [ -L ".claude_config/.credentials.json" ]; then
         info "Claude Code credentials symlink already present"
     else
@@ -474,6 +632,12 @@ fi
 # edit it (e.g. add SSH working-directory entries) before starting the backend.
 if [ ! -f "assistant_config.json" ]; then
     step "Creating default assistant_config.json..."
+    # default_model is provider-appropriate so the first run lands somewhere sensible.
+    if [ "$DEFAULT_PROVIDER" = "qwen" ]; then
+        DEFAULT_MODEL="qwen3.6-plus"
+    else
+        DEFAULT_MODEL="claude-sonnet-4-5-20250929"
+    fi
     cat > assistant_config.json <<EOF
 {
   "working_directory": "$SCRIPT_DIR",
@@ -490,10 +654,11 @@ if [ ! -f "assistant_config.json" ]; then
   ],
   "enabled_mcps": [],
   "chrome_extension": false,
-  "default_model": "claude-sonnet-4-5-20250929"
+  "provider": "$DEFAULT_PROVIDER",
+  "default_model": "$DEFAULT_MODEL"
 }
 EOF
-    info "Created assistant_config.json"
+    info "Created assistant_config.json (provider=$DEFAULT_PROVIDER)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -520,7 +685,10 @@ step "Verifying installation..."
 
 VERIFICATION_FAILED=false
 
-# Check Python packages
+# Check Python packages.  claude-agent-sdk is a hard dependency of the
+# wrapper regardless of which provider the user picks at runtime, because
+# the BaseSessionManager subclasses share imports at module load time.
+# That's a tradeoff favoring code simplicity over a smaller Qwen-only install.
 if .venv/bin/python -c "import fastapi, uvicorn, chromadb, sentence_transformers, claude_agent_sdk" 2>/dev/null; then
     info "Python packages OK"
 else
@@ -571,28 +739,43 @@ echo ""
 echo -e "${BOLD}Next steps:${NC}"
 echo ""
 
-# Check Claude authentication
-if ! command -v claude &> /dev/null; then
-    echo "  ${RED}1.${NC} Install Claude Code CLI:"
-    echo "     ${BLUE}npm install -g @anthropic-ai/claude-code${NC}"
+STEP=1
+
+# Claude Code instructions (only if the user opted in)
+if [ "$WITH_CLAUDE" = true ]; then
+    if ! command -v claude &> /dev/null; then
+        echo "  ${RED}${STEP}.${NC} Install Claude Code CLI:"
+        echo "     ${BLUE}npm install -g @anthropic-ai/claude-code${NC}"
+        echo ""
+        STEP=$((STEP + 1))
+        echo "  ${RED}${STEP}.${NC} Authenticate Claude Code:"
+        echo "     ${BLUE}claude auth login${NC}"
+        echo ""
+        STEP=$((STEP + 1))
+    elif ! claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
+        echo "  ${RED}${STEP}.${NC} Authenticate Claude Code:"
+        echo "     ${BLUE}claude auth login${NC}"
+        echo ""
+        STEP=$((STEP + 1))
+    fi
+fi
+
+# Qwen Code instructions (only if the user opted in)
+if [ "$WITH_QWEN" = true ] && ! command -v qwen &> /dev/null; then
+    echo "  ${RED}${STEP}.${NC} Install Qwen Code CLI:"
+    echo "     ${BLUE}npm install -g @qwen-code/qwen-code${NC}"
     echo ""
-    echo "  ${RED}2.${NC} Authenticate Claude Code:"
-    echo "     ${BLUE}claude auth login${NC}"
+    STEP=$((STEP + 1))
+    echo "  ${RED}${STEP}.${NC} Authenticate Qwen Code:"
+    echo "     ${BLUE}qwen${NC}   ${CYAN}(launches interactive auth on first run)${NC}"
     echo ""
-    STEP=3
-elif ! claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
-    echo "  ${RED}1.${NC} Authenticate Claude Code:"
-    echo "     ${BLUE}claude auth login${NC}"
-    echo ""
-    STEP=2
-else
-    STEP=1
+    STEP=$((STEP + 1))
 fi
 
 # Check .env configuration
 if [ ! -f "context/.env" ] || ! grep -q "^OPENAI_API_KEY=.\+" context/.env 2>/dev/null; then
     echo "  ${RED}${STEP}.${NC} Configure your API keys:"
-    echo "     ${BLUE}Edit context/.env${NC}"
+    echo "     ${BLUE}Edit context/.env${NC}   ${CYAN}(OPENAI_API_KEY for voice mode)${NC}"
     echo ""
     STEP=$((STEP + 1))
 fi
@@ -609,4 +792,7 @@ echo "  ${GREEN}$((STEP + 2)).${NC} Open ${BLUE}https://localhost:5432${NC} in y
 echo ""
 
 echo -e "${CYAN}Tip:${NC} Use ${BOLD}/help${NC} in the assistant to see available commands."
+if [ "$WITH_CLAUDE" = true ] && [ "$WITH_QWEN" = true ]; then
+    echo -e "${CYAN}Tip:${NC} You can switch providers anytime in Configuration → Session provider."
+fi
 echo ""

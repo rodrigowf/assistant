@@ -121,6 +121,7 @@ def _default_config() -> dict[str, Any]:
         "working_directory_history": [default_entry],
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
         "chrome_extension": False,  # launch sessions with --chrome flag
+        "provider": "claude",  # session provider — "claude" | "qwen"
         "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
         "default_voice_provider": DEFAULT_VOICE_PROVIDER,
         "default_voice_model": DEFAULT_VOICE_MODEL,
@@ -154,11 +155,15 @@ class WorkingDirectoryEntry(BaseModel):
     claude_config_dir: str | None = None  # Override CLAUDE_CONFIG_DIR on the remote machine
 
 
+_VALID_PROVIDERS: frozenset[str] = frozenset({"claude", "qwen"})
+
+
 class ConfigUpdate(BaseModel):
     working_directory: str | None = None  # entry id to set as active
     working_directory_history: list[WorkingDirectoryEntry] | None = None  # full replacement
     enabled_mcps: list[str] | None = None
     chrome_extension: bool | None = None
+    provider: str | None = None  # session provider — "claude" | "qwen"
     default_model: str | None = None  # default model for new orchestrator sessions
     default_voice_provider: str | None = None  # default provider for voice sessions
     default_voice_model: str | None = None     # default model for voice sessions
@@ -220,6 +225,15 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
 
     if body.chrome_extension is not None:
         config["chrome_extension"] = body.chrome_extension
+
+    if body.provider is not None:
+        provider = body.provider.strip().lower()
+        if provider not in _VALID_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown provider {body.provider!r}; expected one of {sorted(_VALID_PROVIDERS)}",
+            )
+        config["provider"] = provider
 
     if body.default_model is not None:
         # Accept any non-empty model ID. The orchestrator infers provider from

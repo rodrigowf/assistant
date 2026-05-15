@@ -18,6 +18,16 @@ const VOICE_PROVIDER_LABELS: Record<string, string> = {
   google: "Google Gemini",
 };
 
+const SESSION_PROVIDER_LABELS: Record<string, string> = {
+  claude: "Claude Code",
+  qwen: "Qwen Code",
+};
+
+const SESSION_PROVIDER_DESCRIPTIONS: Record<string, string> = {
+  claude: "Anthropic's Claude Code CLI. Stores sessions at context/<id>.jsonl and reads CLAUDE.md.",
+  qwen: "Alibaba's Qwen Code CLI. Stores sessions at context/chats/<id>.jsonl and reads AGENTS.md.",
+};
+
 interface Props {
   isOpen: boolean;
   onClose: () => void;
@@ -327,6 +337,36 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                     </label>
                   </div>
                 </div>
+              </section>
+
+              {/* ── Session Provider ──────────────────────────── */}
+              <section className="config-section">
+                <h3 className="config-section-title">Session provider</h3>
+                <p className="config-section-desc">
+                  Which agent backs new chat sessions. Existing sessions keep their original
+                  provider; this only affects newly-created tabs.
+                </p>
+                <div className="model-dropdowns">
+                  <div className="model-dropdown-field">
+                    <label className="model-dropdown-label">Provider</label>
+                    <select
+                      className="model-dropdown-select"
+                      value={config.provider ?? "claude"}
+                      disabled={saving}
+                      onChange={(e) =>
+                        save({ provider: e.target.value as "claude" | "qwen" })
+                          .catch(err => setError(String(err)))
+                      }
+                    >
+                      {(["claude", "qwen"] as const).map(p => (
+                        <option key={p} value={p}>{SESSION_PROVIDER_LABELS[p]}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <p className="config-section-desc" style={{ marginTop: 8 }}>
+                  {SESSION_PROVIDER_DESCRIPTIONS[config.provider ?? "claude"]}
+                </p>
               </section>
 
               {/* ── Working Directories ───────────────────────── */}

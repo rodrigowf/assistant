@@ -153,6 +153,7 @@ class SessionInfo:
     title: str  # first user prompt, truncated
     message_count: int
     is_orchestrator: bool = False
+    provider: str = "claude"  # "claude" | "qwen" — detected or from marker
 
 
 @dataclass(slots=True)
@@ -176,6 +177,7 @@ class MessagePreview:
     text: str  # primary text content (for backwards compat / display)
     blocks: list[ContentBlock] = field(default_factory=list)
     timestamp: datetime | None = None
+    provider: str = "claude"  # "claude" | "qwen" — inherited from session
 
 
 @dataclass(slots=True)
@@ -189,6 +191,7 @@ class SessionDetail:
     message_count: int
     messages: list[MessagePreview] = field(default_factory=list)
     is_orchestrator: bool = False
+    provider: str = "claude"  # "claude" | "qwen"
 
 
 # ---------------------------------------------------------------------------

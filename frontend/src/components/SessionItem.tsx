@@ -74,6 +74,19 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
         {session.is_orchestrator && (
           <span className="session-type-label">orchestrator</span>
         )}
+        {/* Provider badge hidden for orchestrator sessions: those don't go
+            through the Claude/Qwen CLI — they're a standalone agent loop
+            that talks to Anthropic/OpenAI APIs directly. The "orchestrator"
+            label above already conveys the session kind. */}
+        {session.provider && !session.is_orchestrator && (
+          <span
+            className={`session-provider-dot session-provider-${session.provider}`}
+            title={session.provider === "qwen" ? "Qwen Code" : "Claude Code"}
+            aria-label={`Provider: ${session.provider}`}
+          >
+            {session.provider === "qwen" ? "Q" : "C"}
+          </span>
+        )}
         <span className="session-time">{timeAgo}</span>
         <span className="session-count">{session.message_count} msgs</span>
       </div>

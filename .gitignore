@@ -32,6 +32,9 @@ context/
 # Claude Code SDK config (symlink to context/)
 .claude_config/
 
+# Qwen Code per-user runtime state (settings.json, etc.)
+.qwen/
+
 # Claude Code runtime artifacts (created if CLAUDE_CONFIG_DIR is not set)
 .claude.json
 .claude.json.backup.*

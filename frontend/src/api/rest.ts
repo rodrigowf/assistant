@@ -111,11 +111,14 @@ export interface WorkingDirectoryEntry {
   claude_config_dir?: string | null; // Override CLAUDE_CONFIG_DIR on the remote machine
 }
 
+export type AssistantProvider = "claude" | "qwen";
+
 export interface AssistantConfig {
   working_directory: string;                     // active entry id
   working_directory_history: WorkingDirectoryEntry[];
   enabled_mcps: string[];
   chrome_extension: boolean;
+  provider: AssistantProvider;                   // session provider for new chats
   default_model: string;
   default_voice_provider: string;
   default_voice_model: string;
@@ -129,6 +132,7 @@ export interface ConfigUpdate {
   working_directory_history?: WorkingDirectoryEntry[];   // full list replacement
   enabled_mcps?: string[];
   chrome_extension?: boolean;
+  provider?: AssistantProvider;
   default_model?: string;
   default_voice_provider?: string;
   default_voice_model?: string;

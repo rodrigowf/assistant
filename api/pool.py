@@ -1,17 +1,20 @@
-"""SessionPool — shared pool of Claude Code sessions with event broadcast.
+"""SessionPool — shared pool of agent sessions with event broadcast.
 
-The pool manages both regular agent sessions (SessionManager) and the single
-orchestrator session (OrchestratorSession). All session state lives here;
-there is no separate OrchestratorConnectionManager.
+The pool manages both regular agent sessions (provider-specific
+BaseSessionManager implementations) and the single orchestrator session
+(OrchestratorSession). All session state lives here; there is no
+separate OrchestratorConnectionManager.
 
 Key design:
 - Sessions are keyed by a stable **local_id** (UUID from the frontend) that
   never changes across reconnects or backend restarts.
-- Regular sessions (SessionManager) support multiple concurrent WebSocket
-  subscribers via subscribe/unsubscribe.
+- Regular sessions support multiple concurrent WebSocket subscribers via
+  subscribe/unsubscribe.
 - The orchestrator session is stored separately but uses the same subscriber
   infrastructure. At most one orchestrator can be active at a time.
 - Watchers receive notifications when agent sessions are opened or closed.
+- The provider (Claude vs Qwen) is selected per session based on
+  ``ManagerConfig.provider``; pool internals stay provider-agnostic.
 """
 
 from __future__ import annotations
@@ -27,14 +30,26 @@ import orjson
 from starlette.websockets import WebSocket, WebSocketState
 
 from api.serializers import serialize_event
-from manager.config import ManagerConfig
-from manager.session import (
-    SessionManager,
+from manager.base_session import BaseSessionManager
+from manager.claude_session import (
+    ClaudeSessionManager,
     _process_alive,
     _looks_like_claude,
     kill_claude_subprocess,
 )
+from manager.config import ManagerConfig
+from manager.qwen_session import QwenSessionManager
 from manager.types import Event
+
+
+def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
+    """Factory: build the right session manager for the configured provider."""
+    provider = (config.provider or "claude").lower()
+    if provider == "qwen":
+        return QwenSessionManager(config=config, **kwargs)
+    if provider == "claude":
+        return ClaudeSessionManager(config=config, **kwargs)
+    raise ValueError(f"Unsupported provider: {provider!r}")
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +59,7 @@ class SessionPool:
 
     def __init__(self) -> None:
         # Regular agent sessions
-        self._sessions: dict[str, SessionManager] = {}
+        self._sessions: dict[str, BaseSessionManager] = {}
         self._subscribers: dict[str, set[WebSocket]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -167,11 +182,11 @@ class SessionPool:
             from dataclasses import replace
             config = replace(config, mcp_servers=mcp_servers)
 
-        sm = SessionManager(
+        sm = _session_manager_for(
+            config,
             session_id=resume_sdk_id,
             local_id=lid,
             fork=fork,
-            config=config,
         )
         try:
             await sm.start()
@@ -189,15 +204,15 @@ class SessionPool:
                 # get hammered.  One retry only; if that also fails, surface
                 # the error to the caller instead of looping.
                 logger.warning(
-                    "Resume SDK ID %s not found in Claude state; starting fresh session",
+                    "Resume SDK ID %s not found; starting fresh session",
                     resume_sdk_id,
                 )
                 await asyncio.sleep(0.5 + random.random() * 0.5)
-                sm = SessionManager(
+                sm = _session_manager_for(
+                    config,
                     session_id=None,
                     local_id=lid,
                     fork=False,
-                    config=config,
                 )
                 await sm.start()
             else:
@@ -310,7 +325,7 @@ class SessionPool:
     # Agent session access
     # ------------------------------------------------------------------
 
-    def get(self, session_id: str) -> SessionManager | None:
+    def get(self, session_id: str) -> BaseSessionManager | None:
         return self._sessions.get(session_id)
 
     def has(self, session_id: str) -> bool:
@@ -324,6 +339,7 @@ class SessionPool:
                 "status": sm.status.value,
                 "cost": sm.cost,
                 "turns": sm.turns,
+                "provider": sm.provider_name,
             }
             for lid, sm in self._sessions.items()
         ]
@@ -684,8 +700,15 @@ class SessionPool:
         channels for telling everyone what happened.
         """
         # Imported lazily to keep pool.py importable in environments where
-        # the SDK isn't available (some unit tests).
-        from manager.session import SessionAbandoned
+        # the SDK isn't available (some unit tests).  Both Claude and Qwen
+        # signal upstream wedge via their own exception type; we catch
+        # either.
+        from manager.claude_session import SessionAbandoned
+        from manager.qwen_session import QwenAbandoned
+
+        abandoned_exceptions: tuple[type[Exception], ...] = (
+            SessionAbandoned, QwenAbandoned,
+        )
 
         async def _stream_once() -> None:
             async for _event in self.send(session_id, text, source_ws=source_ws):
@@ -694,7 +717,7 @@ class SessionPool:
         try:
             try:
                 await _stream_once()
-            except SessionAbandoned as exc:
+            except abandoned_exceptions as exc:
                 logger.warning(
                     "Turn abandoned for session %s after %.0fs; retrying once",
                     session_id, exc.elapsed_seconds,
@@ -711,11 +734,11 @@ class SessionPool:
                 await _stream_once()
         except asyncio.CancelledError:
             raise
-        except SessionAbandoned as exc:
+        except abandoned_exceptions as exc:
             await self._broadcast_session(session_id, {
                 "type": "error", "error": "upstream_wedged",
                 "detail": (
-                    f"Anthropic upstream did not respond after retry "
+                    f"Upstream did not respond after retry "
                     f"({exc.elapsed_seconds:.0f}s). Try again in a moment."
                 ),
             })

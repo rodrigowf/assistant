@@ -52,8 +52,8 @@ def test_remote_claude_path_cached_between_wrapper_writes():
     mock_result = MagicMock(stdout="/home/agent/.local/bin/claude\n")
 
     # Pretend the host is reachable so the ping pre-probe doesn't short-circuit.
-    with patch("manager.session._probe_ssh_host_reachable", return_value=True), \
-         patch("manager.session.subprocess.run", return_value=mock_result) as run:
+    with patch("manager.claude_session._probe_ssh_host_reachable", return_value=True), \
+         patch("manager.claude_session.subprocess.run", return_value=mock_result) as run:
         sm1 = SessionManager(config=cfg)
         sm2 = SessionManager(config=cfg)
         path1 = sm1._write_ssh_wrapper()
@@ -74,8 +74,8 @@ def test_remote_claude_path_cache_keyed_per_host():
     cfg_b = _ssh_config("10.0.0.2")
     mock_result = MagicMock(stdout="/usr/local/bin/claude\n")
 
-    with patch("manager.session._probe_ssh_host_reachable", return_value=True), \
-         patch("manager.session.subprocess.run", return_value=mock_result) as run:
+    with patch("manager.claude_session._probe_ssh_host_reachable", return_value=True), \
+         patch("manager.claude_session.subprocess.run", return_value=mock_result) as run:
         SessionManager(config=cfg_a)._write_ssh_wrapper()
         SessionManager(config=cfg_a)._write_ssh_wrapper()
         SessionManager(config=cfg_b)._write_ssh_wrapper()
@@ -90,8 +90,8 @@ def test_remote_claude_path_cache_remembers_fallback():
     clear_remote_claude_path_cache()
     cfg = _ssh_config()
 
-    with patch("manager.session._probe_ssh_host_reachable", return_value=True), \
-         patch("manager.session.subprocess.run", side_effect=TimeoutError()) as run:
+    with patch("manager.claude_session._probe_ssh_host_reachable", return_value=True), \
+         patch("manager.claude_session.subprocess.run", side_effect=TimeoutError()) as run:
         SessionManager(config=cfg)._write_ssh_wrapper()
         SessionManager(config=cfg)._write_ssh_wrapper()
         SessionManager(config=cfg)._write_ssh_wrapper()
@@ -106,8 +106,8 @@ def test_wrapper_skips_probe_when_host_unreachable():
     clear_remote_claude_path_cache()
     cfg = _ssh_config("10.254.254.254")
 
-    with patch("manager.session._probe_ssh_host_reachable", return_value=False), \
-         patch("manager.session.subprocess.run") as run:
+    with patch("manager.claude_session._probe_ssh_host_reachable", return_value=False), \
+         patch("manager.claude_session.subprocess.run") as run:
         SessionManager(config=cfg)._write_ssh_wrapper()
 
     # Zero SSH subprocess calls — the ping-probe short-circuited it.
@@ -223,7 +223,7 @@ async def test_start_raises_fast_when_ssh_host_unreachable():
     """SessionManager.start() fails in ~2 s instead of hanging on SSH TCP timeout."""
     cfg = _ssh_config("10.254.254.254")
 
-    with patch("manager.session._probe_ssh_host_reachable", return_value=False):
+    with patch("manager.claude_session._probe_ssh_host_reachable", return_value=False):
         sm = SessionManager(config=cfg)
         with pytest.raises(RemoteHostUnreachableError):
             await sm.start()

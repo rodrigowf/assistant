@@ -226,6 +226,13 @@ async def _handle_start(
     else:
         config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
 
+    # Apply the configured provider (claude | qwen).  ManagerConfig.load()
+    # already honors ASSISTANT_PROVIDER env var; this overlays the UI-saved
+    # value from assistant_config.json (which is what users actually edit).
+    provider = assistant_cfg.get("provider")
+    if provider:
+        config = replace(config, provider=str(provider).lower())
+
     # If no per-session MCPs provided, use session-level or global enabled MCPs.
     # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".
     if mcp_servers is None:
