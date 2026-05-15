@@ -5,10 +5,12 @@ import {
   listMcpServers,
   listModels,
   listVoiceModels,
+  listQwenHarnessModels,
   type AssistantConfig,
   type McpServerConfig,
   type ModelInfo,
   type VoiceModelEntry,
+  type QwenModelInfo,
 } from "../api/rest";
 import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
 
@@ -37,6 +39,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [config, setConfig] = useState<AssistantConfig | null>(null);
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [qwenHarnessModels, setQwenHarnessModels] = useState<QwenModelInfo[]>([]);
   const [voiceProviders, setVoiceProviders] = useState<Record<string, VoiceModelEntry[]>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -52,16 +55,24 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, modelsRes, voiceRes] = await Promise.all([
+      const [cfg, mcpRes, modelsRes, voiceRes, qwenHarnessRes] = await Promise.all([
         getConfig(),
         listMcpServers(),
         listModels(),
         listVoiceModels(),
+        // Tolerate failure here: if the user hasn't installed the Qwen CLI,
+        // the route still works (returns []) but a fetch error would still
+        // blank the whole config page.  Swallow + log so the rest renders.
+        listQwenHarnessModels().catch(e => {
+          console.warn("listQwenHarnessModels failed:", e);
+          return { models: [] };
+        }),
       ]);
       setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setModels(modelsRes.models);
       setVoiceProviders(voiceRes.providers);
+      setQwenHarnessModels(qwenHarnessRes.models);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -363,10 +374,51 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                       ))}
                     </select>
                   </div>
+
+                  {/* Qwen harness model — sourced from ~/.qwen/settings.json so anything
+                      the user has wired up there (Qwen, DeepSeek, GLM, a local provider,
+                      …) shows up automatically.  An empty value means "let the CLI pick
+                      its own default" — we surface that as the first option so users on a
+                      fresh install don't have to touch this. */}
+                  {(config.provider ?? "claude") === "qwen" && (
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">Model</label>
+                      <select
+                        className="model-dropdown-select"
+                        value={config.harness_model?.qwen ?? ""}
+                        disabled={saving || qwenHarnessModels.length === 0}
+                        onChange={(e) =>
+                          save({ harness_model: { qwen: e.target.value } })
+                            .catch(err => setError(String(err)))
+                        }
+                      >
+                        <option value="">CLI default</option>
+                        {qwenHarnessModels.map(m => {
+                          const badges = [
+                            m.context_window ? `${Math.round(m.context_window / 1000)}K ctx` : null,
+                            m.supports_thinking ? "thinking" : null,
+                            m.supports_vision ? "vision" : null,
+                            m.supports_video ? "video" : null,
+                          ].filter(Boolean).join(" · ");
+                          return (
+                            <option key={m.id} value={m.id}>
+                              {m.display_name}{badges ? ` — ${badges}` : ""}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </div>
+                  )}
                 </div>
                 <p className="config-section-desc" style={{ marginTop: 8 }}>
                   {SESSION_PROVIDER_DESCRIPTIONS[config.provider ?? "claude"]}
                 </p>
+                {(config.provider ?? "claude") === "qwen" && qwenHarnessModels.length === 0 && (
+                  <p className="config-section-desc" style={{ marginTop: 4, opacity: 0.7 }}>
+                    No models found in <code>~/.qwen/settings.json</code> — run <code>qwen</code> once to
+                    initialize the catalog, or add custom providers there.
+                  </p>
+                )}
               </section>
 
               {/* ── Working Directories ───────────────────────── */}

@@ -120,6 +120,7 @@ export interface AssistantConfig {
   chrome_extension: boolean;
   provider: AssistantProvider;                   // session provider for new chats
   default_model: string;
+  harness_model: Partial<Record<AssistantProvider, string>>; // per-provider; "" = CLI default
   default_voice_provider: string;
   default_voice_model: string;
   default_voice_name: string;
@@ -134,6 +135,7 @@ export interface ConfigUpdate {
   chrome_extension?: boolean;
   provider?: AssistantProvider;
   default_model?: string;
+  harness_model?: Partial<Record<AssistantProvider, string>>; // shallow-merged server-side
   default_voice_provider?: string;
   default_voice_model?: string;
   default_voice_name?: string;
@@ -173,6 +175,28 @@ export interface ModelsResponse {
 
 export function listModels(): Promise<ModelsResponse> {
   return json(`${BASE}/orchestrator/models`);
+}
+
+// Harness model catalog (currently Qwen only — Claude has no programmatic
+// equivalent of ~/.qwen/settings.json, so we leave that picker hidden).
+
+export interface QwenModelInfo {
+  id: string;
+  display_name: string;
+  provider: string;             // key under modelProviders in settings.json
+  base_url: string | null;
+  context_window: number | null;
+  supports_vision: boolean;
+  supports_video: boolean;
+  supports_thinking: boolean;
+}
+
+export interface QwenModelsResponse {
+  models: QwenModelInfo[];
+}
+
+export function listQwenHarnessModels(): Promise<QwenModelsResponse> {
+  return json(`${BASE}/config/harness/qwen/models`);
 }
 
 // Voice Provider Configuration

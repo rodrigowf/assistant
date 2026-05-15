@@ -123,6 +123,12 @@ def _default_config() -> dict[str, Any]:
         "chrome_extension": False,  # launch sessions with --chrome flag
         "provider": "claude",  # session provider — "claude" | "qwen"
         "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
+        # Default *harness* model per provider — what `claude --model <id>` or
+        # `qwen --model <id>` runs with on a new session.  Empty string means
+        # "let the CLI pick its own default" (which is what the CLI does when
+        # we omit the flag entirely).  Keyed by provider so the picker can
+        # remember a different choice for each.
+        "harness_model": {"claude": "", "qwen": ""},
         "default_voice_provider": DEFAULT_VOICE_PROVIDER,
         "default_voice_model": DEFAULT_VOICE_MODEL,
         "default_voice_name": default_voice,
@@ -200,6 +206,7 @@ class ConfigUpdate(BaseModel):
     chrome_extension: bool | None = None
     provider: str | None = None  # session provider — "claude" | "qwen"
     default_model: str | None = None  # default model for new orchestrator sessions
+    harness_model: dict[str, str] | None = None  # per-provider harness model ("" = CLI default)
     default_voice_provider: str | None = None  # default provider for voice sessions
     default_voice_model: str | None = None     # default model for voice sessions
     default_voice_name: str | None = None      # default voice/speaker for voice sessions
@@ -215,6 +222,20 @@ class ConfigUpdate(BaseModel):
 async def get_config() -> dict[str, Any]:
     """Return the current global configuration."""
     return _load_config()
+
+
+@router.get("/harness/qwen/models")
+async def list_harness_qwen_models() -> dict[str, Any]:
+    """Return the Qwen Code model catalog discovered from ``~/.qwen/settings.json``.
+
+    The catalog is the source of truth Qwen Code itself uses for ``--model``
+    validation, so anything the user wires up there (Qwen, DeepSeek, GLM, a
+    local Ollama endpoint, …) shows up here automatically.  An empty list
+    means the settings file is missing or has no providers configured — the
+    frontend can fall back to "let Qwen pick the default."
+    """
+    from manager.qwen_models import list_qwen_models
+    return {"models": [m.to_dict() for m in list_qwen_models()]}
 
 
 @router.put("")
@@ -269,6 +290,29 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
                 detail=f"Unknown provider {body.provider!r}; expected one of {sorted(_VALID_PROVIDERS)}",
             )
         config["provider"] = provider
+
+    if body.harness_model is not None:
+        # Shallow merge: only the keys present in the request overwrite the
+        # saved map, so the frontend can patch one provider's choice without
+        # clobbering the other.  Unknown provider keys are rejected so a
+        # typo doesn't silently land in the config and confuse the picker.
+        current = dict(config.get("harness_model") or {})
+        for prov, model_id in body.harness_model.items():
+            if prov not in _VALID_PROVIDERS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unknown harness provider {prov!r}; expected one of "
+                        f"{sorted(_VALID_PROVIDERS)}"
+                    ),
+                )
+            if not isinstance(model_id, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"harness_model[{prov!r}] must be a string (got {type(model_id).__name__})",
+                )
+            current[prov] = model_id.strip()
+        config["harness_model"] = current
 
     if body.default_model is not None:
         # Accept any non-empty model ID. The orchestrator infers provider from

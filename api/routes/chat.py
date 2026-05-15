@@ -233,6 +233,15 @@ async def _handle_start(
     if provider:
         config = replace(config, provider=str(provider).lower())
 
+    # Apply the per-provider harness model the user picked in the Config UI.
+    # An empty/missing value means "let the CLI pick its own default" (we
+    # achieve that by leaving ManagerConfig.model as whatever .manager.json
+    # set it to, or None — which omits the --model flag entirely).
+    harness_models = assistant_cfg.get("harness_model") or {}
+    picked_model = harness_models.get(config.provider)
+    if isinstance(picked_model, str) and picked_model.strip():
+        config = replace(config, model=picked_model.strip())
+
     # If no per-session MCPs provided, use session-level or global enabled MCPs.
     # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".
     if mcp_servers is None:
