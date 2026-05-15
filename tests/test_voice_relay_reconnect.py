@@ -65,12 +65,27 @@ class _FakeWS:
 
 
 class _FakeProvider:
-    """Minimal voice provider double for the relay."""
+    """Minimal voice provider double for the relay.
+
+    Provides only the relay-facing surface — does NOT subclass
+    :class:`BaseVoiceProvider` so the tests can hand-roll edge cases
+    without satisfying every abstract method.  The relay only calls
+    the names we expose here, plus the hook methods that the post-refactor
+    relay drives.
+    """
 
     provider_name = "qwen-test"
     connection_type = "websocket"
     model = "qwen-test-model"
     voice = "test-voice"
+
+    # Treat the same DashScope boilerplate as recoverable — these tests
+    # exercise that path specifically.
+    _RECONNECTABLE_ERR_SUBSTRINGS = (
+        "InvalidParameter",
+        "The provided URL does not appear to be valid",
+        "response_idle_timeout",
+    )
 
     def __init__(self, ws_seq: list[_FakeWS]):
         self._ws_seq = list(ws_seq)
@@ -84,13 +99,29 @@ class _FakeProvider:
     async def inject_event(self, event: dict[str, Any]) -> None:
         self.injected.append(event)
 
-    @staticmethod
-    def extract_audio_out(event):
+    @classmethod
+    def extract_audio_out(cls, event):
         return None
 
-    # Avoid keepalive task spawn — that loop polls _last_audio_in_at and
-    # would race the test's event loop close.
-    # (No build_keepalive_chunk attribute => relay skips the keepalive.)
+    # --- relay hooks (matches BaseVoiceProvider surface) -----------------
+
+    def is_recoverable_error(self, exc: BaseException) -> bool:
+        text = str(exc)
+        return any(s in text for s in self._RECONNECTABLE_ERR_SUBSTRINGS)
+
+    def should_gate_event(self, event):
+        return False
+
+    def on_inbound_event(self, event):
+        pass
+
+    def gate_cleared(self):
+        return True
+
+    def build_keepalive_chunk(self):
+        # Returning None skips the keepalive task — that loop polls
+        # _last_audio_in_at and would race the test's event loop close.
+        return None
 
 
 @pytest.mark.asyncio

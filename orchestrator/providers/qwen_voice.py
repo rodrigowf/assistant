@@ -175,6 +175,12 @@ class QwenVoiceProvider(BaseVoiceProvider):
         self._current_transcript: str = ""
         self._pending_calls: dict[str, str] = {}
         self._pending_args: dict[str, str] = {}
+        # Tracks whether a ``response.created`` has fired without a
+        # matching ``response.done``.  Sending ``response.create`` while
+        # this is True triggers Qwen's "Conversation already has an
+        # active response" error and (empirically) closes the WS.  The
+        # relay defers gated events via :meth:`should_gate_event`.
+        self._response_active = False
 
     # --- identity ---------------------------------------------------------
 
@@ -532,12 +538,50 @@ class QwenVoiceProvider(BaseVoiceProvider):
         """True if the event carries provider audio bytes for the client."""
         return raw_event.get("type") == "response.audio.delta"
 
-    @staticmethod
-    def extract_audio_out(raw_event: dict[str, Any]) -> str | None:
+    @classmethod
+    def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
         """Pull the base-64 PCM chunk from a ``response.audio.delta`` event."""
         if raw_event.get("type") != "response.audio.delta":
             return None
         return raw_event.get("delta")
+
+    # --- relay hook overrides --------------------------------------------
+
+    # Substrings DashScope reuses for its misleading "URL not valid" 400.
+    # That boilerplate fires mid-session with no offending frame on our
+    # side; reopening with a fresh ``session.update`` consistently brings
+    # the session back.  ``response_idle_timeout`` is the 5-min no-response
+    # watchdog — also recoverable, the user just stepped away.
+    _RECONNECTABLE_ERR_SUBSTRINGS = (
+        "InvalidParameter",
+        "The provided URL does not appear to be valid",
+        "response_idle_timeout",
+    )
+
+    def is_recoverable_error(self, exc: BaseException) -> bool:
+        """Match the DashScope boilerplate that signals a recoverable close."""
+        err_text = str(exc)
+        return any(s in err_text for s in self._RECONNECTABLE_ERR_SUBSTRINGS)
+
+    def should_gate_event(self, event: dict[str, Any]) -> bool:
+        """Defer ``response.create`` while another response is in flight.
+
+        Qwen rejects concurrent ``response.create`` with "Conversation
+        already has an active response" and (empirically) closes the WS.
+        """
+        return event.get("type") == "response.create" and self._response_active
+
+    def on_inbound_event(self, event: dict[str, Any]) -> None:
+        """Track the active-response window from upstream events."""
+        evt_type = event.get("type", "")
+        if evt_type == "response.created":
+            self._response_active = True
+        elif evt_type == "response.done":
+            self._response_active = False
+
+    def gate_cleared(self) -> bool:
+        """True once no response is in flight, so deferred frames can ship."""
+        return not self._response_active
 
     # --- connection metadata ---------------------------------------------
 

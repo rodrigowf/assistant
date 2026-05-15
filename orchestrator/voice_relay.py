@@ -42,25 +42,10 @@ EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 SessionUpdateBuilder = Callable[[], Awaitable[dict[str, Any]]]
 
 
-# Substrings in the WS close reason that mark a *recoverable* upstream
-# failure.  DashScope reuses the boilerplate "InvalidParameter: The
-# provided URL does not appear to be valid" 400 for unrelated internal
-# pipeline failures (verified empirically: it fires mid-session with no
-# offending frame on our side).  Reopening the WS with a fresh
-# session.update consistently brings the session back.  ``response_idle_timeout``
-# is the 5-min no-response watchdog — also recoverable, the user just
-# stepped away.
-_RECONNECTABLE_ERR_SUBSTRINGS = (
-    "InvalidParameter",
-    "The provided URL does not appear to be valid",
-    "response_idle_timeout",
-)
-
-
 # How many recent non-audio frames to remember.  When the upstream WS
-# dies with DashScope's misleading "InvalidParameter" 400, the offending
-# frame is in here.  Audio chunks are excluded — they're frequent and
-# almost never the cause; logging them would drown the signal.
+# dies with a misleading error from the provider, the offending frame
+# is in here.  Audio chunks are excluded — they're frequent and almost
+# never the cause; logging them would drown the signal.
 _FRAME_HISTORY_SIZE = 24
 
 # Sample 1-in-N audio frames into the per-session log so we can see the
@@ -139,15 +124,14 @@ class VoiceRelay:
         # they sent back, and which way the close came from.
         self._sent_history: deque[dict[str, Any]] = deque(maxlen=_FRAME_HISTORY_SIZE)
         self._recv_history: deque[dict[str, Any]] = deque(maxlen=_FRAME_HISTORY_SIZE)
-        # Tracks whether a `response.created` has fired without a
-        # matching `response.done` yet.  Sending `response.create` while
-        # this is True triggers Qwen's "Conversation already has an
-        # active response" error and (empirically) closes the session.
-        # We defer queued response.create frames until the active one
-        # finishes.
-        self._response_active = asyncio.Event()
-        self._response_active.clear()
-        self._pending_response_create: list[dict[str, Any]] = []
+        # Provider-driven event gating.  Outbound frames that
+        # :meth:`BaseVoiceProvider.should_gate_event` rejects are
+        # parked here; we replay the most recent one each time
+        # :meth:`BaseVoiceProvider.gate_cleared` reports the gate has
+        # lifted.  The legacy Qwen behaviour (defer ``response.create``
+        # while another response is active) is now implemented entirely
+        # inside :class:`QwenVoiceProvider` via the gate-hook pair.
+        self._deferred_events: list[dict[str, Any]] = []
 
         # --- observability state ---
         self._started_at: float = 0.0  # set in start()
@@ -246,11 +230,12 @@ class VoiceRelay:
         await self._open_and_handshake(session_config)
         self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
 
-        # Keepalive task — only if the provider implements
-        # build_keepalive_chunk().  Sends silent PCM every 30s of audio
-        # silence to prevent Qwen's transcription pipeline from timing
-        # out and crashing on the next real input.
-        if hasattr(self._provider, "build_keepalive_chunk"):
+        # Keepalive task — only if the provider opts in via
+        # build_keepalive_chunk() returning a non-None chunk.  Qwen-Omni
+        # needs this to keep its ASR pipeline from timing out after
+        # ~3-5 min of audio silence; other providers default to None
+        # and skip the task entirely.
+        if self._provider.build_keepalive_chunk() is not None:
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(),
                 name=f"voice-keepalive-{self._provider.provider_name}",
@@ -319,16 +304,20 @@ class VoiceRelay:
         # already accounted for separately.
 
     async def send_event(self, event: dict[str, Any]) -> None:
-        """Forward a frontend control event upstream verbatim."""
+        """Forward a frontend control event upstream verbatim.
+
+        The provider may gate certain event types via
+        :meth:`BaseVoiceProvider.should_gate_event` — gated events are
+        parked until :meth:`BaseVoiceProvider.gate_cleared` reports the
+        gate has lifted (driven by upstream events through the drain
+        loop).
+        """
         if self._ws is None or self._closed.is_set():
             return  # Drop silently — caller already saw an error event.
 
-        # Defer response.create until the active response (if any) finishes.
-        # Qwen rejects concurrent response.create with "Conversation already
-        # has an active response" and (empirically) closes the WS.
-        if event.get("type") == "response.create" and self._response_active.is_set():
-            self._slog("defer response.create (active response in flight)")
-            self._pending_response_create.append(event)
+        if self._provider.should_gate_event(event):
+            self._slog(f"defer event type={event.get('type')} (provider gate active)")
+            self._deferred_events.append(event)
             return
 
         self._record_sent(event)
@@ -341,19 +330,17 @@ class VoiceRelay:
             self._slog(f"WARN send dropped (upstream closed): type={event.get('type')} err={e}")
 
     async def send_audio(self, pcm_b64: str) -> None:
-        """Forward a frontend mic chunk upstream as a provider-specific append."""
+        """Forward a frontend mic chunk upstream as a provider-specific append.
+
+        The provider's :meth:`BaseVoiceProvider.format_audio_in` decides
+        the on-the-wire shape (Qwen: ``input_audio_buffer.append``;
+        Gemini Live: ``realtimeInput.audio``).
+        """
         if self._ws is None or self._closed.is_set():
             return  # Drop silently after upstream close — frontend already notified.
-        # Each provider knows the right wrapper (Qwen: input_audio_buffer.append;
-        # Gemini: BidiGenerateContentRealtimeInput.audio).
-        format_audio_in = getattr(self._provider, "format_audio_in", None)
-        if format_audio_in is None:
-            raise RuntimeError(
-                f"Provider {self._provider.provider_name} does not implement format_audio_in()"
-            )
         try:
             async with self._send_lock:
-                await self._ws.send(json.dumps(format_audio_in(pcm_b64)))
+                await self._ws.send(json.dumps(self._provider.format_audio_in(pcm_b64)))
             now = time.monotonic()
             self._last_send_at = now
             self._last_audio_in_at = now
@@ -447,19 +434,16 @@ class VoiceRelay:
     async def _keepalive_loop(self) -> None:
         """Send a tiny silent PCM chunk every 30s of audio silence.
 
-        Background: Qwen-Omni's transcription pipeline times out after
-        ~3-5 minutes of no audio input; the next real chunk crashes the
-        upstream WS with a misleading "InvalidParameter" 400.  Empirically
-        a periodic silent chunk prevents the timeout without affecting
-        transcripts or VAD (silence stays well below the speech threshold).
+        Driven by the provider's
+        :meth:`BaseVoiceProvider.build_keepalive_chunk` hook.  The loop
+        only spawns when that hook returns a non-None chunk (see
+        :meth:`start`).  Qwen-Omni uses this to keep its ASR pipeline
+        from timing out after multi-minute silences; other providers
+        leave the default ``None`` and the loop never runs.
 
         Aborted on cancellation; logs each tick at debug level.
         """
         assert self._ws is not None
-        build = getattr(self._provider, "build_keepalive_chunk", None)
-        format_audio_in = getattr(self._provider, "format_audio_in", None)
-        if build is None or format_audio_in is None:
-            return  # provider doesn't support keepalive
         try:
             while not self._closed.is_set():
                 await asyncio.sleep(_KEEPALIVE_INTERVAL_S / 2)
@@ -470,9 +454,12 @@ class VoiceRelay:
                 if idle < _KEEPALIVE_INTERVAL_S:
                     continue
                 try:
-                    chunk = build()
+                    chunk = self._provider.build_keepalive_chunk()
+                    if chunk is None:
+                        # Provider stopped wanting keepalive — exit cleanly.
+                        return
                     async with self._send_lock:
-                        await self._ws.send(json.dumps(format_audio_in(chunk)))
+                        await self._ws.send(json.dumps(self._provider.format_audio_in(chunk)))
                     self._last_send_at = time.monotonic()
                     self._slog(f"keepalive sent (idle={idle:.1f}s)")
                 except Exception as e:  # noqa: BLE001
@@ -501,32 +488,31 @@ class VoiceRelay:
                     self._slog(f"WARN non-JSON recv (dropped) bytes={len(raw)}")
                     continue
 
-                # Audio out → ship to frontend. The provider-specific class
-                # method picks the right field name.
-                extract_audio_out = getattr(type(self._provider), "extract_audio_out", None)
-                if extract_audio_out is not None:
-                    audio_b64 = extract_audio_out(event)
-                    if audio_b64:
-                        await self._on_audio_out(audio_b64)
-                        self._audio_out_chunks += 1
-                        self._audio_out_bytes += (len(audio_b64) * 3) // 4
-                        if self._first_audio_out_at is None:
-                            self._first_audio_out_at = self._now_rel()
-                            self._slog(f"first audio_out at t+{self._first_audio_out_at:.2f}s")
-                            logger.info(
-                                "voice_relay first audio_out session_id=%s in %.2fs",
-                                self._session_id, self._first_audio_out_at,
-                            )
-                        elif self._audio_out_chunks % _AUDIO_LOG_SAMPLE_EVERY == 0:
-                            self._slog(
-                                f"audio_out chunks={self._audio_out_chunks}"
-                                f" bytes={self._audio_out_bytes}"
-                            )
-                        # Don't broadcast the audio event itself to the
-                        # frontend — only the canonical audio_out payload.
-                        # But still inject for any provider-internal state.
-                        await self._provider.inject_event(event)
-                        continue
+                # Audio out → ship to frontend. The provider's
+                # ``extract_audio_out`` knows the right field path.
+                audio_b64 = self._provider.extract_audio_out(event)
+                if audio_b64:
+                    await self._on_audio_out(audio_b64)
+                    self._audio_out_chunks += 1
+                    self._audio_out_bytes += (len(audio_b64) * 3) // 4
+                    if self._first_audio_out_at is None:
+                        self._first_audio_out_at = self._now_rel()
+                        self._slog(f"first audio_out at t+{self._first_audio_out_at:.2f}s")
+                        logger.info(
+                            "voice_relay first audio_out session_id=%s in %.2fs",
+                            self._session_id, self._first_audio_out_at,
+                        )
+                    elif self._audio_out_chunks % _AUDIO_LOG_SAMPLE_EVERY == 0:
+                        self._slog(
+                            f"audio_out chunks={self._audio_out_chunks}"
+                            f" bytes={self._audio_out_bytes}"
+                        )
+                    # Don't broadcast the audio event itself to the
+                    # frontend — only the canonical audio_out payload.
+                    # But still inject for any provider-internal state.
+                    self._provider.on_inbound_event(event)
+                    await self._provider.inject_event(event)
+                    continue
 
                 # Non-audio control event — record for post-mortem,
                 # bump counters, and slog.
@@ -535,18 +521,16 @@ class VoiceRelay:
                 size = len(raw) if isinstance(raw, str) else len(raw or "")
                 self._slog(f"recv  type={evt_type} size={size}B")
 
-                # Track active-response state so we don't ship a
-                # `response.create` while another response is in flight.
-                if evt_type == "response.created":
-                    self._response_active.set()
-                elif evt_type == "response.done":
-                    self._response_active.clear()
-                    # Drain any response.create we queued while busy.
-                    if self._pending_response_create:
-                        queued = self._pending_response_create.pop(0)
-                        # Discard duplicates — only one is meaningful.
-                        self._pending_response_create.clear()
-                        await self.send_event(queued)
+                # Let the provider update any internal gating state.
+                self._provider.on_inbound_event(event)
+                # If the gate just cleared, replay the most-recent
+                # deferred event (older ones are stale — keep the queue
+                # tail-only, matching the legacy Qwen "discard duplicate
+                # response.create" behaviour).
+                if self._deferred_events and self._provider.gate_cleared():
+                    queued = self._deferred_events[-1]
+                    self._deferred_events.clear()
+                    await self.send_event(queued)
 
                 # Surface upstream errors prominently — they often
                 # precede a close with a more useful message than the
@@ -631,11 +615,12 @@ class VoiceRelay:
     async def _try_reconnect(self, err: BaseException) -> bool:
         """Attempt to transparently reopen the upstream WS.
 
-        Only fires for errors whose stringification contains one of the
-        recoverable substrings AND when the relay was constructed with a
-        ``rebuild_session_update`` callback AND we haven't exhausted
-        :attr:`_max_reconnects`.  On success the new WS is wired up and
-        ``_ws`` points at it; the caller restarts the drain task.
+        Only fires for errors the provider classifies as recoverable
+        (via :meth:`BaseVoiceProvider.is_recoverable_error`) AND when
+        the relay was constructed with a ``rebuild_session_update``
+        callback AND we haven't exhausted :attr:`_max_reconnects`.  On
+        success the new WS is wired up and ``_ws`` points at it; the
+        caller restarts the drain task.
 
         We deliberately do NOT mirror the upstream error frame to the
         frontend on a successful reconnect — the user shouldn't see a
@@ -649,9 +634,8 @@ class VoiceRelay:
                 f"reconnect skipped: hit max_reconnects={self._max_reconnects}"
             )
             return False
-        err_text = str(err)
-        if not any(s in err_text for s in _RECONNECTABLE_ERR_SUBSTRINGS):
-            self._slog(f"reconnect skipped: not a recoverable error class")
+        if not self._provider.is_recoverable_error(err):
+            self._slog(f"reconnect skipped: provider classifies error as fatal")
             return False
 
         self._reconnect_count += 1
@@ -672,11 +656,11 @@ class VoiceRelay:
                 pass
             self._ws = None
 
-        # Provider-internal state: clear the response-active gate (the old
-        # session's response is gone) and the deferred response.create
-        # queue (those were tied to the old context).
-        self._response_active.clear()
-        self._pending_response_create.clear()
+        # Relay-internal state: clear the deferred-event queue (those
+        # were tied to the old upstream context).  Provider-internal
+        # gating state resets itself naturally as the new session
+        # delivers fresh events through :meth:`on_inbound_event`.
+        self._deferred_events.clear()
 
         try:
             session_config = await self._rebuild_session_update()

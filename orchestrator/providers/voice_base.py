@@ -13,6 +13,15 @@ Two operating modes:
   The frontend captures PCM and ships it to the backend, which forwards it
   to the provider via ``inject_audio``; provider audio is yielded as
   ``VoiceAudioDelta`` events.
+
+WebSocket providers ALSO implement the relay hooks at the bottom of this
+file: ``format_audio_in``, ``extract_audio_out`` (required), plus the
+opt-in hooks ``is_recoverable_error``, ``should_gate_event``,
+``on_inbound_event``, ``build_keepalive_chunk`` (default no-ops on the
+base class). The ``VoiceRelay`` in ``orchestrator/voice_relay.py`` calls
+these hooks instead of branching on the provider name — every Qwen-
+specific quirk that used to be hardcoded in the relay now lives behind
+one of these hooks on ``QwenVoiceProvider``.
 """
 
 from __future__ import annotations
@@ -129,3 +138,91 @@ class BaseVoiceProvider(ABC):
                 "voice": str,
             }
         """
+
+    # --- relay hooks (websocket providers only) --------------------------
+
+    def format_audio_in(self, pcm_b64: str) -> dict[str, Any]:
+        """Wrap a base64-PCM chunk in the upstream provider's frame shape.
+
+        Required for websocket providers (Qwen, Gemini Live). WebRTC
+        providers don't need this since audio bypasses the backend; the
+        default raises so misconfigured providers fail loudly.
+        """
+        raise NotImplementedError(
+            f"{self.provider_name} is a websocket provider but did not "
+            f"override format_audio_in()"
+        )
+
+    @classmethod
+    def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
+        """Return the base64-PCM audio payload from a provider event, or None.
+
+        Required for websocket providers. The base implementation returns
+        None — WebRTC providers (audio bypasses the backend) and any
+        provider that yields a non-audio event hit the base.
+        """
+        return None
+
+    def is_recoverable_error(self, exc: BaseException) -> bool:
+        """Decide whether a drain-loop exception is worth a transparent reconnect.
+
+        Default: ``False``. Providers that know their upstream sometimes
+        closes with a misleading error (e.g. Qwen-Omni's
+        ``InvalidParameter: The provided URL does not appear to be valid``
+        boilerplate) override this to inspect ``str(exc)`` and return
+        ``True``, letting the relay reopen the WS with a fresh
+        ``session.update``.
+        """
+        return False
+
+    def should_gate_event(self, event: dict[str, Any]) -> bool:
+        """Decide whether an outbound control event must be deferred.
+
+        Default: ``False`` (always send immediately). Providers can
+        override to express in-flight constraints — e.g. Qwen-Omni
+        rejects ``response.create`` while another response is active
+        and closes the WS, so it gates that event until ``response.done``
+        clears the active-response flag (tracked by
+        :meth:`on_inbound_event`).
+
+        When ``True`` is returned, the relay holds the event in a
+        per-relay deferred queue and re-tries the most recent one after
+        :meth:`on_inbound_event` reports that the gate has lifted (see
+        :meth:`gate_cleared`).
+        """
+        return False
+
+    def on_inbound_event(self, event: dict[str, Any]) -> None:
+        """Hook called for every inbound provider event before fan-out.
+
+        Lets the provider mutate its own gating/state machine in response
+        to upstream signals — e.g. Qwen tracks ``response.created`` /
+        ``response.done`` to know whether another ``response.create`` is
+        safe to send. Default: no-op.
+
+        Implementations should be cheap and side-effect-only; the relay
+        passes every inbound event through this hook in order.
+        """
+
+    def gate_cleared(self) -> bool:
+        """Return True if a previously-gated event can now be sent.
+
+        Called by the relay after :meth:`on_inbound_event` runs, before
+        the relay decides whether to drain its deferred-event queue.
+        Default: ``True`` (no gating, so the queue can drain freely —
+        though if ``should_gate_event`` never returned True there's
+        nothing in the queue to begin with).
+        """
+        return True
+
+    def build_keepalive_chunk(self) -> str | None:
+        """Return a base64-PCM silent chunk to keep the upstream warm, or None.
+
+        Default: ``None`` (no keepalive). Providers that need it (Qwen-
+        Omni's ASR pipeline times out after ~3-5 min of silence) override
+        to return a short silent PCM chunk, which the relay wraps with
+        :meth:`format_audio_in` and ships every 30s of audio silence.
+
+        Returning ``None`` tells the relay not to spawn the keepalive task.
+        """
+        return None
