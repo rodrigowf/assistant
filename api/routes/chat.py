@@ -68,17 +68,17 @@ def _resolve_session_provider(
     detected_provider: str | None = None
 
     if not session_provider and resume_sdk_id:
-        # Try the canonical Claude path first, then the Qwen chats/ path.
-        # Both layouts are real — Claude writes context/<id>.jsonl and Qwen
-        # writes context/chats/<id>.jsonl, and detect_provider only needs
-        # the path that exists.
-        from utils.paths import get_chats_dir, get_context_dir
-        from manager.protocol import detect_provider, ensure_all_registered
+        # Sniff each registered harness's candidate JSONL paths and run
+        # the matching adapter's detection over the first one that exists.
+        # The candidate list comes from each spec's ``jsonl_path_resolver``,
+        # so adding a fourth harness is purely additive — no edits here.
+        from manager.protocol import detect_provider
+        from manager.registry import ensure_all_registered, get_registry
         ensure_all_registered()
-        for candidate in (
-            get_context_dir() / f"{resume_sdk_id}.jsonl",
-            get_chats_dir() / f"{resume_sdk_id}.jsonl",
-        ):
+        candidates: list = []
+        for spec in get_registry().all().values():
+            candidates.extend(spec.jsonl_path_resolver(resume_sdk_id))
+        for candidate in candidates:
             if candidate.is_file():
                 adapter = detect_provider(candidate)
                 if adapter is not None:

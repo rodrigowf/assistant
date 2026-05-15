@@ -128,3 +128,44 @@ def test_harness_model_rejects_non_string_value(client: TestClient) -> None:
     # so this should come back as a 422 (validation) rather than our 400.
     r = client.put("/api/config", json={"harness_model": {"qwen": 123}})
     assert r.status_code in (400, 422)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/config/providers — registry-driven harness list
+
+
+def test_providers_endpoint_returns_registered_harnesses(
+    client: TestClient,
+) -> None:
+    """The frontend session-provider picker reads this endpoint instead of
+    hardcoding the list, so the response must include every registered
+    harness and only expose the public ``{id, label, description}``
+    surface."""
+    r = client.get("/api/config/providers")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "providers" in body
+    ids = {p["id"] for p in body["providers"]}
+    # The two shipped harnesses are always there; a future fourth lands
+    # additively.  Don't assert equality.
+    assert {"claude", "qwen"}.issubset(ids)
+    for entry in body["providers"]:
+        assert set(entry) == {"id", "label", "description"}
+        assert entry["label"]
+        assert entry["description"]
+
+
+def test_default_config_seeds_harness_model_from_registry(
+    client: TestClient,
+) -> None:
+    """A fresh install (no assistant_config.json) should land with a
+    ``harness_model`` dict whose keys exactly match the registered
+    harnesses — never a hardcoded subset."""
+    # Hit GET to trigger _default_config() materialization.
+    r = client.get("/api/config")
+    assert r.status_code == 200, r.text
+    cfg = r.json()
+    keys = set(cfg["harness_model"])
+    assert {"claude", "qwen"}.issubset(keys)
+    for v in cfg["harness_model"].values():
+        assert v == ""  # empty = "use CLI default"

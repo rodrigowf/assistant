@@ -111,7 +111,24 @@ export interface WorkingDirectoryEntry {
   claude_config_dir?: string | null; // Override CLAUDE_CONFIG_DIR on the remote machine
 }
 
-export type AssistantProvider = "claude" | "qwen";
+// Session-harness id — the canonical list comes from /api/config/providers
+// at runtime, so this is plain `string` rather than a closed union.  Use
+// `listSessionProviders()` to populate UI pickers; never hardcode the set.
+export type AssistantProvider = string;
+
+export interface SessionProviderSpec {
+  id: string;            // registry id (e.g. "claude", "qwen")
+  label: string;         // human-readable picker label
+  description: string;   // one-line description shown under the picker
+}
+
+export interface SessionProvidersResponse {
+  providers: SessionProviderSpec[];
+}
+
+export function listSessionProviders(): Promise<SessionProvidersResponse> {
+  return json(`${BASE}/config/providers`);
+}
 
 export interface AssistantConfig {
   working_directory: string;                     // active entry id

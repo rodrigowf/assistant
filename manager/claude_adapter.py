@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from .protocol import ProviderAdapter, _parse_timestamp, extract_text, register_provider
+from .registry import HarnessSpec, register_harness
 from .types import SessionInfo
 
 
@@ -141,4 +142,40 @@ class ClaudeAdapter(ProviderAdapter):
         )
 
 
-register_provider(ClaudeAdapter())
+_adapter = ClaudeAdapter()
+register_provider(_adapter)
+
+
+def _load_claude_session_class():
+    from .claude_session import ClaudeSessionManager
+    return ClaudeSessionManager
+
+
+def _load_claude_kill_helper():
+    from .claude_session import kill_claude_subprocess
+    return kill_claude_subprocess
+
+
+def _claude_jsonl_candidates(session_id: str):
+    # Claude writes to the top-level context dir (context/<id>.jsonl).
+    # Kept as a single-element list so the resolver contract stays uniform
+    # with harnesses (like Qwen) that have multiple historical layouts.
+    from utils.paths import get_context_dir
+    return [get_context_dir() / f"{session_id}.jsonl"]
+
+
+register_harness(HarnessSpec(
+    name="claude",
+    label="Claude Code",
+    description="Anthropic's official Claude Code CLI (the canonical harness).",
+    session_class_loader=_load_claude_session_class,
+    adapter_loader=lambda: _adapter,
+    comm_prefix="claude",
+    kill_helper_loader=_load_claude_kill_helper,
+    ssh_control_path_prefix="claude",
+    jsonl_path_resolver=_claude_jsonl_candidates,
+    requirements_file="requirements-claude.txt",
+    npm_package="@anthropic-ai/claude-code",
+    cli_binary="claude",
+    env_keys=(),
+))

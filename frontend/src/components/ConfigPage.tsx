@@ -6,11 +6,13 @@ import {
   listModels,
   listVoiceModels,
   listQwenHarnessModels,
+  listSessionProviders,
   type AssistantConfig,
   type McpServerConfig,
   type ModelInfo,
   type VoiceModelEntry,
   type QwenModelInfo,
+  type SessionProviderSpec,
 } from "../api/rest";
 import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
 
@@ -18,16 +20,6 @@ const VOICE_PROVIDER_LABELS: Record<string, string> = {
   openai: "OpenAI",
   qwen: "Qwen (Alibaba)",
   google: "Google Gemini",
-};
-
-const SESSION_PROVIDER_LABELS: Record<string, string> = {
-  claude: "Claude Code",
-  qwen: "Qwen Code",
-};
-
-const SESSION_PROVIDER_DESCRIPTIONS: Record<string, string> = {
-  claude: "Anthropic's Claude Code CLI. Stores sessions at context/<id>.jsonl and reads CLAUDE.md.",
-  qwen: "Alibaba's Qwen Code CLI. Stores sessions at context/chats/<id>.jsonl and reads QWEN.md.",
 };
 
 interface Props {
@@ -41,6 +33,10 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [qwenHarnessModels, setQwenHarnessModels] = useState<QwenModelInfo[]>([]);
   const [voiceProviders, setVoiceProviders] = useState<Record<string, VoiceModelEntry[]>>({});
+  // Session-harness specs loaded from /api/config/providers — the picker
+  // and the "Provider description" text both read from this so adding a
+  // new harness server-side surfaces here automatically.
+  const [sessionProviders, setSessionProviders] = useState<SessionProviderSpec[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,7 +51,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, modelsRes, voiceRes, qwenHarnessRes] = await Promise.all([
+      const [cfg, mcpRes, modelsRes, voiceRes, qwenHarnessRes, providersRes] = await Promise.all([
         getConfig(),
         listMcpServers(),
         listModels(),
@@ -67,12 +63,14 @@ export function ConfigPage({ isOpen, onClose }: Props) {
           console.warn("listQwenHarnessModels failed:", e);
           return { models: [] };
         }),
+        listSessionProviders(),
       ]);
       setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setModels(modelsRes.models);
       setVoiceProviders(voiceRes.providers);
       setQwenHarnessModels(qwenHarnessRes.models);
+      setSessionProviders(providersRes.providers);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -365,12 +363,12 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                       value={config.provider ?? "claude"}
                       disabled={saving}
                       onChange={(e) =>
-                        save({ provider: e.target.value as "claude" | "qwen" })
+                        save({ provider: e.target.value })
                           .catch(err => setError(String(err)))
                       }
                     >
-                      {(["claude", "qwen"] as const).map(p => (
-                        <option key={p} value={p}>{SESSION_PROVIDER_LABELS[p]}</option>
+                      {sessionProviders.map(p => (
+                        <option key={p.id} value={p.id}>{p.label}</option>
                       ))}
                     </select>
                   </div>
@@ -411,7 +409,7 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                   )}
                 </div>
                 <p className="config-section-desc" style={{ marginTop: 8 }}>
-                  {SESSION_PROVIDER_DESCRIPTIONS[config.provider ?? "claude"]}
+                  {sessionProviders.find(p => p.id === (config.provider ?? "claude"))?.description ?? ""}
                 </p>
                 {(config.provider ?? "claude") === "qwen" && qwenHarnessModels.length === 0 && (
                   <p className="config-section-desc" style={{ marginTop: 4, opacity: 0.7 }}>

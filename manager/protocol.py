@@ -9,7 +9,6 @@ Each provider adapter handles:
 
 from __future__ import annotations
 
-import importlib
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -220,12 +219,11 @@ def detect_provider(jsonl_path: Path) -> ProviderAdapter | None:
 def ensure_all_registered() -> None:
     """Import every known adapter so its registration side-effect runs.
 
-    Safe to call repeatedly. Adapters live in separate modules to keep
-    each provider's logic isolated; this function brings them all into
-    the registry without requiring the importer to know about every
-    provider.
+    Safe to call repeatedly.  Delegates to
+    :func:`manager.registry.ensure_all_registered` — every adapter
+    module also registers a :class:`~manager.registry.HarnessSpec`, so a
+    single import does both.  Listing adapters here would be a place to
+    forget to update when a new harness lands.
     """
-    if "claude" in _registry._adapters and "qwen" in _registry._adapters:
-        return
-    importlib.import_module(".claude_adapter", "manager")
-    importlib.import_module(".qwen_adapter", "manager")
+    from .registry import ensure_all_registered as _ensure_harness
+    _ensure_harness()

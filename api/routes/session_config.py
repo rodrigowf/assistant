@@ -20,7 +20,7 @@ _ALLOWED_KEYS = {
     "working_directory",
     "enabled_mcps",
     "chrome_extension",
-    "provider",         # "claude" | "qwen"  — pinned per session
+    "provider",         # registered harness id — pinned per session
     "harness_model",    # provider-appropriate model id, "" = CLI default
 }
 

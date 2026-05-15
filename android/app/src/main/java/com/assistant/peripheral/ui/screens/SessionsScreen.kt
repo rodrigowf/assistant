@@ -324,17 +324,23 @@ private fun SessionItem(
 
                             if (showProviderTag) {
                                 if (isOpen) Spacer(modifier = Modifier.width(4.dp))
-                                val isQwen = session.provider == "qwen"
-                                val bg = if (isQwen) {
-                                    MaterialTheme.colorScheme.secondaryContainer
-                                } else {
+                                // Badge is binary today (Claude / non-Claude) — the desktop
+                                // app uses the same shorthand.  A third harness lands as a
+                                // generic "secondary" badge with its first letter; that's
+                                // good enough until we wire up per-spec colors over the
+                                // /api/config/providers endpoint.
+                                val isClaude = session.provider == "claude" || session.provider.isEmpty()
+                                val bg = if (isClaude) {
                                     MaterialTheme.colorScheme.surfaceVariant
-                                }
-                                val fg = if (isQwen) {
-                                    MaterialTheme.colorScheme.onSecondaryContainer
                                 } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                    MaterialTheme.colorScheme.secondaryContainer
                                 }
+                                val fg = if (isClaude) {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.onSecondaryContainer
+                                }
+                                val initial = (session.provider.firstOrNull()?.uppercaseChar() ?: 'C').toString()
                                 Surface(
                                     shape = CircleShape,
                                     color = bg,
@@ -342,7 +348,7 @@ private fun SessionItem(
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Text(
-                                            text = if (isQwen) "Q" else "C",
+                                            text = initial,
                                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                                             color = fg,
                                             fontWeight = FontWeight.Bold

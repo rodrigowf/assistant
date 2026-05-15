@@ -121,14 +121,16 @@ def _default_config() -> dict[str, Any]:
         "working_directory_history": [default_entry],
         "enabled_mcps": [],   # empty = all enabled (legacy behavior)
         "chrome_extension": False,  # launch sessions with --chrome flag
-        "provider": "claude",  # session provider — "claude" | "qwen"
+        "provider": "claude",  # session-harness id (registry-driven)
         "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
-        # Default *harness* model per provider — what `claude --model <id>` or
-        # `qwen --model <id>` runs with on a new session.  Empty string means
-        # "let the CLI pick its own default" (which is what the CLI does when
-        # we omit the flag entirely).  Keyed by provider so the picker can
-        # remember a different choice for each.
-        "harness_model": {"claude": "", "qwen": ""},
+        # Default *harness* model per provider — what `claude --model <id>`
+        # or `qwen --model <id>` runs with on a new session.  Empty string
+        # means "let the CLI pick its own default" (which is what the CLI
+        # does when we omit the flag entirely).  Keyed by provider so the
+        # picker can remember a different choice for each; populated from
+        # the harness registry so a new harness lands with an empty entry
+        # automatically.
+        "harness_model": {p: "" for p in _valid_provider_names()},
         "default_voice_provider": DEFAULT_VOICE_PROVIDER,
         "default_voice_model": DEFAULT_VOICE_MODEL,
         "default_voice_name": default_voice,
@@ -161,7 +163,15 @@ class WorkingDirectoryEntry(BaseModel):
     claude_config_dir: str | None = None  # Override CLAUDE_CONFIG_DIR on the remote machine
 
 
-_VALID_PROVIDERS: frozenset[str] = frozenset({"claude", "qwen"})
+def _valid_provider_names() -> frozenset[str]:
+    """Return the set of registered session-harness ids.
+
+    Computed dynamically from :mod:`manager.registry` so a new harness
+    is enabled by registering its spec — no edits here.
+    """
+    from manager.registry import ensure_all_registered, registered_provider_names
+    ensure_all_registered()
+    return frozenset(registered_provider_names())
 
 
 def _orchestrator_provider_for_model(model_id: str) -> str | None:
@@ -224,6 +234,23 @@ async def get_config() -> dict[str, Any]:
     return _load_config()
 
 
+@router.get("/providers")
+async def list_session_providers() -> dict[str, Any]:
+    """Return the registered session-harness specs for the frontend picker.
+
+    Each entry has ``{id, label, description}`` — the same shape the
+    Config/Session pages used to hardcode.  Adding a fourth harness lands
+    here automatically by registering its spec.
+    """
+    from manager.registry import ensure_all_registered, get_registry
+    ensure_all_registered()
+    specs = [
+        {"id": s.name, "label": s.label, "description": s.description}
+        for s in get_registry().all().values()
+    ]
+    return {"providers": specs}
+
+
 @router.get("/harness/qwen/models")
 async def list_harness_qwen_models() -> dict[str, Any]:
     """Return the Qwen Code model catalog discovered from ``~/.qwen/settings.json``.
@@ -284,10 +311,11 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
 
     if body.provider is not None:
         provider = body.provider.strip().lower()
-        if provider not in _VALID_PROVIDERS:
+        valid = _valid_provider_names()
+        if provider not in valid:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unknown provider {body.provider!r}; expected one of {sorted(_VALID_PROVIDERS)}",
+                detail=f"Unknown provider {body.provider!r}; expected one of {sorted(valid)}",
             )
         config["provider"] = provider
 
@@ -296,14 +324,15 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         # saved map, so the frontend can patch one provider's choice without
         # clobbering the other.  Unknown provider keys are rejected so a
         # typo doesn't silently land in the config and confuse the picker.
+        valid = _valid_provider_names()
         current = dict(config.get("harness_model") or {})
         for prov, model_id in body.harness_model.items():
-            if prov not in _VALID_PROVIDERS:
+            if prov not in valid:
                 raise HTTPException(
                     status_code=400,
                     detail=(
                         f"Unknown harness provider {prov!r}; expected one of "
-                        f"{sorted(_VALID_PROVIDERS)}"
+                        f"{sorted(valid)}"
                     ),
                 )
             if not isinstance(model_id, str):

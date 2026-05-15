@@ -6,18 +6,15 @@ import {
   updateSessionConfig,
   listMcpServers,
   listQwenHarnessModels,
+  listSessionProviders,
   type AssistantConfig,
   type AssistantProvider,
   type SessionConfig,
   type McpServerConfig,
   type QwenModelInfo,
+  type SessionProviderSpec,
 } from "../api/rest";
 import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
-
-const SESSION_PROVIDER_LABELS: Record<AssistantProvider, string> = {
-  claude: "Claude Code",
-  qwen: "Qwen Code",
-};
 
 interface Props {
   isOpen: boolean;
@@ -35,6 +32,7 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
   const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(null);
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
   const [qwenHarnessModels, setQwenHarnessModels] = useState<QwenModelInfo[]>([]);
+  const [sessionProviders, setSessionProviders] = useState<SessionProviderSpec[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +48,7 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
     setLoading(true);
     setError(null);
     try {
-      const [globalCfg, sessionCfg, mcpRes, qwenHarnessRes] = await Promise.all([
+      const [globalCfg, sessionCfg, mcpRes, qwenHarnessRes, providersRes] = await Promise.all([
         getConfig(),
         getSessionConfig(sessionId),
         listMcpServers(),
@@ -59,11 +57,13 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
           console.warn("listQwenHarnessModels failed:", e);
           return { models: [] };
         }),
+        listSessionProviders(),
       ]);
       setGlobalConfig(globalCfg);
       setSessionConfig(sessionCfg);
       setMcpServers(mcpRes.servers);
       setQwenHarnessModels(qwenHarnessRes.models);
+      setSessionProviders(providersRes.providers);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -230,8 +230,8 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
                         save({ provider: e.target.value as AssistantProvider })
                       }
                     >
-                      {(["claude", "qwen"] as const).map(p => (
-                        <option key={p} value={p}>{SESSION_PROVIDER_LABELS[p]}</option>
+                      {sessionProviders.map(p => (
+                        <option key={p.id} value={p.id}>{p.label}</option>
                       ))}
                     </select>
                   </div>

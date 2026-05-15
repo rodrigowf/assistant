@@ -16,7 +16,7 @@ class SessionInfoResponse(BaseModel):
     title: str
     message_count: int
     is_orchestrator: bool = False
-    # Which agent backed this session — "claude" or "qwen".
+    # Which agent backed this session — registered harness id (see /api/config/providers).
     provider: str = "claude"
     # Set when this session is currently live in the pool (local_id is the stable tab key)
     local_id: str | None = None

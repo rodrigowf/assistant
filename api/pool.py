@@ -39,37 +39,50 @@ from manager.types import Event
 def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
     """Factory: build the right session manager for the configured provider.
 
-    Imports ``ClaudeSessionManager`` / ``QwenSessionManager`` lazily so the
-    pool module can be imported in environments where only one provider's
-    dependencies are installed.  Importing claude-agent-sdk on a Qwen-only
-    machine, or vice-versa, would fail at module load time otherwise.
+    Resolution goes through :mod:`manager.registry` so the pool itself
+    knows nothing about which harnesses exist — adding a fourth is a
+    spec registration plus a new ``manager.<x>_adapter`` module.  The
+    spec's ``session_class_loader`` is lazy, so importing the pool
+    doesn't drag in claude-agent-sdk on a Qwen-only host (or vice-versa).
     """
-    provider = (config.provider or "claude").lower()
-    if provider == "qwen":
-        from manager.qwen_session import QwenSessionManager
-        return QwenSessionManager(config=config, **kwargs)
-    if provider == "claude":
-        from manager.claude_session import ClaudeSessionManager
-        return ClaudeSessionManager(config=config, **kwargs)
-    raise ValueError(f"Unsupported provider: {provider!r}")
+    from manager.registry import ensure_all_registered, get_registry
+    ensure_all_registered()
+    registry = get_registry()
+    provider = (config.provider or "").lower()
+    if not provider:
+        # No provider pinned on the config (legacy default).  Fall back to
+        # the first registered harness so the pool stays deterministic.
+        # Registration order in :mod:`manager.registry._ADAPTER_MODULES`
+        # is the source of truth.
+        names = registry.names()
+        if not names:
+            raise RuntimeError("No session harnesses registered")
+        provider = names[0]
+    spec = registry.require(provider)
+    session_class = spec.session_class_loader()
+    return session_class(config=config, **kwargs)
 
 
 def _kill_tracked_pid(pid: int) -> bool:
-    """Force-kill a tracked subprocess PID, dispatching by comm prefix.
+    """Force-kill a tracked subprocess PID, dispatching via the harness
+    registry.
 
-    Used by the orphan reaper: tracks PIDs from any provider but only
-    actually nukes them if they still look like a session subprocess we
-    spawned (``claude*`` or ``qwen*`` comm).
+    Used by the orphan reaper.  Every registered harness contributes a
+    ``comm_prefix`` and a ``kill_helper_loader``; we look up the helper by
+    the live ``/proc/<pid>/comm`` prefix.  Unknown comm prefixes are left
+    alone — the reaper only acts on PIDs that still look like ones we
+    spawned.
+
+    Iteration order is registration order, so if two specs share a comm
+    prefix (e.g. multiple Node-based harnesses) the first registered
+    wins.  That's fine for the orphan-reaper case: any kill helper that
+    survived the per-spec comm check is safe to call.
     """
-    if looks_like(pid, "claude"):
-        from manager.claude_session import kill_claude_subprocess
-        return kill_claude_subprocess(pid)
-    if looks_like(pid, "qwen") or looks_like(pid, "node"):  # qwen runs as node
-        from manager._proc import kill_subprocess
-        # qwen's wrapper is the `qwen` shim, but the bundled JS runtime
-        # shows up as `node` in /proc/<pid>/comm.  Try the more specific
-        # prefix first; fall back to "node" so we still reap orphans.
-        return kill_subprocess(pid, comm_prefix="node")
+    from manager.registry import ensure_all_registered, get_registry
+    ensure_all_registered()
+    for spec in get_registry().all().values():
+        if looks_like(pid, spec.comm_prefix):
+            return spec.kill_helper_loader()(pid)
     return False
 
 logger = logging.getLogger(__name__)

@@ -119,7 +119,7 @@ class BaseSessionManager(ABC):
     @property
     @abstractmethod
     def provider_name(self) -> str:
-        """Canonical provider identifier ('claude' | 'qwen')."""
+        """Canonical provider identifier — registered harness id."""
 
     @abstractmethod
     async def _run_lifecycle(self) -> None:

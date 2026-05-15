@@ -6,7 +6,6 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 
 _DEFAULT_PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -16,10 +15,24 @@ _DEFAULT_PROJECT_DIR = Path(__file__).resolve().parent.parent
 McpServerConfig = dict  # Can be McpStdioServerConfig, McpSSEServerConfig, etc.
 
 
-# Valid provider identifiers.  Kept narrow so we fail fast on typos in
-# assistant_config.json rather than silently spawning the wrong CLI.
-ProviderName = Literal["claude", "qwen"]
-_VALID_PROVIDERS: frozenset[str] = frozenset({"claude", "qwen"})
+# Type alias for a provider id.  The set of *actually-valid* names is
+# computed at validation time from :mod:`manager.registry` so a new harness
+# is enabled by registering its spec — no edits here.  Kept as ``str``
+# (not ``Literal[...]``) for that reason; runtime validation is the
+# source of truth, not the type checker.
+ProviderName = str
+
+
+def _valid_provider_names() -> frozenset[str]:
+    """Return the set of registered provider ids.
+
+    Computed dynamically — DO NOT cache at module load.  Tests register
+    fixture harnesses after import, and the install loop iterates the
+    set after side-effect registration runs.
+    """
+    from .registry import ensure_all_registered, registered_provider_names
+    ensure_all_registered()
+    return frozenset(registered_provider_names())
 
 
 @dataclass
@@ -87,16 +100,24 @@ class ManagerConfig:
         if "max_turns" in data and data["max_turns"] is not None:
             data["max_turns"] = int(data["max_turns"])
 
-        # Validate provider name early — silent fallback to claude would
-        # be confusing if the user typed "Cluade".
+        # Validate provider name early — silent fallback to the default
+        # would be confusing if the user typed "Cluade".  The set of valid
+        # names is computed from the harness registry so adding a fourth
+        # harness needs no edits here.
         if "provider" in data:
             provider = str(data["provider"]).lower().strip()
-            if provider and provider not in _VALID_PROVIDERS:
+            valid = _valid_provider_names()
+            if provider and provider not in valid:
                 raise ValueError(
                     f"Unknown provider {data['provider']!r}; expected one of "
-                    f"{sorted(_VALID_PROVIDERS)}",
+                    f"{sorted(valid)}",
                 )
-            data["provider"] = provider or "claude"
+            # Empty-string provider means "use default" — fall through to
+            # the dataclass default rather than picking arbitrarily.
+            if provider:
+                data["provider"] = provider
+            else:
+                data.pop("provider", None)
 
         # Filter to known fields only
         known = {f.name for f in cls.__dataclass_fields__.values()}

@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 from .protocol import ProviderAdapter, _parse_timestamp, register_provider
+from .registry import HarnessSpec, register_harness
 from .types import SessionInfo
 
 
@@ -216,4 +217,52 @@ class QwenAdapter(ProviderAdapter):
         )
 
 
-register_provider(QwenAdapter())
+_adapter = QwenAdapter()
+register_provider(_adapter)
+
+
+def _load_qwen_session_class():
+    from .qwen_session import QwenSessionManager
+    return QwenSessionManager
+
+
+def _load_qwen_kill_helper():
+    # Qwen's runtime is Node.js, so its /proc comm shows up as "node".
+    # The kill helper still uses the kernel-comm sanity check via
+    # ``manager._proc.kill_subprocess`` — same shape as Claude's helper.
+    from ._proc import kill_subprocess
+
+    def kill_qwen_subprocess(pid: int, *, sigterm_grace_s: float = 0.5) -> bool:
+        return kill_subprocess(pid, comm_prefix="node", sigterm_grace_s=sigterm_grace_s)
+
+    return kill_qwen_subprocess
+
+
+def _qwen_jsonl_candidates(session_id: str):
+    # Qwen writes JSONL under context/chats/<id>.jsonl.  Kept in a list
+    # so the resolver contract stays uniform with harnesses that have
+    # multiple historical layouts.
+    from utils.paths import get_chats_dir
+    return [get_chats_dir() / f"{session_id}.jsonl"]
+
+
+register_harness(HarnessSpec(
+    name="qwen",
+    label="Qwen Code",
+    description="Alibaba's Qwen Code CLI (open weights; OAuth or DashScope API key).",
+    session_class_loader=_load_qwen_session_class,
+    adapter_loader=lambda: _adapter,
+    # /proc/<pid>/comm shows "node" for Qwen because it runs as a Node
+    # script.  This means Qwen and any future Node-based harness share
+    # the same comm prefix — the orphan reaper dispatches by spec name
+    # via _tracked_pids, not by scanning comm alone, so collisions here
+    # don't cause misdirected kills.
+    comm_prefix="node",
+    kill_helper_loader=_load_qwen_kill_helper,
+    ssh_control_path_prefix="qwen",
+    jsonl_path_resolver=_qwen_jsonl_candidates,
+    requirements_file=None,  # Qwen runs purely as an external Node CLI
+    npm_package="@qwen-code/qwen-code",
+    cli_binary="qwen",
+    env_keys=("DASHSCOPE_API_KEY",),
+))
