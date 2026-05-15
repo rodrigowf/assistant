@@ -1,1 +1,1 @@
-AGENTS.md
+context/AGENTS.md

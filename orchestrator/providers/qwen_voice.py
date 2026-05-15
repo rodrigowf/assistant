@@ -549,9 +549,12 @@ class QwenVoiceProvider(BaseVoiceProvider):
         ``ephemeral_token`` field stays None so the frontend cannot
         accidentally try to authenticate directly.
         """
-        api_key = os.environ.get("ALIBABA_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
+        # DashScope key — matches what the Qwen CLI and ~/.qwen/settings.json
+        # look for, so the same value can be reused across the wrapper, the
+        # CLI, and the realtime voice WebSocket.
+        api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
-            raise RuntimeError("ALIBABA_API_KEY (or DASHSCOPE_API_KEY) not configured")
+            raise RuntimeError("DASHSCOPE_API_KEY not configured")
 
         fmt = _audio_formats_for(self._model)
         return {
@@ -583,9 +586,12 @@ class QwenVoiceProvider(BaseVoiceProvider):
         The relay layer (``orchestrator/voice_relay.py``) calls this once
         per voice session and keeps the connection alive for the duration.
         """
-        api_key = os.environ.get("ALIBABA_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
+        # DashScope key — matches what the Qwen CLI and ~/.qwen/settings.json
+        # look for, so the same value can be reused across the wrapper, the
+        # CLI, and the realtime voice WebSocket.
+        api_key = os.environ.get("DASHSCOPE_API_KEY")
         if not api_key:
-            raise RuntimeError("ALIBABA_API_KEY (or DASHSCOPE_API_KEY) not configured")
+            raise RuntimeError("DASHSCOPE_API_KEY not configured")
 
         url = f"{QWEN_INTL_WS}?model={self._model}"
         return await websockets.connect(

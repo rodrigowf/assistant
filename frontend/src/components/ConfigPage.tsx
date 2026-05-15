@@ -25,7 +25,7 @@ const SESSION_PROVIDER_LABELS: Record<string, string> = {
 
 const SESSION_PROVIDER_DESCRIPTIONS: Record<string, string> = {
   claude: "Anthropic's Claude Code CLI. Stores sessions at context/<id>.jsonl and reads CLAUDE.md.",
-  qwen: "Alibaba's Qwen Code CLI. Stores sessions at context/chats/<id>.jsonl and reads AGENTS.md.",
+  qwen: "Alibaba's Qwen Code CLI. Stores sessions at context/chats/<id>.jsonl and reads QWEN.md.",
 };
 
 interface Props {
