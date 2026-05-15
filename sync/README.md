@@ -34,7 +34,7 @@ ssh-copy-id -i ~/.ssh/id_ed25519 rodrigo@192.168.0.28    # Jetson → Desktop
 ### Desktop (pushes to Jetson)
 
 ```bash
-cd ~/Projects/assistant/sync
+cd ~/assistant/sync
 # config.env is already configured for the Desktop → Jetson direction
 bash install.sh
 ```
@@ -43,7 +43,7 @@ bash install.sh
 
 ```bash
 # Copy sync/ folder to Jetson
-scp -r ~/Projects/assistant/sync rodrigo@192.168.0.200:assistant/sync
+scp -r ~/assistant/sync rodrigo@192.168.0.200:assistant/sync
 
 # SSH into Jetson
 ssh rodrigo@192.168.0.200

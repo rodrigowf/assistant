@@ -50,8 +50,8 @@ def cleanup_history(keep_sessions, auto_confirm=False):
     for chunk_id, metadata in zip(results["ids"], results["metadatas"]):
         file_path = metadata.get("file_path", "")
         # Extract session ID from paths like:
-        # /home/rodrigo/Projects/assistant/.index-temp/SESSION_ID.md
-        # or /home/rodrigo/Projects/assistant/history/...
+        # /home/rodrigo/assistant/.index-temp/SESSION_ID.md
+        # or /home/rodrigo/assistant/history/...
 
         session_id = None
         if ".index-temp" in file_path:

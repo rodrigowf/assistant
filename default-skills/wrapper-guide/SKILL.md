@@ -111,7 +111,7 @@ Reads Claude Code's session files from disk (JSONL format).
 ```
 $CLAUDE_CONFIG_DIR/projects/<mangled-path>/<session-id>.jsonl
 ```
-Where `<mangled-path>` = `/home/rodrigo/Projects/assistant` → `-home-rodrigo-Projects-assistant`
+Where `<mangled-path>` = `/home/rodrigo/assistant` → `-home-rodrigo-assistant`
 
 **Key methods:**
 - `list_sessions()` → All sessions sorted by recency
