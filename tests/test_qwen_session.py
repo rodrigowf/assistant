@@ -578,7 +578,7 @@ class TestErrorPaths:
             "asyncio.create_subprocess_exec",
             AsyncMock(side_effect=FileNotFoundError("no qwen here")),
         ):
-            with pytest.raises(RuntimeError, match="qwen CLI not found"):
+            with pytest.raises(RuntimeError, match="Executable not found"):
                 async for _ in sm.send("hi"):
                     pass
         # Status returned to IDLE so the session is reusable once the CLI

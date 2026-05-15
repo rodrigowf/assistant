@@ -26,6 +26,14 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from ._ssh import (
+    RemoteCommand,
+    RemoteHostUnreachableError,
+    SshTarget,
+    build_remote_argv,
+    probe_host_reachable,
+    resolve_remote_cli_path,
+)
 from .base_session import BaseSessionManager, TurnAbandoned
 from .config import ManagerConfig
 from .types import (
@@ -110,8 +118,22 @@ class QwenSessionManager(BaseSessionManager):
         We mark the session IDLE immediately, signal connect_done, then
         block on ``_stop_requested``.  ``stop()`` triggers it, the finally
         block reaps any subprocess that's somehow still alive, and we exit.
+
+        Remote (SSH) sessions get an ICMP reachability pre-probe before
+        IDLE so a hibernated/offline target fails fast at start() instead
+        of hanging on the first turn's SSH TCP timeout.  Mirrors Claude's
+        ``_assert_ssh_reachable`` behavior; same rationale.
         """
         try:
+            if self._config.ssh_host:
+                reachable = await asyncio.get_running_loop().run_in_executor(
+                    None, probe_host_reachable, self._config.ssh_host, 2.0,
+                )
+                if not reachable:
+                    raise RemoteHostUnreachableError(
+                        f"SSH host {self._config.ssh_host!r} did not reply to "
+                        "ICMP ping; refusing to open SSH connection."
+                    )
             if self._resume_id:
                 self._provider_session_id = self._resume_id
             self._status = SessionStatus.IDLE
@@ -200,9 +222,14 @@ class QwenSessionManager(BaseSessionManager):
 
         self._status = SessionStatus.STREAMING
 
-        argv = self._build_argv()
+        local_argv = self._build_argv()
         env = self._build_env()
-        cwd = self._config.project_dir
+
+        # SSH or local?  _maybe_wrap_with_ssh returns the argv that will
+        # actually be exec'd plus the local cwd to spawn from (which is
+        # the project_dir for local, irrelevant for SSH since the remote
+        # cwd is set inside the SSH command via `cd`).
+        argv, cwd = self._maybe_wrap_with_ssh(local_argv)
 
         # Pipe the prompt as a single stream-json line on stdin.
         stdin_payload = self._render_prompt(prompt).encode("utf-8")
@@ -218,8 +245,13 @@ class QwenSessionManager(BaseSessionManager):
             )
         except FileNotFoundError as e:
             self._status = SessionStatus.IDLE
+            # argv[0] is either the local qwen path or "ssh".  Either way
+            # the missing binary points to a misconfiguration: qwen CLI
+            # not installed locally, or ssh binary absent.
             raise RuntimeError(
-                f"qwen CLI not found ({argv[0]!r}). Set QWEN_CLI_PATH or install via npm.",
+                f"Executable not found ({argv[0]!r}). For local sessions, "
+                "set QWEN_CLI_PATH or install qwen via npm.  For SSH "
+                "sessions, make sure the local `ssh` client is installed."
             ) from e
 
         self._proc = proc
@@ -571,6 +603,69 @@ class QwenSessionManager(BaseSessionManager):
         # the wrapper itself was launched from inside Claude Code.
         env.pop("CLAUDECODE", None)
         return env
+
+    def _maybe_wrap_with_ssh(
+        self, local_argv: list[str],
+    ) -> tuple[list[str], str | None]:
+        """Return ``(argv, cwd)`` to feed ``asyncio.create_subprocess_exec``.
+
+        For local sessions this is a no-op: returns *local_argv* and the
+        configured ``project_dir`` as cwd.
+
+        For SSH sessions, swaps ``local_argv[0]`` (the local qwen path)
+        for the resolved remote path and wraps everything in an
+        ``ssh ... "cd '<remote_dir>' && exec '<remote_qwen>' ..."`` argv.
+        cwd is irrelevant in that case (the remote cwd is set by the
+        SSH command itself), so we return ``None`` and let
+        ``create_subprocess_exec`` inherit the parent's cwd.
+
+        Qwen spawns a fresh subprocess per turn, which means each turn
+        opens an SSH connection.  ``ControlMaster=auto`` +
+        ``ControlPersist=60s`` (set in :func:`_ssh.build_ssh_argv`) keep
+        a single TCP connection alive across the burst — without that
+        we'd pay the SSH handshake on every turn.
+        """
+        if not self._config.ssh_host:
+            return local_argv, self._config.project_dir
+
+        target = SshTarget(
+            host=self._config.ssh_host,
+            user=self._config.ssh_user,
+            key=self._config.ssh_key,
+            control_path_prefix="qwen",
+        )
+        remote_qwen = resolve_remote_cli_path(
+            "qwen",
+            target,
+            extra_search_paths=[
+                "~/.local/bin/qwen",
+                "/usr/local/bin/qwen",
+                "/usr/bin/qwen",
+            ],
+        )
+        remote_cmd = RemoteCommand(
+            project_dir=self._config.project_dir,
+            remote_cli=remote_qwen,
+            # No env to forward: the remote machine has its own .env
+            # (DASHSCOPE_API_KEY, ASSISTANT_PROVIDER, …) set up at install
+            # time, just like Claude's remote installs.  Forwarding the
+            # local env over SSH would either leak the local DASHSCOPE
+            # key (visible in `ps` on the remote) or quietly miss other
+            # vars the remote setup expects.
+        )
+        # ``local_argv[0]`` is the LOCAL qwen path (resolved by
+        # :func:`_qwen_executable`); on the remote machine that path is
+        # meaningless.  We drop it here — the remote path goes into
+        # ``remote_cmd`` (which renders ``... exec '<remote_qwen>'``)
+        # and the rest of the flags pass through as-is.
+        # ``build_remote_argv`` shell-quotes each arg before joining, so
+        # values with spaces or metacharacters survive across SSH.
+        argv = build_remote_argv(
+            target=target,
+            remote_cmd=remote_cmd,
+            remote_args=local_argv[1:],
+        )
+        return argv, None
 
     @staticmethod
     def _render_prompt(prompt: str) -> str:

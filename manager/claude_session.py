@@ -11,73 +11,30 @@ import asyncio
 import json
 import logging
 import os
-import shlex
-import stat
-import subprocess
-import tempfile
-import threading
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from manager._ssh import (
+    RemoteCommand,
+    RemoteHostUnreachableError,
+    SshTarget,
+    build_ssh_argv,
+    cleanup_ssh_wrapper_script,
+    probe_host_reachable,
+    resolve_remote_cli_path,
+    write_ssh_wrapper_script,
+)
+
 logger = logging.getLogger(__name__)
 
-# Cache of resolved remote `claude` absolute paths, keyed by a tuple that
-# identifies a unique SSH target. Avoids opening a fresh SSH connection to
-# probe `which claude` on every session start — under concurrent starts
-# those probes were the main source of session churn on the remote host.
-# Entry is whatever `_resolve_remote_claude` returned (including the
-# fallback string "claude") so we don't re-probe failures either.
-_REMOTE_CLAUDE_PATH_CACHE: dict[tuple[str | None, str | None, str | None], str] = {}
-_REMOTE_CLAUDE_PATH_LOCK = threading.Lock()
-
-
-def clear_remote_claude_path_cache() -> None:
-    """Forget every cached remote-claude path.
-
-    Intended for tests and for the rare case an operator wants to force a
-    re-probe after updating the remote `claude` install.
-    """
-    with _REMOTE_CLAUDE_PATH_LOCK:
-        _REMOTE_CLAUDE_PATH_CACHE.clear()
-
-
-class RemoteHostUnreachableError(RuntimeError):
-    """Raised when an SSH target fails the ICMP reachability pre-probe."""
-
-
-def _probe_ssh_host_reachable(host: str, timeout_s: float = 2.0) -> bool:
-    """Return True if ``host`` replies to a single ICMP ping within *timeout_s*.
-
-    This is a cheap pre-flight so we don't let the SDK (or our own
-    version-probe) open an SSH connection to an unreachable host, which then
-    hangs in TCP retransmit for ~30 s while holding file descriptors and
-    burning CPU cycles in the SSH client.  When the laptop hibernates with
-    an in-flight remote session, this check turns a slow timeout cascade
-    into an instant clean failure.
-
-    The function is deliberately synchronous and non-awaitable — callers
-    that care about event-loop latency should run it in a thread.  The
-    2-second default is long enough for normal LAN jitter and short enough
-    that a typical failed probe costs less than one SSH TCP timeout.
-    """
-    if not host:
-        return True  # Nothing to probe; treat as reachable.
-    try:
-        # -c 1: one packet.  -W <s>: overall deadline for the reply.
-        # stdout/stderr discarded; we only care about the exit code.
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", str(int(max(1, timeout_s))), host],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout_s + 1.0,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        # If ping isn't available or the subprocess itself times out, assume
-        # unreachable rather than silently falling through — the whole point
-        # is to short-circuit bad paths.
-        return False
+# Backward-compatibility re-exports.  Callers (including the existing
+# regression test suite in tests/test_ssh_session_churn.py) used to import
+# these directly from this module; the implementations now live in
+# manager._ssh but the import surface is preserved so external code keeps
+# working.  When the regression suite is updated to point at the new
+# module these can be deleted.
+__all__ = ["RemoteHostUnreachableError", "ClaudeSessionManager", "SessionManager", "SessionAbandoned"]
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -327,7 +284,7 @@ class ClaudeSessionManager(BaseSessionManager):
         if not self._config.ssh_host:
             return
         reachable = await asyncio.get_running_loop().run_in_executor(
-            None, _probe_ssh_host_reachable, self._config.ssh_host, 2.0,
+            None, probe_host_reachable, self._config.ssh_host, 2.0,
         )
         if not reachable:
             raise RemoteHostUnreachableError(
@@ -437,13 +394,8 @@ class ClaudeSessionManager(BaseSessionManager):
             self._subprocess_pid = None
 
             self._status = SessionStatus.DISCONNECTED
-            # Clean up SSH wrapper script if present
-            if self._ssh_wrapper_path:
-                try:
-                    Path(self._ssh_wrapper_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                self._ssh_wrapper_path = None
+            cleanup_ssh_wrapper_script(self._ssh_wrapper_path)
+            self._ssh_wrapper_path = None
 
     async def interrupt(self) -> None:
         """Interrupt the current response.
@@ -828,146 +780,41 @@ class ClaudeSessionManager(BaseSessionManager):
     def _write_ssh_wrapper(self) -> str:
         """Write a temp shell script that SSHes into the remote host and runs claude.
 
-        The script forwards all arguments ("$@") so the SDK flags land on the
-        remote claude process unchanged.  Returns the path to the script.
+        The SDK takes a ``cli_path`` and then invokes ``<cli_path> arg1
+        arg2 ...`` itself, so we can't intercept its argv from Python.
+        The wrapper handles ``"$@"`` forwarding (see
+        :func:`manager._ssh.write_ssh_wrapper_script` for the details of
+        the SSH single-argument trick).  Returns the path to the script.
         """
-        remote_path = self._config.project_dir.replace("'", "'\\''")
-
-        ssh_parts = ["ssh"]
-        ssh_parts += ["-T"]                                     # no pseudo-TTY
-        ssh_parts += ["-o", "BatchMode=yes"]                    # no interactive prompts
-        ssh_parts += ["-o", "StrictHostKeyChecking=accept-new"] # auto-accept on first connect
-        ssh_parts += ["-o", "ControlMaster=auto",               # connection multiplexing
-                      "-o", "ControlPersist=60s",
-                      "-o", f"ControlPath=/tmp/claude-ssh-{self._config.ssh_host}-%r"]
-        if self._config.ssh_key:
-            ssh_parts += ["-i", str(self._config.ssh_key)]
-        if self._config.ssh_user:
-            ssh_parts.append(f"{self._config.ssh_user}@{self._config.ssh_host}")
-        else:
-            ssh_parts.append(self._config.ssh_host)
-
-        ssh_cmd = shlex.join(ssh_parts)
-
-        # Resolve the absolute path of `claude` on the remote machine — cached.
-        #
-        # Each probe opens an SSH connection and runs `which claude` on the
-        # remote.  Historically this ran on every SessionManager.start(), so
-        # a burst of N concurrent starts (e.g. browser reconnect storm)
-        # produced N SSH handshakes *before* the ControlMaster socket could
-        # be established.  On the remote side each handshake = one PAM
-        # session = one systemd --user manager, and the rapid open/close
-        # cycle is what triggered the 2026-04-20 session-churn crash.
-        #
-        # Cache key is (host, user, key) — changing any of these warrants a
-        # new probe.  The fallback result ("claude") is cached too so a
-        # broken/unreachable host doesn't re-probe on every retry.
-        cache_key = (
-            self._config.ssh_host,
-            self._config.ssh_user,
-            self._config.ssh_key,
+        target = SshTarget(
+            host=self._config.ssh_host or "",
+            user=self._config.ssh_user,
+            key=self._config.ssh_key,
+            control_path_prefix="claude",
         )
-        with _REMOTE_CLAUDE_PATH_LOCK:
-            cached = _REMOTE_CLAUDE_PATH_CACHE.get(cache_key)
-        if cached is not None:
-            remote_claude = cached
-            logger.debug("Remote claude path (cached): %s", remote_claude)
-        else:
-            # Before opening an SSH connection for the path probe, ping-probe
-            # the host.  If unreachable, use the "claude" fallback *without*
-            # caching it — when the host comes back online we want to probe
-            # properly rather than being stuck on the fallback forever.
-            if not _probe_ssh_host_reachable(self._config.ssh_host or "", 2.0):
-                logger.warning(
-                    "SSH host %r unreachable; using 'claude' fallback for this "
-                    "wrapper without caching (will re-probe next time)",
-                    self._config.ssh_host,
-                )
-                remote_claude = "claude"
-            else:
-                try:
-                    result = subprocess.run(
-                        ssh_parts + [
-                            "bash -c '. ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null;"
-                            " which claude 2>/dev/null"
-                            " || ls ~/.local/bin/claude /usr/local/bin/claude /usr/bin/claude 2>/dev/null | head -1'"
-                        ],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    remote_claude = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "claude"
-                except Exception as e:
-                    logger.warning("Could not resolve remote claude path: %s", e)
-                    remote_claude = "claude"
-                with _REMOTE_CLAUDE_PATH_LOCK:
-                    _REMOTE_CLAUDE_PATH_CACHE[cache_key] = remote_claude
-                logger.debug("Remote claude path resolved to: %s (cached for future)", remote_claude)
-
-        # Shell-escape helper: wraps a value in single quotes, escaping any embedded
-        # single quotes using the break-and-rejoin technique (e.g. ' → '\'' ).
-        def sq(s: str) -> str:
-            return "'" + s.replace("'", "'\\''") + "'"
-
-        # Build the remote bash -c script body:
-        #   cd <sq(dir)> && CLAUDE_CONFIG_DIR=<sq(dir)> exec <sq(claude)> "$@"
-        # The "$@" is INSIDE the bash -c body so bash expands it to positional args.
-        # Inside single quotes in the wrapper script, "$@" is literal (not expanded by sh).
-        #
-        # NOTE: We intentionally avoid `export VAR=val` here. When a `bash -c` command
-        # containing `export` is run over SSH from a Python subprocess, bash emits a
-        # full `declare -x` environment dump on stdout — corrupting the SDK's JSON stream.
-        # Using the inline assignment prefix `VAR=val exec cmd` sets the variable in
-        # the child process environment without triggering this behaviour.
-        parts = []
-        parts.append("cd " + sq(self._config.project_dir))
-        exec_prefix = ""
+        remote_claude = resolve_remote_cli_path(
+            "claude",
+            target,
+            extra_search_paths=[
+                "~/.local/bin/claude",
+                "/usr/local/bin/claude",
+                "/usr/bin/claude",
+            ],
+        )
+        env: dict[str, str] = {}
         if self._config.ssh_claude_config_dir:
-            exec_prefix += "CLAUDE_CONFIG_DIR=" + sq(self._config.ssh_claude_config_dir) + " "
-        # No "$@" here — args are appended via ${_q} in the wrapper
-        parts.append(exec_prefix + "exec " + sq(remote_claude))
-        remote_cmd = " && ".join(parts)
-
-        # Build the wrapper script.
-        #
-        # KEY INSIGHT: SSH joins all its trailing word-arguments into ONE remote command
-        # string.  "ssh host bash -c 'script' _ arg1 arg2" arrives at the remote shell
-        # as "bash -c script _ arg1 arg2" (one string), which it re-parses as bash with
-        # a single -c value of "script _ arg1 arg2".  This makes `_` and the args part
-        # of the -c body rather than positional params, silently breaking the `cd` and
-        # the "$@" expansion inside the script.
-        #
-        # Fix: expand "$@" locally in the wrapper, shell-quoting each arg, then pass
-        # the entire remote command — cd, env vars, exec, and all args — as ONE
-        # double-quoted string to SSH.  SSH forwards that single string to the remote
-        # shell, which parses and executes it correctly with cd working as expected.
-        #
-        # Generated wrapper:
-        #   #!/bin/sh
-        #   _q=''
-        #   for _a in "$@"; do
-        #     _q="${_q} '$(printf '%s' "$_a" | sed "s/'/'\\''/g")'"
-        #   done
-        #   exec ssh ... "cd '/proj' && [CLAUDE_CONFIG_DIR='/cfg'] exec '/claude'${_q}"
-
-        # remote_cmd already has sq()-quoted paths. We embed it in a double-quoted SSH
-        # arg. Since remote_cmd uses single quotes internally, no further escaping needed
-        # as long as remote_cmd itself contains no double quotes (it never does).
-        script = (
-            "#!/bin/sh\n"
-            "_q=''\n"
-            "for _a in \"$@\"; do\n"
-            "  _q=\"${_q} '$(printf '%s' \"$_a\" | sed \"s/'/'\\''/g\")'\"\n"
-            "done\n"
-            "exec " + ssh_cmd + " \"" + remote_cmd + "${_q}\"\n"
+            env["CLAUDE_CONFIG_DIR"] = self._config.ssh_claude_config_dir
+        remote_cmd = RemoteCommand(
+            project_dir=self._config.project_dir,
+            remote_cli=remote_claude,
+            env=env,
+        ).render_shell()
+        path = write_ssh_wrapper_script(
+            ssh_argv=build_ssh_argv(target),
+            remote_cmd=remote_cmd,
+            prefix="claude",
         )
-
-        fd, path = tempfile.mkstemp(prefix="claude-ssh-", suffix=".sh")
-        try:
-            os.write(fd, script.encode())
-        finally:
-            os.close(fd)
-        os.chmod(path, stat.S_IRWXU)  # 0o700 — owner execute only
         self._ssh_wrapper_path = path
-        logger.debug("SSH wrapper script written to %s", path)
         return path
 
     async def _process_message(self, msg: object) -> AsyncIterator[Event]:
