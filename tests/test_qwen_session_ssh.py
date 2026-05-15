@@ -20,7 +20,7 @@ import pytest
 
 from manager._ssh import RemoteHostUnreachableError, clear_remote_cli_path_cache
 from manager.config import ManagerConfig
-from manager.qwen_session import QwenSessionManager
+from manager.qwen.session import QwenSessionManager
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +60,7 @@ def test_local_session_does_not_probe_or_open_ssh():
     """No CLI-path probe should fire for a local session — that would
     be wasted work and would error if the network is down."""
     sm = QwenSessionManager(config=_local_cfg())
-    with patch("manager.qwen_session.resolve_remote_cli_path") as mock_resolve, \
+    with patch("manager.qwen.session.resolve_remote_cli_path") as mock_resolve, \
          patch("manager._ssh.subprocess.run") as mock_run:
         sm._maybe_wrap_with_ssh(["/local/qwen", "--flag"])
     mock_resolve.assert_not_called()
@@ -80,7 +80,7 @@ def test_ssh_session_wraps_argv_with_ssh_prefix():
         "--resume", "sid-abc",
     ]
     with patch(
-        "manager.qwen_session.resolve_remote_cli_path",
+        "manager.qwen.session.resolve_remote_cli_path",
         return_value="/remote/.local/bin/qwen",
     ):
         argv, cwd = sm._maybe_wrap_with_ssh(local_argv)
@@ -117,7 +117,7 @@ def test_ssh_wrapping_resolves_remote_path_with_extra_search_paths():
         captured["extra_search_paths"] = extra_search_paths
         return "/r/qwen"
 
-    with patch("manager.qwen_session.resolve_remote_cli_path", side_effect=fake_resolve):
+    with patch("manager.qwen.session.resolve_remote_cli_path", side_effect=fake_resolve):
         sm._maybe_wrap_with_ssh(["/local/qwen", "--flag"])
 
     assert captured["cli_name"] == "qwen"
@@ -134,7 +134,7 @@ def test_ssh_wrapping_does_not_forward_local_env():
     The remote should rely entirely on its own .env.  Pin that the
     rendered command contains no env-prefix."""
     sm = QwenSessionManager(config=_ssh_cfg())
-    with patch("manager.qwen_session.resolve_remote_cli_path", return_value="/r/qwen"):
+    with patch("manager.qwen.session.resolve_remote_cli_path", return_value="/r/qwen"):
         argv, _ = sm._maybe_wrap_with_ssh(["/local/qwen"])
 
     remote_cmd = argv[-1]
@@ -154,7 +154,7 @@ async def test_start_raises_fast_when_ssh_host_unreachable():
     """Hibernated/offline target → start() fails in ~2s with
     RemoteHostUnreachableError, not a 30s SSH TCP timeout."""
     sm = QwenSessionManager(config=_ssh_cfg())
-    with patch("manager.qwen_session.probe_host_reachable", return_value=False):
+    with patch("manager.qwen.session.probe_host_reachable", return_value=False):
         with pytest.raises(RemoteHostUnreachableError):
             await sm.start()
 
@@ -163,7 +163,7 @@ async def test_start_raises_fast_when_ssh_host_unreachable():
 async def test_start_proceeds_when_ssh_host_reachable():
     """Reachable host → start() completes normally, session goes IDLE."""
     sm = QwenSessionManager(config=_ssh_cfg())
-    with patch("manager.qwen_session.probe_host_reachable", return_value=True):
+    with patch("manager.qwen.session.probe_host_reachable", return_value=True):
         await sm.start()
     try:
         from manager.types import SessionStatus
@@ -176,7 +176,7 @@ async def test_start_proceeds_when_ssh_host_reachable():
 async def test_local_session_skips_probe():
     """No ssh_host → no probe call, no network dependency at start time."""
     sm = QwenSessionManager(config=_local_cfg())
-    with patch("manager.qwen_session.probe_host_reachable") as mock_probe:
+    with patch("manager.qwen.session.probe_host_reachable") as mock_probe:
         await sm.start()
     mock_probe.assert_not_called()
     await sm.stop()

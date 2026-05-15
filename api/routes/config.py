@@ -261,7 +261,7 @@ async def list_harness_qwen_models() -> dict[str, Any]:
     means the settings file is missing or has no providers configured — the
     frontend can fall back to "let Qwen pick the default."
     """
-    from manager.qwen_models import list_qwen_models
+    from manager.qwen.models import list_qwen_models
     return {"models": [m.to_dict() for m in list_qwen_models()]}
 
 

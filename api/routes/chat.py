@@ -160,7 +160,7 @@ async def chat_ws(ws: WebSocket):
                 # If a permission is pending on this session, treat the user's
                 # chat as a denial with their prose as the rejection reason.
                 # See the conversational-checkpoint policy in
-                # manager.claude_session._PERMISSION_GATING_PROMPT.
+                # manager.claude.session._PERMISSION_GATING_PROMPT.
                 text_payload = msg.get("text", "")
                 if text_payload:
                     pending_ids = list(sm.pending_permission_ids())

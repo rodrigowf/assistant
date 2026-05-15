@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from manager.claude_adapter import ClaudeAdapter
+from manager.claude.adapter import ClaudeAdapter
 from manager.types import SessionInfo
 
 

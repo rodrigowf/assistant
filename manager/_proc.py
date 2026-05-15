@@ -1,13 +1,13 @@
 """Provider-agnostic process helpers — alive checks, comm lookup, signal escalation.
 
-These are shared between :mod:`manager.claude_session` (where Claude's bundled
-SDK subprocess may need force-killing) and :mod:`manager.qwen_session` (where
+These are shared between :mod:`manager.claude.session` (where Claude's bundled
+SDK subprocess may need force-killing) and :mod:`manager.qwen.session` (where
 the per-turn qwen subprocess can in theory be reaped the same way).  The pool's
 orphan reaper also reaches for ``_process_alive`` and a per-provider
 ``looks_like(pid)`` check before sending signals.
 
 Keeping these in their own tiny module means importing them does NOT pull in
-``claude-agent-sdk`` (which ``manager.claude_session`` imports at module load).
+``claude-agent-sdk`` (which ``manager.claude.session`` imports at module load).
 Crucial for Qwen-only installs where the SDK may not even be present at
 import time.
 """

@@ -23,7 +23,7 @@ import pytest
 
 from api.pool import SessionPool
 from manager.config import ManagerConfig
-from manager.claude_session import RemoteHostUnreachableError, SessionManager
+from manager.claude.session import RemoteHostUnreachableError, SessionManager
 from manager._ssh import (
     _REMOTE_CLI_PATH_CACHE,
     clear_remote_cli_path_cache,
@@ -224,7 +224,7 @@ async def test_start_raises_fast_when_ssh_host_unreachable():
     """SessionManager.start() fails in ~2 s instead of hanging on SSH TCP timeout."""
     cfg = _ssh_config("10.254.254.254")
 
-    with patch("manager.claude_session.probe_host_reachable", return_value=False):
+    with patch("manager.claude.session.probe_host_reachable", return_value=False):
         sm = SessionManager(config=cfg)
         with pytest.raises(RemoteHostUnreachableError):
             await sm.start()

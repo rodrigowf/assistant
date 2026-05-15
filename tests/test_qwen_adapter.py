@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from manager.qwen_adapter import QwenAdapter
+from manager.qwen.adapter import QwenAdapter
 from manager.types import ContentBlock, SessionInfo
 
 

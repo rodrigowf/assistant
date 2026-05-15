@@ -81,9 +81,9 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
-from .base_session import BaseSessionManager, TurnAbandoned
-from .config import ManagerConfig
-from .types import (
+from ..base_session import BaseSessionManager, TurnAbandoned
+from ..config import ManagerConfig
+from ..types import (
     CompactComplete,
     Event,
     PermissionRequest,
@@ -157,7 +157,7 @@ class SessionAbandoned(TurnAbandoned):
 # without dragging in claude-agent-sdk (which this module imports at load time).
 # Re-export the legacy underscore names so pool / tests that already import
 # them from here keep working.
-from ._proc import (
+from .._proc import (
     process_alive as _process_alive,
     process_comm as _process_comm,
     kill_subprocess as _kill_subprocess,
@@ -171,7 +171,7 @@ def _looks_like_claude(pid: int) -> bool:
     chars — for our subprocess that's exactly ``claude``.  We accept any
     value that starts with ``claude`` to tolerate possible future renames.
     """
-    from ._proc import looks_like
+    from .._proc import looks_like
     return looks_like(pid, "claude")
 
 

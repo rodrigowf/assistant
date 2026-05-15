@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .protocol import ProviderAdapter, _parse_timestamp, extract_text, register_provider
-from .registry import HarnessSpec, register_harness
-from .types import SessionInfo
+from ..protocol import ProviderAdapter, _parse_timestamp, extract_text, register_provider
+from ..registry import HarnessSpec, register_harness
+from ..types import SessionInfo
 
 
 # Backward-compat alias: tests and SessionStore import this name.
@@ -147,12 +147,12 @@ register_provider(_adapter)
 
 
 def _load_claude_session_class():
-    from .claude_session import ClaudeSessionManager
+    from .session import ClaudeSessionManager
     return ClaudeSessionManager
 
 
 def _load_claude_kill_helper():
-    from .claude_session import kill_claude_subprocess
+    from .session import kill_claude_subprocess
     return kill_claude_subprocess
 
 

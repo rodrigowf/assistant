@@ -21,7 +21,7 @@ import shutil
 import pytest
 
 from manager.config import ManagerConfig
-from manager.qwen_session import QwenSessionManager
+from manager.qwen.session import QwenSessionManager
 from manager.types import TextDelta, TurnComplete
 
 

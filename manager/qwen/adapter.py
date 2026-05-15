@@ -16,9 +16,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .protocol import ProviderAdapter, _parse_timestamp, register_provider
-from .registry import HarnessSpec, register_harness
-from .types import SessionInfo
+from ..protocol import ProviderAdapter, _parse_timestamp, register_provider
+from ..registry import HarnessSpec, register_harness
+from ..types import SessionInfo
 
 
 def _extract_text_from_parts(parts: list[dict]) -> str:
@@ -222,7 +222,7 @@ register_provider(_adapter)
 
 
 def _load_qwen_session_class():
-    from .qwen_session import QwenSessionManager
+    from .session import QwenSessionManager
     return QwenSessionManager
 
 
@@ -230,7 +230,7 @@ def _load_qwen_kill_helper():
     # Qwen's runtime is Node.js, so its /proc comm shows up as "node".
     # The kill helper still uses the kernel-comm sanity check via
     # ``manager._proc.kill_subprocess`` — same shape as Claude's helper.
-    from ._proc import kill_subprocess
+    from .._proc import kill_subprocess
 
     def kill_qwen_subprocess(pid: int, *, sigterm_grace_s: float = 0.5) -> bool:
         return kill_subprocess(pid, comm_prefix="node", sigterm_grace_s=sigterm_grace_s)

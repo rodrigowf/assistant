@@ -120,7 +120,7 @@ class SessionPool:
         # grace period — covers the case where the per-session SIGKILL
         # path inside _lifecycle() was itself bypassed (lifecycle task
         # cancelled hard, SDK transport refactored so we couldn't grab
-        # the pid, etc.).  See manager.claude_session.kill_claude_subprocess.
+        # the pid, etc.).  See manager.claude.session.kill_claude_subprocess.
         self._tracked_pids: dict[int, tuple[str, float]] = {}
         # Sessions that have been removed from _sessions but whose pid we
         # still want to keep an eye on for ``orphan_grace_seconds``.

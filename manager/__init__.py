@@ -55,12 +55,17 @@ from .types import (
 # Names exported lazily.  Keys map to (module_name, attribute_name).
 # Listed under __all__ for IDE/linter awareness even though they aren't
 # bound at module load.
+#
+# Each harness lives in its own subpackage (``manager.claude``,
+# ``manager.qwen``, …); the lazy hook resolves these to the subpackage's
+# ``session`` module so the SDK-importing subpackage doesn't load until
+# it's actually needed.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    "ClaudeSessionManager": (".claude_session", "ClaudeSessionManager"),
-    "SessionManager": (".claude_session", "ClaudeSessionManager"),  # historical alias
-    "SessionAbandoned": (".claude_session", "SessionAbandoned"),
-    "QwenSessionManager": (".qwen_session", "QwenSessionManager"),
-    "QwenAbandoned": (".qwen_session", "QwenAbandoned"),
+    "ClaudeSessionManager": (".claude.session", "ClaudeSessionManager"),
+    "SessionManager": (".claude.session", "ClaudeSessionManager"),  # historical alias
+    "SessionAbandoned": (".claude.session", "SessionAbandoned"),
+    "QwenSessionManager": (".qwen.session", "QwenSessionManager"),
+    "QwenAbandoned": (".qwen.session", "QwenAbandoned"),
 }
 
 

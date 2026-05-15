@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from manager.config import ManagerConfig
-from manager.claude_session import SessionAbandoned, SessionManager
+from manager.claude.session import SessionAbandoned, SessionManager
 from manager.types import (
     CompactComplete,
     SessionStalled,
@@ -89,7 +89,7 @@ class TestSessionManagerLifecycle:
         """start() returns the stable local_id, not the SDK session ID."""
         client = _make_mock_client(server_info={"session_id": "abc-123"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager(local_id="my-local-id")
             sid = await sm.start()
 
@@ -106,7 +106,7 @@ class TestSessionManagerLifecycle:
         """If no local_id is provided, one is generated."""
         client = _make_mock_client(server_info={"session_id": "sdk-abc"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             sid = await sm.start()
 
@@ -119,7 +119,7 @@ class TestSessionManagerLifecycle:
     async def test_stop_disconnects(self):
         client = _make_mock_client(server_info={"session_id": "abc"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
             await sm.stop()
@@ -131,7 +131,7 @@ class TestSessionManagerLifecycle:
     async def test_context_manager(self):
         client = _make_mock_client(server_info={"session_id": "ctx"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             async with SessionManager(local_id="ctx-local") as sm:
                 assert sm.local_id == "ctx-local"
                 assert sm.sdk_session_id == "ctx"
@@ -143,7 +143,7 @@ class TestSessionManagerLifecycle:
         """When resuming, the SDK session ID is stored separately from local_id."""
         client = _make_mock_client(server_info={"commands": [], "output_style": "plain"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager(session_id="existing-session-abc", local_id="local-xyz")
             sid = await sm.start()
 
@@ -166,7 +166,7 @@ class TestSessionManagerLifecycle:
         """
         client = _make_mock_client(server_info={"session_id": "x"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager(local_id="cross-task")
             # Start from this task.
             await sm.start()
@@ -187,7 +187,7 @@ class TestSessionManagerLifecycle:
         task."""
         client = _make_mock_client(server_info={"session_id": "x"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
             with pytest.raises(RuntimeError, match="called twice"):
@@ -200,7 +200,7 @@ class TestSessionManagerLifecycle:
         rather than awaiting a dead task or raising."""
         client = _make_mock_client(server_info={"session_id": "x"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
             await sm.stop()
@@ -217,7 +217,7 @@ class TestSessionManagerLifecycle:
         client = _make_mock_client(server_info={"session_id": "x"})
         client.connect.side_effect = ConnectionRefusedError("nope")
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             with pytest.raises(ConnectionRefusedError, match="nope"):
                 await sm.start()
@@ -237,7 +237,7 @@ class TestSessionManagerLifecycle:
         client._transport._process = MagicMock()
         client._transport._process.pid = 99999  # arbitrary non-real pid
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
             assert sm.subprocess_pid == 99999
@@ -252,8 +252,8 @@ class TestSessionManagerLifecycle:
         orphan reaper still acts as a fallback."""
         client = _make_mock_client(server_info={"session_id": "x"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client), \
-             patch("manager.claude_session._extract_subprocess_pid", return_value=None):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client), \
+             patch("manager.claude.session._extract_subprocess_pid", return_value=None):
             sm = SessionManager()
             await sm.start()
             assert sm.subprocess_pid is None
@@ -276,10 +276,10 @@ class TestSessionManagerLifecycle:
         client._transport._process = MagicMock()
         client._transport._process.pid = 88888
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client), \
-             patch("manager.claude_session._process_alive", return_value=True), \
-             patch("manager.claude_session.kill_claude_subprocess", return_value=True) as kill_mock, \
-             patch("manager.claude_session.asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client), \
+             patch("manager.claude.session._process_alive", return_value=True), \
+             patch("manager.claude.session.kill_claude_subprocess", return_value=True) as kill_mock, \
+             patch("manager.claude.session.asyncio.wait_for", new=AsyncMock(side_effect=asyncio.TimeoutError)):
             sm = SessionManager()
             await sm.start()
             await sm.stop()
@@ -320,7 +320,7 @@ class TestSessionManagerLifecycle:
 
         client.disconnect = AsyncMock(side_effect=_slow_disconnect)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager(local_id="shielded")
             await sm.start()
 
@@ -354,9 +354,9 @@ class TestSessionManagerLifecycle:
         client._transport._process = MagicMock()
         client._transport._process.pid = 77777
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client), \
-             patch("manager.claude_session._process_alive", return_value=False), \
-             patch("manager.claude_session.kill_claude_subprocess") as kill_mock:
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client), \
+             patch("manager.claude.session._process_alive", return_value=False), \
+             patch("manager.claude.session.kill_claude_subprocess") as kill_mock:
             sm = SessionManager()
             await sm.start()
             await sm.stop()
@@ -399,7 +399,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -433,7 +433,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -465,7 +465,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -498,7 +498,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -530,7 +530,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -566,7 +566,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -605,7 +605,7 @@ class TestSessionManagerSend:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -635,7 +635,7 @@ class TestSessionManagerStallWatchdog:
             SystemMessage,
             ToolUseBlock,
         )
-        import manager.claude_session as session_mod
+        import manager.claude.session as session_mod
 
         init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
         tool_use_msg = AssistantMessage(
@@ -668,7 +668,7 @@ class TestSessionManagerStallWatchdog:
 
             client = _make_mock_client([init_msg], fake_response)
 
-            with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+            with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
                 sm = SessionManager()
                 await sm.start()
 
@@ -711,7 +711,7 @@ class TestSessionManagerStallWatchdog:
         orchestrator) should retry once instead of hanging forever.
         """
         from claude_agent_sdk import SystemMessage
-        import manager.claude_session as session_mod
+        import manager.claude.session as session_mod
 
         init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
 
@@ -733,7 +733,7 @@ class TestSessionManagerStallWatchdog:
 
             client = _make_mock_client([init_msg], fake_response)
 
-            with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+            with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
                 sm = SessionManager()
                 await sm.start()
 
@@ -762,7 +762,7 @@ class TestSessionManagerStallWatchdog:
             SystemMessage,
             ToolUseBlock,
         )
-        import manager.claude_session as session_mod
+        import manager.claude.session as session_mod
 
         init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
         tool_use_msg = AssistantMessage(
@@ -792,7 +792,7 @@ class TestSessionManagerStallWatchdog:
 
             client = _make_mock_client([init_msg], fake_response)
 
-            with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+            with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
                 sm = SessionManager()
                 await sm.start()
 
@@ -858,7 +858,7 @@ class TestSessionManagerStaleMessageDrain:
         await send_stream.send(stale_assistant)
         await send_stream.send(stale_result)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -896,7 +896,7 @@ class TestSessionManagerStaleMessageDrain:
         client._query = MagicMock()
         client._query._message_receive = recv
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -914,7 +914,7 @@ class TestSessionManagerStaleMessageDrain:
         raising or spinning the cap loop against a MagicMock."""
         client = _make_mock_client(server_info={"session_id": "s1"})
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -943,7 +943,7 @@ class TestSessionManagerCostTracking:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -1004,7 +1004,7 @@ class TestSlashCommands:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -1030,7 +1030,7 @@ class TestSlashCommands:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
@@ -1056,7 +1056,7 @@ class TestSlashCommands:
 
         client = _make_mock_client([init_msg], fake_response)
 
-        with patch("manager.claude_session.ClaudeSDKClient", return_value=client):
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 

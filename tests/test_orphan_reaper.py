@@ -42,7 +42,7 @@ import pytest
 
 from api.pool import SessionPool
 from manager.config import ManagerConfig
-from manager.claude_session import SessionManager
+from manager.claude.session import SessionManager
 
 
 # ----------------------------------------------------------------------

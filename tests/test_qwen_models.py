@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from manager.qwen_models import QwenModelInfo, list_qwen_models
+from manager.qwen.models import QwenModelInfo, list_qwen_models
 
 
 @pytest.fixture

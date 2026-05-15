@@ -6,7 +6,7 @@ to stdout, and exits.  Multi-turn conversations are stitched together
 by passing ``--resume <session-id>`` on subsequent invocations.
 
 This file implements the same :class:`BaseSessionManager` contract as
-:class:`manager.claude_session.ClaudeSessionManager`, so the pool and
+:class:`manager.claude.session.ClaudeSessionManager`, so the pool and
 WebSocket layer don't need provider-specific code paths.
 
 Event format: Qwen's ``--output-format stream-json`` emits Anthropic-style
@@ -26,7 +26,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from ._ssh import (
+from .._ssh import (
     RemoteCommand,
     RemoteHostUnreachableError,
     SshTarget,
@@ -34,9 +34,9 @@ from ._ssh import (
     probe_host_reachable,
     resolve_remote_cli_path,
 )
-from .base_session import BaseSessionManager, TurnAbandoned
-from .config import ManagerConfig
-from .types import (
+from ..base_session import BaseSessionManager, TurnAbandoned
+from ..config import ManagerConfig
+from ..types import (
     CompactComplete,
     Event,
     SessionStalled,

@@ -126,7 +126,7 @@ class HarnessRegistry:
     """In-process registry of session-harness specs.
 
     Population is side-effecting: each adapter module
-    (:mod:`manager.claude_adapter`, :mod:`manager.qwen_adapter`, …) calls
+    (:mod:`manager.claude.adapter`, :mod:`manager.qwen.adapter`, …) calls
     :func:`register_harness` at import time.  :func:`ensure_all_registered`
     triggers those imports so callers don't need to know which adapter
     modules exist.
@@ -209,6 +209,6 @@ def ensure_all_registered() -> None:
 # registered until after the imports run — chicken-and-egg.  Adding a new
 # harness lands by writing the adapter module and adding it here.
 _ADAPTER_MODULES: tuple[str, ...] = (
-    "manager.claude_adapter",
-    "manager.qwen_adapter",
+    "manager.claude.adapter",
+    "manager.qwen.adapter",
 )

@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from manager.config import ManagerConfig
-from manager.qwen_session import (
+from manager.qwen.session import (
     QwenAbandoned,
     QwenSessionManager,
     _qwen_executable,
@@ -596,7 +596,7 @@ class TestAbandonedWatchdog:
     async def test_abandoned_when_no_events_received(self):
         """If the subprocess produces zero events for _TURN_ABANDON_S, raise
         QwenAbandoned. We monkey-patch the threshold tiny for the test."""
-        from manager import qwen_session as qs
+        from manager.qwen import session as qs
 
         original_abandon = qs._TURN_ABANDON_S
         original_first = qs._STALL_FIRST_NOTICE_S

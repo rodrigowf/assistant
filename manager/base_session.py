@@ -1,7 +1,7 @@
 """BaseSessionManager — abstract interface for a single agent session.
 
-Both :class:`manager.claude_session.ClaudeSessionManager` and
-:class:`manager.qwen_session.QwenSessionManager` implement this contract.
+Both :class:`manager.claude.session.ClaudeSessionManager` and
+:class:`manager.qwen.session.QwenSessionManager` implement this contract.
 The pool, the WebSocket chat handler, and the orchestrator all interact
 with sessions through this interface — they should never see provider
 specifics.
