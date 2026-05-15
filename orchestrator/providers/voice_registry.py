@@ -35,6 +35,11 @@ def _resolve_qwen_voice():
     return QwenVoiceProvider
 
 
+def _resolve_google_voice():
+    from orchestrator.providers.gemini_voice import GeminiLiveVoiceProvider
+    return GeminiLiveVoiceProvider
+
+
 class VoiceEntry(TypedDict):
     id: str             # exact value the provider's session.update accepts
     label: str          # human label for the dropdown
@@ -68,7 +73,7 @@ class VoiceModelEntry(TypedDict):
 _VOICE_PROVIDER_RESOLVERS: dict[str, callable] = {
     "openai": _resolve_openai_voice,
     "qwen": _resolve_qwen_voice,
-    # "google": _resolve_google_voice,   # added in Phase 2
+    "google": _resolve_google_voice,
 }
 
 
@@ -272,6 +277,26 @@ _QWEN_ASR_LANGUAGES: list[TranscriptionLanguageEntry] = [
 _OPENAI_TRANSCRIPTION_LANGUAGES: list[TranscriptionLanguageEntry] = []
 
 
+# Gemini Live prebuilt voices (Sept–Dec 2025 catalogue). The Live API
+# doesn't expose a per-model voice list dynamically; this is the static
+# fallback list, also attached to every entry returned by the
+# /api/config/voice/google/models endpoint.
+_GEMINI_LIVE_VOICES: list[VoiceEntry] = [
+    {"id": "Puck",    "label": "Puck",    "description": "Default, energetic"},
+    {"id": "Charon",  "label": "Charon",  "description": "Male, low"},
+    {"id": "Kore",    "label": "Kore",    "description": "Female, firm"},
+    {"id": "Fenrir",  "label": "Fenrir",  "description": "Male, gruff"},
+    {"id": "Aoede",   "label": "Aoede",   "description": "Female, lyrical"},
+    {"id": "Leda",    "label": "Leda",    "description": "Female, warm"},
+    {"id": "Orus",    "label": "Orus",    "description": "Male, smooth"},
+    {"id": "Zephyr",  "label": "Zephyr",  "description": "Neutral, airy"},
+]
+
+# Gemini Live auto-detects language; no separate transcription-language
+# dropdown is exposed for now (matches our OpenAI behaviour).
+_GEMINI_TRANSCRIPTION_LANGUAGES: list[TranscriptionLanguageEntry] = []
+
+
 VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
     "openai": [
         {"id": "gpt-realtime",      "label": "GPT Realtime",      "voice": "cedar",
@@ -297,10 +322,29 @@ VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
          "default_transcription_language": "en",
          "default": False},
     ],
-    # Filled in by Phase 2:
-    # "google": [
-    #     {"id": "gemini-3.1-flash-live-preview", ...},
-    # ],
+    # Curated fallback list for Gemini Live. The Config-page dropdown
+    # prefers the dynamic /api/config/voice/google/models endpoint
+    # (which queries Google's models.list for any model supporting
+    # bidiGenerateContent); this static list is the fallback when the
+    # dynamic query fails (e.g. GEMINI_API_KEY unset, transient
+    # network error). Keep at least one stable + one preview model
+    # entry so the UI shows something useful even offline.
+    "google": [
+        {"id": "gemini-2.5-flash-native-audio-latest",
+         "label": "Gemini 2.5 Flash Native Audio",
+         "voice": "Puck",
+         "voices": _GEMINI_LIVE_VOICES,
+         "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
+         "default_transcription_language": "",
+         "default": True},
+        {"id": "gemini-3.1-flash-live-preview",
+         "label": "Gemini 3.1 Flash Live (preview)",
+         "voice": "Puck",
+         "voices": _GEMINI_LIVE_VOICES,
+         "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
+         "default_transcription_language": "",
+         "default": False},
+    ],
 }
 
 
