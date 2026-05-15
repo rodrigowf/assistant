@@ -471,6 +471,76 @@ class TestRenderPrompt:
 
 
 # ---------------------------------------------------------------------------
+# Per-turn PID tracking callbacks
+# ---------------------------------------------------------------------------
+
+class TestPidCallbacks:
+    @pytest.mark.asyncio
+    async def test_callbacks_fire_around_turn(self):
+        """Pool-installed callbacks fire when a subprocess spawns and exits.
+
+        Qwen spawns a fresh process per turn, so the pool needs spawn/exit
+        notifications to keep its orphan-reaper bookkeeping in sync.
+        """
+        proc = _make_fake_proc([
+            _init_event(),
+            _result_event(),
+        ])
+
+        sm = QwenSessionManager()
+        await sm.start()
+
+        spawned: list[int] = []
+        exited: list[int] = []
+        sm.set_pid_callbacks(spawned.append, exited.append)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            async for _ in sm.send("hi"):
+                pass
+
+        assert spawned == [proc.pid]
+        assert exited == [proc.pid]
+        await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_callback_exceptions_dont_break_turn(self):
+        """A misbehaving callback must NOT take down the in-flight turn.
+
+        The session logs and keeps going — the pool's tracking might be
+        stale but the user's message still gets through.
+        """
+        proc = _make_fake_proc([
+            _init_event(),
+            _stream_event(
+                "content_block_start", index=0,
+                content_block={"type": "text", "text": ""},
+            ),
+            _stream_event(
+                "content_block_delta", index=0,
+                delta={"type": "text_delta", "text": "ok"},
+            ),
+            _stream_event("content_block_stop", index=0),
+            _result_event(),
+        ])
+
+        def explode(_pid: int) -> None:
+            raise RuntimeError("callback boom")
+
+        sm = QwenSessionManager()
+        await sm.start()
+        sm.set_pid_callbacks(explode, explode)
+
+        events = []
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            async for ev in sm.send("hi"):
+                events.append(ev)
+        await sm.stop()
+
+        # The turn still completed despite the callback raising both times.
+        assert any(isinstance(e, TurnComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
 # Interrupt
 # ---------------------------------------------------------------------------
 

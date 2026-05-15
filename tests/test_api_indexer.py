@@ -16,9 +16,10 @@ from api.indexer import (
 class TestRunIndexScript:
     @pytest.mark.asyncio
     async def test_runs_script(self, tmp_path):
-        # Create mock scripts
-        scripts_dir = tmp_path / "scripts"
-        scripts_dir.mkdir()
+        # _run_index_script looks under <project>/context/scripts/, not
+        # <project>/scripts/, so the fixture has to match that layout.
+        scripts_dir = tmp_path / "context" / "scripts"
+        scripts_dir.mkdir(parents=True)
         run_sh = scripts_dir / "run.sh"
         run_sh.write_text("#!/bin/bash\nexit 0")
         run_sh.chmod(0o755)

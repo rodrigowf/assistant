@@ -42,7 +42,7 @@ import pytest
 
 from api.pool import SessionPool
 from manager.config import ManagerConfig
-from manager.session import SessionManager
+from manager.claude_session import SessionManager
 
 
 # ----------------------------------------------------------------------
@@ -58,7 +58,7 @@ async def test_reaper_tracks_pid_when_session_created():
     cfg = ManagerConfig(project_dir="/local/project")
 
     async def fake_start(self):
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         self._subprocess_pid = 12345
 
     with patch.object(SessionManager, "start", fake_start):
@@ -77,7 +77,7 @@ async def test_reaper_skips_tracking_when_pid_unavailable():
     cfg = ManagerConfig(project_dir="/local/project")
 
     async def fake_start(self):
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         self._subprocess_pid = None  # SDK shape changed
 
     with patch.object(SessionManager, "start", fake_start):
@@ -94,7 +94,7 @@ async def test_reaper_moves_pid_to_closed_set_on_close():
     cfg = ManagerConfig(project_dir="/local/project")
 
     async def fake_start(self):
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         self._subprocess_pid = 54321
 
     async def fake_stop(self):
@@ -112,14 +112,14 @@ async def test_reaper_moves_pid_to_closed_set_on_close():
 
 def test_reaper_pass_kills_orphan_after_grace_period():
     """The reaper should SIGKILL a tracked closed-session pid whose
-    grace period expired AND that's still alive AND looks like claude."""
+    grace period expired AND that's still alive AND looks like one of
+    our subprocesses (dispatched through ``_kill_tracked_pid``)."""
     pool = SessionPool()
     # Manually plant an "expired" closed session
     pool._closed_session_pids["sess-x"] = (99001, time.monotonic() - 60.0)
 
     with patch("api.pool._process_alive", return_value=True), \
-         patch("api.pool._looks_like_claude", return_value=True), \
-         patch("api.pool.kill_claude_subprocess", return_value=True) as kill_mock:
+         patch("api.pool._kill_tracked_pid", return_value=True) as kill_mock:
         pool._reap_orphans_once(orphan_grace_seconds=30.0)
 
     kill_mock.assert_called_once_with(99001)
@@ -134,8 +134,7 @@ def test_reaper_respects_grace_period():
     pool._closed_session_pids["sess-y"] = (99002, time.monotonic() - 5.0)
 
     with patch("api.pool._process_alive", return_value=True), \
-         patch("api.pool._looks_like_claude", return_value=True), \
-         patch("api.pool.kill_claude_subprocess", return_value=True) as kill_mock:
+         patch("api.pool._kill_tracked_pid", return_value=True) as kill_mock:
         pool._reap_orphans_once(orphan_grace_seconds=30.0)
 
     kill_mock.assert_not_called()
@@ -143,19 +142,21 @@ def test_reaper_respects_grace_period():
     assert "sess-y" in pool._closed_session_pids
 
 
-def test_reaper_skips_pid_that_no_longer_looks_like_claude():
-    """If the pid was reused by the kernel for an unrelated process
-    after the bundled claude exited cleanly, we must NOT kill it."""
+def test_reaper_skips_pid_that_no_longer_looks_like_ours():
+    """If the pid was reused by the kernel for an unrelated process after
+    our subprocess exited cleanly, ``_kill_tracked_pid`` returns False
+    (the underlying ``looks_like`` check fails) — but the bookkeeping
+    must still be dropped because the pid is no longer ours to track."""
     pool = SessionPool()
     pool._closed_session_pids["sess-z"] = (99003, time.monotonic() - 60.0)
 
     with patch("api.pool._process_alive", return_value=True), \
-         patch("api.pool._looks_like_claude", return_value=False), \
-         patch("api.pool.kill_claude_subprocess") as kill_mock:
+         patch("api.pool._kill_tracked_pid", return_value=False) as kill_mock:
         pool._reap_orphans_once(orphan_grace_seconds=30.0)
 
-    kill_mock.assert_not_called()
-    # Bookkeeping is dropped — the pid is no longer ours to track
+    # _kill_tracked_pid was consulted; it returned False (comm didn't match).
+    kill_mock.assert_called_once_with(99003)
+    # Bookkeeping is dropped — the pid is no longer ours to track.
     assert "sess-z" not in pool._closed_session_pids
 
 
@@ -167,7 +168,7 @@ def test_reaper_drops_dead_tracked_pids():
     pool._tracked_pids[99004] = ("sess-live", time.monotonic())
 
     with patch("api.pool._process_alive", return_value=False), \
-         patch("api.pool.kill_claude_subprocess") as kill_mock:
+         patch("api.pool._kill_tracked_pid") as kill_mock:
         pool._reap_orphans_once(orphan_grace_seconds=30.0)
 
     kill_mock.assert_not_called()
@@ -183,8 +184,7 @@ def test_reaper_kills_pid_for_session_that_vanished_without_close():
     # Note: sess-vanished is intentionally NOT in pool._sessions
 
     with patch("api.pool._process_alive", return_value=True), \
-         patch("api.pool._looks_like_claude", return_value=True), \
-         patch("api.pool.kill_claude_subprocess", return_value=True) as kill_mock:
+         patch("api.pool._kill_tracked_pid", return_value=True) as kill_mock:
         pool._reap_orphans_once(orphan_grace_seconds=30.0)
 
     kill_mock.assert_called_once_with(99005)

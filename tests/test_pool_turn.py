@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from api.pool import SessionPool
-from manager.session import SessionAbandoned
+from manager.claude_session import SessionAbandoned
 from manager.types import (
     SessionStatus,
     TextDelta,

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from manager.config import ManagerConfig
-from manager.session import SessionAbandoned, SessionManager
+from manager.claude_session import SessionAbandoned, SessionManager
 from manager.types import (
     CompactComplete,
     SessionStalled,

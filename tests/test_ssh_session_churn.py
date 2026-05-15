@@ -23,7 +23,7 @@ import pytest
 
 from api.pool import SessionPool
 from manager.config import ManagerConfig
-from manager.session import (
+from manager.claude_session import (
     RemoteHostUnreachableError,
     SessionManager,
     _REMOTE_CLAUDE_PATH_CACHE,
@@ -141,7 +141,7 @@ async def test_pool_serializes_same_host_concurrent_creates():
         await asyncio.sleep(0.05)
         async with active_lock:
             concurrent_count -= 1
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         return self._local_id
 
     with patch.object(SessionManager, "start", fake_start):
@@ -175,7 +175,7 @@ async def test_pool_does_not_serialize_across_different_hosts():
         await asyncio.sleep(0.05)
         async with active_lock:
             observed_concurrency -= 1
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         return self._local_id
 
     with patch.object(SessionManager, "start", fake_start):
@@ -203,7 +203,7 @@ async def test_pool_local_sessions_are_not_serialized():
         await asyncio.sleep(0.02)
         async with active_lock:
             active -= 1
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         return self._local_id
 
     with patch.object(SessionManager, "start", fake_start):
@@ -281,7 +281,7 @@ async def test_pool_close_awaits_session_manager_stop():
     stop_called = False
 
     async def fake_start(self):
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         return self._local_id
 
     async def fake_stop(self):
@@ -304,7 +304,7 @@ async def test_pool_close_tolerates_slow_session_manager_stop():
     cfg = ManagerConfig(project_dir="/local/project")
 
     async def fake_start(self):
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         return self._local_id
 
     # A stop() coroutine that would hang forever — close() must time it out.
@@ -334,7 +334,7 @@ async def test_pool_close_all_drains_every_session():
     stops: list[str] = []
 
     async def fake_start(self):
-        self._sdk_session_id = f"sdk-{self._local_id}"
+        self._provider_session_id = f"sdk-{self._local_id}"
         return self._local_id
 
     async def fake_stop(self):

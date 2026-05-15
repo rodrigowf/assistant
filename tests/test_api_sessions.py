@@ -7,7 +7,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from api.app import create_app
-from api.deps import get_store
+from api.deps import get_pool, get_store
 from manager.types import MessagePreview, SessionDetail, SessionInfo
 
 
@@ -60,7 +60,16 @@ def _make_app(sessions=None, detail=None, delete_ok=True):
     mock_store.get_preview.return_value = detail.messages[:5] if detail else []
     mock_store.delete_session.return_value = delete_ok
 
+    # The list_sessions route also reads from the pool to surface live
+    # sessions (with no JSONL yet).  AsyncClient bypasses the FastAPI
+    # lifespan that would normally populate ``app.state.pool``, so we
+    # inject a stub directly via the dependency-override hook.
+    mock_pool = MagicMock()
+    mock_pool.list_sessions.return_value = []
+    mock_pool.has_orchestrator.return_value = False
+
     app.dependency_overrides[get_store] = lambda: mock_store
+    app.dependency_overrides[get_pool] = lambda: mock_pool
     return app
 
 
