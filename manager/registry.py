@@ -211,4 +211,5 @@ def ensure_all_registered() -> None:
 _ADAPTER_MODULES: tuple[str, ...] = (
     "manager.claude.adapter",
     "manager.qwen.adapter",
+    "manager.gemini.adapter",
 )

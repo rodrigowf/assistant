@@ -59,18 +59,25 @@ def test_adapter_loader_returns_provideradapter_instance():
         )
 
 
-def test_jsonl_path_resolver_returns_nonempty_list():
-    """Every harness must propose at least one candidate path for a
-    given session id, so the chat-resume sniffer has something to probe."""
+def test_jsonl_path_resolver_returns_list_of_paths():
+    """Every harness's resolver returns a list (possibly empty).
+
+    Some harnesses (e.g. Claude, Qwen) construct a deterministic path
+    from the session id alone — those always return a single candidate.
+    Others (e.g. Gemini, which embeds a timestamp in the filename) need
+    to glob the storage directory and may return ``[]`` for unknown
+    sessions; that's correct behavior, not a bug.
+
+    The shared contract is just: returns ``list[Path]``, never crashes.
+    """
+    from pathlib import Path
+
     ensure_all_registered()
     for name, spec in get_registry().all().items():
-        paths = spec.jsonl_path_resolver("some-session-id")
-        assert isinstance(paths, list)
-        assert len(paths) >= 1, f"{name}: resolver returned no candidates"
+        paths = spec.jsonl_path_resolver("11111111-1111-1111-1111-111111111111")
+        assert isinstance(paths, list), f"{name}: resolver did not return a list"
         for p in paths:
-            assert "some-session-id" in str(p), (
-                f"{name}: resolver dropped the session id from {p!r}"
-            )
+            assert isinstance(p, Path), f"{name}: resolver yielded non-Path {p!r}"
 
 
 def test_ssh_control_path_prefixes_are_unique():

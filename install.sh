@@ -54,6 +54,7 @@ IMPORT_CONTEXT=""
 # --with-X / --without-X pin them non-interactively.
 WITH_CLAUDE=""
 WITH_QWEN=""
+WITH_GEMINI=""
 WITH_ANTHROPIC=""
 WITH_OPENAI=""
 # Shortcut: --qwen-only sets harness=qwen-only and orchestrator=openai-only
@@ -87,12 +88,20 @@ while [[ $# -gt 0 ]]; do
             WITH_QWEN=true
             shift
             ;;
+        --with-gemini)
+            WITH_GEMINI=true
+            shift
+            ;;
         --without-claude)
             WITH_CLAUDE=false
             shift
             ;;
         --without-qwen)
             WITH_QWEN=false
+            shift
+            ;;
+        --without-gemini)
+            WITH_GEMINI=false
             shift
             ;;
         --with-anthropic)
@@ -126,11 +135,13 @@ Options:
   --import-context URL   Import existing context repository
   -h, --help             Show this help message
 
-Session harness (which agent CLI runs your chats):
-  --with-claude          Set up Claude Code
-  --with-qwen            Set up Qwen Code
+Session harness (which agent CLI runs your chats — multiple OK):
+  --with-claude          Set up Claude Code (Anthropic)
+  --with-qwen            Set up Qwen Code (Alibaba)
+  --with-gemini          Set up Gemini CLI (Google)
   --without-claude       Skip Claude Code setup
   --without-qwen         Skip Qwen Code setup
+  --without-gemini       Skip Gemini CLI setup
 
 Orchestrator backends (which API SDKs to install):
   --with-anthropic       Install the `anthropic` SDK (for Claude models in the orchestrator)
@@ -165,6 +176,7 @@ done
 if [ "$QWEN_ONLY" = true ]; then
     WITH_CLAUDE="${WITH_CLAUDE:-false}"
     WITH_QWEN="${WITH_QWEN:-true}"
+    WITH_GEMINI="${WITH_GEMINI:-false}"
     WITH_ANTHROPIC="${WITH_ANTHROPIC:-false}"
     WITH_OPENAI="${WITH_OPENAI:-true}"
 fi
@@ -184,33 +196,38 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 0a: Session harness — which agent CLI(s) to set up
 # ─────────────────────────────────────────────────────────────────────────────
-# Claude Code and Qwen Code are both optional.  The wrapper supports either
-# (or both) — the UI's "Session provider" selector picks which one new chats
-# use.  We ask up front so we only do the relevant per-provider setup work
-# (SDK config symlinks, credential links, CLI install hints) below.
-if [ -z "$WITH_CLAUDE" ] && [ -z "$WITH_QWEN" ]; then
+# Each harness is independently optional.  The wrapper supports any
+# combination — the UI's "Session provider" selector picks which one new
+# chats use.  We ask up front so we only do the relevant per-harness
+# setup work (SDK config symlinks, credential links, CLI install hints).
+#
+# Adding a new harness here: append a y/n prompt block matching the
+# existing ones AND a corresponding --with-<name> / --without-<name> flag
+# in the argv parser above.  The per-harness install blocks further down
+# remain guarded by their WITH_<name> flag, so the new harness stays
+# opt-in.
+if [ -z "$WITH_CLAUDE" ] && [ -z "$WITH_QWEN" ] && [ -z "$WITH_GEMINI" ]; then
     echo -e "${BOLD}── Session harness ──${NC}"
-    echo "Which agent CLI(s) should run your chats?"
+    echo "Which agent CLI(s) should run your chats?  (You can pick more than one;"
+    echo "the UI's Session Provider selector switches between them at runtime.)"
     echo ""
-    echo "  ${BOLD}1)${NC} Claude Code only (Anthropic — current default)"
-    echo "  ${BOLD}2)${NC} Qwen Code only (Alibaba — open weights, OAuth or DashScope key)"
-    echo "  ${BOLD}3)${NC} Both — pick at runtime in the Configuration panel"
-    echo ""
-    ask "Choice [1/2/3] (default 1): "
-    read -r HARNESS_CHOICE
-    case "${HARNESS_CHOICE:-1}" in
-        1) WITH_CLAUDE=true;  WITH_QWEN=false ;;
-        2) WITH_CLAUDE=false; WITH_QWEN=true  ;;
-        3) WITH_CLAUDE=true;  WITH_QWEN=true  ;;
-        *) error "Invalid choice: ${HARNESS_CHOICE}. Expected 1, 2, or 3." ;;
-    esac
+    ask "Set up Claude Code (Anthropic — recommended default)? [Y/n] "
+    read -r ANS
+    if [[ "${ANS:-Y}" =~ ^[Nn]$ ]]; then WITH_CLAUDE=false; else WITH_CLAUDE=true; fi
+    ask "Set up Qwen Code (Alibaba — open weights, OAuth or DashScope key)? [y/N] "
+    read -r ANS
+    if [[ "${ANS:-N}" =~ ^[Yy]$ ]]; then WITH_QWEN=true;  else WITH_QWEN=false;  fi
+    ask "Set up Gemini CLI (Google — OAuth or GEMINI_API_KEY)? [y/N] "
+    read -r ANS
+    if [[ "${ANS:-N}" =~ ^[Yy]$ ]]; then WITH_GEMINI=true; else WITH_GEMINI=false; fi
     echo ""
 fi
 WITH_CLAUDE="${WITH_CLAUDE:-false}"
 WITH_QWEN="${WITH_QWEN:-false}"
+WITH_GEMINI="${WITH_GEMINI:-false}"
 
-if [ "$WITH_CLAUDE" = false ] && [ "$WITH_QWEN" = false ]; then
-    error "Refusing to install with neither harness — pick at least one (--with-claude and/or --with-qwen)."
+if [ "$WITH_CLAUDE" = false ] && [ "$WITH_QWEN" = false ] && [ "$WITH_GEMINI" = false ]; then
+    error "Refusing to install with no harnesses — pick at least one (--with-claude / --with-qwen / --with-gemini)."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +261,8 @@ WITH_ANTHROPIC="${WITH_ANTHROPIC:-false}"
 WITH_OPENAI="${WITH_OPENAI:-false}"
 
 if [ "$WITH_CLAUDE" = true ]; then info "Will set up Claude Code harness"; fi
-if [ "$WITH_QWEN"  = true ]; then info "Will set up Qwen Code harness"; fi
+if [ "$WITH_QWEN"   = true ]; then info "Will set up Qwen Code harness"; fi
+if [ "$WITH_GEMINI" = true ]; then info "Will set up Gemini CLI harness"; fi
 if [ "$WITH_ANTHROPIC" = true ]; then info "Will install anthropic SDK (orchestrator)"; fi
 if [ "$WITH_OPENAI"    = true ]; then info "Will install openai SDK (orchestrator + voice)"; fi
 if [ "$WITH_ANTHROPIC" = false ] && [ "$WITH_OPENAI" = false ]; then
@@ -933,6 +951,18 @@ if [ "$WITH_QWEN" = true ] && ! command -v qwen &> /dev/null; then
     STEP=$((STEP + 1))
 fi
 
+# Gemini CLI instructions (only if the user opted in)
+if [ "$WITH_GEMINI" = true ] && ! command -v gemini &> /dev/null; then
+    echo "  ${RED}${STEP}.${NC} Install Gemini CLI:"
+    echo "     ${BLUE}npm install -g @google/gemini-cli${NC}"
+    echo ""
+    STEP=$((STEP + 1))
+    echo "  ${RED}${STEP}.${NC} Authenticate Gemini CLI:"
+    echo "     ${BLUE}gemini${NC}   ${CYAN}(launches Google OAuth on first run; alternative: set GEMINI_API_KEY in context/.env)${NC}"
+    echo ""
+    STEP=$((STEP + 1))
+fi
+
 # Check .env configuration — surface only the keys for axes the user selected.
 ENV_KEYS_MISSING=()
 if [ -f "context/.env" ]; then
@@ -971,7 +1001,12 @@ echo "  ${GREEN}$((STEP + 2)).${NC} Open ${BLUE}https://localhost:5432${NC} in y
 echo ""
 
 echo -e "${CYAN}Tip:${NC} Use ${BOLD}/help${NC} in the assistant to see available commands."
-if [ "$WITH_CLAUDE" = true ] && [ "$WITH_QWEN" = true ]; then
+# Show the multi-harness tip whenever the user enabled more than one.
+HARNESS_COUNT=0
+[ "$WITH_CLAUDE" = true ] && HARNESS_COUNT=$((HARNESS_COUNT + 1))
+[ "$WITH_QWEN"   = true ] && HARNESS_COUNT=$((HARNESS_COUNT + 1))
+[ "$WITH_GEMINI" = true ] && HARNESS_COUNT=$((HARNESS_COUNT + 1))
+if [ "$HARNESS_COUNT" -gt 1 ]; then
     echo -e "${CYAN}Tip:${NC} You can switch providers anytime in Configuration → Session provider."
 fi
 echo ""
