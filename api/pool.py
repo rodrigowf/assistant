@@ -30,26 +30,47 @@ import orjson
 from starlette.websockets import WebSocket, WebSocketState
 
 from api.serializers import serialize_event
+from manager._proc import process_alive as _process_alive, looks_like
 from manager.base_session import BaseSessionManager
-from manager.claude_session import (
-    ClaudeSessionManager,
-    _process_alive,
-    _looks_like_claude,
-    kill_claude_subprocess,
-)
 from manager.config import ManagerConfig
-from manager.qwen_session import QwenSessionManager
 from manager.types import Event
 
 
 def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
-    """Factory: build the right session manager for the configured provider."""
+    """Factory: build the right session manager for the configured provider.
+
+    Imports ``ClaudeSessionManager`` / ``QwenSessionManager`` lazily so the
+    pool module can be imported in environments where only one provider's
+    dependencies are installed.  Importing claude-agent-sdk on a Qwen-only
+    machine, or vice-versa, would fail at module load time otherwise.
+    """
     provider = (config.provider or "claude").lower()
     if provider == "qwen":
+        from manager.qwen_session import QwenSessionManager
         return QwenSessionManager(config=config, **kwargs)
     if provider == "claude":
+        from manager.claude_session import ClaudeSessionManager
         return ClaudeSessionManager(config=config, **kwargs)
     raise ValueError(f"Unsupported provider: {provider!r}")
+
+
+def _kill_tracked_pid(pid: int) -> bool:
+    """Force-kill a tracked subprocess PID, dispatching by comm prefix.
+
+    Used by the orphan reaper: tracks PIDs from any provider but only
+    actually nukes them if they still look like a session subprocess we
+    spawned (``claude*`` or ``qwen*`` comm).
+    """
+    if looks_like(pid, "claude"):
+        from manager.claude_session import kill_claude_subprocess
+        return kill_claude_subprocess(pid)
+    if looks_like(pid, "qwen") or looks_like(pid, "node"):  # qwen runs as node
+        from manager._proc import kill_subprocess
+        # qwen's wrapper is the `qwen` shim, but the bundled JS runtime
+        # shows up as `node` in /proc/<pid>/comm.  Try the more specific
+        # prefix first; fall back to "node" so we still reap orphans.
+        return kill_subprocess(pid, comm_prefix="node")
+    return False
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +107,7 @@ class SessionPool:
         # grace period — covers the case where the per-session SIGKILL
         # path inside _lifecycle() was itself bypassed (lifecycle task
         # cancelled hard, SDK transport refactored so we couldn't grab
-        # the pid, etc.).  See manager.session.kill_claude_subprocess.
+        # the pid, etc.).  See manager.claude_session.kill_claude_subprocess.
         self._tracked_pids: dict[int, tuple[str, float]] = {}
         # Sessions that have been removed from _sessions but whose pid we
         # still want to keep an eye on for ``orphan_grace_seconds``.
@@ -221,14 +242,31 @@ class SessionPool:
         self._sessions[lid] = sm
         self._subscribers[lid] = set()
         self._locks[lid] = asyncio.Lock()
-        # Track the bundled-claude subprocess pid for the orphan reaper.
-        # Best-effort: the SessionManager exposes None when the SDK
-        # transport refactored its private shape — we'll just rely on
-        # the per-session SIGKILL path in that case.
+        # Track the session subprocess pid for the orphan reaper.
+        #
+        # Two paths converge here:
+        #
+        #   Claude: ``sm.subprocess_pid`` returns the bundled-claude PID
+        #   that was captured at SDK connect time.  Stable for the life
+        #   of the session, so a single insert here is enough.
+        #
+        #   Qwen: spawns a fresh subprocess per turn, so ``subprocess_pid``
+        #   only returns a value while a turn is mid-flight (typically
+        #   ``None`` at this point).  Instead, install spawn/exit
+        #   callbacks the QwenSessionManager invokes around each turn —
+        #   keeps tracking in sync with the actual subprocess lifetime.
+        import time as _time
         pid = sm.subprocess_pid
         if pid is not None:
-            import time as _time
             self._tracked_pids[pid] = (lid, _time.monotonic())
+
+        def _on_pid_spawn(spawned_pid: int, _lid: str = lid) -> None:
+            self._tracked_pids[spawned_pid] = (_lid, _time.monotonic())
+
+        def _on_pid_exit(exited_pid: int) -> None:
+            self._tracked_pids.pop(exited_pid, None)
+
+        sm.set_pid_callbacks(_on_pid_spawn, _on_pid_exit)
 
         await self._notify_watchers({
             "type": "agent_session_opened",
@@ -269,16 +307,31 @@ class SessionPool:
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
 
-        # Hand the pid off to the closed-session shadow map so the reaper
-        # has a grace window to verify the subprocess actually exits.
-        # If sm.stop() (which calls our SIGKILL fallback) succeeds, the
-        # pid will be gone by the time the reaper looks at it — no-op.
-        # If it doesn't, the reaper escalates after orphan_grace_seconds.
+        # Hand the pid(s) off to the closed-session shadow map so the
+        # reaper has a grace window to verify the subprocess actually
+        # exits.  If sm.stop() (which calls our SIGKILL fallback)
+        # succeeds, the pid will be gone by the time the reaper looks
+        # at it — no-op.  Otherwise the reaper escalates after
+        # orphan_grace_seconds.
+        #
+        # Detach the spawn callback first so a Qwen session can't push
+        # more PIDs after we've started tearing down.  The exit callback
+        # stays attached briefly so any PID exit during stop() still
+        # cleans up the tracking entry.
+        sm.set_pid_callbacks(None, None)
+        import time as _time
+        now = _time.monotonic()
         pid = sm.subprocess_pid
         if pid is not None:
-            import time as _time
-            self._closed_session_pids[session_id] = (pid, _time.monotonic())
+            self._closed_session_pids[session_id] = (pid, now)
             self._tracked_pids.pop(pid, None)
+        # Sweep any other tracked PIDs that still belong to this session
+        # (Qwen turns leave the spawn callback's entries behind even if
+        # the per-turn cleanup ran — defensive cleanup, no signals sent).
+        for tracked_pid, (owner_lid, _seen) in list(self._tracked_pids.items()):
+            if owner_lid == session_id:
+                self._closed_session_pids.setdefault(session_id, (tracked_pid, now))
+                self._tracked_pids.pop(tracked_pid, None)
 
         try:
             # Bound the wait so a misbehaving SDK transport (e.g. a remote
@@ -498,7 +551,13 @@ class SessionPool:
 
     def _reap_orphans_once(self, orphan_grace_seconds: float) -> None:
         """One pass of the orphan reaper.  Synchronous so it can run in a
-        thread executor — kill_claude_subprocess does sleep() polls."""
+        thread executor — the underlying kill helpers do sleep() polls.
+
+        Provider-agnostic: ``_kill_tracked_pid`` dispatches by /proc comm
+        prefix, so the same reaper works for both Claude and Qwen
+        subprocesses.  Unrecognized comm prefixes are left alone (we never
+        signal a PID that doesn't look like one of ours).
+        """
         import time as _time
         now = _time.monotonic()
 
@@ -508,9 +567,7 @@ class SessionPool:
         for pid in dead_pids:
             self._tracked_pids.pop(pid, None)
 
-        # Pass 2: closed sessions whose grace period expired.  Force-kill
-        # the subprocess if it's still alive AND still looks like claude
-        # (kill_claude_subprocess does the comm check internally).
+        # Pass 2: closed sessions whose grace period expired.
         expired = [
             sid
             for sid, (_pid, closed_at) in self._closed_session_pids.items()
@@ -520,39 +577,29 @@ class SessionPool:
             pid, _closed_at = self._closed_session_pids.pop(sid)
             if not _process_alive(pid):
                 continue
-            if not _looks_like_claude(pid):
-                # PID was reused by something else after the subprocess
-                # exited — leave it alone.
-                continue
-            killed = kill_claude_subprocess(pid)
-            if killed:
+            if _kill_tracked_pid(pid):
                 logger.warning(
-                    "Orphan reaper: killed leaked claude subprocess pid=%d "
+                    "Orphan reaper: killed leaked subprocess pid=%d "
                     "(session %s closed %.0fs ago)",
-                    pid,
-                    sid,
-                    now - _closed_at,
+                    pid, sid, now - _closed_at,
                 )
 
         # Pass 3 (paranoid): a session is *still* in the pool but its
-        # claimed pid no longer matches a live `claude` process — likely
-        # the SDK crashed and we never noticed.  Mark the session as dead
-        # so the next operation triggers a fresh start.  We don't kill
-        # anything here; the pid is already gone.
+        # claimed pid no longer matches a live process — likely the
+        # subprocess crashed and we never noticed.  Mark the session as
+        # dead so the next operation triggers a fresh start.
         for pid, (sid, _seen_at) in list(self._tracked_pids.items()):
             if sid not in self._sessions:
                 # Session vanished without going through close() — should
                 # be rare but possible if a test or code path popped it
                 # directly.  Treat the pid as orphaned.
                 self._tracked_pids.pop(pid, None)
-                if _process_alive(pid) and _looks_like_claude(pid):
-                    if kill_claude_subprocess(pid):
-                        logger.warning(
-                            "Orphan reaper: killed pid=%d for vanished "
-                            "session %s (no close() recorded)",
-                            pid,
-                            sid,
-                        )
+                if _process_alive(pid) and _kill_tracked_pid(pid):
+                    logger.warning(
+                        "Orphan reaper: killed pid=%d for vanished "
+                        "session %s (no close() recorded)",
+                        pid, sid,
+                    )
 
     @property
     def orchestrator_subscriber_count(self) -> int:
@@ -687,11 +734,16 @@ class SessionPool:
         already see the events via the broadcast inside ``send()``; this
         loop just consumes the iterator to completion.
 
-        Owns the SessionAbandoned retry: if the upstream request never
+        Owns the TurnAbandoned retry: if the upstream request never
         produced any messages (TCP path silently wedged), interrupt the
         wedged turn and retry once.  This logic used to live in
         ``api.routes.chat._handle_send`` — moved here because the WS task
         no longer owns the iteration and so couldn't observe the exception.
+
+        ``TurnAbandoned`` is the provider-agnostic base for both Claude's
+        ``SessionAbandoned`` and Qwen's ``QwenAbandoned``, so a single
+        except clause covers both providers without forcing either SDK
+        to be installed at module load time.
 
         The reason we don't surface exceptions to a caller is that THERE
         IS NO CALLER once the turn starts — the WebSocket that initiated
@@ -699,16 +751,7 @@ class SessionPool:
         by the time the turn finishes.  Broadcast and logs are the right
         channels for telling everyone what happened.
         """
-        # Imported lazily to keep pool.py importable in environments where
-        # the SDK isn't available (some unit tests).  Both Claude and Qwen
-        # signal upstream wedge via their own exception type; we catch
-        # either.
-        from manager.claude_session import SessionAbandoned
-        from manager.qwen_session import QwenAbandoned
-
-        abandoned_exceptions: tuple[type[Exception], ...] = (
-            SessionAbandoned, QwenAbandoned,
-        )
+        from manager.base_session import TurnAbandoned
 
         async def _stream_once() -> None:
             async for _event in self.send(session_id, text, source_ws=source_ws):
@@ -717,7 +760,7 @@ class SessionPool:
         try:
             try:
                 await _stream_once()
-            except abandoned_exceptions as exc:
+            except TurnAbandoned as exc:
                 logger.warning(
                     "Turn abandoned for session %s after %.0fs; retrying once",
                     session_id, exc.elapsed_seconds,
@@ -734,7 +777,7 @@ class SessionPool:
                 await _stream_once()
         except asyncio.CancelledError:
             raise
-        except abandoned_exceptions as exc:
+        except TurnAbandoned as exc:
             await self._broadcast_session(session_id, {
                 "type": "error", "error": "upstream_wedged",
                 "detail": (

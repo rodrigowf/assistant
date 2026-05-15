@@ -165,6 +165,11 @@ def _infer_model_info(model_id: str) -> ModelInfo | None:
         or mid.startswith("o1")
         or mid.startswith("o3")
         or mid.startswith("o4")
+        # Qwen and other OpenAI-compatible models share the openai SDK
+        # transport — route them through the same provider.
+        or mid.startswith("qwen")
+        or mid.startswith("glm-")
+        or mid.startswith("gemini-")  # served via OpenAI-compatible endpoint
     ):
         return ModelInfo(
             provider=Provider.OPENAI,

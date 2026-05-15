@@ -32,8 +32,11 @@ from orchestrator.config import (
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
-from orchestrator.providers.anthropic import AnthropicProvider
-from orchestrator.providers.openai_text import OpenAITextProvider, create_audio_message
+# Provider classes are imported lazily inside the methods that need them so
+# this module remains importable on machines where the corresponding SDK
+# (``anthropic`` for Claude, ``openai`` for GPT/Qwen/Gemini) isn't installed.
+# Missing SDKs surface as a 400 at config-save time and a friendly runtime
+# error at send time — never as a backend that won't boot.
 from orchestrator.runner import BackgroundAgentRunner, Notification, NotificationQueue
 from orchestrator.token_budget import (
     RECENT_VERBATIM_TOKENS,
@@ -368,17 +371,35 @@ class OrchestratorSession:
         return self._local_id
 
     def _create_provider(self):
-        """Create a provider instance based on current config."""
+        """Create a provider instance based on current config.
+
+        Imports the underlying SDK lazily so a Qwen-only deployment can
+        still load this module — the SDK is only required at the moment
+        we actually need to talk to its API.
+        """
         if self._config.provider == Provider.OPENAI:
+            try:
+                from orchestrator.providers.openai_text import OpenAITextProvider
+            except ImportError as e:
+                raise RuntimeError(
+                    "OpenAI provider requested but `openai` package is not installed. "
+                    "Install it with: pip install -r requirements-openai.txt"
+                ) from e
             return OpenAITextProvider(
                 model=self._config.model,
                 max_tokens=self._config.max_tokens,
             )
-        else:
-            return AnthropicProvider(
-                model=self._config.model,
-                max_tokens=self._config.max_tokens,
-            )
+        try:
+            from orchestrator.providers.anthropic import AnthropicProvider
+        except ImportError as e:
+            raise RuntimeError(
+                "Anthropic provider requested but `anthropic` package is not installed. "
+                "Install it with: pip install -r requirements-anthropic.txt"
+            ) from e
+        return AnthropicProvider(
+            model=self._config.model,
+            max_tokens=self._config.max_tokens,
+        )
 
     def set_model(self, model_id: str) -> bool:
         """Switch to a different model mid-conversation.
@@ -911,6 +932,18 @@ class OrchestratorSession:
         """
         if self._agent is None:
             raise RuntimeError("Session not started")
+
+        # Audio mode is OpenAI-only — import lazily so a Qwen-only install
+        # can still import this module.
+        try:
+            from orchestrator.providers.openai_text import (
+                OpenAITextProvider, create_audio_message,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "Audio mode requires the `openai` package. "
+                "Install it with: pip install -r requirements-openai.txt"
+            ) from e
 
         # Audio mode also drains notifications — prepend them to the audio's
         # accompanying text prompt so the LLM sees them first in this turn.

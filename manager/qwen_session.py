@@ -26,7 +26,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from .base_session import BaseSessionManager
+from .base_session import BaseSessionManager, TurnAbandoned
 from .config import ManagerConfig
 from .types import (
     CompactComplete,
@@ -52,15 +52,14 @@ _STALL_REPEAT_INTERVAL_S = 60.0
 _TURN_ABANDON_S = 240.0
 
 
-class QwenAbandoned(Exception):
+class QwenAbandoned(TurnAbandoned):
     """Raised when a Qwen turn produced no events for so long the request
-    almost certainly never landed."""
+    almost certainly never landed.
 
-    def __init__(self, elapsed_seconds: float):
-        super().__init__(
-            f"Turn produced no qwen events after {elapsed_seconds:.0f}s",
-        )
-        self.elapsed_seconds = elapsed_seconds
+    Inherits :class:`manager.base_session.TurnAbandoned` so catch sites
+    that want to handle both Claude and Qwen abandoned turns can do so
+    with a single ``except TurnAbandoned`` clause.
+    """
 
 
 def _qwen_executable() -> str:
@@ -225,6 +224,16 @@ class QwenSessionManager(BaseSessionManager):
 
         self._proc = proc
 
+        # Notify the pool (if it installed a callback) that a new PID is
+        # alive.  The pool tracks it for the orphan reaper so we can
+        # SIGKILL leaks if this turn's normal cleanup paths get bypassed
+        # (e.g. caller cancels the lifecycle task hard).
+        if self._on_pid_spawn is not None:
+            try:
+                self._on_pid_spawn(proc.pid)
+            except Exception:
+                logger.exception("on_pid_spawn callback raised for pid=%d", proc.pid)
+
         # Feed stdin in a background task so we can stream stdout
         # concurrently.  Close stdin after writing so qwen knows there's
         # no more input.
@@ -283,6 +292,13 @@ class QwenSessionManager(BaseSessionManager):
                 await self._kill_proc()
             else:
                 self._proc = None
+            # Tell the pool the PID is done — keeps _tracked_pids clean
+            # so the reaper doesn't have to scan dead pids every iteration.
+            if self._on_pid_exit is not None:
+                try:
+                    self._on_pid_exit(proc.pid)
+                except Exception:
+                    logger.exception("on_pid_exit callback raised for pid=%d", proc.pid)
             self._event_inbox = None
             self._drain_pending_permissions()
             self._status = SessionStatus.IDLE

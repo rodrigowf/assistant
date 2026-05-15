@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 
 from .config import ManagerConfig
@@ -35,6 +35,23 @@ from .types import Event, PermissionRequest, PermissionResolved, SessionStatus
 
 if TYPE_CHECKING:
     pass
+
+
+class TurnAbandoned(Exception):
+    """Raised when a turn produced no events for so long the upstream
+    request is considered wedged.  Subclassed by each provider to add
+    provider-specific context (Claude: ``SessionAbandoned``; Qwen:
+    ``QwenAbandoned``).
+
+    Catch ``TurnAbandoned`` to handle both providers uniformly.
+    """
+
+    def __init__(self, elapsed_seconds: float) -> None:
+        super().__init__(
+            f"Turn produced no events after {elapsed_seconds:.0f}s "
+            "(upstream request appears wedged)"
+        )
+        self.elapsed_seconds = elapsed_seconds
 
 
 class BaseSessionManager(ABC):
@@ -79,6 +96,14 @@ class BaseSessionManager(ABC):
         self._connect_done: asyncio.Event = asyncio.Event()
         self._connect_error: BaseException | None = None
         self._stop_requested: asyncio.Event = asyncio.Event()
+
+        # Optional callbacks the pool installs so it can track per-turn
+        # subprocess PIDs without polling.  Qwen spawns a fresh subprocess
+        # for every turn; Claude has one persistent PID for the session.
+        # Either provider can register/deregister PIDs through these hooks
+        # so the pool's orphan reaper sees them.
+        self._on_pid_spawn: "Callable[[int], None] | None" = None
+        self._on_pid_exit: "Callable[[int], None] | None" = None
 
         # Permission gating shared state. ``_event_inbox`` is set by send()
         # so the permission callback can inject events into the live stream;
@@ -346,5 +371,26 @@ class BaseSessionManager(ABC):
         """PID of the provider subprocess, if the implementation tracks it.
 
         Used by the pool's orphan reaper. Default: None (no tracking).
+        Note: this only returns a value while a subprocess is actually
+        running — for Qwen that means mid-turn.  Callers that need
+        continuous tracking should register via :meth:`set_pid_callbacks`
+        so they're notified at spawn and exit.
         """
         return None
+
+    def set_pid_callbacks(
+        self,
+        on_spawn: Callable[[int], None] | None,
+        on_exit: Callable[[int], None] | None,
+    ) -> None:
+        """Register callbacks the session invokes when a subprocess starts
+        or exits.  The pool installs these so its orphan reaper can track
+        Qwen's per-turn PIDs (and could track Claude's long-lived PID too
+        if we ever needed to).
+
+        Either callback may be ``None``; both are called best-effort and
+        must not raise.  Implementations that don't fork subprocesses
+        ignore the callbacks entirely.
+        """
+        self._on_pid_spawn = on_spawn
+        self._on_pid_exit = on_exit

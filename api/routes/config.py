@@ -158,6 +158,41 @@ class WorkingDirectoryEntry(BaseModel):
 _VALID_PROVIDERS: frozenset[str] = frozenset({"claude", "qwen"})
 
 
+def _orchestrator_provider_for_model(model_id: str) -> str | None:
+    """Map a model id to the orchestrator provider that handles it.
+
+    Returns one of ``"anthropic"``, ``"openai"``, or ``None`` if the
+    provider couldn't be inferred.  Used to validate at config-save time
+    that the underlying SDK is installed before we let the user pick a
+    model they can't actually run.
+    """
+    from orchestrator.config import _infer_model_info, get_model_info
+    info = get_model_info(model_id) or _infer_model_info(model_id)
+    if info is None:
+        return None
+    return info.provider.value
+
+
+def _check_orchestrator_sdk_available(provider_id: str) -> str | None:
+    """Return an install hint if the SDK for *provider_id* isn't importable.
+
+    Returns ``None`` when the SDK is available.  Hint is a human-readable
+    string suitable for a 400 response body.
+    """
+    sdk = {"anthropic": "anthropic", "openai": "openai"}.get(provider_id)
+    if sdk is None:
+        return None
+    try:
+        __import__(sdk)
+    except ImportError:
+        return (
+            f"The `{sdk}` package isn't installed in this venv, so models "
+            f"backed by the {provider_id} provider can't be used.  "
+            f"Install it with: pip install -r requirements-{sdk}.txt"
+        )
+    return None
+
+
 class ConfigUpdate(BaseModel):
     working_directory: str | None = None  # entry id to set as active
     working_directory_history: list[WorkingDirectoryEntry] | None = None  # full replacement
@@ -241,6 +276,13 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         # send time rather than being gated here.
         if not body.default_model.strip():
             raise HTTPException(status_code=400, detail="default_model cannot be empty")
+        # Reject models whose underlying SDK isn't installed — better to fail
+        # fast at save than to crash on the first message of a new session.
+        provider_id = _orchestrator_provider_for_model(body.default_model)
+        if provider_id is not None:
+            hint = _check_orchestrator_sdk_available(provider_id)
+            if hint is not None:
+                raise HTTPException(status_code=400, detail=hint)
         config["default_model"] = body.default_model
 
     if (
@@ -299,6 +341,12 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
             )
         except (ValueError, RuntimeError) as e:
             raise HTTPException(status_code=400, detail=str(e))
+        # OpenAI voice needs the `openai` SDK installed.  Qwen voice uses
+        # raw websockets so it works regardless.
+        if provider_id == "openai":
+            hint = _check_orchestrator_sdk_available("openai")
+            if hint is not None:
+                raise HTTPException(status_code=400, detail=hint)
         config["default_voice_provider"] = provider_id
         config["default_voice_model"] = model_entry["id"]
         config["default_voice_name"] = voice_id

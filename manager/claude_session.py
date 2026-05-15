@@ -8,12 +8,10 @@ exported under both ``ClaudeSessionManager`` and the historical
 from __future__ import annotations
 
 import asyncio
-import errno
 import json
 import logging
 import os
 import shlex
-import signal
 import stat
 import subprocess
 import tempfile
@@ -126,7 +124,7 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
-from .base_session import BaseSessionManager
+from .base_session import BaseSessionManager, TurnAbandoned
 from .config import ManagerConfig
 from .types import (
     CompactComplete,
@@ -186,55 +184,27 @@ _STALL_REPEAT_INTERVAL_S = 60.0  # re-emit every minute thereafter
 _TURN_ABANDON_S = 240.0
 
 
-class SessionAbandoned(Exception):
-    """Raised by SessionManager.send when a turn produced zero events for so
-    long we conclude the upstream request never landed.  Distinct from a
-    mid-tool stall: by the time this fires, ``last_tool_name`` is None and
-    ``messages_received == 0`` — no progress has been made at all."""
+class SessionAbandoned(TurnAbandoned):
+    """Raised by SessionManager.send when a Claude turn produced zero events
+    for so long we conclude the upstream request never landed.  Distinct
+    from a mid-tool stall: by the time this fires, ``last_tool_name`` is
+    None and ``messages_received == 0`` — no progress has been made at all.
 
-    def __init__(self, elapsed_seconds: float):
-        super().__init__(
-            f"Turn produced no SDK messages after {elapsed_seconds:.0f}s "
-            "(upstream request appears wedged)"
-        )
-        self.elapsed_seconds = elapsed_seconds
-
-
-def _process_alive(pid: int) -> bool:
-    """Return True if a process with *pid* exists and we can signal it.
-
-    Uses ``os.kill(pid, 0)`` — the kernel resolves the pid and checks
-    permissions but doesn't actually deliver any signal.  Distinguishes
-    cleanly between "process is gone" (ESRCH) and "process exists but we
-    can't touch it" (EPERM, treated as alive).
+    Inherits :class:`manager.base_session.TurnAbandoned` so catch sites
+    that want to handle both Claude and Qwen abandoned turns can do so
+    with a single ``except TurnAbandoned`` clause.
     """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError as e:
-        return e.errno != errno.ESRCH
 
 
-def _process_comm(pid: int) -> str | None:
-    """Read /proc/<pid>/comm and return its content (the kernel's view of
-    the executable basename, capped at 15 chars).  Returns None if the
-    process is gone or /proc isn't readable.
-
-    Used as a sanity check before SIGKILL: PIDs are reused by the kernel
-    after a process exits, so before nuking pid X we verify it still looks
-    like the `claude` subprocess we spawned — not some innocent process
-    that happened to be assigned the recycled pid.
-    """
-    try:
-        return Path(f"/proc/{pid}/comm").read_text().strip() or None
-    except (OSError, FileNotFoundError):
-        return None
+# Process-management helpers live in manager/_proc.py so they're importable
+# without dragging in claude-agent-sdk (which this module imports at load time).
+# Re-export the legacy underscore names so pool / tests that already import
+# them from here keep working.
+from ._proc import (
+    process_alive as _process_alive,
+    process_comm as _process_comm,
+    kill_subprocess as _kill_subprocess,
+)
 
 
 def _looks_like_claude(pid: int) -> bool:
@@ -244,8 +214,8 @@ def _looks_like_claude(pid: int) -> bool:
     chars — for our subprocess that's exactly ``claude``.  We accept any
     value that starts with ``claude`` to tolerate possible future renames.
     """
-    comm = _process_comm(pid)
-    return comm is not None and comm.startswith("claude")
+    from ._proc import looks_like
+    return looks_like(pid, "claude")
 
 
 def _extract_subprocess_pid(client: ClaudeSDKClient) -> int | None:
@@ -276,61 +246,19 @@ def _extract_subprocess_pid(client: ClaudeSDKClient) -> int | None:
 def kill_claude_subprocess(pid: int, *, sigterm_grace_s: float = 0.5) -> bool:
     """Force-kill an orphaned bundled-claude subprocess identified by *pid*.
 
-    Verifies the pid still belongs to a process whose ``/proc/<pid>/comm``
-    starts with ``claude`` before signalling — the kernel can recycle pids
-    immediately after a process exits, and we never want to SIGKILL an
-    unrelated process that happened to inherit the number.
+    Verifies the pid still matches a ``claude*`` comm via ``/proc/<pid>/comm``
+    before signalling — the kernel can recycle pids immediately after a
+    process exits, and we never want to SIGKILL an unrelated process that
+    happened to inherit the number.
 
-    First sends SIGTERM (giving the subprocess *sigterm_grace_s* seconds
-    to wind down via its normal handlers — flushing JSONL, etc.); if the
-    process is still alive after that, escalates to SIGKILL.  Returns
-    True if a signal was sent (process was alive and looked like claude),
-    False otherwise.
+    First sends SIGTERM (with *sigterm_grace_s* for clean shutdown); if the
+    process is still alive after that, escalates to SIGKILL.  Returns True
+    if a signal was sent, False otherwise.
 
     Safe to call concurrently from the per-session lifecycle finally and
-    from the pool's orphan reaper — the second caller will simply observe
-    the process is gone (or no longer matches ``claude``) and no-op.
+    from the pool's orphan reaper.
     """
-    if not _process_alive(pid):
-        return False
-    if not _looks_like_claude(pid):
-        # PID was reused by the kernel for an unrelated process — bail
-        # out instead of nuking something innocent.
-        logger.info(
-            "Skipping kill of pid %d: comm=%r does not look like claude",
-            pid,
-            _process_comm(pid),
-        )
-        return False
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        logger.exception("SIGTERM to pid %d failed", pid)
-
-    # Brief grace period — bundled claude can take a moment to flush JSONL
-    # before exiting.  Synchronous poll (no asyncio) so this helper is
-    # safely callable from sync contexts (e.g. the orphan reaper).
-    import time
-    end = time.monotonic() + sigterm_grace_s
-    while time.monotonic() < end:
-        if not _process_alive(pid):
-            return True
-        time.sleep(0.05)
-
-    if _process_alive(pid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-            logger.warning(
-                "Pid %d (claude) ignored SIGTERM after %.1fs; sent SIGKILL", pid, sigterm_grace_s
-            )
-        except ProcessLookupError:
-            return False
-        except OSError:
-            logger.exception("SIGKILL to pid %d failed", pid)
-    return True
+    return _kill_subprocess(pid, comm_prefix="claude", sigterm_grace_s=sigterm_grace_s)
 
 
 class ClaudeSessionManager(BaseSessionManager):
@@ -382,17 +310,6 @@ class ClaudeSessionManager(BaseSessionManager):
     @property
     def provider_name(self) -> str:
         return "claude"
-
-    # Backward-compat alias — pre-refactor code (and a handful of tests)
-    # reads ``self._sdk_session_id`` directly.  Wrap it as a property that
-    # forwards to the base class's ``_provider_session_id``.
-    @property
-    def _sdk_session_id(self) -> str | None:
-        return self._provider_session_id
-
-    @_sdk_session_id.setter
-    def _sdk_session_id(self, value: str | None) -> None:
-        self._provider_session_id = value
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -448,12 +365,12 @@ class ClaudeSessionManager(BaseSessionManager):
 
             # Capture the SDK session ID if available at connect time.
             if self._resume_id:
-                self._sdk_session_id = self._resume_id
+                self._provider_session_id = self._resume_id
             else:
                 try:
                     server_info = await self._client.get_server_info()
                     if server_info:
-                        self._sdk_session_id = server_info.get("session_id")
+                        self._provider_session_id = server_info.get("session_id")
                 except Exception:
                     # Failing to read server_info shouldn't kill the session;
                     # the SDK ID will be filled in from the first ResultMessage.
@@ -1089,8 +1006,8 @@ class ClaudeSessionManager(BaseSessionManager):
             # still mid-tool (no ResultMessage yet) are still addressable by
             # their SDK id — otherwise they vanish from /api/sessions on refresh.
             sid = data.get("session_id")
-            if sid and not self._sdk_session_id:
-                self._sdk_session_id = sid
+            if sid and not self._provider_session_id:
+                self._provider_session_id = sid
             if msg.subtype == "compact":
                 trigger = data.get("trigger", "manual")
                 summary = data.get("summary", "")
@@ -1159,7 +1076,7 @@ class ClaudeSessionManager(BaseSessionManager):
                 self._cost += msg.total_cost_usd
             # Always capture the SDK session ID from ResultMessage
             if msg.session_id:
-                self._sdk_session_id = msg.session_id
+                self._provider_session_id = msg.session_id
             yield TurnComplete(
                 cost=msg.total_cost_usd,
                 usage=msg.usage or {},

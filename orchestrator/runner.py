@@ -23,7 +23,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from manager.session import SessionAbandoned
+# TurnAbandoned is the provider-agnostic base for both SessionAbandoned
+# (Claude) and QwenAbandoned (Qwen) — catching it handles both.  Avoid
+# importing the provider-specific subclasses here so this module loads
+# even when the matching SDK isn't installed.
+from manager.base_session import TurnAbandoned
 from manager.types import (
     PermissionRequest,
     PermissionResolved,
@@ -474,12 +478,12 @@ class BackgroundAgentRunner:
                     record.turns = event.num_turns or 0
 
         async def _consume_with_retry() -> None:
-            """Run _consume; if it raises SessionAbandoned, interrupt the SDK
+            """Run _consume; if it raises TurnAbandoned, interrupt the SDK
             and retry once.  Single retry only — repeated abandonment means
             the network path is durably broken, not a transient blip."""
             try:
                 await _consume()
-            except SessionAbandoned as exc:
+            except TurnAbandoned as exc:
                 logger.warning(
                     "Turn %s abandoned after %.0fs (no SDK messages); retrying once",
                     record.turn_id, exc.elapsed_seconds,
@@ -514,7 +518,7 @@ class BackgroundAgentRunner:
             except asyncio.CancelledError:
                 self._finalise(record, status="cancelled", error="cancelled by orchestrator")
                 raise
-            except SessionAbandoned as exc:
+            except TurnAbandoned as exc:
                 # Retry already happened inside _consume_with_retry and
                 # also failed — give up and surface the failure.
                 logger.error("Turn %s abandoned twice (%.0fs); giving up", record.turn_id, exc.elapsed_seconds)

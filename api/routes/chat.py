@@ -22,7 +22,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.pool import SessionPool
 from api.serializers import serialize_event
-from manager.session import SessionManager
+from manager.base_session import BaseSessionManager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
@@ -33,7 +33,7 @@ async def chat_ws(ws: WebSocket):
     await ws.accept()
     pool: SessionPool = ws.app.state.pool
 
-    sm: SessionManager | None = None
+    sm: BaseSessionManager | None = None
     session_id: str | None = None
 
     try:
@@ -64,7 +64,7 @@ async def chat_ws(ws: WebSocket):
                 # If a permission is pending on this session, treat the user's
                 # chat as a denial with their prose as the rejection reason.
                 # See the conversational-checkpoint policy in
-                # manager.session._PERMISSION_GATING_PROMPT.
+                # manager.claude_session._PERMISSION_GATING_PROMPT.
                 text_payload = msg.get("text", "")
                 if text_payload:
                     pending_ids = list(sm.pending_permission_ids())
@@ -171,7 +171,7 @@ async def chat_ws(ws: WebSocket):
 
 async def _handle_start(
     ws: WebSocket, pool: SessionPool, msg: dict,
-) -> tuple[SessionManager | None, str | None]:
+) -> tuple[BaseSessionManager | None, str | None]:
     """Start or resume a session via the pool. Returns (sm, session_id) or (None, None).
 
     The frontend sends ``local_id`` (stable tab UUID) and optionally
@@ -310,7 +310,7 @@ async def _handle_compact(ws: WebSocket, pool: SessionPool, session_id: str) -> 
         }))
 
 
-async def _handle_command(ws: WebSocket, sm: SessionManager, text: str) -> None:
+async def _handle_command(ws: WebSocket, sm: BaseSessionManager, text: str) -> None:
     """Stream events from sm.command() to the WebSocket.
 
     Slash commands are a single-WS path: the user who issued ``/help`` sees

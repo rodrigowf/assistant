@@ -17,9 +17,22 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from orchestrator.providers.openai_voice import OpenAIVoiceProvider
-from orchestrator.providers.qwen_voice import QwenVoiceProvider
+# Lazy class lookup — both providers self-register on first use so a
+# missing SDK (``openai`` for OpenAI voice; ``websockets`` for Qwen) only
+# bites at instantiation time, not at import.  ``_resolve_provider`` does
+# the lookup; callers should treat the registry as ``{name: class | None}``
+# semantically even though we materialize the class lazily.
 from orchestrator.providers.voice_base import BaseVoiceProvider
+
+
+def _resolve_openai_voice():
+    from orchestrator.providers.openai_voice import OpenAIVoiceProvider
+    return OpenAIVoiceProvider
+
+
+def _resolve_qwen_voice():
+    from orchestrator.providers.qwen_voice import QwenVoiceProvider
+    return QwenVoiceProvider
 
 
 class VoiceEntry(TypedDict):
@@ -49,11 +62,44 @@ class VoiceModelEntry(TypedDict):
 # Provider registry
 # ----------------------------------------------------------------------------
 
-VOICE_PROVIDERS: dict[str, type[BaseVoiceProvider]] = {
-    "openai": OpenAIVoiceProvider,
-    "qwen": QwenVoiceProvider,
-    # "google": GoogleVoiceProvider,   # added in Phase 2
+# Provider lookup is by resolver callable so the underlying class
+# (and its SDK imports) only loads on first instantiation.  Keeps a
+# Qwen-only deployment importable without the ``openai`` SDK.
+_VOICE_PROVIDER_RESOLVERS: dict[str, callable] = {
+    "openai": _resolve_openai_voice,
+    "qwen": _resolve_qwen_voice,
+    # "google": _resolve_google_voice,   # added in Phase 2
 }
+
+
+class _LazyVoiceProviderRegistry:
+    """Mapping-like view that resolves provider classes on demand."""
+
+    def __getitem__(self, key: str) -> type[BaseVoiceProvider]:
+        resolver = _VOICE_PROVIDER_RESOLVERS.get(key)
+        if resolver is None:
+            raise KeyError(key)
+        return resolver()
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+        except ImportError:
+            return default  # SDK missing — same as unknown
+
+    def __contains__(self, key: object) -> bool:
+        return key in _VOICE_PROVIDER_RESOLVERS
+
+    def __iter__(self):
+        return iter(_VOICE_PROVIDER_RESOLVERS)
+
+    def keys(self):
+        return _VOICE_PROVIDER_RESOLVERS.keys()
+
+
+VOICE_PROVIDERS = _LazyVoiceProviderRegistry()
 
 
 # OpenAI Realtime voices — full list verified at
