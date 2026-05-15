@@ -250,6 +250,19 @@ export function listVoiceModels(): Promise<VoiceModelsResponse> {
   return json(`${BASE}/orchestrator/voice/models`);
 }
 
+// Dynamic Gemini Live model listing — queries Google's models.list at
+// request time, filtering for bidiGenerateContent. Backend caches for
+// 60s. Returns ``{models: []}`` when GEMINI_API_KEY is unset or the
+// upstream call fails; callers should fall back to the static
+// ``VOICE_MODELS["google"]`` from ``listVoiceModels()`` in that case.
+export interface GoogleVoiceModelsResponse {
+  models: VoiceModelEntry[];
+}
+
+export function listGoogleVoiceModels(): Promise<GoogleVoiceModelsResponse> {
+  return json(`${BASE}/config/voice/google/models`);
+}
+
 // Per-session config
 
 export interface SessionConfig {

@@ -5,6 +5,7 @@ import {
   listMcpServers,
   listModels,
   listVoiceModels,
+  listGoogleVoiceModels,
   listQwenHarnessModels,
   listSessionProviders,
   type AssistantConfig,
@@ -51,11 +52,20 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, modelsRes, voiceRes, qwenHarnessRes, providersRes] = await Promise.all([
+      const [cfg, mcpRes, modelsRes, voiceRes, googleVoiceRes, qwenHarnessRes, providersRes] = await Promise.all([
         getConfig(),
         listMcpServers(),
         listModels(),
         listVoiceModels(),
+        // Dynamic Gemini Live list — backend queries models.list and
+        // caches for 60s.  Tolerate failure: if GEMINI_API_KEY is unset
+        // or upstream is broken, the route returns {models: []} and we
+        // fall back to the static VOICE_MODELS["google"] from
+        // listVoiceModels() below.
+        listGoogleVoiceModels().catch(e => {
+          console.warn("listGoogleVoiceModels failed:", e);
+          return { models: [] };
+        }),
         // Tolerate failure here: if the user hasn't installed the Qwen CLI,
         // the route still works (returns []) but a fetch error would still
         // blank the whole config page.  Swallow + log so the rest renders.
@@ -68,7 +78,15 @@ export function ConfigPage({ isOpen, onClose }: Props) {
       setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setModels(modelsRes.models);
-      setVoiceProviders(voiceRes.providers);
+      // Merge the dynamic Gemini Live list into voiceProviders, replacing
+      // the static "google" entries when the dynamic list is non-empty.
+      // Empty list → keep the static fallback so the UI still works
+      // even when the API key isn't configured.
+      const mergedVoiceProviders = { ...voiceRes.providers };
+      if (googleVoiceRes.models.length > 0) {
+        mergedVoiceProviders.google = googleVoiceRes.models;
+      }
+      setVoiceProviders(mergedVoiceProviders);
       setQwenHarnessModels(qwenHarnessRes.models);
       setSessionProviders(providersRes.providers);
     } catch (e) {
