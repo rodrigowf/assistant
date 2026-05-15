@@ -28,6 +28,102 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 
+def _resolve_session_provider(
+    *,
+    resume_sdk_id: str | None,
+    session_cfg: dict,
+    assistant_cfg: dict,
+) -> tuple[str | None, str | None, str | None]:
+    """Decide which provider + harness model this session should use.
+
+    Returns ``(resolved_provider, resolved_model, persist_provider)``:
+
+    * ``resolved_provider`` — the provider id to apply to ``ManagerConfig``,
+      or ``None`` if no decision was reached (caller leaves the default).
+    * ``resolved_model`` — the harness model id (or ``""`` for "CLI default"),
+      or ``None`` if no override applies.  An empty string is meaningful:
+      it means "explicitly use the CLI's own default for this session"
+      and the caller should NOT fall back to the global harness_model map.
+    * ``persist_provider`` — if non-None, the caller should write this
+      back to the session config (i.e. we detected a provider for a legacy
+      session that didn't have one pinned).  Caller checks
+      ``resume_sdk_id`` before persisting.
+
+    Precedence (provider):
+      1. ``session_cfg["provider"]`` — authoritative once written.  Switching
+         the CLI behind an existing JSONL would corrupt the adapter shape,
+         so we never override a pinned per-session provider.
+      2. Sniff the provider from the existing JSONL via ``detect_provider``.
+         Covers legacy sessions written before per-session provider was
+         tracked.  The caller persists this back so we don't re-detect.
+      3. ``assistant_cfg["provider"]`` (global default).
+
+    Precedence (harness model):
+      1. ``session_cfg["harness_model"]`` if not None.  Empty string is a
+         valid pin ("CLI default for this session"); ``None`` means inherit.
+      2. ``assistant_cfg["harness_model"][resolved_provider]`` if non-empty.
+    """
+    # ── Provider resolution ────────────────────────────────────────────
+    session_provider = session_cfg.get("provider")
+    detected_provider: str | None = None
+
+    if not session_provider and resume_sdk_id:
+        # Try the canonical Claude path first, then the Qwen chats/ path.
+        # Both layouts are real — Claude writes context/<id>.jsonl and Qwen
+        # writes context/chats/<id>.jsonl, and detect_provider only needs
+        # the path that exists.
+        from utils.paths import get_chats_dir, get_context_dir
+        from manager.protocol import detect_provider, ensure_all_registered
+        ensure_all_registered()
+        for candidate in (
+            get_context_dir() / f"{resume_sdk_id}.jsonl",
+            get_chats_dir() / f"{resume_sdk_id}.jsonl",
+        ):
+            if candidate.is_file():
+                adapter = detect_provider(candidate)
+                if adapter is not None:
+                    detected_provider = adapter.provider_name
+                    break
+
+    resolved_provider = (
+        session_provider
+        or detected_provider
+        or assistant_cfg.get("provider")
+    )
+    if isinstance(resolved_provider, str):
+        resolved_provider = resolved_provider.lower()
+
+    # Persist only when we DETECTED a provider (i.e. the session didn't
+    # already have one pinned).  Persisting the global default would
+    # confuse the next resume after the user flips the global selector.
+    persist_provider = detected_provider if not session_provider else None
+
+    # ── Harness-model resolution ───────────────────────────────────────
+    session_model = session_cfg.get("harness_model")
+    resolved_model: str | None
+    if session_model is not None:
+        # Empty string is a valid pin.  Pass it through verbatim so the
+        # caller knows "the user picked CLI-default for this session" and
+        # doesn't fall back to the global map.
+        resolved_model = session_model if isinstance(session_model, str) else None
+    else:
+        global_map = assistant_cfg.get("harness_model") or {}
+        candidate = global_map.get(resolved_provider) if resolved_provider else None
+        if isinstance(candidate, str) and candidate.strip():
+            resolved_model = candidate.strip()
+        else:
+            resolved_model = None
+
+    # An empty-string resolved_model means "explicit CLI default" — but the
+    # caller's `config = replace(config, model=...)` would write "" into
+    # ManagerConfig.model, which gets passed as `--model ""` and breaks.
+    # Translate to None so the model flag is omitted entirely.
+    if resolved_model == "":
+        resolved_model = None
+
+    return resolved_provider, resolved_model, persist_provider
+
+
 @router.websocket("/api/sessions/chat")
 async def chat_ws(ws: WebSocket):
     await ws.accept()
@@ -226,21 +322,37 @@ async def _handle_start(
     else:
         config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
 
-    # Apply the configured provider (claude | qwen).  ManagerConfig.load()
-    # already honors ASSISTANT_PROVIDER env var; this overlays the UI-saved
-    # value from assistant_config.json (which is what users actually edit).
-    provider = assistant_cfg.get("provider")
-    if provider:
-        config = replace(config, provider=str(provider).lower())
+    # Resolve provider + harness model from per-session / global / detected
+    # sources.  Extracted as a helper so the precedence rules can be tested
+    # in isolation without spinning up the WS handler.
+    resolved_provider, resolved_model, persist_provider = _resolve_session_provider(
+        resume_sdk_id=resume_sdk_id,
+        session_cfg=session_cfg,
+        assistant_cfg=assistant_cfg,
+    )
+    if resolved_provider:
+        config = replace(config, provider=resolved_provider)
+    if resolved_model is not None:
+        config = replace(config, model=resolved_model)
 
-    # Apply the per-provider harness model the user picked in the Config UI.
-    # An empty/missing value means "let the CLI pick its own default" (we
-    # achieve that by leaving ManagerConfig.model as whatever .manager.json
-    # set it to, or None — which omits the --model flag entirely).
-    harness_models = assistant_cfg.get("harness_model") or {}
-    picked_model = harness_models.get(config.provider)
-    if isinstance(picked_model, str) and picked_model.strip():
-        config = replace(config, model=picked_model.strip())
+    # Persist the resolved provider into the session config so future
+    # resumes are deterministic — even if the global default flips or
+    # the JSONL gets truncated below detect_provider's threshold.  Only
+    # applicable to resumed sessions: fresh sessions don't have an SDK
+    # session id yet, so there's no stable key to file the config under.
+    # (The user can pin a provider for a fresh session after its first
+    # turn via the per-session gear panel, which calls PUT /sessions/{id}/config.)
+    if persist_provider and resume_sdk_id:
+        from api.routes.session_config import save_session_config
+        try:
+            save_session_config(resume_sdk_id, {"provider": persist_provider})
+        except Exception as e:
+            # Persistence is best-effort — losing it means the next resume
+            # falls back to detection again, which is still correct.
+            logger.warning(
+                "Failed to persist resolved provider for session %s: %s",
+                resume_sdk_id, e,
+            )
 
     # If no per-session MCPs provided, use session-level or global enabled MCPs.
     # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".

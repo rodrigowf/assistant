@@ -239,6 +239,14 @@ export interface SessionConfig {
   working_directory: string | null;  // null = inherit active from global
   enabled_mcps: string[] | null;     // null = inherit from global
   chrome_extension: boolean | null;  // null = inherit from global
+  // Per-session provider pin.  null = inherit from global; otherwise the
+  // resume path treats this as authoritative (you can't safely switch the
+  // CLI behind an existing JSONL).
+  provider: AssistantProvider | null;
+  // Per-session harness model override.  null = inherit from global
+  // harness_model[provider];  "" = explicit "CLI default" for this session;
+  // any other string is the model id passed to the CLI.
+  harness_model: string | null;
 }
 
 export type SessionConfigUpdate = Partial<SessionConfig>;
