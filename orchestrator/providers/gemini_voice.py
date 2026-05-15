@@ -213,7 +213,17 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
             if server_content.get("interrupted"):
                 return VoiceInterrupted(partial_text=self._current_transcript)
 
-            # Streaming text via parts[].text.
+            # Output ASR transcription — the model's spoken reply as text.
+            # Surfaces in the chat as a streaming assistant message
+            # alongside the audio.
+            output_t = server_content.get("outputTranscription")
+            if output_t is not None:
+                txt = output_t.get("text", "")
+                if txt:
+                    return TextDelta(text=txt)
+
+            # Streaming text via parts[].text (rare with native-audio
+            # models but supported by the half-cascade Live preview).
             parts = server_content.get("modelTurn", {}).get("parts", [])
             for p in parts:
                 txt = p.get("text")
@@ -230,6 +240,17 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
                     input_tokens=usage.get("promptTokenCount", 0),
                     output_tokens=usage.get("candidatesTokenCount", 0),
                 )
+
+        # Input ASR transcription — what the user said. Emit as
+        # TextDelta so the orchestrator's voice-transcription pipeline
+        # picks it up and writes a ``[voice]`` JSONL entry.  The Live
+        # API ships this as a top-level "inputTranscription" object,
+        # not under serverContent.
+        input_t = raw_event.get("inputTranscription")
+        if isinstance(input_t, dict):
+            txt = input_t.get("text", "")
+            if txt:
+                return TextDelta(text=txt)
 
         # Tool call: track id→name so format_tool_result can echo the
         # name back (Gemini's toolResponse requires it; our canonical
@@ -339,6 +360,13 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
                     },
                 },
             },
+            # Surface both ASR streams so the orchestrator can persist
+            # user speech as ``[voice]`` JSONL entries and the model's
+            # spoken reply as TextDelta/TextComplete events alongside
+            # the audio.  Without these the Live API ships audio only
+            # and our chat window has nothing to show.
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
         }
         if system:
             setup["systemInstruction"] = {"parts": [{"text": system}]}
@@ -382,6 +410,11 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
                 if data:
                     return data
         return None
+
+    @property
+    def handshake_direction(self) -> str:
+        """Gemini Live: client sends ``setup`` first, server acks with ``setupComplete``."""
+        return "client_first"
 
     # No keepalive needed empirically — Gemini Live doesn't have Qwen's
     # ASR-timeout pathology. If a similar problem surfaces, override

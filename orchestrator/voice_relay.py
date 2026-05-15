@@ -251,25 +251,31 @@ class VoiceRelay:
         self._ws = await self._provider.open_upstream()
         self._slog("upstream connected")
 
-        # session.created is pushed by the server unprompted — drain it so
-        # the drain task starts in a clean state.
-        try:
-            first = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
-            first_event = json.loads(first)
-            self._record_recv(first_event)
-            self._slog(f"recv session.created in {self._now_rel():.2f}s")
-            logger.info(
-                "voice_relay session.created session_id=%s in %.2fs",
-                self._session_id, self._now_rel(),
-            )
-            await self._provider.inject_event(first_event)
-            await self._on_event_for_frontend(first_event)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "voice_relay no session.created within 10s session_id=%s",
-                self._session_id,
-            )
-            self._slog("WARN no session.created within 10s")
+        direction = getattr(self._provider, "handshake_direction", "server_first")
+
+        if direction == "server_first":
+            # session.created is pushed by the server unprompted — drain it
+            # so the drain task starts in a clean state.
+            try:
+                first = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
+                first_event = json.loads(first)
+                self._record_recv(first_event)
+                self._slog(f"recv session.created in {self._now_rel():.2f}s")
+                logger.info(
+                    "voice_relay session.created session_id=%s in %.2fs",
+                    self._session_id, self._now_rel(),
+                )
+                await self._provider.inject_event(first_event)
+                await self._on_event_for_frontend(first_event)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "voice_relay no session.created within 10s session_id=%s",
+                    self._session_id,
+                )
+                self._slog("WARN no session.created within 10s")
+        # else: client_first — Gemini Live expects the setup payload to
+        # be the very first frame; the server replies with setupComplete
+        # which the drain loop will handle in line with subsequent frames.
 
         # Push our session config upstream.
         self._record_sent(session_config)
@@ -277,6 +283,7 @@ class VoiceRelay:
         tools_count = len(session_config.get("session", {}).get("tools", []) or [])
         self._slog(
             f"send session.update instructions={instr_size}B tools={tools_count}"
+            f" direction={direction}"
         )
         async with self._send_lock:
             await self._ws.send(json.dumps(session_config))

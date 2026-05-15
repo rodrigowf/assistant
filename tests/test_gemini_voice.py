@@ -63,6 +63,33 @@ def test_session_config_minimal():
     assert setup["systemInstruction"]["parts"][0]["text"] == "You are helpful."
     # No tools → no "tools" key in setup (Gemini rejects empty array as invalid).
     assert "tools" not in setup
+    # Both ASR streams are enabled so the chat window sees transcripts.
+    assert setup["inputAudioTranscription"] == {}
+    assert setup["outputAudioTranscription"] == {}
+
+
+def test_handshake_direction_is_client_first():
+    """Gemini sends setup before setupComplete — opposite of OpenAI/Qwen."""
+    p = _make_provider()
+    assert p.handshake_direction == "client_first"
+
+
+def test_translate_output_transcription_emits_text_delta():
+    """outputTranscription.text → TextDelta so chat shows what Gemini said."""
+    p = _make_provider()
+    ev = {"serverContent": {"outputTranscription": {"text": "Hello there"}}}
+    out = p.translate_event(ev)
+    assert isinstance(out, TextDelta)
+    assert out.text == "Hello there"
+
+
+def test_translate_input_transcription_emits_text_delta():
+    """inputTranscription.text → TextDelta so the user's words land in JSONL."""
+    p = _make_provider()
+    ev = {"inputTranscription": {"text": "what time is it"}}
+    out = p.translate_event(ev)
+    assert isinstance(out, TextDelta)
+    assert out.text == "what time is it"
 
 
 def test_session_config_skips_system_when_empty():

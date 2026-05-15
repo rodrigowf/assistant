@@ -226,3 +226,18 @@ class BaseVoiceProvider(ABC):
         Returning ``None`` tells the relay not to spawn the keepalive task.
         """
         return None
+
+    @property
+    def handshake_direction(self) -> str:
+        """Order of the WS handshake — ``"server_first"`` or ``"client_first"``.
+
+        - ``"server_first"`` (default, used by OpenAI / Qwen): the server
+          greets with a ``session.created`` frame, THEN the client sends
+          its ``session.update``.  The relay drains the first inbound
+          frame before sending the config.
+        - ``"client_first"`` (used by Gemini Live): the client sends the
+          ``setup`` payload as the very first frame; the server then
+          replies with ``setupComplete``.  The relay sends the config
+          immediately and lets the drain loop handle the ack inline.
+        """
+        return "server_first"
