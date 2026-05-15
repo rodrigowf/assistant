@@ -169,3 +169,163 @@ def test_default_config_seeds_harness_model_from_registry(
     assert {"claude", "qwen"}.issubset(keys)
     for v in cfg["harness_model"].values():
         assert v == ""  # empty = "use CLI default"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/config/voice/google/models — dynamic Gemini Live model listing
+#
+# Mirrors the Qwen models endpoint pattern. Unlike Qwen (file-backed
+# catalog), this one queries Google's HTTP API at request time and
+# caches the result in-memory for 60s. The endpoint must return
+# ``{"models": []}`` when the API key is unset or the upstream is
+# broken — the frontend falls back to the static registry list in that
+# case.
+
+
+def test_gemini_voice_models_returns_empty_without_api_key(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No GEMINI_API_KEY → empty list, NOT a 500."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    # Reset module-level cache so prior tests don't poison this one.
+    import api.routes.config as cfg
+    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
+    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+
+    r = client.get("/api/config/voice/google/models")
+    assert r.status_code == 200
+    assert r.json() == {"models": []}
+
+
+def test_gemini_voice_models_returns_empty_on_upstream_failure(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upstream non-200 / connection error → empty list, not a crash."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    import api.routes.config as cfg
+    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
+    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+
+    # Patch the httpx call to raise.
+    import httpx
+
+    class _BrokenClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **kw):
+            raise httpx.ConnectError("simulated outage")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _BrokenClient)
+
+    r = client.get("/api/config/voice/google/models")
+    assert r.status_code == 200
+    assert r.json() == {"models": []}
+
+
+def test_gemini_voice_models_filters_bidi_and_parses(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful upstream response is filtered for bidiGenerateContent
+    and each entry gets a humanized label, voice catalogue, and the
+    first becomes the default."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    import api.routes.config as cfg
+    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
+    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+
+    class _StubResp:
+        status_code = 200
+        def json(self):
+            return {
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-flash-native-audio-latest",
+                        "supportedGenerationMethods": ["bidiGenerateContent"],
+                        "description": "Native audio Live model",
+                    },
+                    {
+                        "name": "models/gemini-3.1-flash-live-preview",
+                        "supportedGenerationMethods": ["bidiGenerateContent"],
+                        "description": "Live preview",
+                    },
+                    {
+                        # Should be filtered out — not a Live model.
+                        "name": "models/gemini-2.5-pro",
+                        "supportedGenerationMethods": ["generateContent"],
+                        "description": "Not live",
+                    },
+                ]
+            }
+
+    class _StubClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **kw):
+            return _StubResp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
+
+    r = client.get("/api/config/voice/google/models")
+    assert r.status_code == 200
+    models = r.json()["models"]
+    assert len(models) == 2
+
+    ids = [m["id"] for m in models]
+    assert ids == [
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-3.1-flash-live-preview",
+    ]
+    # First entry is the default and has the canonical voice list.
+    assert models[0]["default"] is True
+    assert models[1]["default"] is False
+    assert models[0]["voice"] == "Puck"
+    voice_ids = [v["id"] for v in models[0]["voices"]]
+    assert "Puck" in voice_ids and "Charon" in voice_ids
+    # Humanized labels — confirm they are not the raw IDs.
+    assert "Gemini" in models[0]["label"]
+    assert models[0]["label"] != models[0]["id"]
+
+
+def test_gemini_voice_models_caches_response(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two successive calls within the TTL hit the upstream once."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    import api.routes.config as cfg
+    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
+    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+
+    call_count = {"n": 0}
+
+    class _StubResp:
+        status_code = 200
+        def json(self):
+            return {
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-flash-native-audio-latest",
+                        "supportedGenerationMethods": ["bidiGenerateContent"],
+                    },
+                ]
+            }
+
+    class _CountingClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **kw):
+            call_count["n"] += 1
+            return _StubResp()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _CountingClient)
+
+    r1 = client.get("/api/config/voice/google/models")
+    r2 = client.get("/api/config/voice/google/models")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json() == r2.json()
+    assert call_count["n"] == 1, "Second call inside TTL must hit cache, not upstream"

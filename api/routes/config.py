@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -263,6 +266,121 @@ async def list_harness_qwen_models() -> dict[str, Any]:
     """
     from manager.qwen.models import list_qwen_models
     return {"models": [m.to_dict() for m in list_qwen_models()]}
+
+
+# In-memory cache for the Gemini Live models list. The upstream API
+# response shape is stable across calls but Google ships new Live
+# models frequently — refresh every 60s so a new model becomes
+# available without a server restart, but page loads don't hammer
+# models.list.
+_GEMINI_LIVE_MODELS_CACHE: dict[str, Any] = {"at": 0.0, "models": None}
+_GEMINI_LIVE_MODELS_CACHE_TTL_S = 60.0
+
+
+def _humanize_gemini_model_name(model_id: str) -> str:
+    """Turn ``gemini-2.5-flash-native-audio-latest`` into a human label.
+
+    Best-effort — strips the ``gemini-`` prefix, splits on ``-``, and
+    title-cases each token (with a few special cases). Falls back to
+    the raw id if the heuristic doesn't apply.
+    """
+    if not model_id.startswith("gemini-"):
+        return model_id
+    stem = model_id[len("gemini-"):]
+    # Pull off a trailing date stamp like "preview-09-2025" or
+    # "latest" so we can format it as a parenthesized suffix.
+    parts = stem.split("-")
+    out_parts: list[str] = ["Gemini"]
+    for token in parts:
+        if token in {"latest"}:
+            out_parts.append("(latest)")
+        elif token in {"preview"}:
+            out_parts.append("(preview)")
+        elif token in {"live"}:
+            out_parts.append("Live")
+        elif token in {"native"}:
+            out_parts.append("Native")
+        elif token in {"audio"}:
+            out_parts.append("Audio")
+        elif token in {"flash"}:
+            out_parts.append("Flash")
+        elif token.isdigit() and len(token) == 4:
+            # Year fragment — append as parenthesized suffix.
+            out_parts.append(f"({token})")
+        else:
+            out_parts.append(token.capitalize())
+    return " ".join(out_parts)
+
+
+@router.get("/voice/google/models")
+async def list_voice_google_models() -> dict[str, Any]:
+    """Return the Gemini Live model catalog queried from Google's models.list.
+
+    Filters for models advertising ``bidiGenerateContent`` in their
+    ``supportedGenerationMethods``. Cached in-memory for 60s so page
+    loads don't hammer the upstream API. Returns ``{models: []}`` when
+    ``GEMINI_API_KEY`` is missing or the upstream call fails — the
+    frontend falls back to ``VOICE_MODELS["google"]`` from the static
+    registry in that case.
+    """
+    from orchestrator.providers.gemini_voice import GEMINI_LIVE_VOICES
+
+    now = time.monotonic()
+    cached = _GEMINI_LIVE_MODELS_CACHE
+    if cached["models"] is not None and (now - cached["at"]) < _GEMINI_LIVE_MODELS_CACHE_TTL_S:
+        return {"models": cached["models"]}
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {"models": []}
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                params={"key": api_key},
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "Gemini models.list returned %s; falling back to static registry",
+                resp.status_code,
+            )
+            return {"models": []}
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        logger.exception("Gemini models.list failed; falling back to static registry")
+        return {"models": []}
+
+    voices_list = [{"id": v, "label": v, "description": ""} for v in GEMINI_LIVE_VOICES]
+    out: list[dict[str, Any]] = []
+    for m in data.get("models", []):
+        methods = m.get("supportedGenerationMethods", [])
+        if "bidiGenerateContent" not in methods:
+            continue
+        # Strip the "models/" prefix Gemini uses on the `name` field.
+        name = m.get("name", "")
+        mid = name.split("/", 1)[1] if "/" in name else name
+        if not mid:
+            continue
+        out.append({
+            "id": mid,
+            "label": _humanize_gemini_model_name(mid),
+            "voice": GEMINI_LIVE_VOICES[0],
+            "voices": voices_list,
+            "transcription_languages": [],
+            "default_transcription_language": "",
+            "default": False,
+            "description": m.get("description", ""),
+        })
+
+    # Mark the first entry default — preserves the Config-page assumption
+    # that exactly one entry per provider is the default.
+    if out:
+        out[0]["default"] = True
+
+    _GEMINI_LIVE_MODELS_CACHE["models"] = out
+    _GEMINI_LIVE_MODELS_CACHE["at"] = now
+    return {"models": out}
 
 
 @router.put("")
