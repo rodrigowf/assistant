@@ -495,8 +495,12 @@ ANTHROPIC_API_KEY=sk-ant-...
 # Qwen harness + Qwen voice + Qwen orchestrator models via the OpenAI-compatible endpoint.
 DASHSCOPE_API_KEY=sk-...
 
-# Google Gemini — only for the /generate-image (Nano Banana) skill.
-GOOGLE_GEMINI_API_KEY=...
+# Google Gemini — used by:
+#   - the /generate-image (Nano Banana) skill
+#   - the Gemini CLI harness (if installed via --with-gemini and using API key auth instead of OAuth)
+#   - the Gemini Live realtime voice provider (when enabled)
+# This is the canonical name Google's own SDKs and the gemini CLI expect.
+GEMINI_API_KEY=...
 
 # Session harness default (env var only applies when assistant_config.json hasn't been
 # written yet — the Configuration UI is the primary way to flip this).
