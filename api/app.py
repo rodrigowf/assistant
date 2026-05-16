@@ -8,7 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -170,6 +170,27 @@ def create_app() -> FastAPI:
     project_root = Path(__file__).resolve().parent.parent
     context_public = project_root / "context" / "public"
     context_public_resolved = context_public.resolve() if context_public.exists() else None
+
+    # Projects directory (projects/ at repo root). Exposed at /projects/* so
+    # build artifacts (rendered videos, generated assets, etc.) are reachable
+    # from peripherals on the network without copying them into context/public/.
+    projects_dir = project_root / "projects"
+    projects_dir_resolved = projects_dir.resolve() if projects_dir.exists() else None
+
+    # Projects directory mount: /projects/<path> → projects/<path>.
+    # Registered before the SPA catch-all so /projects never falls through.
+    if projects_dir_resolved is not None:
+        @app.get("/projects/{full_path:path}")
+        async def serve_projects(full_path: str):
+            if not full_path:
+                raise HTTPException(status_code=404)
+            candidate = (projects_dir / full_path).resolve()
+            if (
+                candidate.is_relative_to(projects_dir_resolved)
+                and candidate.is_file()
+            ):
+                return FileResponse(candidate)
+            raise HTTPException(status_code=404)
 
     # Serve the production frontend build if it exists
     frontend_dist = project_root / "frontend" / "dist"
