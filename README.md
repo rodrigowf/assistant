@@ -191,31 +191,50 @@ The assistant is **ready to deploy** on any machine with the prerequisites insta
 ### Prerequisites
 
 - **Python 3.12+**
-- **Node.js 20+**
-- **At least one agent CLI:**
-  - Claude Code — `npm install -g @anthropic-ai/claude-code && claude auth login`
-  - Qwen Code — `npm install -g @qwen-code/qwen-code` (interactive auth on first `qwen` run)
+- **Node.js 20+** (Qwen Code and Gemini CLI both depend on Node)
+- **At least one agent CLI** — the installer can install and walk you through login for any combination:
+  - Claude Code (Anthropic) — `@anthropic-ai/claude-code`, OAuth via `claude auth login`
+  - Qwen Code (Alibaba) — `@qwen-code/qwen-code`, OAuth or DashScope key
+  - Gemini CLI (Google) — `@google/gemini-cli`, OAuth or `GEMINI_API_KEY`
 - **API keys** for the axes you opted into (see [Environment Variables](#environment-variables)):
   - `ANTHROPIC_API_KEY` — only if you picked the Anthropic orchestrator backend (Claude Code itself uses OAuth)
   - `OPENAI_API_KEY` — for the OpenAI orchestrator backend and realtime voice
   - `DASHSCOPE_API_KEY` — for the Qwen harness, Qwen voice, and Qwen models served via the OpenAI-compatible endpoint
+  - `GEMINI_API_KEY` — for the Gemini CLI harness (when not using OAuth) and the `/generate-image` skill
 
 Check prerequisites:
 ```bash
 ./default-scripts/install-prerequisites.sh
 ```
 
-### One-Command Installation
+For the full step-by-step procedure (used by both `install.sh` and `install-with-agent.sh`), see [INSTALL.md](INSTALL.md).
+
+### Two ways to install
+
+Pick whichever feels right — both arrive at the same end state, and full details for either are in [INSTALL.md](INSTALL.md).
 
 ```bash
 git clone https://github.com/rodrigowf/assistant.git
 cd assistant
+```
+
+**Option A — Conversational installer (recommended for first-time users).**  Launches one of the agent CLIs (Claude Code / Qwen Code / Gemini CLI) and lets it walk you through the install conversationally — asking each question, running each step, and writing progress to `context/install.log`.  Reads `install.sh` as its recipe.
+
+```bash
+./install-with-agent.sh
+```
+
+If no agent CLI is installed yet, the script offers to `npm install -g` one and walks you through first-run login before handing off.
+
+**Option B — Deterministic shell installer.**  Asks two questions up front (harness + orchestrator) then runs every step automatically.  No agent involved.  Recommended if you already know what you want or prefer to see every action as plain bash.
+
+```bash
 ./install.sh
 ```
 
-The interactive installer asks two questions:
+Either way, the installer asks two questions:
 
-1. **Session harness** — which agent CLI(s) should run your chats: Claude Code, Qwen Code, or both.
+1. **Session harness** — which agent CLI(s) should run your chats: Claude Code, Qwen Code, Gemini CLI, or any combination.
 2. **Orchestrator backends** — which API SDK(s) the orchestrator should use: OpenAI, Anthropic, both, or neither (orchestrator disabled).
 
 Then it:
@@ -224,11 +243,13 @@ Then it:
 2. ✓ Sets up your context (fresh install or import existing)
 3. ✓ Copies fresh-install templates from `install/` into `context/` (AGENTS.md, MEMORY.md, `.env`, configs)
 4. ✓ Creates symlinks to default skills, scripts, and agents
-5. ✓ Configures the agent CLI(s) you picked (Claude SDK config dir and/or Qwen project dir)
+5. ✓ Configures the agent CLI(s) you picked (Claude SDK config dir and/or Qwen / Gemini project dirs)
 6. ✓ Wires `CLAUDE.md` and `QWEN.md` symlinks → `context/AGENTS.md` so both CLIs read the same instructions
-7. ✓ Installs core Python dependencies and only the provider SDKs for the axes you picked
-8. ✓ Installs frontend dependencies (React, Vite)
-9. ✓ Verifies the installation (warns about missing API keys for the keys your axes actually need)
+7. ✓ Seeds the per-CLI runtime dirs (`.claude/`, `.qwen/`, `.gemini/`) from `install/cli-runtime/` templates
+8. ✓ Installs core Python dependencies and only the provider SDKs for the axes you picked
+9. ✓ Installs frontend dependencies (React, Vite)
+10. ✓ Installs and walks you through first-run login for each agent CLI you picked (skippable via `--skip-auth`)
+11. ✓ Verifies the installation (warns about missing API keys for the keys your axes actually need)
 
 **Installation Options:**
 
@@ -238,6 +259,7 @@ Then it:
 ./install.sh --import-context URL               # Import existing context repo
 ./install.sh --dev                              # Include dev dependencies (ruff, mypy)
 ./install.sh --skip-prereqs                     # Skip prerequisite checks
+./install.sh --skip-auth                        # Skip the agent CLI install/login step
 ```
 
 **Skip the two questions** by pinning the axes from the command line:
