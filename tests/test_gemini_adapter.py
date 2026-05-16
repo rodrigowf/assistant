@@ -65,8 +65,9 @@ def _gemini_line(
     text: str,
     ts: str = "2026-05-15T20:57:11.910Z",
     thoughts: list[dict] | None = None,
+    tool_calls: list[dict] | None = None,
 ) -> dict:
-    return {
+    out = {
         "id": "g1",
         "timestamp": ts,
         "type": "gemini",
@@ -74,6 +75,40 @@ def _gemini_line(
         "thoughts": thoughts or [],
         "tokens": {"input": 10, "output": 5, "cached": 0, "thoughts": 0, "tool": 0, "total": 15},
         "model": "gemini-3-flash-preview",
+    }
+    if tool_calls is not None:
+        out["toolCalls"] = tool_calls
+    return out
+
+
+def _tool_call(
+    tool_id: str = "read_file_1",
+    name: str = "read_file",
+    args: dict | None = None,
+    output: str | None = "file contents",
+    status: str = "success",
+    result_display: str | None = None,
+    error_message: str | None = None,
+) -> dict:
+    """Build one entry shaped like the real ``toolCalls[i]`` Gemini writes."""
+    args = args if args is not None else {"file_path": "foo.txt"}
+    if status == "error":
+        response = {"error": error_message or "boom"}
+    else:
+        response = {"output": output if output is not None else ""}
+    return {
+        "id": tool_id,
+        "name": name,
+        "args": args,
+        "result": [{
+            "functionResponse": {"id": tool_id, "name": name, "response": response},
+        }],
+        "status": status,
+        "resultDisplay": result_display if result_display is not None else (output or ""),
+        "timestamp": "2026-05-16T17:18:54.002Z",
+        "description": "test tool",
+        "displayName": name,
+        "renderOutputAsMarkdown": True,
     }
 
 
@@ -160,19 +195,19 @@ def test_normalize_message_user_joins_content_parts() -> None:
         "timestamp": "t1",
         "content": [{"text": "hello"}, {"text": "world"}],
     }
-    msg = _normalize_message(raw)
-    assert msg is not None
-    assert msg["type"] == "user"
-    assert msg["message"]["content"] == "hello\nworld"
+    msgs = _normalize_message(raw)
+    assert len(msgs) == 1
+    assert msgs[0]["type"] == "user"
+    assert msgs[0]["message"]["content"] == "hello\nworld"
 
 
 def test_normalize_message_user_accepts_plain_string_content() -> None:
     """Future-proofing: if the CLI ever emits user.content as a string,
     the adapter should still parse it."""
     raw = {"type": "user", "timestamp": "t1", "content": "hello"}
-    msg = _normalize_message(raw)
-    assert msg is not None
-    assert msg["message"]["content"] == "hello"
+    msgs = _normalize_message(raw)
+    assert len(msgs) == 1
+    assert msgs[0]["message"]["content"] == "hello"
 
 
 def test_normalize_message_assistant_emits_text_block() -> None:
@@ -182,11 +217,11 @@ def test_normalize_message_assistant_emits_text_block() -> None:
         "content": "the answer is 42",
         "thoughts": [],
     }
-    msg = _normalize_message(raw)
-    assert msg is not None
-    assert msg["type"] == "assistant"
-    assert msg["message"]["role"] == "assistant"
-    assert msg["message"]["content"] == [
+    msgs = _normalize_message(raw)
+    assert len(msgs) == 1
+    assert msgs[0]["type"] == "assistant"
+    assert msgs[0]["message"]["role"] == "assistant"
+    assert msgs[0]["message"]["content"] == [
         {"type": "text", "text": "the answer is 42"},
     ]
 
@@ -200,19 +235,135 @@ def test_normalize_message_assistant_includes_thoughts_as_thinking_blocks() -> N
             {"subject": "Step 1", "description": "Think hard", "timestamp": "t0"},
         ],
     }
-    msg = _normalize_message(raw)
-    assert msg is not None
-    blocks = msg["message"]["content"]
+    msgs = _normalize_message(raw)
+    assert len(msgs) == 1
+    blocks = msgs[0]["message"]["content"]
     # Thinking blocks come first (the order users expect — think then say).
     assert blocks[0] == {"type": "thinking", "text": "Step 1\nThink hard"}
     assert blocks[1] == {"type": "text", "text": "answer"}
 
 
-def test_normalize_message_returns_none_for_unrelated_types() -> None:
-    """Header line, $set markers, and unknown event types all map to None."""
-    assert _normalize_message(_header_line()) is None
-    assert _normalize_message(_set_line()) is None
-    assert _normalize_message({"type": "unknown"}) is None
+def test_normalize_message_returns_empty_for_unrelated_types() -> None:
+    """Header line, $set markers, and unknown event types all map to []."""
+    assert _normalize_message(_header_line()) == []
+    assert _normalize_message(_set_line()) == []
+    assert _normalize_message({"type": "unknown"}) == []
+
+
+def test_normalize_message_emits_tool_use_block_for_each_tool_call() -> None:
+    """A gemini line with ``toolCalls`` should add a ``tool_use`` block per
+    entry to the assistant message, *and* synthesize a user message with
+    matching ``tool_result`` blocks (so the frontend can pair them by id)."""
+    raw = _gemini_line(
+        "result text",
+        tool_calls=[
+            _tool_call(tool_id="t1", name="read_file", args={"path": "a.txt"}),
+            _tool_call(tool_id="t2", name="write_file", args={"path": "b.txt"}),
+        ],
+    )
+    msgs = _normalize_message(raw)
+    assert len(msgs) == 2
+
+    assistant = msgs[0]
+    assert assistant["type"] == "assistant"
+    blocks = assistant["message"]["content"]
+    tool_uses = [b for b in blocks if b["type"] == "tool_use"]
+    assert len(tool_uses) == 2
+    assert tool_uses[0] == {
+        "type": "tool_use",
+        "id": "t1",
+        "name": "read_file",
+        "input": {"path": "a.txt"},
+    }
+    assert tool_uses[1]["name"] == "write_file"
+
+    # Tool-result user message paired by id.
+    tool_user = msgs[1]
+    assert tool_user["type"] == "user"
+    results = tool_user["message"]["content"]
+    assert len(results) == 2
+    assert results[0]["type"] == "tool_result"
+    assert results[0]["tool_use_id"] == "t1"
+    assert results[1]["tool_use_id"] == "t2"
+
+
+def test_normalize_message_marks_tool_result_error_status() -> None:
+    """Tool calls with ``status: "error"`` produce ``is_error=True`` results
+    whose output is the error message, not the success output."""
+    raw = _gemini_line(
+        "",
+        tool_calls=[
+            _tool_call(
+                tool_id="t1",
+                status="error",
+                error_message="path is not allowed",
+                result_display="path is not allowed",
+            ),
+        ],
+    )
+    msgs = _normalize_message(raw)
+    tool_user = msgs[1]
+    res = tool_user["message"]["content"][0]
+    assert res["type"] == "tool_result"
+    assert res["tool_use_id"] == "t1"
+    assert res["is_error"] is True
+    assert "path is not allowed" in res["content"]
+
+
+def test_normalize_message_skips_tool_result_for_in_flight_call() -> None:
+    """A ``toolCalls`` entry without ``status`` or ``result`` is still in
+    flight — the live event stream will publish the result.  We should
+    emit the tool_use but no tool_result on disk-replay."""
+    raw_call = {
+        "id": "t1",
+        "name": "shell",
+        "args": {"command": "ls"},
+        # no status, no result
+    }
+    raw = _gemini_line("", tool_calls=[raw_call])
+    msgs = _normalize_message(raw)
+    assistant = msgs[0]
+    tool_uses = [b for b in assistant["message"]["content"] if b["type"] == "tool_use"]
+    assert len(tool_uses) == 1
+    # Only the assistant message, no synthetic user message.
+    assert len(msgs) == 1
+
+
+def test_normalize_message_tool_use_blocks_round_trip_to_content_blocks(
+    adapter: GeminiAdapter, tmp_path: Path,
+) -> None:
+    """End-to-end: read a JSONL with toolCalls, run it through
+    ``extract_blocks``, and verify the frontend sees ``tool_use`` +
+    ``tool_result`` ContentBlocks paired by id."""
+    from manager.protocol import extract_blocks
+
+    p = tmp_path / "session.jsonl"
+    _write_jsonl(p, [
+        _header_line(),
+        _user_line("read the file"),
+        _gemini_line(
+            "Here you go.",
+            tool_calls=[
+                _tool_call(tool_id="abc", name="read_file", output="contents"),
+            ],
+        ),
+    ])
+    msgs = adapter.read_messages(p)
+    # user, assistant, tool-result-user
+    assert len(msgs) == 3
+
+    assistant_blocks = extract_blocks(msgs[1])
+    tool_use_blocks = [b for b in assistant_blocks if b.type == "tool_use"]
+    assert len(tool_use_blocks) == 1
+    assert tool_use_blocks[0].tool_use_id == "abc"
+    assert tool_use_blocks[0].tool_name == "read_file"
+
+    tool_result_blocks = extract_blocks(msgs[2])
+    result_blocks = [b for b in tool_result_blocks if b.type == "tool_result"]
+    assert len(result_blocks) == 1
+    assert result_blocks[0].tool_use_id == "abc"
+    assert result_blocks[0].is_error is False
+    assert "contents" in (result_blocks[0].output or "")
 
 
 # ---------------------------------------------------------------------------

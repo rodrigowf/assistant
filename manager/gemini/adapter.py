@@ -44,11 +44,24 @@ few categories::
 Tool calls
 ----------
 
-The on-disk JSONL doesn't (currently) record tool calls in a separate
-shape from the assistant text — they appear within the streamed
-events instead, captured live by :class:`GeminiSessionManager`.  The
-adapter therefore only sees user/assistant messages when re-reading
-disk JSONL.
+Tool calls are written *inline* on the same JSONL line as the assistant
+turn, under a top-level ``toolCalls`` array (NOT as separate lines like
+Qwen/Claude do).  Each entry has the shape::
+
+    {"id": "...", "name": "...", "args": {...},
+     "result": [{"functionResponse": {"id": "...", "name": "...",
+                                       "response": {"output": "..."}}}],
+     "status": "success" | "error",
+     "resultDisplay": "<markdown rendered output>",
+     "timestamp": "...",
+     ...}
+
+The adapter splits one such line into TWO normalized messages: the
+assistant turn (with a ``tool_use`` block per ``toolCalls`` entry) and
+a synthetic user message carrying matched ``tool_result`` blocks.  This
+mirrors the Anthropic shape the frontend pairs via ``tool_use_id``.
+Without this, re-opened Gemini conversations show only the text replies
+and the tool calls vanish from the UI.
 """
 
 from __future__ import annotations
@@ -76,19 +89,57 @@ def _normalize_type(t: str) -> str | None:
     return None
 
 
-def _normalize_message(obj: dict) -> dict | None:
-    """Translate a raw Gemini JSONL message line to the common shape.
+def _extract_tool_result_text(call: dict) -> str:
+    """Pull the human-visible output for one ``toolCalls`` entry.
 
-    Returns None if the line isn't a user/assistant message.  Matches
-    the contract documented on :class:`~manager.protocol.ProviderAdapter`:
-    output has ``type`` ∈ {user, assistant}, ``timestamp``, and
-    ``message.content`` as either a string (user) or a list of blocks
-    (assistant — text blocks plus optional thinking blocks).
+    Prefers ``resultDisplay`` (the markdown the CLI renders to its own
+    UI) and falls back to digging through ``result[].functionResponse.
+    response.output`` or ``.error``.
+    """
+    display = call.get("resultDisplay")
+    if isinstance(display, str) and display.strip():
+        return display
+    result = call.get("result")
+    if isinstance(result, list):
+        parts: list[str] = []
+        for entry in result:
+            if not isinstance(entry, dict):
+                continue
+            resp = entry.get("functionResponse")
+            if not isinstance(resp, dict):
+                continue
+            inner = resp.get("response")
+            if not isinstance(inner, dict):
+                continue
+            if "output" in inner and inner.get("output") is not None:
+                parts.append(str(inner.get("output")))
+            elif "error" in inner and inner.get("error") is not None:
+                parts.append(str(inner.get("error")))
+        if parts:
+            return "\n".join(parts)
+    return ""
+
+
+def _normalize_message(obj: dict) -> list[dict]:
+    """Translate a raw Gemini JSONL message line to one or more normalized
+    messages.
+
+    Returns an empty list if the line isn't a user/assistant message.
+    Most lines produce a single message; a ``type: "gemini"`` line that
+    also carries ``toolCalls`` produces TWO messages — the assistant
+    turn (with ``tool_use`` blocks) followed by a synthetic user message
+    carrying the matched ``tool_result`` blocks, so the frontend can
+    pair them via ``tool_use_id``.
+
+    Output shape matches the contract on
+    :class:`~manager.protocol.ProviderAdapter`: each entry has ``type``
+    ∈ {user, assistant}, ``timestamp``, and ``message.content`` as
+    either a string (plain user text) or a list of content blocks.
     """
     raw_type = obj.get("type")
     role = _normalize_type(raw_type) if isinstance(raw_type, str) else None
     if role is None:
-        return None
+        return []
 
     timestamp = obj.get("timestamp")
 
@@ -106,14 +157,15 @@ def _normalize_message(obj: dict) -> dict | None:
             content = raw_content
         else:
             content = ""
-        return {
+        return [{
             "type": "user",
             "timestamp": timestamp,
             "message": {"role": "user", "content": content},
-        }
+        }]
 
     # Assistant message: build content blocks.  Start with thoughts
-    # (each becomes a thinking block), then the main text body.
+    # (each becomes a thinking block), then the main text body, then any
+    # tool_use blocks from ``toolCalls``.
     blocks: list[dict] = []
     thoughts = obj.get("thoughts")
     if isinstance(thoughts, list):
@@ -132,11 +184,50 @@ def _normalize_message(obj: dict) -> dict | None:
     if isinstance(raw_content, str) and raw_content:
         blocks.append({"type": "text", "text": raw_content})
 
-    return {
+    tool_result_blocks: list[dict] = []
+    raw_calls = obj.get("toolCalls")
+    if isinstance(raw_calls, list):
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            tool_id = call.get("id")
+            tool_name = call.get("name", "")
+            args = call.get("args", {})
+            if not isinstance(args, dict):
+                args = {}
+            blocks.append({
+                "type": "tool_use",
+                "id": tool_id,
+                "name": tool_name,
+                "input": args,
+            })
+            # Synthesize a tool_result block — but only if the call
+            # actually completed (status field present).  An in-flight
+            # call would have no result yet; the live event stream
+            # handles that path.
+            status = call.get("status")
+            if status is None and "result" not in call:
+                continue
+            output = _extract_tool_result_text(call)
+            tool_result_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": output,
+                "is_error": status == "error",
+            })
+
+    out: list[dict] = [{
         "type": "assistant",
         "timestamp": timestamp,
         "message": {"role": "assistant", "content": blocks},
-    }
+    }]
+    if tool_result_blocks:
+        out.append({
+            "type": "user",
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": tool_result_blocks},
+        })
+    return out
 
 
 class GeminiAdapter(ProviderAdapter):
@@ -186,7 +277,9 @@ class GeminiAdapter(ProviderAdapter):
         """Read user/assistant messages from a Gemini JSONL file, normalized.
 
         Skips the header line and ``$set`` bookkeeping markers; converts
-        each remaining user/gemini line to the common message shape.
+        each remaining user/gemini line to one or more normalized
+        messages (an assistant turn that used tools fans out into the
+        assistant message plus a synthetic tool-result user message).
         """
         messages: list[dict] = []
         try:
@@ -201,9 +294,7 @@ class GeminiAdapter(ProviderAdapter):
                         continue
                     if _is_metadata_line(obj):
                         continue
-                    msg = _normalize_message(obj)
-                    if msg is not None:
-                        messages.append(msg)
+                    messages.extend(_normalize_message(obj))
         except (OSError, PermissionError):
             pass
         return messages
@@ -266,9 +357,9 @@ class GeminiAdapter(ProviderAdapter):
                     if role in ("user", "assistant"):
                         message_count += 1
                         if role == "user" and not first_user_text:
-                            normalized = _normalize_message(obj)
-                            if normalized is not None:
-                                first_user_text = extract_text(normalized)
+                            normalized_list = _normalize_message(obj)
+                            if normalized_list:
+                                first_user_text = extract_text(normalized_list[0])
         except (OSError, PermissionError):
             return None
 
