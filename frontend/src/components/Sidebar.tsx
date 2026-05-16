@@ -7,6 +7,7 @@ interface Props {
   sessions: SessionInfo[];
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => void;
+  onDuplicate: (id: string) => void;
   onNew: () => void;
   onNewOrchestrator: () => void;
   onSelectOrchestrator: (id: string, title: string) => void;
@@ -15,7 +16,7 @@ interface Props {
   onClose?: () => void;
 }
 
-export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
+export function Sidebar({ sessions, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
   const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
 
   const handleSelect = (sdkId: string, localId?: string) => {
@@ -124,6 +125,7 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
               onClick={() => handleSelect(s.session_id, s.local_id)}
               onDelete={() => onDelete(s.session_id)}
               onRename={(title) => onRename(s.session_id, title)}
+              onDuplicate={() => onDuplicate(s.session_id)}
             />
           );
         })}

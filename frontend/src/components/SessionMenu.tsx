@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 
 interface Props {
   onRename: () => void;
+  onDuplicate: () => void;
   onDelete: () => void;
 }
 
-export function SessionMenu({ onRename, onDelete }: Props) {
+export function SessionMenu({ onRename, onDuplicate, onDelete }: Props) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -59,6 +60,13 @@ export function SessionMenu({ onRename, onDelete }: Props) {
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
             </svg>
             Edit title
+          </button>
+          <button className="session-menu-item" role="menuitem" onClick={pick(onDuplicate)}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+            Duplicate
           </button>
           <button className="session-menu-item session-menu-item-danger" role="menuitem" onClick={pick(onDelete)}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">

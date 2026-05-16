@@ -33,6 +33,8 @@ interface Props {
   isActive?: boolean;
   hasMoreMessages?: boolean;
   onLoadMore?: () => Promise<void>;
+  onRewindMessage?: (dropLastN: number) => void;
+  onForkMessage?: (dropLastN: number) => void;
   // Voice mode props (orchestrator only)
   isOrchestrator?: boolean;
   voiceStatus?: VoiceStatus;
@@ -70,6 +72,8 @@ export function ChatPanel({
   isActive,
   hasMoreMessages,
   onLoadMore,
+  onRewindMessage,
+  onForkMessage,
   isOrchestrator,
   voiceStatus,
   onVoiceStart,
@@ -89,7 +93,14 @@ export function ChatPanel({
 
   return (
     <main className="chat-panel">
-      <MessageList messages={messages} isActive={isActive} hasMoreMessages={hasMoreMessages} onLoadMore={onLoadMore} />
+      <MessageList
+        messages={messages}
+        isActive={isActive}
+        hasMoreMessages={hasMoreMessages}
+        onLoadMore={onLoadMore}
+        onRewindMessage={onRewindMessage}
+        onForkMessage={onForkMessage}
+      />
       {error && (
         <div className="error-banner">{error}</div>
       )}

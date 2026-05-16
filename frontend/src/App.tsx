@@ -14,7 +14,7 @@ import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
 import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
-  const { sessions, refresh, deleteSession, renameSession } = useSessions();
+  const { sessions, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
   useReconnectPoolSessions();
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
@@ -121,6 +121,7 @@ function AppContent() {
         sessions={sessions}
         onDelete={requestDeleteSession}
         onRename={renameSession}
+        onDuplicate={(id) => { duplicateSession(id).catch((e) => { console.error("Duplicate failed:", e); }); }}
         onNew={handleNewSession}
         onNewOrchestrator={handleNewOrchestrator}
         onSelectOrchestrator={handleSelectOrchestrator}

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import shutil
+import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -264,6 +266,158 @@ class SessionStore:
             self._save_titles(titles)
         remove_session_from_index(session_id, collection_name="history")
         return True
+
+    def duplicate_session(self, session_id: str) -> str | None:
+        """Copy a session's JSONL (and title entry) under a fresh UUID.
+
+        Returns the new session_id, or None if the source doesn't exist.
+        The copy lives in the same directory as the original (Claude root
+        or Qwen chats/), so provider detection works automatically.
+        """
+        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            return None
+
+        new_id = str(_uuid.uuid4())
+        new_path = jsonl_path.with_name(f"{new_id}.jsonl")
+        shutil.copy2(str(jsonl_path), str(new_path))
+
+        titles = self._load_titles()
+        src_title = titles.get(session_id)
+        if src_title:
+            titles[new_id] = f"{src_title} (copy)"
+            self._save_titles(titles)
+
+        self._info_cache.pop(new_id, None)
+        self._provider_cache.pop(new_id, None)
+        return new_id
+
+    def truncate_session(self, session_id: str, drop_last_n: int) -> bool:
+        """Drop the last ``drop_last_n`` visible messages from a session.
+
+        The cutoff is counted **from the end** of the conversation, which makes
+        it pagination-safe: the frontend only needs to know the index of the
+        clicked message relative to the bottom of the loaded view, not the
+        absolute position in the full JSONL.
+
+        Visible messages = the user/assistant entries the user actually sees,
+        which on Claude / Qwen excludes "user" lines whose entire content is
+        tool_result blocks (those are protocol wrappers, not real turns).
+        Internal events (queue-operation, file-history-snapshot,
+        orchestrator_meta, tool_use, tool_result, voice_interrupted, etc.)
+        are kept as long as they fall before the cutoff.
+
+        Trailing tool_use / tool_result / system lines that come *after* the
+        last kept visible message are also dropped — keeping them around
+        would leave dangling tool calls with no follow-up assistant turn.
+
+        Returns True on success, False if the session doesn't exist or
+        ``drop_last_n`` is negative or larger than the visible-message count.
+        """
+        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            return False
+        if drop_last_n < 0:
+            return False
+
+        # First pass: read every line and tag whether it is a visible message.
+        # We need the index of the last visible message we want to keep, so
+        # this can't be done in a single forward streaming pass without
+        # buffering everything anyway.
+        try:
+            with open(jsonl_path) as f:
+                raw_lines = [raw.rstrip("\n") for raw in f]
+        except OSError:
+            return False
+
+        def is_visible_message(line: str) -> bool:
+            if not line.strip():
+                return False
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                return False
+            if not isinstance(obj, dict):
+                return False
+            msg_type = obj.get("type")
+            if msg_type == "assistant":
+                return True
+            if msg_type != "user":
+                return False
+            msg = obj.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            # Qwen native format puts blocks under `parts`, not `content`.
+            if (not content) and isinstance(msg, dict):
+                content = msg.get("parts")
+            if isinstance(content, list):
+                # Claude embeds tool_result as user-message content blocks;
+                # those wrap a tool result and aren't a real user turn.
+                return any(
+                    isinstance(b, dict) and b.get("type") != "tool_result"
+                    for b in content
+                )
+            return bool(content)
+
+        visible_line_indices = [
+            i for i, line in enumerate(raw_lines) if is_visible_message(line)
+        ]
+        total_visible = len(visible_line_indices)
+
+        if drop_last_n == 0:
+            # No-op truncate. Still report success so the frontend can refresh.
+            return True
+        if drop_last_n > total_visible:
+            return False
+
+        # Index of the last visible message we want to keep. Trailing
+        # non-visible lines (tool_use / tool_result / system events) that
+        # come after it would be dangling — drop them too.
+        last_keep_pos = visible_line_indices[total_visible - drop_last_n - 1]
+        kept_lines = raw_lines[: last_keep_pos + 1]
+
+        tmp_path = jsonl_path.with_suffix(jsonl_path.suffix + ".tmp")
+        try:
+            with open(tmp_path, "w") as f:
+                if kept_lines:
+                    f.write("\n".join(kept_lines) + "\n")
+            tmp_path.replace(jsonl_path)
+        except OSError:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        # Invalidate caches and the vector index for this session.
+        self._info_cache.pop(session_id, None)
+        self._provider_cache.pop(session_id, None)
+        try:
+            remove_session_from_index(session_id, collection_name="history")
+        except Exception:
+            pass
+        return True
+
+    def fork_session(self, session_id: str, drop_last_n: int) -> str | None:
+        """Duplicate, then truncate the copy by ``drop_last_n`` from the end.
+
+        Returns the new session_id, or None on failure. If truncation fails,
+        the duplicate is cleaned up.
+        """
+        new_id = self.duplicate_session(session_id)
+        if new_id is None:
+            return None
+        if not self.truncate_session(new_id, drop_last_n):
+            # Roll back the duplicate so we don't leave orphan JSONLs around.
+            try:
+                self.delete_session(new_id)
+            except Exception:
+                pass
+            return None
+        return new_id
 
     @property
     def sessions_dir(self) -> Path:

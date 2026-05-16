@@ -10,9 +10,10 @@ interface Props {
   onClick: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
+  onDuplicate: () => void;
 }
 
-export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDelete, onRename }: Props) {
+export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDelete, onRename, onDuplicate }: Props) {
   const timeAgo = formatRelative(session.last_activity);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -103,6 +104,19 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
             </svg>
           </button>
           <button
+            className="session-duplicate"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDuplicate();
+            }}
+            title="Duplicate conversation"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+          </button>
+          <button
             className="session-delete"
             onClick={(e) => {
               e.stopPropagation();
@@ -112,7 +126,7 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
           >
             ×
           </button>
-          <SessionMenu onRename={() => startEdit()} onDelete={onDelete} />
+          <SessionMenu onRename={() => startEdit()} onDuplicate={onDuplicate} onDelete={onDelete} />
         </>
       )}
     </div>

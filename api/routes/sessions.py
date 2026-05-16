@@ -275,6 +275,101 @@ def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
         raise HTTPException(404, detail=f"Session {session_id!r} not found")
 
 
+def _is_live_session(session_id: str, pool: SessionPool) -> bool:
+    """True if the given session_id is currently open in the pool.
+
+    Matches both the regular-agent SDK session id and the orchestrator's
+    jsonl_id, so the on-disk JSONL is not mutated while a process may be
+    appending to it.
+    """
+    if pool.has_orchestrator():
+        orc_session = pool.get_orchestrator()
+        jsonl_id = (
+            getattr(orc_session, "jsonl_id", pool.orchestrator_id)
+            if orc_session
+            else pool.orchestrator_id
+        )
+        if jsonl_id == session_id or pool.orchestrator_id == session_id:
+            return True
+    for s in pool.list_sessions():
+        if s.get("sdk_session_id") == session_id or s.get("session_id") == session_id:
+            return True
+    return False
+
+
+@router.post("/{session_id}/duplicate", status_code=201)
+def duplicate_session(
+    session_id: str,
+    store: SessionStore = Depends(get_store),
+):
+    """Copy a session's JSONL + title under a fresh UUID. Returns the new session_id.
+
+    Safe even when the source session is open: this is a read of the JSONL,
+    so concurrent appends just mean the duplicate may or may not catch the
+    very latest line. The new file is independent.
+    """
+    new_id = store.duplicate_session(session_id)
+    if new_id is None:
+        raise HTTPException(404, detail=f"Session {session_id!r} not found")
+    return {"session_id": new_id}
+
+
+@router.post("/{session_id}/truncate", status_code=200)
+def truncate_session(
+    session_id: str,
+    body: dict,
+    store: SessionStore = Depends(get_store),
+    pool: SessionPool = Depends(get_pool),
+):
+    """Rewind a session by dropping the last ``drop_last_n`` visible messages.
+
+    Body: ``{"drop_last_n": <N>}`` — counted from the bottom so the request
+    survives pagination (the frontend may only have the most recent page
+    loaded, so absolute indices from the top would be unreliable).
+
+    Rejected with 409 when the session is currently open in the pool — the
+    in-memory CLI state would diverge from the truncated file.
+    """
+    if _is_live_session(session_id, pool):
+        raise HTTPException(
+            409,
+            detail="Session is currently open. Close the tab before rewinding.",
+        )
+    drop_last_n = body.get("drop_last_n")
+    if not isinstance(drop_last_n, int) or drop_last_n < 0:
+        raise HTTPException(400, detail="drop_last_n (non-negative int) is required")
+    if not store.truncate_session(session_id, drop_last_n):
+        raise HTTPException(
+            404,
+            detail=f"Session {session_id!r} not found or drop_last_n out of range",
+        )
+    return {"session_id": session_id}
+
+
+@router.post("/{session_id}/fork", status_code=201)
+def fork_session(
+    session_id: str,
+    body: dict,
+    store: SessionStore = Depends(get_store),
+):
+    """Duplicate ``session_id`` and rewind the copy by ``drop_last_n``.
+
+    Body: ``{"drop_last_n": <N>}``. The original session is untouched (only
+    the copy is truncated), so this is safe even if the source is open.
+    Returns ``{"session_id": <new_uuid>}``.
+    """
+    drop_last_n = body.get("drop_last_n")
+    if not isinstance(drop_last_n, int) or drop_last_n < 0:
+        raise HTTPException(400, detail="drop_last_n (non-negative int) is required")
+    new_id = store.fork_session(session_id, drop_last_n)
+    if new_id is None:
+        raise HTTPException(
+            404,
+            detail=f"Session {session_id!r} not found or drop_last_n out of range",
+        )
+    return {"session_id": new_id}
+
+
 @router.post("/{local_id}/close", status_code=204)
 async def close_pool_session(
     local_id: str,

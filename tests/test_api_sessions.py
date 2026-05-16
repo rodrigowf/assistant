@@ -146,3 +146,86 @@ class TestDeleteSession:
     async def test_delete_not_found(self, client_empty):
         resp = await client_empty.delete("/api/sessions/nope")
         assert resp.status_code == 404
+
+
+class TestDuplicateSession:
+    async def test_duplicate_success(self, client):
+        app = client._transport.app
+        app.dependency_overrides[get_store]().duplicate_session.return_value = "new-id"
+        resp = await client.post("/api/sessions/s1/duplicate")
+        assert resp.status_code == 201
+        assert resp.json() == {"session_id": "new-id"}
+
+    async def test_duplicate_missing(self, client):
+        app = client._transport.app
+        app.dependency_overrides[get_store]().duplicate_session.return_value = None
+        resp = await client.post("/api/sessions/nope/duplicate")
+        assert resp.status_code == 404
+
+    async def test_duplicate_allowed_for_live_session(self, client):
+        """Duplicate is safe while source is open — it's a file read; the new
+        file is independent."""
+        app = client._transport.app
+        app.dependency_overrides[get_store]().duplicate_session.return_value = "new-id"
+        app.dependency_overrides[get_pool]().list_sessions.return_value = [
+            {"session_id": "local-1", "sdk_session_id": "s1"}
+        ]
+        resp = await client.post("/api/sessions/s1/duplicate")
+        assert resp.status_code == 201
+
+
+class TestTruncateSession:
+    async def test_truncate_success(self, client):
+        app = client._transport.app
+        app.dependency_overrides[get_store]().truncate_session.return_value = True
+        resp = await client.post(
+            "/api/sessions/s1/truncate", json={"drop_last_n": 1}
+        )
+        assert resp.status_code == 200
+
+    async def test_truncate_missing_field(self, client):
+        resp = await client.post("/api/sessions/s1/truncate", json={})
+        assert resp.status_code == 400
+
+    async def test_truncate_negative_value(self, client):
+        resp = await client.post(
+            "/api/sessions/s1/truncate", json={"drop_last_n": -1}
+        )
+        assert resp.status_code == 400
+
+    async def test_truncate_not_found(self, client):
+        app = client._transport.app
+        app.dependency_overrides[get_store]().truncate_session.return_value = False
+        resp = await client.post(
+            "/api/sessions/nope/truncate", json={"drop_last_n": 1}
+        )
+        assert resp.status_code == 404
+
+
+class TestForkSession:
+    async def test_fork_success(self, client):
+        app = client._transport.app
+        app.dependency_overrides[get_store]().fork_session.return_value = "forked-id"
+        resp = await client.post(
+            "/api/sessions/s1/fork", json={"drop_last_n": 2}
+        )
+        assert resp.status_code == 201
+        assert resp.json() == {"session_id": "forked-id"}
+
+    async def test_fork_bad_value(self, client):
+        resp = await client.post(
+            "/api/sessions/s1/fork", json={"drop_last_n": "bad"}
+        )
+        assert resp.status_code == 400
+
+    async def test_fork_allowed_for_live_session(self, client):
+        """Fork only mutates the copy, so the source can stay open."""
+        app = client._transport.app
+        app.dependency_overrides[get_store]().fork_session.return_value = "forked-id"
+        app.dependency_overrides[get_pool]().list_sessions.return_value = [
+            {"session_id": "local-1", "sdk_session_id": "s1"}
+        ]
+        resp = await client.post(
+            "/api/sessions/s1/fork", json={"drop_last_n": 1}
+        )
+        assert resp.status_code == 201

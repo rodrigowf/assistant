@@ -283,6 +283,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     // Chat input state lives at app scope so it persists across tab switches.
     var chatInputText by remember { mutableStateOf("") }
 
+    // Pending rewind / fork confirmation. We capture the UI index at click time
+    // and resolve it to a JSONL-absolute index inside the ViewModel.
+    var pendingMessageAction by remember {
+        mutableStateOf<Pair<String, Int>?>(null) // (kind, uiIndex)
+    }
+
     Scaffold { innerPadding ->
     Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
         // Page content
@@ -296,7 +302,9 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         messages = messages,
                         hasMoreMessages = hasMoreMessages,
                         isLoadingMoreMessages = isLoadingMoreMessages,
-                        onLoadMoreMessages = viewModel::loadMoreMessages
+                        onLoadMoreMessages = viewModel::loadMoreMessages,
+                        onRewindMessage = { idx -> pendingMessageAction = "rewind" to idx },
+                        onForkMessage = { idx -> pendingMessageAction = "fork" to idx }
                     )
                 }
 
@@ -316,6 +324,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         },
                         onRenameSession = viewModel::renameSession,
                         onDeleteSession = viewModel::deleteSession,
+                        onDuplicateSession = viewModel::duplicateSession,
                         onCloseSession = viewModel::closeSession,
                         onRefresh = viewModel::refreshSessions
                     )
@@ -418,5 +427,40 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             }
         }
     }
+    }
+
+    // Rewind / fork confirmation dialog. Rendered outside the Scaffold's
+    // content so it overlays the whole screen.
+    pendingMessageAction?.let { (kind, uiIndex) ->
+        AlertDialog(
+            onDismissRequest = { pendingMessageAction = null },
+            title = {
+                Text(
+                    if (kind == "rewind") "Rewind conversation?" else "Fork conversation?"
+                )
+            },
+            text = {
+                Text(
+                    if (kind == "rewind")
+                        "All messages after the selected one will be removed from this conversation. The session will be closed; reopen it from History to continue from the rewound point."
+                    else
+                        "A copy of this conversation will be created, truncated to the selected message. The original is unchanged."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (kind == "rewind") viewModel.rewindCurrentSessionAt(uiIndex)
+                    else viewModel.forkCurrentSessionAt(uiIndex)
+                    pendingMessageAction = null
+                }) {
+                    Text(if (kind == "rewind") "Rewind" else "Fork")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingMessageAction = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }

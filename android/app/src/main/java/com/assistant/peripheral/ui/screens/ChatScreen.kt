@@ -9,6 +9,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -45,6 +46,8 @@ fun ChatScreen(
     hasMoreMessages: Boolean,
     isLoadingMoreMessages: Boolean,
     onLoadMoreMessages: () -> Unit,
+    onRewindMessage: ((Int) -> Unit)? = null,
+    onForkMessage: ((Int) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
@@ -135,8 +138,12 @@ fun ChatScreen(
                     }
                 }
 
-                items(messages, key = { it.id }) { message ->
-                    MessageItem(message)
+                itemsIndexed(messages, key = { _, m -> m.id }) { index, message ->
+                    MessageItem(
+                        message = message,
+                        onRewind = onRewindMessage?.let { { it(index) } },
+                        onFork = onForkMessage?.let { { it(index) } }
+                    )
                 }
             }
 
@@ -163,6 +170,58 @@ fun ChatScreen(
     }
 }
 
+/**
+ * Per-message overflow menu (⋮) with Rewind / Fork actions. Wires through
+ * to the ViewModel via the supplied callbacks; the host is responsible for
+ * any confirmation UI.
+ */
+@Composable
+private fun MessageActionsMenu(
+    onRewind: () -> Unit,
+    onFork: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = modifier) {
+        IconButton(
+            onClick = { expanded = true },
+            modifier = Modifier.size(28.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.MoreVert,
+                contentDescription = "Message actions",
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            DropdownMenuItem(
+                text = { Text("Rewind conversation to here") },
+                onClick = {
+                    expanded = false
+                    onRewind()
+                },
+                leadingIcon = {
+                    Icon(Icons.Default.History, contentDescription = null)
+                }
+            )
+            DropdownMenuItem(
+                text = { Text("Fork conversation from here") },
+                onClick = {
+                    expanded = false
+                    onFork()
+                },
+                leadingIcon = {
+                    Icon(Icons.Default.CallSplit, contentDescription = null)
+                }
+            )
+        }
+    }
+}
+
 // User bubble palette — middle ground between the original Material primaryContainer
 // and the web's `--user-bg` (#18181F). Keeps the soft, muted feel of the web while
 // retaining enough blue saturation to distinguish user turns from assistant prose.
@@ -175,7 +234,11 @@ private const val USER_FOLD_LINE_THRESHOLD = 25
 private val USER_FOLD_COLLAPSED_MAX_HEIGHT = 150.dp
 
 @Composable
-private fun MessageItem(message: ChatMessage) {
+private fun MessageItem(
+    message: ChatMessage,
+    onRewind: (() -> Unit)? = null,
+    onFork: (() -> Unit)? = null
+) {
     val isUser = message.role == MessageRole.USER
     val isSystem = message.role == MessageRole.SYSTEM
 
@@ -196,6 +259,13 @@ private fun MessageItem(message: ChatMessage) {
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
     ) {
+        if (onRewind != null || onFork != null) {
+            MessageActionsMenu(
+                onRewind = onRewind ?: {},
+                onFork = onFork ?: {},
+                modifier = Modifier.align(if (isUser) Alignment.End else Alignment.Start)
+            )
+        }
         if (isUser || isSystem) {
             // USER / SYSTEM: Keep bubble with rounded corners
             Surface(

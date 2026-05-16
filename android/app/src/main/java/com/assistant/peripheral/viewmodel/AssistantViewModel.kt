@@ -1183,6 +1183,111 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * Duplicate a session: copies its JSONL + title under a fresh UUID.
+     * Refreshes the session list so the copy appears at the top.
+     */
+    fun duplicateSession(sessionId: String) {
+        viewModelScope.launch {
+            val newId = apiClient?.duplicateSession(sessionId)
+            if (newId != null) {
+                lastRefreshTime = 0L  // bypass refresh debounce
+                refreshSessions()
+            } else {
+                Log.w(TAG, "duplicateSession: backend rejected $sessionId")
+            }
+        }
+    }
+
+    /**
+     * Rewind a session: drop the last [dropLastN] visible messages.
+     * The session must be closed first (backend rejects truncate on live sessions).
+     * If the rewound session is the currently-loaded one, closes it first.
+     */
+    fun truncateSession(sessionId: String, dropLastN: Int) {
+        viewModelScope.launch {
+            // If the session is open, close it first.
+            val localId = _sdkToLocalId.value[sessionId]
+            if (localId != null) {
+                apiClient?.closePoolSession(localId)
+                _liveSessionIds.update { it - sessionId }
+                _sdkToLocalId.update { it - sessionId }
+            }
+
+            val ok = apiClient?.truncateSession(sessionId, dropLastN) ?: false
+            if (!ok) {
+                Log.w(TAG, "truncateSession: backend rejected $sessionId drop=$dropLastN")
+                return@launch
+            }
+
+            // If we were displaying this session in either bucket, clear it; user
+            // can re-open from the session list to see the rewound state.
+            for ((_, b) in buckets) {
+                if (b.currentSessionIdForPagination == sessionId) {
+                    b.messages.value = emptyList()
+                    b.currentSessionId.value = null
+                    b.currentSessionIdForPagination = null
+                    b.hasMoreMessages.value = false
+                }
+            }
+            sessionCache.remove(sessionId)
+
+            lastRefreshTime = 0L
+            refreshSessions()
+        }
+    }
+
+    /**
+     * Fork a session: duplicate, then drop the last [dropLastN] messages in the copy.
+     * The original session is untouched.
+     */
+    fun forkSession(sessionId: String, dropLastN: Int) {
+        viewModelScope.launch {
+            val newId = apiClient?.forkSession(sessionId, dropLastN)
+            if (newId != null) {
+                lastRefreshTime = 0L
+                refreshSessions()
+            } else {
+                Log.w(TAG, "forkSession: backend rejected $sessionId drop=$dropLastN")
+            }
+        }
+    }
+
+    /**
+     * Rewind the *currently displayed* session at the UI-visible message
+     * position [uiIndex]. Converts to a bottom-relative drop count so the
+     * action survives pagination — the frontend may only have the most
+     * recent page loaded, so an absolute top-index would be unreliable.
+     */
+    fun rewindCurrentSessionAt(uiIndex: Int) {
+        val b = activeBucket()
+        val sessionId = b.jsonlSessionId ?: b.currentSessionIdForPagination ?: b.currentSessionId.value
+        if (sessionId == null) {
+            Log.w(TAG, "rewindCurrentSessionAt: no session id on active bucket")
+            return
+        }
+        val total = b.messages.value.size
+        val dropLastN = (total - 1 - uiIndex).coerceAtLeast(0)
+        truncateSession(sessionId, dropLastN)
+    }
+
+    /**
+     * Fork the *currently displayed* session at the UI-visible message
+     * position [uiIndex]. See [rewindCurrentSessionAt] for the index
+     * mapping; the original session is left untouched.
+     */
+    fun forkCurrentSessionAt(uiIndex: Int) {
+        val b = activeBucket()
+        val sessionId = b.jsonlSessionId ?: b.currentSessionIdForPagination ?: b.currentSessionId.value
+        if (sessionId == null) {
+            Log.w(TAG, "forkCurrentSessionAt: no session id on active bucket")
+            return
+        }
+        val total = b.messages.value.size
+        val dropLastN = (total - 1 - uiIndex).coerceAtLeast(0)
+        forkSession(sessionId, dropLastN)
+    }
+
     // Recording
     fun startRecording() {
         viewModelScope.launch {

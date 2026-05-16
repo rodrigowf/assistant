@@ -420,6 +420,100 @@ class ApiClient(private val baseUrl: String) {
     }
 
     /**
+     * Duplicate a session: copies its JSONL + title under a fresh UUID.
+     * POST /api/sessions/{session_id}/duplicate
+     *
+     * Returns the new session_id on success, or null on failure.
+     */
+    suspend fun duplicateSession(sessionId: String): String? = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/sessions/$sessionId/duplicate")
+            Log.d(TAG, "POST $url")
+
+            val request = Request.Builder()
+                .url(url)
+                .post(okhttp3.RequestBody.create(null, ByteArray(0)))
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.w(TAG, "duplicateSession failed: ${response.code}")
+                return@withContext null
+            }
+            val body = response.body?.string() ?: return@withContext null
+            JSONObject(body).optString("session_id").takeIf { it.isNotEmpty() }
+        } catch (e: Exception) {
+            Log.e(TAG, "duplicateSession error: ${e.message}", e)
+            null
+        }
+    }
+
+    /**
+     * Rewind a session by dropping the last ``dropLastN`` visible messages.
+     * POST /api/sessions/{session_id}/truncate
+     *
+     * Bottom-relative so the action stays correct under pagination (the
+     * frontend may only have the most recent page loaded). Rejected (409)
+     * when the session is currently open in the pool — caller must close
+     * the tab first.
+     */
+    suspend fun truncateSession(sessionId: String, dropLastN: Int): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/sessions/$sessionId/truncate")
+            Log.d(TAG, "POST $url drop_last_n=$dropLastN")
+
+            val body = JSONObject().apply { put("drop_last_n", dropLastN) }
+            val request = Request.Builder()
+                .url(url)
+                .post(okhttp3.RequestBody.create(
+                    "application/json".toMediaTypeOrNull(),
+                    body.toString()
+                ))
+                .build()
+
+            val response = client.newCall(request).execute()
+            response.isSuccessful
+        } catch (e: Exception) {
+            Log.e(TAG, "truncateSession error: ${e.message}", e)
+            false
+        }
+    }
+
+    /**
+     * Fork a session: duplicate, then drop the last ``dropLastN`` messages in the copy.
+     * POST /api/sessions/{session_id}/fork
+     *
+     * Returns the new session_id on success, or null on failure. The original
+     * session is untouched.
+     */
+    suspend fun forkSession(sessionId: String, dropLastN: Int): String? = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/sessions/$sessionId/fork")
+            Log.d(TAG, "POST $url drop_last_n=$dropLastN")
+
+            val body = JSONObject().apply { put("drop_last_n", dropLastN) }
+            val request = Request.Builder()
+                .url(url)
+                .post(okhttp3.RequestBody.create(
+                    "application/json".toMediaTypeOrNull(),
+                    body.toString()
+                ))
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.w(TAG, "forkSession failed: ${response.code}")
+                return@withContext null
+            }
+            val respBody = response.body?.string() ?: return@withContext null
+            JSONObject(respBody).optString("session_id").takeIf { it.isNotEmpty() }
+        } catch (e: Exception) {
+            Log.e(TAG, "forkSession error: ${e.message}", e)
+            null
+        }
+    }
+
+    /**
      * Delete a session.
      * DELETE /api/sessions/{session_id}
      */

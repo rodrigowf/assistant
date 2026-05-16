@@ -7,12 +7,23 @@ interface Props {
   isActive?: boolean;
   hasMoreMessages?: boolean;
   onLoadMore?: () => Promise<void>;
+  /** Drop the last `dropLastN` visible messages from the conversation file. */
+  onRewindMessage?: (dropLastN: number) => void;
+  /** Fork the conversation, dropping the last `dropLastN` messages in the copy. */
+  onForkMessage?: (dropLastN: number) => void;
 }
 
 const NEAR_BOTTOM_THRESHOLD = 150;
 const LOAD_MORE_THRESHOLD = 80; // px from top to trigger load
 
-export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }: Props) {
+export function MessageList({
+  messages,
+  isActive,
+  hasMoreMessages,
+  onLoadMore,
+  onRewindMessage,
+  onForkMessage,
+}: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const prevCountRef = useRef(0);
   const isNearBottomRef = useRef(true);
@@ -166,9 +177,24 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
               </div>
             )}
             <div className="message-list-inner">
-              {displayedMessages.map((msg) => (
-                <Message key={msg.id} message={msg} />
-              ))}
+              {displayedMessages.map((msg, i) => {
+                // dropLastN = number of messages below this one. Keeping this
+                // bottom-relative makes the action survive pagination — the
+                // frontend may have only loaded the most recent page.
+                const dropLastN = displayedMessages.length - 1 - i;
+                return (
+                  <Message
+                    key={msg.id}
+                    message={msg}
+                    onRewind={
+                      onRewindMessage ? () => onRewindMessage(dropLastN) : undefined
+                    }
+                    onFork={
+                      onForkMessage ? () => onForkMessage(dropLastN) : undefined
+                    }
+                  />
+                );
+              })}
             </div>
           </>
         )}

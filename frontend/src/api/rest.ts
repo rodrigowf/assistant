@@ -40,6 +40,36 @@ export async function deleteSession(id: string): Promise<void> {
   if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
 }
 
+async function postJson<T>(url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = (await res.json())?.detail || "";
+    } catch {
+      // ignore
+    }
+    throw new Error(detail || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export function duplicateSession(id: string): Promise<{ session_id: string }> {
+  return postJson(`${BASE}/sessions/${id}/duplicate`);
+}
+
+export function truncateSession(id: string, dropLastN: number): Promise<{ session_id: string }> {
+  return postJson(`${BASE}/sessions/${id}/truncate`, { drop_last_n: dropLastN });
+}
+
+export function forkSession(id: string, dropLastN: number): Promise<{ session_id: string }> {
+  return postJson(`${BASE}/sessions/${id}/fork`, { drop_last_n: dropLastN });
+}
+
 export async function closePoolSession(localId: string): Promise<void> {
   const res = await fetch(`${BASE}/sessions/${localId}/close`, { method: "POST" });
   if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);

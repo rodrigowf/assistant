@@ -4,9 +4,12 @@ import { Markdown } from "./Markdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolUseBlock } from "./ToolUseBlock";
 import { CompactDivider } from "./CompactDivider";
+import { MessageActionsMenu } from "./MessageActionsMenu";
 
 interface Props {
   message: ChatMessage;
+  onRewind?: () => void;
+  onFork?: () => void;
 }
 
 const LINE_THRESHOLD = 25;
@@ -30,7 +33,7 @@ function UserTextBlock({ content }: { content: string }) {
   );
 }
 
-export function Message({ message }: Props) {
+export function Message({ message, onRewind, onFork }: Props) {
   const isUser = message.role === "user";
 
   // Compact divider — rendered full-width outside the bubble
@@ -41,6 +44,12 @@ export function Message({ message }: Props) {
 
   return (
     <div className={`message ${isUser ? "message-user" : "message-assistant"}`}>
+      {(onRewind || onFork) && (
+        <MessageActionsMenu
+          onRewind={onRewind ?? (() => {})}
+          onFork={onFork ?? (() => {})}
+        />
+      )}
       {message.blocks.map((block, i) => {
         if (block.type === "text") {
           return isUser ? (

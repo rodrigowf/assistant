@@ -40,6 +40,7 @@ fun SessionsScreen(
     onNewSession: () -> Unit,
     onRenameSession: (String, String) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onDuplicateSession: (String) -> Unit,
     onCloseSession: (String) -> Unit,
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier
@@ -122,6 +123,7 @@ fun SessionsScreen(
                             onClick = { onSessionClick(session.sessionId, session.isOrchestrator, session.localId) },
                             onRename = { newTitle -> onRenameSession(session.sessionId, newTitle) },
                             onDelete = { onDeleteSession(session.sessionId) },
+                            onDuplicate = { onDuplicateSession(session.sessionId) },
                             onClose = { onCloseSession(session.sessionId) }
                         )
                     }
@@ -148,6 +150,7 @@ private fun SessionItem(
     onClick: () -> Unit,
     onRename: (String) -> Unit,
     onDelete: () -> Unit,
+    onDuplicate: () -> Unit,
     onClose: () -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
@@ -420,6 +423,16 @@ private fun SessionItem(
                             },
                             leadingIcon = {
                                 Icon(Icons.Default.Edit, contentDescription = null)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Duplicate") },
+                            onClick = {
+                                showMenu = false
+                                onDuplicate()
+                            },
+                            leadingIcon = {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null)
                             }
                         )
                         if (isOpen) {
