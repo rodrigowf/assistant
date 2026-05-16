@@ -202,35 +202,37 @@ The assistant is **ready to deploy** on any machine with the prerequisites insta
   - `DASHSCOPE_API_KEY` — for the Qwen harness, Qwen voice, and Qwen models served via the OpenAI-compatible endpoint
   - `GEMINI_API_KEY` — for the Gemini CLI harness (when not using OAuth) and the `/generate-image` skill
 
-Check prerequisites:
+Check prerequisites (pick the script for your OS):
+
 ```bash
-./default-scripts/install-prerequisites.sh
+./install/linux/install-prerequisites.sh    # Linux
+./install/apple/install-prerequisites.sh    # macOS
+.\install\windows\install-prerequisites.ps1 # Windows (PowerShell)
 ```
 
-For the full step-by-step procedure (used by both `install.sh` and `install-with-agent.sh`), see [INSTALL.md](INSTALL.md).
+On macOS and Windows the prereq script also offers to bootstrap missing tools via Homebrew / winget respectively.
+
+For the full step-by-step procedure (used by both `install.sh` and `install-with-agent.sh`, on every OS), see [INSTALL.md](INSTALL.md).
 
 ### Two ways to install
 
-Pick whichever feels right — both arrive at the same end state, and full details for either are in [INSTALL.md](INSTALL.md).
+Pick whichever feels right — both arrive at the same end state on every supported OS (Linux, macOS, Windows).  Full details for either are in [INSTALL.md](INSTALL.md).
 
 ```bash
 git clone https://github.com/rodrigowf/assistant.git
 cd assistant
 ```
 
-**Option A — Conversational installer (recommended for first-time users).**  Launches one of the agent CLIs (Claude Code / Qwen Code / Gemini CLI) and lets it walk you through the install conversationally — asking each question, running each step, and writing progress to `context/install.log`.  Reads `install.sh` as its recipe.
+The installer entry points at the project root auto-detect the host OS and dispatch to the right per-OS implementation under `install/<os>/`.  Pick the appropriate command for your platform:
 
-```bash
-./install-with-agent.sh
-```
+|  | Linux / macOS | Windows (PowerShell) |
+|---|---|---|
+| **Option A — Conversational installer (recommended for first-time users)** | `./install-with-agent.sh` | `.\install-with-agent.ps1` |
+| **Option B — Deterministic installer** | `./install.sh` | `.\install.ps1` |
 
-If no agent CLI is installed yet, the script offers to `npm install -g` one and walks you through first-run login before handing off.
+**Option A** launches one of the agent CLIs (Claude Code / Qwen Code / Gemini CLI) and lets it walk you through the install conversationally — asking each question, running each step, and writing progress to `context/install.log`.  Reads the appropriate per-OS `install.sh` / `install.ps1` as its recipe.  If no agent CLI is installed yet, the script offers to `npm install -g` one and walks you through first-run login before handing off.
 
-**Option B — Deterministic shell installer.**  Asks two questions up front (harness + orchestrator) then runs every step automatically.  No agent involved.  Recommended if you already know what you want or prefer to see every action as plain bash.
-
-```bash
-./install.sh
-```
+**Option B** asks two questions up front (harness + orchestrator) then runs every step automatically.  No agent involved.  Recommended if you already know what you want or prefer to see every action as plain shell.
 
 Either way, the installer asks two questions:
 

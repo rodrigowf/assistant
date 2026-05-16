@@ -1,11 +1,40 @@
 # Installing the Personal Assistant
 
-There are two ways to install this project.
+The installer supports **Linux**, **macOS**, and **Windows**.  Each OS has its own implementation under `install/<os>/`, dispatched by thin wrappers at the project root.
 
-- **`./install.sh`** — A deterministic shell installer.  Asks two questions (harness + orchestrator) up front, then runs every step automatically.  Recommended if you already know what you want, or if you want every action to be visible in plain bash.
-- **`./install-with-agent.sh`** — A conversational installer.  Launches one of the agent CLIs (Claude Code, Qwen Code, or Gemini CLI) and hands it this file as instructions.  The agent then walks you through each decision, executes the steps itself, and writes a running log to `context/install.log`.  Recommended if you're new to the project and want a guided setup.
+There are two installation styles, both available on every OS.
 
-Both paths arrive at the same end state: a working assistant with the harnesses, SDKs, and config you chose.  Pick whichever you prefer.
+| | Linux / macOS | Windows |
+|--|--|--|
+| **Deterministic** | `./install.sh` | `.\install.ps1` |
+| **Conversational** | `./install-with-agent.sh` | `.\install-with-agent.ps1` |
+
+- **Deterministic** — runs every step automatically.  Asks two questions up front (session harness + orchestrator backends), then proceeds non-interactively.  Recommended if you already know what you want.
+- **Conversational** — launches one of the agent CLIs (Claude Code, Qwen Code, or Gemini CLI) and hands it this file as instructions.  The agent walks you through each decision, executes the steps itself, and writes a running log to `context/install.log`.  Recommended if you're new to the project and want a guided setup.
+
+Both paths arrive at the same end state: a working assistant with the harnesses, SDKs, and config you chose.
+
+### Where the per-OS scripts live
+
+```
+install/
+├── README.md, AGENTS.md, MEMORY.md, ...   shared templates (every OS uses these)
+├── cli-runtime/                           shared per-CLI seed dirs
+├── linux/                                 Linux installer
+│   ├── install.sh
+│   ├── install-with-agent.sh
+│   └── install-prerequisites.sh
+├── apple/                                 macOS installer (Intel + Apple Silicon)
+│   ├── install.sh
+│   ├── install-with-agent.sh
+│   └── install-prerequisites.sh
+└── windows/                               Windows installer (PowerShell 5.1 / 7+)
+    ├── install.ps1
+    ├── install-with-agent.ps1
+    └── install-prerequisites.ps1
+```
+
+The wrappers at the project root (`install.sh`, `install-with-agent.sh`, `install.ps1`, `install-with-agent.ps1`) detect the host OS and dispatch to the right per-OS script.  You can also call the per-OS scripts directly if you prefer.
 
 ---
 
@@ -13,18 +42,27 @@ Both paths arrive at the same end state: a working assistant with the harnesses,
 
 > **If you are an LLM reading this file as the install agent: this section is your instructions.  Human readers can skip ahead to [Prerequisites](#prerequisites).**
 >
-> You were launched by `install-with-agent.sh` to drive this installation conversationally.  You are running inside the project root with file and Bash tools available.
+> You were launched by `install-with-agent.sh` (Linux/macOS) or `install-with-agent.ps1` (Windows) to drive this installation conversationally.  You are running inside the project root with file and shell tools available.
+>
+> **First: determine which per-OS recipe to follow.**  The top-level `./install.sh` / `.\install.ps1` are thin dispatchers — they exec the real installer under `install/<os>/`.  The canonical recipe for *your* OS is one of:
+>
+> - **Linux** → `install/linux/install.sh`
+> - **macOS** → `install/apple/install.sh`
+> - **Windows** → `install/windows/install.ps1`
+>
+> Pick the one matching the host (the launching wrapper script tells you in its kickoff prompt, or check `uname -s` / `$IsWindows`).  All three follow the same step structure (`# Step 0a`, `# Step 0b`, ..., `# Step 12`) and arrive at the same end state, but they differ in concrete commands (`apt`/`brew`/`winget`, `sed -i` vs `sed -i ''`, symlinks vs junctions).  **Do not read the wrong one** — the differences are real.
 >
 > Your job:
 >
-> 1. **Read `install.sh` end-to-end** before doing anything.  Treat it as the canonical recipe — every step you take should correspond to a step in that script.  Pay special attention to the `# Step N` headers and the per-axis flag logic at the top.
-> 2. **Read `install/README.md`** to understand what the `install/` templates do and which files get copied where.
+> 1. **Read the per-OS installer end-to-end** before doing anything.  Treat it as the canonical recipe — every step you take should correspond to a step in that script.  Pay special attention to the `# Step N` headers and the per-axis flag logic at the top.
+> 2. **Read `install/README.md` and `install/<os>/README.md`** to understand what the templates do and which files get copied where, plus OS-specific quirks (Homebrew on macOS, winget + Developer Mode on Windows).
 > 3. **Walk the user through the two axis decisions** (session harness, orchestrator backends) — same questions the script's Steps 0a/0b ask.  Explain each option briefly when asked.
-> 4. **Execute the steps yourself**, in order, using your file and Bash tools.  Don't just run `./install.sh` — read it as the spec and re-do each step interactively so you can adapt to the user's answers and recover from errors.  The deterministic parts (`pip install -r requirements*.txt`, `npm install`, venv creation) are fine to shell out for; the conversational/branching parts (axis decisions, context import vs. fresh, optional symlinks, `install/cli-runtime/` seeding) you handle directly.
+> 4. **Execute the steps yourself**, in order, using your file and shell tools.  Don't just run the deterministic installer — read it as the spec and re-do each step interactively so you can adapt to the user's answers and recover from errors.  The deterministic parts (`pip install -r requirements*.txt`, `npm install`, venv creation) are fine to shell out for; the conversational/branching parts (axis decisions, context import vs. fresh, optional symlinks, CLI runtime seeding) you handle directly.
 > 5. **Log your progress to `context/install.log` continuously.**  At the start of each step, append a line like `[2026-05-16 14:32] step 4: creating venv ...`.  Append the outcome on completion or error.  If the install crashes, this log lets the user (or a future agent) resume manually.
-> 6. **Never invent steps.**  If `install.sh` doesn't do something, neither should you.  If you're unsure, read the relevant block of `install.sh` and follow it literally.
-> 7. **Never skip the API key reminders.**  Step 12 in `install.sh` warns about missing keys for the axes the user picked — do the same warning.
-> 8. **When everything is done**, ask the user if they'd like you to start the backend (`context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765`) and/or the frontend (`cd frontend && npm run dev`) in the background.  If yes, launch them in background mode so they survive your exit, then tell the user the install is complete and they can press Ctrl-C to exit this session.  Confirm the services are reachable before declaring victory.
+> 6. **Never invent steps.**  If the per-OS installer doesn't do something, neither should you.  If you're unsure, read the relevant block and follow it literally.
+> 7. **Never skip the API key reminders.**  Step 12 warns about missing keys for the axes the user picked — do the same warning.
+> 8. **Windows-specific**: if you're on Windows, check whether symlink creation works before attempting any link steps (the installer's `Test-Symlinks` does this).  If it fails, tell the user about Developer Mode before falling back to junctions + copies.  Path mangling for the CLI project dirs replaces both `\` and `:` with `-`.
+> 9. **When everything is done**, ask the user if they'd like you to start the backend (`context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765` on POSIX, or `.venv\Scripts\python.exe -m uvicorn api.app:create_app --factory --port 8765` on Windows) and/or the frontend (`cd frontend && npm run dev`) in the background.  If yes, launch them in background mode so they survive your exit, then tell the user the install is complete and they can press Ctrl-C to exit this session.  Confirm the services are reachable before declaring victory.
 >
 > A few additional rules:
 >
@@ -44,13 +82,19 @@ Both paths arrive at the same end state: a working assistant with the harnesses,
 - **npm** (comes with Node)
 - **git**
 
-Run the bundled prereq checker:
+The deterministic installer's Step 1 runs the per-OS prereq checker for you.  You can also run it standalone:
 
-```bash
-./default-scripts/install-prerequisites.sh
-```
+| OS | Command |
+|--|--|
+| Linux | `./install/linux/install-prerequisites.sh` |
+| macOS | `./install/apple/install-prerequisites.sh` |
+| Windows | `.\install\windows\install-prerequisites.ps1` |
 
-It checks each tool's version and prints what's missing.  Install anything it flags before proceeding.
+Each one checks tool versions and offers to install whatever's missing:
+
+- **Linux** prints `apt` / `dnf` / `pacman` install hints — install manually before re-running.
+- **macOS** offers to bootstrap **Homebrew** and install Python 3.12 + Node 20 via brew.  Handles both Apple Silicon (`/opt/homebrew`) and Intel (`/usr/local`).
+- **Windows** offers to install Python 3.12 + Node LTS + Git via **winget** (Microsoft's built-in package manager on Windows 10 1809+ / Windows 11).
 
 You'll also need at least one of these API keys *somewhere* — either obtained ahead of time, or set up during install:
 
@@ -60,6 +104,19 @@ You'll also need at least one of these API keys *somewhere* — either obtained 
 - **Orchestrator backends** — `OPENAI_API_KEY` for OpenAI/GPT/Qwen-via-compatible/Gemini-via-compatible; `ANTHROPIC_API_KEY` for Anthropic Claude models in the orchestrator.
 
 You don't need every key — only the ones for axes you opt into.
+
+### Windows-only prerequisites
+
+- **PowerShell 7+** is recommended (`winget install Microsoft.PowerShell`).  Windows PowerShell 5.1 — bundled with Windows — also works.
+- **Execution policy**: if you see "running scripts is disabled on this system", lift it for your user:
+  ```powershell
+  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+  ```
+  Or invoke the installer with a one-time bypass:
+  ```powershell
+  powershell.exe -ExecutionPolicy Bypass -File .\install.ps1
+  ```
+- **Symlinks** require either Developer Mode enabled OR running PowerShell as Administrator.  Without them, the installer falls back to NTFS junctions for directories and plain file copies for files — fully functional, but file links won't auto-update if you change the source.  **To enable Developer Mode:** Settings → Update & Security → For Developers (Windows 10) or Settings → System → For Developers (Windows 11) → toggle on Developer Mode.
 
 ---
 
@@ -90,11 +147,11 @@ The orchestrator agent (text + voice) is independent of the harness.  Which API 
 
 ## Install steps
 
-These mirror the `# Step N` headers in `install.sh`.  Run them in order.
+These mirror the `# Step N` headers in your OS's installer (`install/linux/install.sh`, `install/apple/install.sh`, or `install/windows/install.ps1`).  Run them in order.  Throughout this section, "install.sh" refers to *your* OS's installer; the Windows variant is `install.ps1` but uses the same step structure.
 
 ### Step 1: Prerequisites
 
-`./default-scripts/install-prerequisites.sh` — fail fast on missing Python / Node / npm / git.
+Run the per-OS prereq checker (`install/linux/install-prerequisites.sh`, `install/apple/install-prerequisites.sh`, or `install\windows\install-prerequisites.ps1`) — fail fast on missing Python / Node / npm / git, and on macOS / Windows offer to bootstrap whatever's missing via Homebrew / winget.
 
 ### Step 2: Context setup
 
@@ -120,7 +177,11 @@ For each enabled harness, create the project-local config dir the CLI expects:
 - **Qwen** — `~/.qwen/projects/<mangled-cwd>` → `context/`.  Qwen mangles the cwd by replacing `/` with `-`, e.g. `-home-rodrigo-assistant`.
 - **Gemini** — `~/.gemini/tmp/<label>/` symlinked similarly.  Gemini uses a hash-based label rather than a mangled path.
 
-The exact mangling logic is in `install.sh` — read it there.  Idempotent: re-runs leave existing symlinks alone.
+The exact mangling logic is in the per-OS installer — read it there.  Idempotent: re-runs leave existing symlinks alone.
+
+**Windows path mangling**: on Windows, both `\` and `:` are replaced with `-`, so `C:\Users\you\assistant` becomes `C--Users-you-assistant`.  If a CLI version uses a different mangle, run the CLI once (it'll create its own real dir under `%USERPROFILE%\.<cli>\projects\`), then re-run `install.ps1` — it detects the real dir and replaces it with a link to `context\` (after migrating any chat history).
+
+**Symlinks on Windows**: real symbolic links require Developer Mode or Administrator.  Without those, the installer falls back to NTFS junctions (directories) and copies (files).  See the [Windows section](#windows-only-prerequisites) above for how to enable Developer Mode.
 
 ### Step 3d: AGENTS.md symlinks
 
@@ -143,13 +204,15 @@ These hold default permission allowlists and the Gemini `respectGitIgnore=false`
 ### Step 4: Python venv
 
 ```bash
-python3 -m venv .venv
+python3 -m venv .venv               # Linux / macOS
+py -3.12 -m venv .venv              # Windows
 ```
 
 ### Step 5: Upgrade pip
 
 ```bash
-.venv/bin/pip install --upgrade pip
+.venv/bin/pip install --upgrade pip               # Linux / macOS
+.venv\Scripts\pip.exe install --upgrade pip       # Windows
 ```
 
 ### Step 6: Python dependencies
@@ -157,17 +220,18 @@ python3 -m venv .venv
 Always install:
 
 ```bash
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt         # Linux / macOS
+.venv\Scripts\pip.exe install -r requirements.txt # Windows
 ```
 
-Then conditionally:
+Then conditionally (use the venv pip path matching your OS):
 
-- `--with-anthropic` → `.venv/bin/pip install anthropic`
-- `--with-openai` → `.venv/bin/pip install openai`
-- `--with-claude` → `.venv/bin/pip install claude-agent-sdk`
-- `--with-qwen` → no extra Python deps (Qwen runs as a subprocess via the CLI)
-- `--with-gemini` → no extra Python deps
-- `--dev` → `.venv/bin/pip install ruff mypy`
+- `--with-anthropic` / `-WithAnthropic` → `pip install -r requirements-anthropic.txt`
+- `--with-openai` / `-WithOpenAI` → `pip install -r requirements-openai.txt`
+- `--with-claude` / `-WithClaude` → `pip install -r requirements-claude.txt`
+- `--with-qwen` / `-WithQwen` → no extra Python deps (Qwen runs as a subprocess via the CLI)
+- `--with-gemini` / `-WithGemini` → no extra Python deps
+- `--dev` / `-Dev` → `pip install -r requirements-dev.txt`
 
 ### Step 7: Frontend deps
 
@@ -226,6 +290,8 @@ For each axis the user opted into, check that the required env key is set in `co
 
 ### After install
 
+**Linux / macOS:**
+
 ```bash
 # Terminal 1 — Backend
 context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765
@@ -234,9 +300,19 @@ context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --
 cd frontend && npm run dev
 ```
 
+**Windows:**
+
+```powershell
+# Terminal 1 — Backend
+.venv\Scripts\python.exe -m uvicorn api.app:create_app --factory --port 8765
+
+# Terminal 2 — Frontend
+cd frontend; npm run dev
+```
+
 Open **https://localhost:5432** and start chatting.
 
-If you used `install-with-agent.sh`, the agent can offer to start both in the background for you.
+If you used the conversational installer, the agent can offer to start both in the background for you.
 
 ---
 
