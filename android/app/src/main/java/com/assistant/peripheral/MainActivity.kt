@@ -12,7 +12,11 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -406,24 +410,49 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             )
         }
 
-        NavigationBar {
-            val currentDestination = navBackStackEntry?.destination
+        Surface(
+            color = NavigationBarDefaults.containerColor,
+            tonalElevation = NavigationBarDefaults.Elevation,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(NavigationBarDefaults.windowInsets)
+                    .height(80.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                val currentDestination = navBackStackEntry?.destination
+                val selectedBg = MaterialTheme.colorScheme.secondaryContainer
+                val selectedFg = MaterialTheme.colorScheme.onSecondaryContainer
+                val unselectedFg = MaterialTheme.colorScheme.onSurfaceVariant
 
-            screens.forEach { screen ->
-                NavigationBarItem(
-                    icon = { Icon(screen.icon, contentDescription = screen.title) },
-                    label = { Text(screen.title) },
-                    selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
-                    onClick = {
-                        navController.navigate(screen.route) {
-                            popUpTo(navController.graph.findStartDestination().id) {
-                                saveState = true
-                            }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
+                screens.forEach { screen ->
+                    val selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(if (selected) selectedBg else androidx.compose.ui.graphics.Color.Transparent)
+                            .clickable {
+                                navController.navigate(screen.route) {
+                                    popUpTo(navController.graph.findStartDestination().id) {
+                                        saveState = true
+                                    }
+                                    launchSingleTop = true
+                                    restoreState = true
+                                }
+                            },
+                        contentAlignment = androidx.compose.ui.Alignment.Center
+                    ) {
+                        Icon(
+                            screen.icon,
+                            contentDescription = screen.title,
+                            tint = if (selected) selectedFg else unselectedFg
+                        )
                     }
-                )
+                }
             }
         }
     }
