@@ -13,7 +13,7 @@ import { useReconnectPoolSessions } from "@/hooks/useReconnectPoolSessions";
 import { generateUUID } from "@/utils/uuid";
 
 function AppContent() {
-  const { sessions, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
+  const { sessions, deleting, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
   useReconnectPoolSessions();
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
@@ -104,6 +104,7 @@ function AppContent() {
     <>
       <Sidebar
         sessions={sessions}
+        deleting={deleting}
         onDelete={requestDeleteSession}
         onRename={renameSession}
         onDuplicate={(id) => { duplicateSession(id).catch((e) => { console.error("Duplicate failed:", e); }); }}

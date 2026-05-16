@@ -5,6 +5,8 @@ import { generateUUID } from "../utils/uuid";
 
 interface Props {
   sessions: SessionInfo[];
+  /** True while a delete is in flight — dims the list and shows a spinner. */
+  deleting?: boolean;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onDuplicate: (id: string) => void;
@@ -16,7 +18,7 @@ interface Props {
   onClose?: () => void;
 }
 
-export function Sidebar({ sessions, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
+export function Sidebar({ sessions, deleting, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
   const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
 
   const handleSelect = (sdkId: string, localId?: string) => {
@@ -109,7 +111,7 @@ export function Sidebar({ sessions, onDelete, onRename, onDuplicate, onNew, onNe
         </svg>
         Configuration
       </button>
-      <div className="session-list">
+      <div className={`session-list${deleting ? " session-list--busy" : ""}`}>
         {sessions.map((s) => {
           // A session item is active if the current tab matches by resumeSdkId or by local_id
           const isActive =
@@ -131,6 +133,12 @@ export function Sidebar({ sessions, onDelete, onRename, onDuplicate, onNew, onNe
         })}
         {sessions.length === 0 && (
           <div className="sidebar-empty">No sessions yet</div>
+        )}
+        {deleting && (
+          <div className="session-list-overlay" aria-busy="true" aria-live="polite">
+            <div className="session-list-spinner" aria-hidden="true" />
+            <span className="session-list-overlay-label">Deleting…</span>
+          </div>
         )}
       </div>
     </aside>

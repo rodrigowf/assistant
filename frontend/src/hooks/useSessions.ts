@@ -10,6 +10,8 @@ import {
 interface UseSessionsResult {
   sessions: SessionInfo[];
   loading: boolean;
+  /** True while a delete is in flight — drives the history-panel spinner. */
+  deleting: boolean;
   refresh: () => void;
   deleteSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
@@ -19,6 +21,7 @@ interface UseSessionsResult {
 export function useSessions(): UseSessionsResult {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deleting, setDeleting] = useState(false);
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -33,8 +36,13 @@ export function useSessions(): UseSessionsResult {
   }, [refresh]);
 
   const handleDelete = useCallback(async (id: string) => {
-    await apiDelete(id);
-    setSessions((prev) => prev.filter((s) => s.session_id !== id));
+    setDeleting(true);
+    try {
+      await apiDelete(id);
+      setSessions((prev) => prev.filter((s) => s.session_id !== id));
+    } finally {
+      setDeleting(false);
+    }
   }, []);
 
   const handleRename = useCallback(async (id: string, title: string) => {
@@ -54,6 +62,7 @@ export function useSessions(): UseSessionsResult {
   return {
     sessions,
     loading,
+    deleting,
     refresh,
     deleteSession: handleDelete,
     renameSession: handleRename,
