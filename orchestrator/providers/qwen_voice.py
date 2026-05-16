@@ -103,10 +103,12 @@ DEFAULT_VAD = {
     # false speech_started events (which interrupt the model's audio).
     "threshold": 0.4,
     "prefix_padding_ms": 300,
-    # 1800ms (vs Alibaba's 800 default) so the model doesn't cut in when
-    # the user pauses mid-sentence to think.  Qwen-Omni only supports
-    # server_vad — semantic_vad is rejected on this endpoint.
-    "silence_duration_ms": 1800,
+    # 2500ms (vs Alibaba's 800 default) so the model doesn't cut in when
+    # the user pauses mid-sentence to think.  Empirically 1800ms still
+    # let the model jump in on longer thoughtful pauses; 2500ms gives
+    # more headroom for the natural rhythm of speech.  Qwen-Omni only
+    # supports server_vad — semantic_vad is rejected on this endpoint.
+    "silence_duration_ms": 2500,
     "create_response": True,
     "interrupt_response": True,
 }
@@ -143,9 +145,17 @@ def _build_transcription_config(language: str) -> dict[str, Any]:
     Empty ``language`` means auto-detect — the ``language`` key is omitted
     so Qwen3-ASR-Flash identifies the language per utterance.  Otherwise
     we send the explicit ISO-639-1 code (e.g. ``"en"``, ``"pt"``).
+
+    As of 2026-05-15 DashScope's omni endpoint rejects ``session.update``
+    payloads that include a ``language`` field — ``InternalError: Parse
+    RealtimeEvent error: Common error!`` (WS 1011) within seconds, even
+    though the field was accepted (and clearly honored) until 2026-05-02.
+    Honor the user-facing setting only if ``QWEN_ALLOW_TRANSCRIPTION_LANGUAGE=1``
+    is set in the environment, in case Alibaba re-allows the field
+    later. Default behavior: omit the field entirely → auto-detect.
     """
     cfg: dict[str, Any] = {"model": "qwen3-asr-flash-realtime"}
-    if language:
+    if language and os.environ.get("QWEN_ALLOW_TRANSCRIPTION_LANGUAGE") == "1":
         cfg["language"] = language
     return cfg
 
@@ -430,13 +440,22 @@ class QwenVoiceProvider(BaseVoiceProvider):
         # then the validator fires later when the omni pipeline scans
         # the context, killing the session mid-conversation.
         instructions = _sanitize_for_qwen((system or "") + voice_directives)
+        # Sanitise tool parameter schemas: DashScope's session.update
+        # parser rejects JSON Schema union types (``"type": ["X", "null"]``)
+        # with a generic ``Parse RealtimeEvent error: Common error!`` —
+        # the same misleading boilerplate as the URL-validator hazard,
+        # but coming from the schema parser and firing right after
+        # ``session.created``. We collapse ``[X, "null"]`` to plain ``X``
+        # for any single offending field; if Alibaba ever publishes a
+        # ``nullable``-equivalent flag we'll wire it in here.
+        sanitized_tools = [_sanitize_tool_for_qwen(t) for t in tools or []]
         return {
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
                 "voice": voice or self._voice,
                 "instructions": instructions,
-                "tools": tools,
+                "tools": sanitized_tools,
                 # Plus reliably calls tools with "auto"; Flash needs "required".
                 # Compromise: leave "auto" so the model can also chat freely
                 # (which Plus does fine), and let users with Flash override
@@ -664,3 +683,42 @@ def _sanitize_for_qwen(text: str) -> str:
         # cheap and avoids stacking quotes when the model echoes back).
         return f"`{token}`"
     return _URL_LIKE_RE.sub(_wrap, text)
+
+
+def _sanitize_tool_for_qwen(tool: dict[str, Any]) -> dict[str, Any]:
+    """Recursively scrub JSON Schema union types from a tool definition.
+
+    DashScope's ``session.update`` parser closes the WebSocket with
+    ``InternalError: Parse RealtimeEvent error: Common error!`` (1011)
+    when any parameter schema uses ``"type": ["X", "null"]``. This is
+    valid JSON Schema Draft 7 but unsupported here. We collapse the
+    union to its first non-null branch and drop the null option;
+    callers who relied on accepting null should mark the field
+    non-required instead.
+
+    Bisected 2026-05-15 — when this sanitiser is bypassed, the only
+    tool in our current registry that trips it is
+    ``read_agent_session`` via its ``max_messages: [integer, null]``
+    parameter.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    return _scrub_union_types(tool)
+
+
+def _scrub_union_types(node: Any) -> Any:
+    """Recursively rewrite ``"type": [..., "null"]`` to a scalar type."""
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            if k == "type" and isinstance(v, list):
+                non_null = [t for t in v if t != "null"]
+                # Best-effort: keep the first non-null type, default to
+                # "string" if the union was purely null (unlikely).
+                out[k] = non_null[0] if non_null else "string"
+            else:
+                out[k] = _scrub_union_types(v)
+        return out
+    if isinstance(node, list):
+        return [_scrub_union_types(x) for x in node]
+    return node
