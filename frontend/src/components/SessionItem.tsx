@@ -73,19 +73,19 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
       </div>
       <div className="session-meta">
         {session.is_orchestrator && (
-          <span className="session-type-label">orchestrator</span>
+          <span className="session-type-label">orch</span>
         )}
         {/* Provider badge hidden for orchestrator sessions: those don't go
-            through the Claude/Qwen CLI — they're a standalone agent loop
-            that talks to Anthropic/OpenAI APIs directly. The "orchestrator"
+            through the Claude/Qwen/Gemini CLI — they're a standalone agent
+            loop that talks to Anthropic/OpenAI APIs directly. The "orch"
             label above already conveys the session kind. */}
         {session.provider && !session.is_orchestrator && (
           <span
             className={`session-provider-dot session-provider-${session.provider}`}
-            title={session.provider === "qwen" ? "Qwen Code" : "Claude Code"}
+            title={providerTitle(session.provider)}
             aria-label={`Provider: ${session.provider}`}
           >
-            {session.provider === "qwen" ? "Q" : "C"}
+            {providerLetter(session.provider)}
           </span>
         )}
         <span className="session-time">{timeAgo}</span>
@@ -131,6 +131,24 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
       )}
     </div>
   );
+}
+
+function providerLetter(provider: string): string {
+  switch (provider) {
+    case "qwen": return "Q";
+    case "gemini": return "G";
+    case "claude": return "C";
+    default: return provider.charAt(0).toUpperCase();
+  }
+}
+
+function providerTitle(provider: string): string {
+  switch (provider) {
+    case "qwen": return "Qwen Code";
+    case "gemini": return "Gemini CLI";
+    case "claude": return "Claude Code";
+    default: return provider;
+  }
 }
 
 function formatRelative(iso: string): string {

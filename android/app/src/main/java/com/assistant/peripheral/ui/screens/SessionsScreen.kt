@@ -317,7 +317,7 @@ private fun SessionItem(
                                     color = MaterialTheme.colorScheme.tertiaryContainer
                                 ) {
                                     Text(
-                                        text = "orchestrator",
+                                        text = "orch",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onTertiaryContainer,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
