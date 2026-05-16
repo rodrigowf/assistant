@@ -641,7 +641,87 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3c: Wire AGENTS.md as the shared project-instructions file
+# Step 3c: Set up Gemini CLI config symlink (only if --with-gemini)
+# ─────────────────────────────────────────────────────────────────────────────
+# The Gemini CLI stores per-project session JSONLs under
+# ~/.gemini/tmp/<label>/chats/ where <label> comes from ~/.gemini/projects.json
+# (defaults to the cwd basename — for this repo, "assistant").  Symlink that
+# label directory at context/, so Gemini writes chats/session-*.jsonl directly
+# alongside Qwen's <uuid>.jsonl files.  The two harnesses coexist cleanly:
+# Gemini's session-prefixed names don't collide with Qwen's <uuid>.jsonl
+# names, and SessionStore picks up both formats via the same chats/ scan.
+if [ "$WITH_GEMINI" = true ]; then
+    step "Setting up Gemini CLI configuration..."
+
+    GEMINI_HOME="$HOME/.gemini"
+    # Compute Gemini's label for this cwd.  Read ~/.gemini/projects.json if
+    # present (any prior `gemini` run in this dir registered one); fall back
+    # to the cwd basename, which is exactly what the CLI does on first run.
+    GEMINI_LABEL=""
+    if [ -f "$GEMINI_HOME/projects.json" ] && command -v python3 &> /dev/null; then
+        GEMINI_LABEL="$(python3 -c "
+import json, sys
+try:
+    with open('$GEMINI_HOME/projects.json') as f:
+        data = json.load(f)
+    label = data.get('projects', {}).get('$SCRIPT_DIR')
+    print(label or '')
+except Exception:
+    print('')
+" 2>/dev/null || true)"
+    fi
+    if [ -z "$GEMINI_LABEL" ]; then
+        GEMINI_LABEL="$(basename "$SCRIPT_DIR")"
+    fi
+    GEMINI_PROJECT_DIR="$GEMINI_HOME/tmp/$GEMINI_LABEL"
+    EXPECTED_LINK_TARGET="$SCRIPT_DIR/context"
+
+    mkdir -p "$GEMINI_HOME/tmp"
+
+    if [ -L "$GEMINI_PROJECT_DIR" ]; then
+        CURRENT_TARGET="$(readlink -f "$GEMINI_PROJECT_DIR" 2>/dev/null || true)"
+        EXPECTED_RESOLVED="$(readlink -f "$EXPECTED_LINK_TARGET" 2>/dev/null || true)"
+        if [ "$CURRENT_TARGET" = "$EXPECTED_RESOLVED" ]; then
+            info "Gemini project symlink already points to context/"
+        else
+            warn "Gemini project symlink points to $CURRENT_TARGET (not this project) — leaving alone"
+        fi
+    elif [ -d "$GEMINI_PROJECT_DIR" ]; then
+        # Gemini already populated a real directory in ~/.gemini/tmp/.
+        # Same migration shape as Qwen above: back up the original, lift
+        # chats into context/chats/, then replace with our symlink.
+        warn "Found real directory at $GEMINI_PROJECT_DIR — migrating to symlink"
+        mkdir -p context/chats
+        BACKUP_DIR="context/gemini-backup-$(date +%Y%m%dT%H%M%S)"
+        cp -r "$GEMINI_PROJECT_DIR" "$BACKUP_DIR" 2>/dev/null || true
+        if [ -d "$BACKUP_DIR" ]; then
+            info "Backed up original Gemini project dir → $BACKUP_DIR"
+        fi
+        if [ -d "$GEMINI_PROJECT_DIR/chats" ] && \
+           compgen -G "$GEMINI_PROJECT_DIR/chats/session-*.jsonl" > /dev/null; then
+            cp -n "$GEMINI_PROJECT_DIR/chats/session-"*.jsonl context/chats/ 2>/dev/null || true
+            info "Migrated Gemini chats into context/chats/"
+        fi
+        rm -rf "$GEMINI_PROJECT_DIR"
+        ln -s "$EXPECTED_LINK_TARGET" "$GEMINI_PROJECT_DIR"
+        info "Replaced directory with Gemini project symlink → context/"
+    else
+        ln -s "$EXPECTED_LINK_TARGET" "$GEMINI_PROJECT_DIR"
+        info "Created Gemini project symlink → context/"
+    fi
+
+    # Ensure context/chats/ exists so SessionStore picks up Gemini sessions
+    # from day one (Qwen's setup creates this too — idempotent).
+    mkdir -p context/chats
+
+    echo ""
+else
+    info "Skipping Gemini CLI setup (--without-gemini)"
+    echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3d: Wire AGENTS.md as the shared project-instructions file
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENTS.md lives inside context/ (the private data repo).  Claude Code reads
 # CLAUDE.md, Qwen Code reads QWEN.md — both at the project root, both

@@ -357,65 +357,90 @@ def _gemini_project_label(project_dir: str | None = None) -> str | None:
     return label if isinstance(label, str) else None
 
 
+def _gemini_chats_dir(project_dir: str) -> Path:
+    """Where Gemini JSONLs live for *project_dir*.
+
+    install.sh symlinks ``~/.gemini/tmp/<label>`` → ``<project_dir>/context``
+    (see ``install/setup-gemini-storage.sh``), so the Gemini CLI writes its
+    session files into the same ``context/chats/`` directory Qwen uses.
+    Same path resolution as :meth:`SessionStore._resolve_chats_dir`.
+    """
+    return Path(project_dir) / "context" / "chats"
+
+
 def _gemini_jsonl_candidates(session_id: str) -> list[Path]:
     """Return candidate JSONL paths for *session_id*.
 
-    Gemini's file name format is ``session-<short-iso>-<uuid-prefix>.jsonl``
-    where ``<uuid-prefix>`` is the first 8 chars of the session UUID.
-    The session id alone isn't enough to construct a deterministic path,
-    so we glob every project's chats directory looking for a matching
-    file.  This is O(projects × files) but both numbers are tiny in
-    practice (single-digit projects, low double-digit chats each).
-
-    Returns a list (possibly empty) of existing JSONL paths whose name
-    contains the session-id's first 8 chars.  Caller is_file()-checks
-    each as usual.
+    Gemini's file name is ``session-<short-iso>-<uuid-prefix>.jsonl`` where
+    ``<uuid-prefix>`` is the first 8 chars of the session UUID, so the full
+    id alone isn't enough to construct a deterministic path — we glob by
+    prefix instead.  Scans both the live ``context/chats/`` (where the CLI
+    writes now, via the symlink) and the legacy ``~/.gemini/tmp/<label>/chats/``
+    layout so pre-migration sessions stay reachable on hosts where the
+    symlink hasn't been set up yet.
     """
     short = session_id[:8]
     if not short:
         return []
-    tmp_root = _gemini_home() / "tmp"
-    if not tmp_root.is_dir():
-        return []
     out: list[Path] = []
-    # Walk every project's chats/ subdir.  Defensive try/except — a
-    # corrupted or permission-denied subdir shouldn't blow up the resume
-    # sniffer for the whole UI.
+    # Live location: context/chats/.  Project dir comes from ManagerConfig,
+    # which we don't have here — fall back to the default project dir, since
+    # the JSONLs are project-scoped and there's only one ``context/`` per
+    # install.
     try:
-        for project_dir in tmp_root.iterdir():
-            chats_dir = project_dir / "chats"
-            if not chats_dir.is_dir():
-                continue
-            try:
-                for f in chats_dir.glob(f"*-{short}.jsonl"):
-                    if f.is_file():
-                        out.append(f)
-            except OSError:
-                continue
-    except OSError:
-        return []
+        from manager.config import ManagerConfig
+        project_dir = ManagerConfig.load().project_dir
+    except Exception:
+        project_dir = str(Path(__file__).resolve().parent.parent.parent)
+    chats_dir = _gemini_chats_dir(project_dir)
+    if chats_dir.is_dir():
+        try:
+            out.extend(
+                f for f in chats_dir.glob(f"session-*-{short}.jsonl") if f.is_file()
+            )
+        except OSError:
+            pass
+    # Legacy location: ~/.gemini/tmp/<label>/chats/.  Only relevant on hosts
+    # that haven't run install/setup-gemini-storage.sh yet; once the symlink
+    # is in place the chats_dir resolves to the same path via two routes.
+    tmp_root = _gemini_home() / "tmp"
+    if tmp_root.is_dir():
+        try:
+            for label_dir in tmp_root.iterdir():
+                legacy_chats = label_dir / "chats"
+                # Skip the symlinked label — we already scanned that path above.
+                try:
+                    if legacy_chats.resolve() == chats_dir.resolve():
+                        continue
+                except OSError:
+                    pass
+                if not legacy_chats.is_dir():
+                    continue
+                try:
+                    out.extend(
+                        f for f in legacy_chats.glob(f"session-*-{short}.jsonl")
+                        if f.is_file()
+                    )
+                except OSError:
+                    continue
+        except OSError:
+            pass
     return out
 
 
 def _gemini_discover_sessions(project_dir: str):
     """Yield ``(session_id, jsonl_path)`` for Gemini sessions in *project_dir*.
 
-    Gemini's storage is global (``~/.gemini/tmp/<label>/chats/``) but each
-    label corresponds to a specific cwd via ``projects.json``.  We resolve
-    the label for *project_dir* and only walk that one chats directory,
-    so the store stays scoped to the project the user is actually viewing
-    (tests with isolated cwds get an empty result instead of leaking the
-    developer's real Gemini history).
+    Scans the project's ``context/chats/`` directory for the
+    ``session-<iso>-<uuid-prefix>.jsonl`` naming pattern the Gemini CLI
+    uses (Qwen's JSONLs in the same directory are ``<full-uuid>.jsonl``
+    and don't match the glob, so the two harnesses coexist cleanly).
 
     The full session id is NOT in the file name (only the first 8 chars
-    are), so we peek at the header line to recover it.  Falls back to
-    skipping a file with a malformed header rather than crashing.
+    are), so we peek at the header line to recover it.  Skips files with
+    malformed headers rather than crashing.
     """
-    label = _gemini_project_label(project_dir)
-    if label is None:
-        # No record of this cwd in projects.json → no Gemini sessions for it.
-        return
-    chats_dir = _gemini_home() / "tmp" / label / "chats"
+    chats_dir = _gemini_chats_dir(project_dir)
     if not chats_dir.is_dir():
         return
     try:

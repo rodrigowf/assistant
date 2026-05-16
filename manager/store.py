@@ -136,34 +136,14 @@ class SessionStore:
         sessions: list[SessionInfo] = []
         seen_ids: set[str] = set()
 
-        # Scan Claude sessions (root level)
-        if self._sessions_dir.is_dir():
-            for jsonl_path in self._sessions_dir.glob("*.jsonl"):
-                if ".sync-conflict-" in jsonl_path.name:
-                    continue
-                session_id = jsonl_path.stem
-                seen_ids.add(session_id)
-                info = self._scan_file(jsonl_path, session_id, titles)
-                if info is not None:
-                    sessions.append(info)
-
-        # Scan Qwen sessions (chats/ subdir)
-        if self._chats_dir.is_dir():
-            for jsonl_path in self._chats_dir.glob("*.jsonl"):
-                if ".sync-conflict-" in jsonl_path.name:
-                    continue
-                session_id = jsonl_path.stem
-                seen_ids.add(session_id)
-                info = self._scan_file(jsonl_path, session_id, titles)
-                if info is not None:
-                    sessions.append(info)
-
-        # Scan harness-external sessions (Gemini lives under ~/.gemini/).
-        # The discoverer yields (session_id, path); the file name doesn't
-        # carry the full id (Gemini puts only its first 8 chars in there),
-        # so we trust the discoverer's id rather than ``path.stem``.
+        # First pass: harness discoverers.  Run before the default scans so
+        # discoverer-claimed files (Gemini's ``session-<iso>-<prefix>.jsonl``
+        # in context/chats/) are bound to their real session id from the
+        # header line, NOT the misleading ``path.stem``.  The default scan
+        # below then skips any file the discoverer already claimed.
         from .registry import get_registry
         fresh_external: dict[str, Path] = {}
+        claimed_paths: set[Path] = set()
         for spec in get_registry().all().values():
             if spec.session_discoverer is None:
                 continue
@@ -173,6 +153,7 @@ class SessionStore:
                         continue
                     seen_ids.add(sid)
                     fresh_external[sid] = jsonl_path
+                    claimed_paths.add(jsonl_path)
                     info = self._scan_file(jsonl_path, sid, titles)
                     if info is not None:
                         sessions.append(info)
@@ -181,6 +162,42 @@ class SessionStore:
                 continue
         # Replace the cache wholesale so deleted external files drop out.
         self._external_paths = fresh_external
+
+        # Scan Claude sessions (root level)
+        if self._sessions_dir.is_dir():
+            for jsonl_path in self._sessions_dir.glob("*.jsonl"):
+                if ".sync-conflict-" in jsonl_path.name:
+                    continue
+                if jsonl_path in claimed_paths:
+                    continue
+                session_id = jsonl_path.stem
+                seen_ids.add(session_id)
+                info = self._scan_file(jsonl_path, session_id, titles)
+                if info is not None:
+                    sessions.append(info)
+
+        # Scan Qwen sessions (chats/ subdir).  Gemini's chats live here too
+        # (via the install.sh symlink to ~/.gemini/tmp/<label>) but were
+        # already picked up by the discoverer above with their canonical
+        # session id; claimed_paths plus the ``session-*`` filename skip
+        # keep us from double-counting them.  The latter is a belt to
+        # claimed_paths' suspenders: a header-less Gemini file the
+        # discoverer rejects would otherwise leak into this scan with its
+        # path stem (``session-<iso>-<prefix>``) as a bogus session id.
+        if self._chats_dir.is_dir():
+            for jsonl_path in self._chats_dir.glob("*.jsonl"):
+                if ".sync-conflict-" in jsonl_path.name:
+                    continue
+                if jsonl_path in claimed_paths:
+                    continue
+                if jsonl_path.name.startswith("session-"):
+                    # Discoverer-owned naming convention — skip.
+                    continue
+                session_id = jsonl_path.stem
+                seen_ids.add(session_id)
+                info = self._scan_file(jsonl_path, session_id, titles)
+                if info is not None:
+                    sessions.append(info)
 
         # Drop cache entries for files that no longer exist
         for stale_id in set(self._info_cache) - seen_ids:
