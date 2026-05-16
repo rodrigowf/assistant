@@ -47,9 +47,11 @@ def _parse_timestamp(ts: str) -> datetime:
 class SessionStore:
     """Reads session storage to list past sessions from disk.
 
-    Sessions are stored as JSONL files in two locations:
+    Sessions are stored as JSONL files in:
     - ``context/<session-id>.jsonl`` (Claude)
     - ``context/chats/<session-id>.jsonl`` (Qwen)
+    - Anywhere a registered harness's ``session_discoverer`` reports
+      (e.g. Gemini at ``~/.gemini/tmp/<label>/chats/session-*.jsonl``).
 
     Each line is a JSON object with a ``type`` field. Provider adapters
     translate native formats into normalized messages.
@@ -63,6 +65,13 @@ class SessionStore:
         self._info_cache: dict[str, tuple[int, int, SessionInfo]] = {}
         # Provider cache: session_id → ProviderAdapter
         self._provider_cache: dict[str, ProviderAdapter] = {}
+        # External-JSONL lookup populated by every list_sessions() pass.
+        # Harnesses whose JSONL lives outside context/ (Gemini) register
+        # a ``session_discoverer`` on their HarnessSpec; the store walks
+        # those on listing and remembers each session_id → path mapping
+        # so per-session methods (get_messages_paginated, rename, etc.)
+        # can locate the file without re-walking the whole external tree.
+        self._external_paths: dict[str, Path] = {}
         # Ensure all adapters are registered (lazy import to avoid circular deps)
         ensure_all_registered()
 
@@ -79,6 +88,36 @@ class SessionStore:
         if project_context.is_dir():
             return project_context / "chats"
         return get_chats_dir()
+
+    def _locate_jsonl(self, session_id: str) -> Path | None:
+        """Find the JSONL for *session_id* across all known storage layouts.
+
+        Checks (in order) the Claude root, the Qwen ``chats/`` subdir, the
+        cached external-path map populated by :meth:`list_sessions`, and
+        finally every harness's :attr:`HarnessSpec.jsonl_path_resolver`
+        (so a fresh session id we've never listed still resolves).
+        """
+        candidate = self._sessions_dir / f"{session_id}.jsonl"
+        if candidate.is_file():
+            return candidate
+        candidate = self._chats_dir / f"{session_id}.jsonl"
+        if candidate.is_file():
+            return candidate
+        cached = self._external_paths.get(session_id)
+        if cached is not None and cached.is_file():
+            return cached
+        # Last resort: ask each harness where its JSONL would live.
+        from .registry import get_registry
+        for spec in get_registry().all().values():
+            try:
+                for path in spec.jsonl_path_resolver(session_id):
+                    if path.is_file():
+                        self._external_paths[session_id] = path
+                        return path
+            except Exception:
+                # A buggy resolver shouldn't blow up the whole lookup.
+                continue
+        return None
 
     # ------------------------------------------------------------------
     # Public API
@@ -119,6 +158,30 @@ class SessionStore:
                 if info is not None:
                     sessions.append(info)
 
+        # Scan harness-external sessions (Gemini lives under ~/.gemini/).
+        # The discoverer yields (session_id, path); the file name doesn't
+        # carry the full id (Gemini puts only its first 8 chars in there),
+        # so we trust the discoverer's id rather than ``path.stem``.
+        from .registry import get_registry
+        fresh_external: dict[str, Path] = {}
+        for spec in get_registry().all().values():
+            if spec.session_discoverer is None:
+                continue
+            try:
+                for sid, jsonl_path in spec.session_discoverer(str(self._project_dir)):
+                    if sid in seen_ids:
+                        continue
+                    seen_ids.add(sid)
+                    fresh_external[sid] = jsonl_path
+                    info = self._scan_file(jsonl_path, sid, titles)
+                    if info is not None:
+                        sessions.append(info)
+            except Exception:
+                # A buggy discoverer shouldn't blank the whole session list.
+                continue
+        # Replace the cache wholesale so deleted external files drop out.
+        self._external_paths = fresh_external
+
         # Drop cache entries for files that no longer exist
         for stale_id in set(self._info_cache) - seen_ids:
             del self._info_cache[stale_id]
@@ -128,11 +191,8 @@ class SessionStore:
 
     def get_session(self, session_id: str) -> SessionDetail | None:
         """Get full metadata for a specific session."""
-        # Try Claude location first, then Qwen
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        jsonl_path = self._locate_jsonl(session_id)
+        if jsonl_path is None:
             return None
 
         adapter = self._resolve_adapter(jsonl_path)
@@ -186,11 +246,8 @@ class SessionStore:
         before_index: int | None = None,
     ) -> tuple[list[MessagePreview], int, bool]:
         """Get paginated messages from a session."""
-        # Try Claude location first, then Qwen
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        jsonl_path = self._locate_jsonl(session_id)
+        if jsonl_path is None:
             return [], 0, False
 
         adapter = self._resolve_adapter(jsonl_path)
@@ -222,20 +279,14 @@ class SessionStore:
 
     def get_session_info(self, session_id: str) -> SessionInfo | None:
         """Get lightweight summary info for a single session."""
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        jsonl_path = self._locate_jsonl(session_id)
+        if jsonl_path is None:
             return None
         return self._parse_session_info(jsonl_path, session_id)
 
     def rename_session(self, session_id: str, title: str) -> bool:
         """Store a custom title for a session. Returns True if the session exists."""
-        # Check both locations
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        if self._locate_jsonl(session_id) is None:
             return False
         titles = self._load_titles()
         titles[session_id] = title.strip()
@@ -244,10 +295,8 @@ class SessionStore:
 
     def delete_session(self, session_id: str) -> bool:
         """Soft-delete a session: move its JSONL into context/trash/."""
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        jsonl_path = self._locate_jsonl(session_id)
+        if jsonl_path is None:
             return False
 
         trash_dir = get_trash_dir()
@@ -274,10 +323,8 @@ class SessionStore:
         The copy lives in the same directory as the original (Claude root
         or Qwen chats/), so provider detection works automatically.
         """
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        jsonl_path = self._locate_jsonl(session_id)
+        if jsonl_path is None:
             return None
 
         new_id = str(_uuid.uuid4())
@@ -316,10 +363,8 @@ class SessionStore:
         Returns True on success, False if the session doesn't exist or
         ``drop_last_n`` is negative or larger than the visible-message count.
         """
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
-            jsonl_path = self._chats_dir / f"{session_id}.jsonl"
-        if not jsonl_path.is_file():
+        jsonl_path = self._locate_jsonl(session_id)
+        if jsonl_path is None:
             return False
         if drop_last_n < 0:
             return False

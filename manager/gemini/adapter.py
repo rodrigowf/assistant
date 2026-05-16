@@ -397,6 +397,61 @@ def _gemini_jsonl_candidates(session_id: str) -> list[Path]:
     return out
 
 
+def _gemini_discover_sessions(project_dir: str):
+    """Yield ``(session_id, jsonl_path)`` for Gemini sessions in *project_dir*.
+
+    Gemini's storage is global (``~/.gemini/tmp/<label>/chats/``) but each
+    label corresponds to a specific cwd via ``projects.json``.  We resolve
+    the label for *project_dir* and only walk that one chats directory,
+    so the store stays scoped to the project the user is actually viewing
+    (tests with isolated cwds get an empty result instead of leaking the
+    developer's real Gemini history).
+
+    The full session id is NOT in the file name (only the first 8 chars
+    are), so we peek at the header line to recover it.  Falls back to
+    skipping a file with a malformed header rather than crashing.
+    """
+    label = _gemini_project_label(project_dir)
+    if label is None:
+        # No record of this cwd in projects.json → no Gemini sessions for it.
+        return
+    chats_dir = _gemini_home() / "tmp" / label / "chats"
+    if not chats_dir.is_dir():
+        return
+    try:
+        jsonl_files = list(chats_dir.glob("session-*.jsonl"))
+    except OSError:
+        return
+    for jsonl_path in jsonl_files:
+        if not jsonl_path.is_file():
+            continue
+        session_id = _read_gemini_session_id(jsonl_path)
+        if session_id:
+            yield session_id, jsonl_path
+
+
+def _read_gemini_session_id(jsonl_path: Path) -> str | None:
+    """Read the header line of a Gemini JSONL and return its ``sessionId``."""
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    return None
+                if isinstance(obj, dict):
+                    sid = obj.get("sessionId")
+                    if isinstance(sid, str) and sid:
+                        return sid
+                return None
+    except OSError:
+        return None
+    return None
+
+
 register_harness(HarnessSpec(
     name="gemini",
     label="Gemini CLI",
@@ -409,6 +464,7 @@ register_harness(HarnessSpec(
     kill_helper_loader=_load_gemini_kill_helper,
     ssh_control_path_prefix="gemini",
     jsonl_path_resolver=_gemini_jsonl_candidates,
+    session_discoverer=_gemini_discover_sessions,
     requirements_file=None,  # external Node CLI; no Python deps
     npm_package="@google/gemini-cli",
     cli_binary="gemini",

@@ -33,7 +33,7 @@ Two concerns this registry deliberately does NOT own:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,6 +49,12 @@ SessionClassLoader = Callable[[], type["BaseSessionManager"]]
 AdapterLoader = Callable[[], "ProviderAdapter"]
 KillHelperLoader = Callable[[], Callable[[int], bool]]
 JsonlPathResolver = Callable[[str], list[Path]]
+# Yields (session_id, jsonl_path) for every JSONL this harness has on disk
+# for the given project_dir.  Lets SessionStore enumerate sessions that
+# live outside the project's context/ folder (notably Gemini, which writes
+# under ~/.gemini/tmp/<label>/chats/ — globally, so the discoverer must
+# filter by project to keep the listing project-scoped).
+SessionDiscoverer = Callable[[str], "Iterable[tuple[str, Path]]"]
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,13 @@ class HarnessSpec:
         harness's JSONL would live (most return one, but a harness with
         both legacy and current layouts returns both — the caller
         is_file()-checks each).
+    session_discoverer
+        Optional.  Yields ``(session_id, jsonl_path)`` for every JSONL
+        this harness has on disk.  Used by :class:`SessionStore` to
+        enumerate sessions stored *outside* the project's ``context/``
+        folder (Gemini writes under ``~/.gemini/tmp/<label>/chats/``;
+        Claude and Qwen both live inside ``context/`` and don't need
+        this hook — the store scans those directories directly).
     requirements_file
         Pip requirements file specific to this harness (used by
         ``install.sh``'s registry-driven loop).  None for harnesses that
@@ -116,6 +129,7 @@ class HarnessSpec:
     kill_helper_loader: KillHelperLoader
     ssh_control_path_prefix: str
     jsonl_path_resolver: JsonlPathResolver
+    session_discoverer: SessionDiscoverer | None = None
     requirements_file: str | None = None
     npm_package: str | None = None
     cli_binary: str | None = None
