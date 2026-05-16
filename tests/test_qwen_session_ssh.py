@@ -14,7 +14,7 @@ we want to pin here:
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -161,9 +161,19 @@ async def test_start_raises_fast_when_ssh_host_unreachable():
 
 @pytest.mark.asyncio
 async def test_start_proceeds_when_ssh_host_reachable():
-    """Reachable host → start() completes normally, session goes IDLE."""
+    """Reachable host → start() completes normally, session goes IDLE.
+
+    We also mock ``resolve_remote_cli_path`` to keep this test hermetic:
+    the prewarm path (added to amortize first-prompt latency) would
+    otherwise spawn a real ``ssh`` subprocess against the dummy host
+    and add a couple of seconds of timeout to the test.
+    """
     sm = QwenSessionManager(config=_ssh_cfg())
-    with patch("manager.qwen.session.probe_host_reachable", return_value=True):
+    with patch("manager.qwen.session.probe_host_reachable", return_value=True), \
+         patch(
+            "manager.qwen.session.resolve_remote_cli_path",
+            return_value="/r/qwen",
+         ):
         await sm.start()
     try:
         from manager.types import SessionStatus
@@ -174,9 +184,21 @@ async def test_start_proceeds_when_ssh_host_reachable():
 
 @pytest.mark.asyncio
 async def test_local_session_skips_probe():
-    """No ssh_host → no probe call, no network dependency at start time."""
+    """No ssh_host → no probe call, no network dependency at start time.
+
+    Also patches ``create_subprocess_exec`` because the local prewarm
+    path spawns ``qwen --version`` to warm the OS file cache; we don't
+    want that to actually run during the test.
+    """
     sm = QwenSessionManager(config=_local_cfg())
-    with patch("manager.qwen.session.probe_host_reachable") as mock_probe:
+    fake_proc = MagicMock()
+    fake_proc.wait = AsyncMock(return_value=0)
+    fake_proc.kill = MagicMock()
+    with patch("manager.qwen.session.probe_host_reachable") as mock_probe, \
+         patch(
+            "manager.qwen.session.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=fake_proc),
+         ):
         await sm.start()
     mock_probe.assert_not_called()
     await sm.stop()

@@ -10,6 +10,17 @@ and emits the same stream-json shape on stdout.  Argv is the simplest
 path — ``asyncio.create_subprocess_exec`` doesn't shell-interpret args,
 so even prompts with quotes/newlines survive.
 
+SSH remote execution
+--------------------
+
+When ``ManagerConfig.ssh_host`` is set the CLI runs on the remote host,
+wrapped by an ``ssh ...`` argv produced via :mod:`manager._ssh` — same
+pattern as :class:`manager.qwen.session.QwenSessionManager`.  The
+remote argv shape Gemini needs (``gemini --prompt 'text' --skip-trust
+...``) is identical to Qwen's in structure (we build the whole argv
+ourselves, no ``"$@"`` forwarding), so :func:`build_remote_argv` does
+the right thing without provider-specific glue.
+
 Trust prompt
 ------------
 
@@ -49,6 +60,14 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from .._ssh import (
+    RemoteCommand,
+    RemoteHostUnreachableError,
+    SshTarget,
+    build_remote_argv,
+    probe_host_reachable,
+    resolve_remote_cli_path,
+)
 from ..base_session import BaseSessionManager, TurnAbandoned
 from ..config import ManagerConfig
 from ..types import (
@@ -129,8 +148,26 @@ class GeminiSessionManager(BaseSessionManager):
         on _stop_requested, reap on shutdown.  If no session id was passed
         in (fresh session), we generate one here so the very first send()
         can pin it via ``--session-id``.
+
+        Remote (SSH) sessions get an ICMP reachability pre-probe before
+        IDLE so a hibernated/offline target fails fast at start() instead
+        of hanging on the first turn's SSH TCP timeout.  Same rationale
+        as Qwen's lifecycle and Claude's ``_assert_ssh_reachable``.
+
+        We also pre-warm two slow things before signaling connect_done,
+        so the cost lands at tab-open rather than on the user's first
+        prompt.  See :meth:`_prewarm` for the rationale.
         """
         try:
+            if self._config.ssh_host:
+                reachable = await asyncio.get_running_loop().run_in_executor(
+                    None, probe_host_reachable, self._config.ssh_host, 2.0,
+                )
+                if not reachable:
+                    raise RemoteHostUnreachableError(
+                        f"SSH host {self._config.ssh_host!r} did not reply to "
+                        "ICMP ping; refusing to open SSH connection."
+                    )
             if self._resume_id:
                 self._provider_session_id = self._resume_id
             else:
@@ -139,6 +176,12 @@ class GeminiSessionManager(BaseSessionManager):
                 # invent its own id, and we'd lose track of where the
                 # JSONL landed until we sniffed the stream-json init event.
                 self._provider_session_id = str(uuid.uuid4())
+            # Move the slow first-prompt costs (remote `which` probe,
+            # local Node startup) here so start() pays them once instead
+            # of the user staring at an unresponsive prompt.  Failures
+            # are logged but NOT raised — a flaky warmup shouldn't block
+            # the session from opening.
+            await self._prewarm()
             self._status = SessionStatus.IDLE
         except BaseException as e:
             self._connect_error = e
@@ -220,8 +263,14 @@ class GeminiSessionManager(BaseSessionManager):
 
         self._status = SessionStatus.STREAMING
 
-        argv = self._build_argv(prompt)
+        local_argv = self._build_argv(prompt)
         env = self._build_env()
+
+        # SSH or local?  Mirrors Qwen's _maybe_wrap_with_ssh contract:
+        # returns the argv that will actually be exec'd plus the local
+        # cwd (project_dir for local sessions, None for SSH where the
+        # remote `cd` is embedded in the SSH command).
+        argv, cwd = self._maybe_wrap_with_ssh(local_argv)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -229,14 +278,18 @@ class GeminiSessionManager(BaseSessionManager):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=self._config.project_dir,
+                cwd=cwd,
                 env=env,
             )
         except FileNotFoundError as e:
             self._status = SessionStatus.IDLE
+            # argv[0] is either the local gemini path or "ssh".  Either
+            # way the missing binary points to a misconfiguration.
             raise RuntimeError(
-                f"Executable not found ({argv[0]!r}). Set GEMINI_CLI_PATH or "
-                "install gemini via `npm install -g @google/gemini-cli`."
+                f"Executable not found ({argv[0]!r}). For local sessions, "
+                "set GEMINI_CLI_PATH or install gemini via `npm install -g "
+                "@google/gemini-cli`.  For SSH sessions, make sure the "
+                "local `ssh` client is installed."
             ) from e
 
         self._proc = proc
@@ -587,3 +640,167 @@ class GeminiSessionManager(BaseSessionManager):
         # confused if the wrapper itself was launched from inside one.
         env.pop("CLAUDECODE", None)
         return env
+
+    def _maybe_wrap_with_ssh(
+        self, local_argv: list[str],
+    ) -> tuple[list[str], str | None]:
+        """Return ``(argv, cwd)`` to feed ``asyncio.create_subprocess_exec``.
+
+        Local sessions: returns *local_argv* and the configured
+        ``project_dir`` as cwd — no SSH involvement.
+
+        SSH sessions: swaps ``local_argv[0]`` (the local gemini path)
+        for the resolved remote path and wraps everything in an
+        ``ssh ... "cd '<remote_dir>' && exec '<remote_gemini>' ..."``
+        argv.  cwd is irrelevant in that case (the remote cwd is set
+        inside the SSH command), so we return ``None`` and let
+        ``create_subprocess_exec`` inherit the parent's cwd.
+
+        Mirror of :meth:`manager.qwen.session.QwenSessionManager._maybe_wrap_with_ssh`
+        — the two providers share the same argv shape (full argv built
+        by the wrapper, no ``"$@"`` forwarding), so
+        :func:`build_remote_argv` works for both.  The Claude path is
+        different because the SDK builds its own argv, hence the
+        wrapper-script detour in :mod:`manager._ssh`.
+
+        Gemini spawns a fresh subprocess per turn, which means each
+        turn opens an SSH connection.  ``ControlMaster=auto`` +
+        ``ControlPersist=60s`` (set in :func:`_ssh.build_ssh_argv`)
+        keep a single TCP connection alive across a burst — without
+        that we'd pay the SSH handshake on every turn.
+        """
+        if not self._config.ssh_host:
+            return local_argv, self._config.project_dir
+
+        target = SshTarget(
+            host=self._config.ssh_host,
+            user=self._config.ssh_user,
+            key=self._config.ssh_key,
+            # Distinct ControlMaster socket per provider so two providers
+            # on the same host don't share lifetimes — one's
+            # ControlPersist timeout would otherwise tear down the other.
+            control_path_prefix="gemini",
+        )
+        remote_gemini = resolve_remote_cli_path(
+            "gemini",
+            target,
+            extra_search_paths=[
+                "~/.local/bin/gemini",
+                "/usr/local/bin/gemini",
+                "/usr/bin/gemini",
+            ],
+        )
+        remote_cmd = RemoteCommand(
+            project_dir=self._config.project_dir,
+            remote_cli=remote_gemini,
+            # No env forwarding: the remote host has its own .env (e.g.
+            # GEMINI_API_KEY) set up at install time.  Forwarding the
+            # local env over SSH would either leak local credentials
+            # (visible in `ps` on the remote) or miss vars the remote
+            # setup expects.  Same rationale as Qwen.
+        )
+        # ``local_argv[0]`` is the LOCAL gemini path; the remote path is
+        # already embedded inside ``remote_cmd``.  Drop it and pass the
+        # rest of the flags as positional args — ``build_remote_argv``
+        # shell-quotes each one so prompts with spaces/quotes/newlines
+        # survive across SSH intact.
+        argv = build_remote_argv(
+            target=target,
+            remote_cmd=remote_cmd,
+            remote_args=local_argv[1:],
+        )
+        return argv, None
+
+    async def _prewarm(self) -> None:
+        """Pre-pay the slow first-prompt costs at session start.
+
+        Without this, the FIRST send() on a fresh session blocks the
+        user for several seconds while we either:
+
+        1. **Remote sessions**: open SSH, run ``which gemini`` (2-10s
+           for the first call, cached for subsequent calls — see
+           :func:`manager._ssh.resolve_remote_cli_path`).
+        2. **Local sessions**: cold-start the Node runtime that backs
+           the ``gemini`` CLI.  On a fresh boot the Node binary + the
+           CLI's JS modules aren't in the OS page cache, so the first
+           invocation pays a multi-second I/O hit; later invocations
+           are warm.
+
+        Running both probes here moves that latency off the user's
+        first prompt and onto the session-open step (which already
+        shows a spinner / connecting indicator).
+
+        Best-effort — exceptions are logged and swallowed.  If the
+        warmup itself fails, the user will simply pay the cost on the
+        real first turn instead, which is no worse than today.
+
+        Mirror of :meth:`manager.qwen.session.QwenSessionManager._prewarm`.
+        """
+        if self._config.ssh_host:
+            try:
+                target = SshTarget(
+                    host=self._config.ssh_host,
+                    user=self._config.ssh_user,
+                    key=self._config.ssh_key,
+                    control_path_prefix="gemini",
+                )
+                # resolve_remote_cli_path is synchronous (runs `ssh ...
+                # which gemini` via subprocess.run with a 10s timeout) —
+                # offload to a worker thread so we don't block the loop.
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: resolve_remote_cli_path(
+                        "gemini",
+                        target,
+                        extra_search_paths=[
+                            "~/.local/bin/gemini",
+                            "/usr/local/bin/gemini",
+                            "/usr/bin/gemini",
+                        ],
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Gemini remote CLI path warmup failed for %s; first turn "
+                    "will pay the resolution cost instead.",
+                    self._local_id,
+                )
+            return
+
+        # Local-only Node-runtime warmup.  Spawn `gemini --version` with
+        # a short timeout — its only purpose is to fault in the Node
+        # binary and the CLI's JS bundle so the FS page cache is hot
+        # before the user's first real turn.  We don't care about the
+        # exit code or output.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _gemini_executable(), "--version",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                # Warmup overran our budget — kill and move on.  The
+                # real turn might still be slow but at least we won't
+                # delay session-open further.
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                logger.warning(
+                    "Gemini local CLI warmup exceeded 10s for %s; skipping.",
+                    self._local_id,
+                )
+        except FileNotFoundError:
+            # Missing CLI surfaces on the real first turn with a clearer
+            # error message; no point duplicating it here.
+            pass
+        except Exception:
+            logger.exception(
+                "Gemini local CLI warmup failed for %s; first turn will "
+                "pay the cold-start cost instead.",
+                self._local_id,
+            )

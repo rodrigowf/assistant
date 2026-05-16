@@ -123,6 +123,10 @@ class QwenSessionManager(BaseSessionManager):
         IDLE so a hibernated/offline target fails fast at start() instead
         of hanging on the first turn's SSH TCP timeout.  Mirrors Claude's
         ``_assert_ssh_reachable`` behavior; same rationale.
+
+        We also pre-warm two slow things before signaling connect_done,
+        so the cost lands at tab-open rather than on the user's first
+        prompt.  See :meth:`_prewarm` for the rationale.
         """
         try:
             if self._config.ssh_host:
@@ -136,6 +140,12 @@ class QwenSessionManager(BaseSessionManager):
                     )
             if self._resume_id:
                 self._provider_session_id = self._resume_id
+            # Move the slow first-prompt costs (remote `which` probe,
+            # local Node startup) here so start() pays them once instead
+            # of the user staring at an unresponsive prompt.  Failures
+            # are logged but NOT raised — a flaky warmup shouldn't block
+            # the session from opening.
+            await self._prewarm()
             self._status = SessionStatus.IDLE
         except BaseException as e:
             self._connect_error = e
@@ -148,6 +158,98 @@ class QwenSessionManager(BaseSessionManager):
         finally:
             await self._kill_proc()
             self._status = SessionStatus.DISCONNECTED
+
+    async def _prewarm(self) -> None:
+        """Pre-pay the slow first-prompt costs at session start.
+
+        Without this, the FIRST send() on a fresh session blocks the
+        user for several seconds while we either:
+
+        1. **Remote sessions**: open SSH, run ``which qwen`` (2-10s for
+           the first call, cached for subsequent calls — see
+           :func:`manager._ssh.resolve_remote_cli_path`).
+        2. **Local sessions**: cold-start the Node runtime that backs
+           the ``qwen`` CLI.  On a fresh boot the Node binary + the
+           CLI's JS modules aren't in the OS page cache, so the first
+           invocation pays a multi-second I/O hit; later invocations
+           are warm.
+
+        Running both probes here moves that latency off the user's
+        first prompt and onto the session-open step (which already
+        shows a spinner / connecting indicator).
+
+        Best-effort — exceptions are logged and swallowed.  If the
+        warmup itself fails, the user will simply pay the cost on the
+        real first turn instead, which is no worse than today.
+        """
+        if self._config.ssh_host:
+            try:
+                target = SshTarget(
+                    host=self._config.ssh_host,
+                    user=self._config.ssh_user,
+                    key=self._config.ssh_key,
+                    control_path_prefix="qwen",
+                )
+                # resolve_remote_cli_path is synchronous (runs `ssh ...
+                # which qwen` via subprocess.run with a 10s timeout) —
+                # offload to a worker thread so we don't block the loop.
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: resolve_remote_cli_path(
+                        "qwen",
+                        target,
+                        extra_search_paths=[
+                            "~/.local/bin/qwen",
+                            "/usr/local/bin/qwen",
+                            "/usr/bin/qwen",
+                        ],
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Qwen remote CLI path warmup failed for %s; first turn "
+                    "will pay the resolution cost instead.",
+                    self._local_id,
+                )
+            return
+
+        # Local-only Node-runtime warmup.  Spawn `qwen --version` with a
+        # short timeout — its only purpose is to fault in the Node
+        # binary and the CLI's JS bundle so the FS page cache is hot
+        # before the user's first real turn.  We don't care about the
+        # exit code or output.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _qwen_executable(), "--version",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                # Warmup overran our budget — kill and move on.  The
+                # real turn might still be slow but at least we won't
+                # delay session-open further.
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                logger.warning(
+                    "Qwen local CLI warmup exceeded 10s for %s; skipping.",
+                    self._local_id,
+                )
+        except FileNotFoundError:
+            # Missing CLI surfaces on the real first turn with a clearer
+            # error message; no point duplicating it here.
+            pass
+        except Exception:
+            logger.exception(
+                "Qwen local CLI warmup failed for %s; first turn will "
+                "pay the cold-start cost instead.",
+                self._local_id,
+            )
 
     async def _kill_proc(self) -> None:
         """Terminate any in-flight qwen subprocess.  Idempotent."""
