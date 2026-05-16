@@ -286,7 +286,7 @@ async def _handle_start(
         sm = pool.get(local_id)
         pool.subscribe(local_id, ws)
         from manager.context_windows import context_window_for
-        ctx_window = context_window_for(sm.provider_name(), getattr(sm._config, "model", None))
+        ctx_window = context_window_for(sm.provider_name, getattr(sm._config, "model", None))
         await ws.send_bytes(orjson.dumps({
             "type": "session_started",
             "session_id": local_id,
@@ -410,7 +410,7 @@ async def _handle_start(
     sm = pool.get(session_id)
     pool.subscribe(session_id, ws)
     from manager.context_windows import context_window_for
-    ctx_window = context_window_for(sm.provider_name(), getattr(sm._config, "model", None))
+    ctx_window = context_window_for(sm.provider_name, getattr(sm._config, "model", None))
     await ws.send_bytes(orjson.dumps({
         "type": "session_started",
         "session_id": session_id,
