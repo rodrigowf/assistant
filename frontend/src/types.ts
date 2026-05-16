@@ -66,6 +66,12 @@ export type ServerEvent =
       voice_connection_info?: VoiceConnectionInfoPayload;
       voice_connection_error?: string;
       voice_recording_enabled?: boolean;
+      /** Provider/model context window in tokens. Used by the compact-button %
+       * counter. May be omitted when the backend has no opinion — frontend
+       * falls back to a conservative default. */
+      context_window?: number | null;
+      /** Orchestrator-only — full model metadata including ``context_window``. */
+      model_info?: { context_window?: number | null; [key: string]: unknown };
     }
   | { type: "session_stopped" }
   | { type: "text_delta"; text: string }

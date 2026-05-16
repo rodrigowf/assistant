@@ -41,6 +41,7 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict."""
+        from manager.context_windows import context_window_for
         return {
             "provider": self.provider.value,
             "model_id": self.model_id,
@@ -49,6 +50,7 @@ class ModelInfo:
             "supports_vision": self.supports_vision,
             "supports_tools": self.supports_tools,
             "max_tokens": self.max_tokens,
+            "context_window": context_window_for(self.provider.value, self.model_id),
         }
 
 

@@ -15,8 +15,11 @@ import { getMessagesPaginated } from "../api/rest";
 // State
 // -------------------------------------------------------------------
 
-// Context window sizes (tokens) — used to compute usage percentage
-const CONTEXT_WINDOW = 200_000; // Claude models (conservative default)
+// Conservative default context window in tokens when the backend hasn't yet
+// told us this session's actual limit. Claude models cap out at 200K, so this
+// is the smallest "real" limit we'd encounter — better to under- than
+// over-report usage on the compact button.
+const DEFAULT_CONTEXT_WINDOW = 200_000;
 
 interface StallState {
   /** Seconds since the SDK last produced a message in the active turn. */
@@ -44,6 +47,9 @@ interface ChatState {
   turns: number;
   error: string | null;
   contextTokens: number; // latest input_tokens count
+  /** Provider/model-specific context window in tokens, set on session_started.
+   * ``null`` until the backend reports one — falls back to DEFAULT_CONTEXT_WINDOW. */
+  contextWindow: number | null;
   /** Set when the backend has reported a stall on the in-flight turn. */
   stall: StallState | null;
   /** Set when the SDK is awaiting a permission decision (modal is open). */
@@ -58,6 +64,7 @@ const INITIAL_STATE: ChatState = {
   turns: 0,
   error: null,
   contextTokens: 0,
+  contextWindow: null,
   stall: null,
   pendingPermission: null,
 };
@@ -70,7 +77,7 @@ type Action =
   | { type: "RESET" }
   | { type: "LOAD_HISTORY"; messages: MessagePreview[] }
   | { type: "PREPEND_HISTORY"; messages: MessagePreview[] }
-  | { type: "SESSION_STARTED"; sessionId: string }
+  | { type: "SESSION_STARTED"; sessionId: string; contextWindow?: number | null }
   | { type: "USER_MESSAGE"; text: string }
   | { type: "TEXT_DELTA"; text: string }
   | { type: "TEXT_COMPLETE"; text: string }
@@ -183,7 +190,14 @@ function reducer(state: ChatState, action: Action): ChatState {
       return { ...state, messages: [...convertPreviews(action.messages), ...state.messages] };
 
     case "SESSION_STARTED":
-      return { ...state, sessionId: action.sessionId, status: "idle", error: null };
+      return {
+        ...state,
+        sessionId: action.sessionId,
+        status: "idle",
+        error: null,
+        contextWindow:
+          action.contextWindow !== undefined ? action.contextWindow : state.contextWindow,
+      };
 
     case "USER_MESSAGE":
       return {
@@ -562,13 +576,24 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
 
   const handleEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
-      case "session_started":
-        dispatch({ type: "SESSION_STARTED", sessionId: event.session_id });
+      case "session_started": {
+        // Chat sessions carry the window directly; orchestrator nests it under
+        // model_info. Either may be null/undefined — the reducer keeps the
+        // previous value (or null → falls back to DEFAULT_CONTEXT_WINDOW).
+        const ctxWindow =
+          event.context_window ??
+          (event.model_info?.context_window as number | null | undefined);
+        dispatch({
+          type: "SESSION_STARTED",
+          sessionId: event.session_id,
+          contextWindow: ctxWindow,
+        });
         // Voice mode: send session.update to OpenAI via voice bridge
         if (event.voice_session_update) {
           onVoiceCommandRef.current?.(event.voice_session_update as Record<string, unknown>);
         }
         break;
+      }
       case "text_delta":
         dispatch({ type: "TEXT_DELTA", text: event.text });
         break;
@@ -913,7 +938,10 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     [wsSend]
   );
 
-  const contextUsage = Math.min(100, Math.round((state.contextTokens / CONTEXT_WINDOW) * 100));
+  const effectiveWindow = state.contextWindow && state.contextWindow > 0
+    ? state.contextWindow
+    : DEFAULT_CONTEXT_WINDOW;
+  const contextUsage = Math.min(100, Math.round((state.contextTokens / effectiveWindow) * 100));
 
   return {
     messages: state.messages,
