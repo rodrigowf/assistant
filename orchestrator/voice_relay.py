@@ -279,8 +279,24 @@ class VoiceRelay:
 
         # Push our session config upstream.
         self._record_sent(session_config)
-        instr_size = len(session_config.get("session", {}).get("instructions", "") or "")
-        tools_count = len(session_config.get("session", {}).get("tools", []) or [])
+        # The session-config payload shape varies by provider — OpenAI / Qwen
+        # nest under "session", Gemini Live nests under "setup".  Probe both
+        # so the log is informative regardless.
+        sess = session_config.get("session") or session_config.get("setup") or {}
+        instr_obj = sess.get("instructions") or sess.get("systemInstruction")
+        if isinstance(instr_obj, str):
+            instr_size = len(instr_obj)
+        elif isinstance(instr_obj, dict):
+            # Gemini: {"parts": [{"text": "..."}]}
+            parts = instr_obj.get("parts", [])
+            instr_size = sum(len(p.get("text", "")) for p in parts if isinstance(p, dict))
+        else:
+            instr_size = 0
+        tools_obj = sess.get("tools") or []
+        if tools_obj and isinstance(tools_obj[0], dict) and "functionDeclarations" in tools_obj[0]:
+            tools_count = len(tools_obj[0]["functionDeclarations"])
+        else:
+            tools_count = len(tools_obj)
         self._slog(
             f"send session.update instructions={instr_size}B tools={tools_count}"
             f" direction={direction}"

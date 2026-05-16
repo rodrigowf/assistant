@@ -84,12 +84,36 @@ def test_translate_output_transcription_emits_text_delta():
 
 
 def test_translate_input_transcription_emits_text_delta():
-    """inputTranscription.text → TextDelta so the user's words land in JSONL."""
+    """inputTranscription.text → TextDelta so the user's words land in JSONL.
+
+    Live API ships this at top level (older docs) — we accept it.
+    """
     p = _make_provider()
     ev = {"inputTranscription": {"text": "what time is it"}}
     out = p.translate_event(ev)
     assert isinstance(out, TextDelta)
     assert out.text == "what time is it"
+
+
+def test_translate_input_transcription_nested_under_server_content():
+    """Newer Live API nests inputTranscription under serverContent."""
+    p = _make_provider()
+    ev = {"serverContent": {"inputTranscription": {"text": "hello there"}}}
+    out = p.translate_event(ev)
+    assert isinstance(out, TextDelta)
+    assert out.text == "hello there"
+
+
+def test_session_config_includes_activity_detection():
+    """Tuned VAD prevents an open mic from preempting subsequent replies."""
+    p = _make_provider()
+    cfg = p.format_session_config(system="x", tools=[])
+    rt = cfg["setup"]["realtimeInputConfig"]
+    aad = rt["automaticActivityDetection"]
+    assert aad["disabled"] is False
+    assert aad["startOfSpeechSensitivity"] == "START_SENSITIVITY_LOW"
+    assert aad["endOfSpeechSensitivity"] == "END_SENSITIVITY_LOW"
+    assert aad["silenceDurationMs"] == 1500
 
 
 def test_session_config_skips_system_when_empty():

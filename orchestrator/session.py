@@ -691,6 +691,113 @@ class OrchestratorSession:
 
         event_type = event.get("type", "")
 
+        # --- Gemini Live event shape -----------------------------------
+        # Gemini Live doesn't carry a top-level ``type`` field — it uses
+        # camelCase top-level keys (``setupComplete``, ``serverContent``,
+        # ``toolCall``, ``toolResponse``) and nests transcription /
+        # turn-complete / interruption signals under ``serverContent``.
+        # Translate to the same persistence behaviour the OpenAI / Qwen
+        # branches below provide.
+        if not event_type and self._voice_provider.provider_name == "google":
+            sc = event.get("serverContent") or {}
+            input_t = sc.get("inputTranscription") if isinstance(sc, dict) else None
+            output_t = sc.get("outputTranscription") if isinstance(sc, dict) else None
+            tool_call = event.get("toolCall")
+
+            # User speech transcript — persist a [voice] JSONL entry.
+            if isinstance(input_t, dict) and not self.is_injecting:
+                transcript = input_t.get("text", "")
+                if transcript:
+                    segment = None
+                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                        segment = self._audio_recorder.mark_user_turn_end(transcript)
+                    if segment:
+                        content = (
+                            f"[voice, recording: {self._local_id} "
+                            f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+                        )
+                    else:
+                        content = f"[voice] {transcript}"
+                    entry: dict[str, Any] = {
+                        "type": "user",
+                        "message": {"role": "user", "content": content},
+                        "source": "voice_transcription",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if segment:
+                        entry["audio_segment"] = segment
+                    self._writer.append(entry)
+
+            # Assistant transcript delta — accumulate; persist on turnComplete.
+            if isinstance(output_t, dict):
+                delta = output_t.get("text", "")
+                if delta:
+                    staged = getattr(self, "_pending_assistant_transcript", None) or ""
+                    self._pending_assistant_transcript = staged + delta
+
+            # Turn complete — persist staged assistant transcript.
+            if isinstance(sc, dict) and sc.get("turnComplete"):
+                staged = getattr(self, "_pending_assistant_transcript", None)
+                if staged:
+                    segment = None
+                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                        segment = self._audio_recorder.mark_assistant_turn_end(staged)
+                    if segment:
+                        content = (
+                            f"[voice, recording: {self._local_id} "
+                            f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
+                        )
+                    else:
+                        content = staged
+                    entry = {
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": content},
+                        "source": "voice_response",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if segment:
+                        entry["audio_segment"] = segment
+                    self._writer.append(entry)
+                self._pending_assistant_transcript = None
+
+            # Interrupted — mark in JSONL like OpenAI's speech_started.
+            if isinstance(sc, dict) and sc.get("interrupted") and not self.is_injecting:
+                self._writer.append({
+                    "type": "voice_interrupted",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+            # Tool call — execute synchronously, ship the toolResponse back.
+            if isinstance(tool_call, dict):
+                for call in tool_call.get("functionCalls", []):
+                    call_id = call.get("id", "")
+                    name = call.get("name", "")
+                    args = call.get("args", {}) or {}
+                    if not (call_id and name):
+                        continue
+                    result = await registry.execute(name, args, self._context)
+                    self._writer.append({
+                        "type": "tool_use",
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "tool_input": args,
+                        "source": "voice",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._writer.append({
+                        "type": "tool_result",
+                        "tool_call_id": call_id,
+                        "output": result,
+                        "is_error": False,
+                        "source": "voice",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    commands.extend(self._voice_provider.format_tool_result(call_id, result))
+
+            return commands
+
+        # --- OpenAI / Qwen event shape (uses top-level ``type``) -------
+
         # User speech transcript — arrives when Whisper transcription completes.
         # Skip while listen_recording is replaying past audio into the WS:
         # the provider's ASR is transcribing those bytes and firing this

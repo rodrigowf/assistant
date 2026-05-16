@@ -213,6 +213,16 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
             if server_content.get("interrupted"):
                 return VoiceInterrupted(partial_text=self._current_transcript)
 
+            # Input ASR transcription — what the user said. Live API
+            # ships this either as ``serverContent.inputTranscription``
+            # (current docs) or at the top level (older docs); we
+            # accept both.
+            input_t = server_content.get("inputTranscription")
+            if isinstance(input_t, dict):
+                txt = input_t.get("text", "")
+                if txt:
+                    return TextDelta(text=txt)
+
             # Output ASR transcription — the model's spoken reply as text.
             # Surfaces in the chat as a streaming assistant message
             # alongside the audio.
@@ -241,11 +251,9 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
                     output_tokens=usage.get("candidatesTokenCount", 0),
                 )
 
-        # Input ASR transcription — what the user said. Emit as
-        # TextDelta so the orchestrator's voice-transcription pipeline
-        # picks it up and writes a ``[voice]`` JSONL entry.  The Live
-        # API ships this as a top-level "inputTranscription" object,
-        # not under serverContent.
+        # Top-level inputTranscription — older Live API shape.  Newer
+        # builds nest it under serverContent (handled above); we accept
+        # either since the docs disagree across versions.
         input_t = raw_event.get("inputTranscription")
         if isinstance(input_t, dict):
             txt = input_t.get("text", "")
@@ -367,6 +375,23 @@ class GeminiLiveVoiceProvider(BaseVoiceProvider):
             # and our chat window has nothing to show.
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
+            # Tune activity (VAD) detection.  The defaults are
+            # aggressive enough that an open mic with ambient noise
+            # keeps resetting the model's pending turn and the second
+            # reply never lands.  Higher-sensitivity end-of-speech and
+            # a longer silence gap let the model actually finish.
+            "realtimeInputConfig": {
+                "automaticActivityDetection": {
+                    "disabled": False,
+                    "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                    "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                    "prefixPaddingMs": 300,
+                    # Wait 1.5s of silence before deciding the user is
+                    # done; matches our Qwen tuning so users can pause
+                    # mid-sentence without the model cutting in.
+                    "silenceDurationMs": 1500,
+                },
+            },
         }
         if system:
             setup["systemInstruction"] = {"parts": [{"text": system}]}
