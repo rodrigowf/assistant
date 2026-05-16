@@ -26,6 +26,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 from collections import Counter, deque
 from pathlib import Path
@@ -301,6 +302,46 @@ class VoiceRelay:
             f"send session.update instructions={instr_size}B tools={tools_count}"
             f" direction={direction}"
         )
+        # Gemini debug: dump the *non-instruction, non-tool* setup fields so
+        # we can confirm outputAudioTranscription / responseModalities are
+        # actually in the wire bytes (the full systemInstruction + tool
+        # declarations are dropped — they bloat the log without telling us
+        # anything about the transcription wiring).
+        if (
+            self._provider.provider_name == "google"
+            and os.environ.get("VOICE_DEBUG_GEMINI_BODIES") == "1"
+        ):
+            sess_keys = {k: v for k, v in sess.items() if k not in ("systemInstruction", "tools")}
+            self._slog(f"  setup_keys={sorted(sess.keys())}")
+            self._slog(f"  setup_minus_instructions_tools={json.dumps(sess_keys)[:3000]}")
+        # Qwen debug: dump session keys + tool names + a slim copy of the
+        # session block (instructions truncated, tools reduced to names)
+        # so we can spot DashScope-side schema rejections without spamming
+        # the log with 24 KB of system prompt. Opt-in via
+        # VOICE_DEBUG_QWEN_BODIES=1.
+        if (
+            self._provider.provider_name == "qwen"
+            and os.environ.get("VOICE_DEBUG_QWEN_BODIES") == "1"
+        ):
+            slim = dict(sess)
+            instr = slim.get("instructions", "")
+            slim["instructions"] = f"<truncated:{len(instr)}B>"
+            tnames = []
+            for t in slim.get("tools", []) or []:
+                tnames.append(t.get("name") or t.get("function", {}).get("name") or "?")
+            slim["tools"] = tnames
+            self._slog(f"  qwen_session_keys={sorted(sess.keys())}")
+            self._slog(f"  qwen_session_slim={json.dumps(slim)[:3000]}")
+            # Also dump the FULL session.update payload to a sibling
+            # file so we can diff against Alibaba's published example
+            # without searching through the slog.
+            try:
+                dump = self._log_file_path.with_suffix(".session_update.json") if self._log_file_path else None
+                if dump is not None:
+                    dump.write_text(json.dumps(session_config, indent=2))
+                    self._slog(f"  qwen_full_payload_dumped={dump}")
+            except Exception:
+                logger.exception("Failed to dump qwen session.update payload")
         async with self._send_lock:
             await self._ws.send(json.dumps(session_config))
         self._last_send_at = time.monotonic()
@@ -511,6 +552,23 @@ class VoiceRelay:
                     self._slog(f"WARN non-JSON recv (dropped) bytes={len(raw)}")
                     continue
 
+                # Pre-audio-filter Gemini debug: log EVERY incoming frame
+                # (after stripping audio data so the log stays readable),
+                # so we can see whether outputTranscription is bundled
+                # alongside audio, hidden under an unknown field, or
+                # simply never arriving. Opt-in via
+                # VOICE_DEBUG_GEMINI_BODIES=1.
+                if (
+                    self._provider.provider_name == "google"
+                    and os.environ.get("VOICE_DEBUG_GEMINI_BODIES") == "1"
+                ):
+                    self._slog(f"  raw_keys={sorted(_top_keys(event))}")
+                    redacted = _redact_inline_audio(event)
+                    # No truncation: we want to see every byte of the
+                    # non-audio fields so an undocumented transcript path
+                    # can't hide behind a cutoff.
+                    self._slog(f"  raw_full={json.dumps(redacted)}")
+
                 # Audio out → ship to frontend. The provider's
                 # ``extract_audio_out`` knows the right field path.
                 audio_b64 = self._provider.extract_audio_out(event)
@@ -535,6 +593,17 @@ class VoiceRelay:
                     # But still inject for any provider-internal state.
                     self._provider.on_inbound_event(event)
                     await self._provider.inject_event(event)
+                    # Gemini Live bundles ``outputTranscription`` (and
+                    # sometimes ``turnComplete`` / ``interrupted``) into
+                    # the SAME frame as the audio chunk under
+                    # ``serverContent``. If we ``continue`` here those
+                    # control fields never reach the orchestrator /
+                    # frontend, so the model's text reply never renders.
+                    # Forward an audio-stripped copy of the event so the
+                    # rest of the pipeline sees the control side.
+                    control = _strip_audio_parts(event)
+                    if control is not None:
+                        await self._on_event_for_frontend(control)
                     continue
 
                 # Non-audio control event — record for post-mortem,
@@ -543,6 +612,15 @@ class VoiceRelay:
                 self._record_recv(event)
                 size = len(raw) if isinstance(raw, str) else len(raw or "")
                 self._slog(f"recv  type={evt_type} size={size}B")
+                # Gemini Live debug: log full body of control events so we
+                # can see whether outputTranscription / turnComplete are
+                # actually arriving. Opt-in via VOICE_DEBUG_GEMINI_BODIES=1.
+                if (
+                    self._provider.provider_name == "google"
+                    and os.environ.get("VOICE_DEBUG_GEMINI_BODIES") == "1"
+                ):
+                    body = json.dumps(event)[:1000]
+                    self._slog(f"  body={body}")
 
                 # Let the provider update any internal gating state.
                 self._provider.on_inbound_event(event)
@@ -726,3 +804,91 @@ def _redact_for_log(event: dict[str, Any]) -> dict[str, Any]:
             return [_clip(x) for x in v[:10]]
         return v
     return _clip(event)
+
+
+def _top_keys(event: Any) -> list[str]:
+    """Top-level keys of a frame; recurses one level into serverContent."""
+    if not isinstance(event, dict):
+        return []
+    keys: list[str] = []
+    for k, v in event.items():
+        keys.append(k)
+        if k == "serverContent" and isinstance(v, dict):
+            for sk in v.keys():
+                keys.append(f"serverContent.{sk}")
+    return keys
+
+
+def _strip_audio_parts(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a copy with audio-only ``modelTurn.parts`` filtered out.
+
+    Used by the Gemini Live drain: the provider bundles
+    ``outputTranscription`` (and sometimes ``turnComplete``/``interrupted``)
+    into the same frame as the inline audio chunk under
+    ``serverContent``. After we've shipped the audio to the frontend
+    we still want to surface the rest of the event for transcription
+    rendering — but without re-shipping the audio bytes. Strips
+    ``inlineData`` parts (and any other ``audio/*`` mime types) from
+    ``serverContent.modelTurn.parts``; drops an empty ``modelTurn`` if
+    no non-audio parts remain. Returns ``None`` if the resulting
+    ``serverContent`` would be empty (nothing left to surface).
+    """
+    if not isinstance(event, dict):
+        return None
+    out = dict(event)
+    sc = out.get("serverContent")
+    if not isinstance(sc, dict):
+        return out  # No serverContent — pass through unchanged.
+    sc = dict(sc)
+    mt = sc.get("modelTurn")
+    if isinstance(mt, dict):
+        parts = mt.get("parts") or []
+        kept = []
+        for p in parts:
+            if not isinstance(p, dict):
+                kept.append(p)
+                continue
+            inline = p.get("inlineData")
+            if isinstance(inline, dict):
+                mime = inline.get("mimeType", "") or ""
+                if mime.startswith("audio/"):
+                    continue  # drop audio inline data
+            kept.append(p)
+        if kept:
+            mt = dict(mt)
+            mt["parts"] = kept
+            sc["modelTurn"] = mt
+        else:
+            sc.pop("modelTurn", None)
+    out["serverContent"] = sc
+    # If serverContent is now empty AND the event has no other useful
+    # top-level keys, suppress the forward.
+    if not sc and not any(k for k in out if k != "serverContent"):
+        return None
+    return out
+
+
+def _redact_inline_audio(event: Any) -> Any:
+    """Strip ``inlineData.data`` (base64 PCM) so frames stay log-sized.
+
+    Replaces the data field with ``<audio:NB>`` where N is the byte
+    length, leaving every other field intact. Recurses into dicts and
+    lists.
+    """
+    if isinstance(event, dict):
+        out: dict[str, Any] = {}
+        for k, v in event.items():
+            if k == "inlineData" and isinstance(v, dict):
+                inner: dict[str, Any] = {}
+                for ik, iv in v.items():
+                    if ik == "data" and isinstance(iv, str):
+                        inner[ik] = f"<audio:{len(iv)}B>"
+                    else:
+                        inner[ik] = iv
+                out[k] = inner
+            else:
+                out[k] = _redact_inline_audio(v)
+        return out
+    if isinstance(event, list):
+        return [_redact_inline_audio(x) for x in event]
+    return event

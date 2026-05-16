@@ -198,6 +198,65 @@ export function useVoiceOrchestrator(
   const handleProviderEvent = useCallback((event: RealtimeEvent) => {
     const eventType = event.type;
 
+    // Gemini Live event shape: no top-level ``type`` field. Top-level
+    // keys are camelCase (``setupComplete``, ``serverContent``,
+    // ``toolCall``). Map to the same callbacks the OpenAI/Qwen branches
+    // below drive so the UI renders transcripts + tool cards.
+    if (!eventType) {
+      const ev = event as unknown as Record<string, unknown>;
+      const sc = ev.serverContent as Record<string, unknown> | undefined;
+      if (sc) {
+        const inputT = sc.inputTranscription as Record<string, unknown> | undefined;
+        if (inputT) {
+          const text = (inputT.text as string) || "";
+          if (text) optsRef.current.onUserTranscript?.(text);
+        }
+        const outputT = sc.outputTranscription as Record<string, unknown> | undefined;
+        if (outputT) {
+          const text = (outputT.text as string) || "";
+          if (text) optsRef.current.onAssistantDelta?.(text);
+        }
+        // Streaming text via modelTurn.parts[].text (half-cascade Live preview)
+        const modelTurn = sc.modelTurn as Record<string, unknown> | undefined;
+        if (modelTurn) {
+          const parts = (modelTurn.parts as Array<Record<string, unknown>>) || [];
+          for (const p of parts) {
+            const t = p.text as string | undefined;
+            if (t) optsRef.current.onAssistantDelta?.(t);
+          }
+        }
+        if (sc.interrupted) {
+          // Barge-in: Gemini server detected the user spoke over the
+          // model. Drop the locally-buffered audio (chunks already
+          // received and queued in PCMPlayer) so the assistant stops
+          // talking immediately — without this the buffered tail keeps
+          // playing to the end. Match the Qwen flushAudioOut() path.
+          const t = transportRef.current;
+          if (t?.kind === "websocket") t.flushAudioOut();
+          responseInFlightRef.current = false;
+          updateStatus("active");
+        }
+        if (sc.turnComplete) {
+          responseInFlightRef.current = false;
+          updateStatus("active");
+          optsRef.current.onAssistantComplete?.("");
+          optsRef.current.onTurnComplete?.();
+        }
+      }
+      const toolCall = ev.toolCall as Record<string, unknown> | undefined;
+      if (toolCall) {
+        const calls = (toolCall.functionCalls as Array<Record<string, unknown>>) || [];
+        updateStatus("tool_use");
+        for (const c of calls) {
+          const callId = (c.id as string) || "";
+          const name = (c.name as string) || "";
+          const args = (c.args as Record<string, unknown>) || {};
+          if (callId && name) optsRef.current.onToolUse?.(callId, name, args);
+        }
+      }
+      return;
+    }
+
     if (eventType === "error") {
       const err = event.error as Record<string, unknown> | undefined;
       const code = err?.code as string | undefined;

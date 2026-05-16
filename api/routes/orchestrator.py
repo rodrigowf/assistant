@@ -465,6 +465,16 @@ async def _attach_voice_payload(
                         name="voice-tool-call",
                     )
                     return
+                # Gemini Live tool calls — same idea but the wire shape is
+                # ``toolCall.functionCalls[]`` at the top level, no
+                # ``type`` field.  Route through a dedicated dispatcher so
+                # tool_use / tool_result broadcasts reach the chat UI.
+                if not event.get("type") and event.get("toolCall"):
+                    asyncio.create_task(
+                        _handle_gemini_voice_tool_call(pool, session, event),
+                        name="voice-tool-call-gemini",
+                    )
+                    return
                 # All other events: run orchestrator-side processing
                 # (persists transcripts, etc.).  inject=False because
                 # the relay already pushed the event into the provider
@@ -766,4 +776,55 @@ async def _handle_voice_tool_call(
         await _dispatch_voice_commands(pool, session, commands)
     except Exception as e:
         logger.exception("Voice tool call execution failed")
+        await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
+
+
+async def _handle_gemini_voice_tool_call(
+    pool: SessionPool, session: OrchestratorSession, event: dict,
+) -> None:
+    """Execute a Gemini Live tool call off the relay-drain task.
+
+    Gemini's wire shape is ``toolCall.functionCalls: [{id, name, args}]``
+    with no top-level ``type`` field.  We broadcast ``tool_use`` per call
+    before execution, run them via ``process_voice_event`` (which writes
+    JSONL + dispatches the ``toolResponse`` back upstream), then
+    broadcast ``tool_result`` per call so the chat UI renders the
+    output the assistant is about to talk over.
+    """
+    try:
+        calls = (event.get("toolCall") or {}).get("functionCalls", []) or []
+
+        for call in calls:
+            call_id = call.get("id", "")
+            name = call.get("name", "")
+            args = call.get("args", {}) or {}
+            if call_id and name:
+                await pool.broadcast_orchestrator({
+                    "type": "tool_use",
+                    "tool_use_id": call_id,
+                    "tool_name": name,
+                    "tool_input": args,
+                })
+
+        commands = await session.process_voice_event(event, inject=False)
+
+        # Gemini's tool result commands look like
+        # ``{"toolResponse": {"functionResponses": [{id, name, response}]}}``.
+        # Surface each as a tool_result broadcast.
+        for cmd in commands:
+            tr = cmd.get("toolResponse") if isinstance(cmd, dict) else None
+            if not tr:
+                continue
+            for fr in tr.get("functionResponses", []) or []:
+                output = fr.get("response", {}).get("output", "")
+                await pool.broadcast_orchestrator({
+                    "type": "tool_result",
+                    "tool_use_id": fr.get("id", ""),
+                    "output": output,
+                    "is_error": False,
+                })
+
+        await _dispatch_voice_commands(pool, session, commands)
+    except Exception as e:
+        logger.exception("Gemini voice tool call execution failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})

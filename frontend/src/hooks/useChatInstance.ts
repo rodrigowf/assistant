@@ -410,9 +410,15 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         messages: updateLastAssistantBlock(state.messages, (blocks) => {
           const last = blocks[blocks.length - 1];
+          // Empty text → just finalize the currently-streaming block
+          // without overwriting (Gemini Live signals turn-complete via
+          // serverContent.turnComplete with no final transcript; the
+          // text has already been delivered via delta events).
           if (last?.type === "text" && last.streaming) {
-            return [...blocks.slice(0, -1), { ...last, content: action.text, streaming: false }];
+            const content = action.text || last.content;
+            return [...blocks.slice(0, -1), { ...last, content, streaming: false }];
           }
+          if (!action.text) return blocks;
           return [...blocks, { type: "text", content: action.text, streaming: false }];
         }),
       };
