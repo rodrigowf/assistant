@@ -380,7 +380,6 @@ private fun ThinkingBlock(block: MessageBlock.Thinking) {
         modifier = Modifier
             .fillMaxWidth()
             .drawBehind {
-                // 2dp left border in amber
                 drawLine(
                     color = borderColor,
                     start = Offset(0f, 0f),
@@ -404,7 +403,7 @@ private fun ThinkingBlock(block: MessageBlock.Thinking) {
                 Text(
                     text = "...",
                     style = MaterialTheme.typography.labelMedium,
-                    color = MdColors.thinkingBorder
+                    color = MdColors.textMuted
                 )
                 Spacer(modifier = Modifier.width(8.dp))
             }
@@ -413,7 +412,7 @@ private fun ThinkingBlock(block: MessageBlock.Thinking) {
                 style = MaterialTheme.typography.labelMedium.copy(
                     fontWeight = androidx.compose.ui.text.font.FontWeight.W600
                 ),
-                color = MdColors.thinkingBorder
+                color = MdColors.textMuted
             )
             Spacer(modifier = Modifier.weight(1f))
             Text(

@@ -707,7 +707,7 @@
   margin: 8px 0;
   border-left: 2px solid var(--thinking-border);
   border-radius: 0 var(--radius) var(--radius) 0;
-  background: rgba(201, 150, 58, 0.04);
+  background: var(--thinking-bg);
   overflow: hidden;
 }
 
@@ -718,12 +718,12 @@
   gap: 8px;
   padding: 9px 14px;
   font-size: 0.82rem;
-  color: var(--thinking-border);
+  color: var(--text-muted);
   text-align: left;
   transition: background var(--transition);
 }
 
-.thinking-toggle:hover { background: rgba(201, 150, 58, 0.05); }
+.thinking-toggle:hover { background: var(--thinking-bg-hover); }
 
 .thinking-label { flex: 1; font-weight: 600; letter-spacing: 0.01em; }
 
@@ -1795,7 +1795,7 @@ pre.field-value {
 
 .status-dot.idle         { background: var(--success); }
 .status-dot.streaming    { background: var(--accent);   animation: pulse 1s infinite; }
-.status-dot.thinking     { background: var(--thinking-border); animation: pulse 1.5s infinite; }
+.status-dot.thinking     { background: var(--status-pending); animation: pulse 1.5s infinite; }
 .status-dot.tool_use     { background: var(--tool-border); }
 .status-dot.interrupted  { background: var(--error); }
 .status-dot.disconnected { background: var(--text-dim); }
@@ -1811,7 +1811,7 @@ pre.field-value {
 }
 
 .conn-state.connected  { color: var(--success); }
-.conn-state.connecting { color: var(--thinking-border); }
+.conn-state.connecting { color: var(--status-pending); }
 .conn-state.error      { color: var(--error); }
 
 .stat-sep {

@@ -35,7 +35,10 @@
   --success:    #4aaa7a;
   --success-bg: rgba(74, 170, 122, 0.1);
 
-  --thinking-border: #c4923a;
+  --thinking-border:   #7a7a85;
+  --thinking-bg:       rgba(140, 140, 155, 0.05);
+  --thinking-bg-hover: rgba(140, 140, 155, 0.08);
+  --status-pending:    #c4923a;
   --tool-border:     #5888cc;
 
   /* Tool colors — muted, intentional */
