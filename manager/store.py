@@ -310,8 +310,16 @@ class SessionStore:
         self._save_titles(titles)
         return True
 
-    def delete_session(self, session_id: str) -> bool:
-        """Soft-delete a session: move its JSONL into context/trash/."""
+    def delete_session(self, session_id: str, *, skip_index_cleanup: bool = False) -> bool:
+        """Soft-delete a session: move its JSONL into context/trash/.
+
+        The vector-index cleanup spawns a chromadb subprocess (multi-second
+        cold start) and is the slow part of deletion. Callers that want to
+        return to the user immediately can pass ``skip_index_cleanup=True``
+        and schedule :func:`remove_session_from_index` themselves (e.g. via
+        ``asyncio.to_thread``).  Cleanup is best-effort either way — a
+        leftover index chunk is harmless until the next re-index pass.
+        """
         jsonl_path = self._locate_jsonl(session_id)
         if jsonl_path is None:
             return False
@@ -330,7 +338,8 @@ class SessionStore:
         if session_id in titles:
             del titles[session_id]
             self._save_titles(titles)
-        remove_session_from_index(session_id, collection_name="history")
+        if not skip_index_cleanup:
+            remove_session_from_index(session_id, collection_name="history")
         return True
 
     def duplicate_session(self, session_id: str) -> str | None:

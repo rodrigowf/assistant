@@ -270,9 +270,23 @@ def rename_session(session_id: str, body: dict, store: SessionStore = Depends(ge
 
 
 @router.delete("/{session_id}", status_code=204)
-def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
-    if not store.delete_session(session_id):
+async def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
+    # Move the JSONL into trash synchronously (fast — a single rename) so
+    # the next list_sessions() call already reflects the deletion.  Defer
+    # the vector-index cleanup to a background task: it spawns a chromadb
+    # subprocess that takes 2–10s to cold-start, which would otherwise
+    # block the HTTP response and freeze the sidebar.  Cleanup is
+    # best-effort by design (failures are swallowed and logged) so
+    # fire-and-forget is safe — at worst a stale chunk sits in the index
+    # until the next re-index pass removes it.
+    if not store.delete_session(session_id, skip_index_cleanup=True):
         raise HTTPException(404, detail=f"Session {session_id!r} not found")
+
+    import asyncio
+    from manager.index_utils import remove_session_from_index
+    asyncio.create_task(asyncio.to_thread(
+        remove_session_from_index, session_id, "history"
+    ))
 
 
 def _is_live_session(session_id: str, pool: SessionPool) -> bool:

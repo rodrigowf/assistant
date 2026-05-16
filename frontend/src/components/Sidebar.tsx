@@ -111,29 +111,31 @@ export function Sidebar({ sessions, deleting, onDelete, onRename, onDuplicate, o
         </svg>
         Configuration
       </button>
-      <div className={`session-list${deleting ? " session-list--busy" : ""}`}>
-        {sessions.map((s) => {
-          // A session item is active if the current tab matches by resumeSdkId or by local_id
-          const isActive =
-            activeTab?.resumeSdkId === s.session_id ||
-            (!!s.local_id && activeTab?.sessionId === s.local_id);
-          return (
-            <SessionItem
-              key={s.session_id}
-              session={s}
-              active={isActive}
-              tabOpen={sdkTabOpenSet.has(s.session_id)}
-              tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
-              onClick={() => handleSelect(s.session_id, s.local_id)}
-              onDelete={() => onDelete(s.session_id)}
-              onRename={(title) => onRename(s.session_id, title)}
-              onDuplicate={() => onDuplicate(s.session_id)}
-            />
-          );
-        })}
-        {sessions.length === 0 && (
-          <div className="sidebar-empty">No sessions yet</div>
-        )}
+      <div className="session-list-wrap">
+        <div className={`session-list${deleting ? " session-list--busy" : ""}`}>
+          {sessions.map((s) => {
+            // A session item is active if the current tab matches by resumeSdkId or by local_id
+            const isActive =
+              activeTab?.resumeSdkId === s.session_id ||
+              (!!s.local_id && activeTab?.sessionId === s.local_id);
+            return (
+              <SessionItem
+                key={s.session_id}
+                session={s}
+                active={isActive}
+                tabOpen={sdkTabOpenSet.has(s.session_id)}
+                tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
+                onClick={() => handleSelect(s.session_id, s.local_id)}
+                onDelete={() => onDelete(s.session_id)}
+                onRename={(title) => onRename(s.session_id, title)}
+                onDuplicate={() => onDuplicate(s.session_id)}
+              />
+            );
+          })}
+          {sessions.length === 0 && (
+            <div className="sidebar-empty">No sessions yet</div>
+          )}
+        </div>
         {deleting && (
           <div className="session-list-overlay" aria-busy="true" aria-live="polite">
             <div className="session-list-spinner" aria-hidden="true" />
