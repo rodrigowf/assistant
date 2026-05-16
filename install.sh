@@ -46,6 +46,7 @@ ask() { echo -e "${CYAN}?${NC} $1"; }
 # ─────────────────────────────────────────────────────────────────────────────
 DEV_MODE=false
 SKIP_PREREQS=false
+SKIP_AUTH=false
 NEW_CONTEXT=false
 IMPORT_CONTEXT=""
 # Two independent axes — leave empty so the interactive prompts ask:
@@ -70,6 +71,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-prereqs)
             SKIP_PREREQS=true
+            shift
+            ;;
+        --skip-auth)
+            SKIP_AUTH=true
             shift
             ;;
         --new-context)
@@ -131,6 +136,7 @@ Usage: ./install.sh [OPTIONS]
 Options:
   --dev                  Install development dependencies (ruff, mypy)
   --skip-prereqs         Skip prerequisite checks
+  --skip-auth            Skip the agent-CLI install/login step (npm i + first run)
   --new-context          Create a fresh context (non-interactive)
   --import-context URL   Import existing context repository
   -h, --help             Show this help message
@@ -782,6 +788,50 @@ fi
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 3e: Seed per-CLI runtime dirs (.claude/, .qwen/, .gemini/)
+# ─────────────────────────────────────────────────────────────────────────────
+# The CLI runtime dirs at the project root are gitignored — each CLI normally
+# auto-creates them on first run.  We seed them here from install/cli-runtime/
+# so the carve-outs we depend on (Gemini's respectGitIgnore=false, default
+# allowlists) are in place before the user's first run.
+#
+# Existing files are NEVER overwritten — the seed is idempotent and safe on
+# re-runs (a hand-edited settings.json on a working install stays as-is).
+step "Seeding local CLI runtime dirs..."
+
+seed_cli_runtime() {
+    local cli="$1"           # claude | qwen | gemini
+    local dst=".$cli"
+    local src="install/cli-runtime/$cli"
+    if [ ! -d "$src" ]; then
+        warn "No template at $src — skipping $cli seed"
+        return 0
+    fi
+    mkdir -p "$dst"
+    # Copy regular files and dotfiles, but never clobber existing ones.
+    shopt -s nullglob dotglob
+    for f in "$src"/*; do
+        local name
+        name="$(basename "$f")"
+        # Skip "." and ".." entries that dotglob picks up in some bash versions
+        [ "$name" = "." ] || [ "$name" = ".." ] && continue
+        if [ -e "$dst/$name" ] || [ -L "$dst/$name" ]; then
+            : # already there — leave it alone
+        else
+            cp "$f" "$dst/$name"
+            info "Seeded $dst/$name"
+        fi
+    done
+    shopt -u nullglob dotglob
+}
+
+[ "$WITH_CLAUDE" = true ] && seed_cli_runtime claude
+[ "$WITH_QWEN"   = true ] && seed_cli_runtime qwen
+[ "$WITH_GEMINI" = true ] && seed_cli_runtime gemini
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 4: Create Python virtual environment
 # ─────────────────────────────────────────────────────────────────────────────
 step "Setting up Python virtual environment..."
@@ -841,6 +891,141 @@ else
     info "Updated node_modules/"
 fi
 cd ..
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 7b: Install + authenticate agent CLIs
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs after Python + Node deps so npm is guaranteed present.  Each enabled
+# harness is handled in its own block:
+#
+#   1. Install the CLI globally via npm (if missing).
+#   2. Detect auth state.  Skip the login prompt if:
+#        - the relevant API key is already set in context/.env, OR
+#        - the CLI's local credential file already exists.
+#   3. Otherwise pause and ask the user to run the login command in a separate
+#      terminal, then press Enter to continue.  Re-checks auth state after.
+#
+# Interactive vs non-interactive:
+#   The login prompt is skipped silently when stdin is not a TTY (CI, piped
+#   installs) OR when --skip-auth is passed.  Either way, the script continues —
+#   the user can finish login later before their first chat.
+#
+# Adding a new harness here: add a new `if [ "$WITH_<name>" = true ]` block
+# below, supplying the npm package, the login command, the credential-file
+# check, and the env-var fallback key.
+if [ "$SKIP_AUTH" = false ]; then
+    step "Installing and authenticating agent CLIs..."
+    echo ""
+fi
+
+# Returns 0 if stdin is a TTY (interactive shell), 1 otherwise.
+is_interactive() { [ -t 0 ]; }
+
+# Install one CLI globally via npm if it's not already on PATH.  Returns 0 if
+# the CLI is available after this call, non-zero if the install was skipped or
+# failed.  Asks for confirmation in interactive mode; auto-installs otherwise.
+install_harness_cli() {
+    local cli="$1" pkg="$2"
+    if command -v "$cli" &>/dev/null; then
+        info "$cli CLI already installed ($(command -v "$cli"))"
+        return 0
+    fi
+    if is_interactive; then
+        ask "$cli CLI not found.  Install globally via npm? [Y/n] "
+        read -r ANS
+        if [[ "${ANS:-Y}" =~ ^[Nn]$ ]]; then
+            warn "Skipped $cli install — run 'npm install -g $pkg' manually before first use."
+            return 1
+        fi
+    else
+        info "$cli CLI not found — installing (non-interactive mode)"
+    fi
+    step "Installing $cli via npm..."
+    if npm install -g "$pkg"; then
+        info "$cli installed"
+        return 0
+    else
+        warn "$cli install failed — install manually: npm install -g $pkg"
+        return 1
+    fi
+}
+
+# Check auth state for one CLI; prompt the user to log in interactively if
+# unauthenticated.  Skips silently in non-interactive mode or when --skip-auth.
+#
+#   $1: cli name (display only)
+#   $2: login command shown to the user
+#   $3: auth-check shell snippet (eval'd; returns 0 if authenticated)
+#   $4: env-var name that, when set in context/.env, counts as "auth handled
+#       via API key" and short-circuits the login prompt.
+prompt_harness_login() {
+    local cli="$1" login_cmd="$2" check_cmd="$3" env_key="$4"
+    # API-key fallback wins — if the env var is set, the CLI uses it and no
+    # OAuth login is needed.
+    if [ -n "$env_key" ] && [ -f "context/.env" ] && \
+       grep -q "^${env_key}=.\+" context/.env 2>/dev/null; then
+        info "$cli: $env_key set in context/.env — no interactive login needed"
+        return 0
+    fi
+    if eval "$check_cmd" &>/dev/null; then
+        info "$cli already authenticated"
+        return 0
+    fi
+    if [ "$SKIP_AUTH" = true ]; then
+        warn "$cli not authenticated, --skip-auth set — log in manually before first use"
+        return 0
+    fi
+    if ! is_interactive; then
+        warn "$cli not authenticated (non-interactive install) — run '$login_cmd' manually before first use"
+        return 0
+    fi
+    echo ""
+    warn "$cli is not authenticated."
+    echo "    Open a separate terminal in this directory and run:"
+    echo "      ${BLUE}${login_cmd}${NC}"
+    echo "    (Or set ${env_key} in context/.env to use an API key instead.)"
+    ask "Press Enter once login completes (or just press Enter to finish setup later): "
+    read -r _
+    if eval "$check_cmd" &>/dev/null; then
+        info "$cli authenticated"
+    else
+        warn "$cli still not authenticated — finish login before your first chat."
+    fi
+}
+
+if [ "$SKIP_AUTH" = false ]; then
+    if [ "$WITH_CLAUDE" = true ]; then
+        install_harness_cli claude '@anthropic-ai/claude-code' || true
+        if command -v claude &>/dev/null; then
+            prompt_harness_login claude 'claude auth login' \
+                'claude auth status 2>/dev/null | grep -q "\"loggedIn\": true"' \
+                'ANTHROPIC_API_KEY'
+        fi
+    fi
+    if [ "$WITH_QWEN" = true ]; then
+        install_harness_cli qwen '@qwen-code/qwen-code' || true
+        if command -v qwen &>/dev/null; then
+            # Qwen has no `auth status` subcommand and stores OAuth state in
+            # ~/.qwen/oauth_creds.json when used in OAuth mode.  API-key mode
+            # (DashScope) is detected via context/.env.
+            prompt_harness_login qwen 'qwen' \
+                '[ -f "$HOME/.qwen/oauth_creds.json" ]' \
+                'DASHSCOPE_API_KEY'
+        fi
+    fi
+    if [ "$WITH_GEMINI" = true ]; then
+        install_harness_cli gemini '@google/gemini-cli' || true
+        if command -v gemini &>/dev/null; then
+            prompt_harness_login gemini 'gemini' \
+                '[ -f "$HOME/.gemini/oauth_creds.json" ]' \
+                'GEMINI_API_KEY'
+        fi
+    fi
+    echo ""
+else
+    info "Skipping agent CLI install/login step (--skip-auth)"
+    echo ""
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 8: Create local directories
@@ -1000,48 +1185,9 @@ echo ""
 
 STEP=1
 
-# Claude Code instructions (only if the user opted in)
-if [ "$WITH_CLAUDE" = true ]; then
-    if ! command -v claude &> /dev/null; then
-        echo "  ${RED}${STEP}.${NC} Install Claude Code CLI:"
-        echo "     ${BLUE}npm install -g @anthropic-ai/claude-code${NC}"
-        echo ""
-        STEP=$((STEP + 1))
-        echo "  ${RED}${STEP}.${NC} Authenticate Claude Code:"
-        echo "     ${BLUE}claude auth login${NC}"
-        echo ""
-        STEP=$((STEP + 1))
-    elif ! claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
-        echo "  ${RED}${STEP}.${NC} Authenticate Claude Code:"
-        echo "     ${BLUE}claude auth login${NC}"
-        echo ""
-        STEP=$((STEP + 1))
-    fi
-fi
-
-# Qwen Code instructions (only if the user opted in)
-if [ "$WITH_QWEN" = true ] && ! command -v qwen &> /dev/null; then
-    echo "  ${RED}${STEP}.${NC} Install Qwen Code CLI:"
-    echo "     ${BLUE}npm install -g @qwen-code/qwen-code${NC}"
-    echo ""
-    STEP=$((STEP + 1))
-    echo "  ${RED}${STEP}.${NC} Authenticate Qwen Code:"
-    echo "     ${BLUE}qwen${NC}   ${CYAN}(launches interactive auth on first run)${NC}"
-    echo ""
-    STEP=$((STEP + 1))
-fi
-
-# Gemini CLI instructions (only if the user opted in)
-if [ "$WITH_GEMINI" = true ] && ! command -v gemini &> /dev/null; then
-    echo "  ${RED}${STEP}.${NC} Install Gemini CLI:"
-    echo "     ${BLUE}npm install -g @google/gemini-cli${NC}"
-    echo ""
-    STEP=$((STEP + 1))
-    echo "  ${RED}${STEP}.${NC} Authenticate Gemini CLI:"
-    echo "     ${BLUE}gemini${NC}   ${CYAN}(launches Google OAuth on first run; alternative: set GEMINI_API_KEY in context/.env)${NC}"
-    echo ""
-    STEP=$((STEP + 1))
-fi
+# Agent CLI install + login is handled inline at Step 7b.  Any harness that
+# still needs attention after that step prints its own warning during the
+# install run, so we don't repeat per-CLI instructions here.
 
 # Check .env configuration — surface only the keys for axes the user selected.
 ENV_KEYS_MISSING=()
