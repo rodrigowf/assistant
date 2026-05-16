@@ -432,8 +432,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                     val selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true
                     Box(
                         modifier = Modifier
-                            .size(56.dp)
-                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .size(width = 72.dp, height = 56.dp)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(28.dp))
                             .background(if (selected) selectedBg else androidx.compose.ui.graphics.Color.Transparent)
                             .clickable {
                                 navController.navigate(screen.route) {
