@@ -187,6 +187,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val discoveredServers by viewModel.discoveredServers.collectAsState()
     val isScanning by viewModel.isScanning.collectAsState()
     val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
+    val systemConfig by viewModel.systemConfig.collectAsState()
 
     // Wire wake word detection: start turn-based recording and navigate to chat
     val coroutineScope = rememberCoroutineScope()
@@ -340,6 +341,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         connectionState = connectionState,
                         discoveredServers = discoveredServers,
                         isScanning = isScanning,
+                        systemConfig = systemConfig,
                         onUpdateServerUrl = viewModel::updateServerUrl,
                         onUpdateThemeMode = viewModel::updateThemeMode,
                         onUpdateAutoConnect = viewModel::updateAutoConnect,
@@ -363,7 +365,10 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         onConnectToServer = viewModel::connectToDiscoveredServer,
                         onAddSavedServer = viewModel::addSavedServer,
                         onRemoveSavedServer = viewModel::removeSavedServer,
-                        onSelectSavedServer = viewModel::selectSavedServer
+                        onSelectSavedServer = viewModel::selectSavedServer,
+                        onLoadSystemConfig = viewModel::loadSystemConfig,
+                        onUpdateSystemConfig = viewModel::updateSystemConfig,
+                        onToggleMcp = viewModel::toggleMcp,
                     )
                 }
             }

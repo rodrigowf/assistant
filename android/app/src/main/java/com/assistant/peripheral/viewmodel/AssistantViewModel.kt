@@ -21,6 +21,7 @@ import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
 import com.assistant.peripheral.voice.VoiceManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -199,6 +200,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+
+    // System (backend) configuration — drives the System Settings tab.
+    // Loaded on demand when the System tab is opened and refreshed after
+    // each save. Independent of the App-side AppSettings.
+    private val _systemConfig = MutableStateFlow(SystemConfigState())
+    val systemConfig: StateFlow<SystemConfigState> = _systemConfig.asStateFlow()
+    private var savedFlashJob: kotlinx.coroutines.Job? = null
 
     // Preference keys
     private object PreferenceKeys {
@@ -1587,6 +1595,113 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, word, s.wakeWordMicGainLevel)
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // System (backend) configuration — System Settings tab
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * Load the full backend system config (assistant config + MCP servers +
+     * model catalog + voice models + session providers + Qwen harness models).
+     *
+     * Each sub-list is fetched in parallel. Failures of individual lists fall
+     * through to empty defaults — only a full failure to load the main config
+     * surfaces as an error.
+     */
+    fun loadSystemConfig() {
+        val client = apiClient
+        if (client == null) {
+            _systemConfig.value = _systemConfig.value.copy(
+                error = "Not connected to a server",
+                loading = false,
+            )
+            return
+        }
+        viewModelScope.launch {
+            _systemConfig.value = _systemConfig.value.copy(loading = true, error = null)
+            try {
+                // Fan out — these don't depend on each other.
+                val cfgDef = async(Dispatchers.IO) { client.getAssistantConfig() }
+                val mcpDef = async(Dispatchers.IO) { client.listMcpServers() }
+                val modelsDef = async(Dispatchers.IO) { client.listOrchestratorModels() }
+                val voiceDef = async(Dispatchers.IO) { client.listVoiceModels() }
+                val googleVoiceDef = async(Dispatchers.IO) { client.listGoogleVoiceModels() }
+                val qwenDef = async(Dispatchers.IO) { client.listQwenHarnessModels() }
+                val providersDef = async(Dispatchers.IO) { client.listSessionProviders() }
+
+                val cfg = cfgDef.await()
+                if (cfg == null) {
+                    _systemConfig.value = _systemConfig.value.copy(
+                        loading = false,
+                        error = "Failed to load configuration",
+                    )
+                    return@launch
+                }
+                // Merge dynamic Gemini Live list into static voice providers
+                // (replaces the static "google" entries only when non-empty).
+                val voiceProviders = voiceDef.await().toMutableMap()
+                val googleVoice = googleVoiceDef.await()
+                if (googleVoice.isNotEmpty()) voiceProviders["google"] = googleVoice
+
+                _systemConfig.value = SystemConfigState(
+                    config = cfg,
+                    mcpServers = mcpDef.await(),
+                    models = modelsDef.await(),
+                    voiceProviders = voiceProviders,
+                    qwenHarnessModels = qwenDef.await(),
+                    sessionProviders = providersDef.await(),
+                    loading = false,
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "loadSystemConfig error: ${e.message}", e)
+                _systemConfig.value = _systemConfig.value.copy(
+                    loading = false,
+                    error = e.message ?: "Failed to load configuration",
+                )
+            }
+        }
+    }
+
+    /**
+     * Apply a partial update to the backend config. The full updated config
+     * is returned and stored on success; on failure the current state is left
+     * unchanged and an error message is surfaced.
+     */
+    fun updateSystemConfig(patch: ConfigPatch) {
+        val client = apiClient ?: return
+        viewModelScope.launch {
+            _systemConfig.value = _systemConfig.value.copy(saving = true, error = null)
+            val result = client.updateAssistantConfig(patch)
+            result.fold(
+                onSuccess = { newCfg ->
+                    _systemConfig.value = _systemConfig.value.copy(
+                        config = newCfg,
+                        saving = false,
+                        savedFlash = true,
+                    )
+                    savedFlashJob?.cancel()
+                    savedFlashJob = viewModelScope.launch {
+                        kotlinx.coroutines.delay(2000)
+                        _systemConfig.value = _systemConfig.value.copy(savedFlash = false)
+                    }
+                },
+                onFailure = { e ->
+                    _systemConfig.value = _systemConfig.value.copy(
+                        saving = false,
+                        error = e.message ?: "Failed to save",
+                    )
+                },
+            )
+        }
+    }
+
+    /** Toggle a single MCP server in `enabled_mcps`. */
+    fun toggleMcp(name: String) {
+        val cfg = _systemConfig.value.config ?: return
+        val next = cfg.enabledMcps.toMutableList()
+        if (next.contains(name)) next.remove(name) else next.add(name)
+        updateSystemConfig(ConfigPatch(enabledMcps = next))
     }
 
     override fun onCleared() {

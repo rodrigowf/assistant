@@ -703,6 +703,288 @@ class ApiClient(private val baseUrl: String) {
             System.currentTimeMillis()
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // System configuration (mirrors `frontend/src/api/rest.ts`).
+    // Powers the System tab of the Settings screen.
+    // ─────────────────────────────────────────────────────────────────
+
+    /** GET /api/config — full assistant config. */
+    suspend fun getAssistantConfig(): AssistantConfig? = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/config")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.e(TAG, "getAssistantConfig failed: ${response.code}")
+                return@withContext null
+            }
+            parseAssistantConfig(JSONObject(response.body?.string() ?: return@withContext null))
+        } catch (e: Exception) {
+            Log.e(TAG, "getAssistantConfig error: ${e.message}", e)
+            null
+        }
+    }
+
+    /**
+     * PUT /api/config — partial update. Returns the updated config on success,
+     * `Pair(null, errorMessage)` on a 4xx where the backend provided a detail.
+     */
+    suspend fun updateAssistantConfig(patch: ConfigPatch): Result<AssistantConfig> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/config")
+            val body = JSONObject().apply {
+                patch.workingDirectory?.let { put("working_directory", it) }
+                patch.enabledMcps?.let { put("enabled_mcps", JSONArray(it)) }
+                patch.chromeExtension?.let { put("chrome_extension", it) }
+                patch.provider?.let { put("provider", it) }
+                patch.defaultModel?.let { put("default_model", it) }
+                patch.harnessModel?.let { put("harness_model", JSONObject(it as Map<*, *>)) }
+                patch.defaultVoiceProvider?.let { put("default_voice_provider", it) }
+                patch.defaultVoiceModel?.let { put("default_voice_model", it) }
+                patch.defaultVoiceName?.let { put("default_voice_name", it) }
+                patch.defaultVoiceTranscriptionLanguage?.let {
+                    put("default_voice_transcription_language", it)
+                }
+                patch.voiceRecordingEnabled?.let { put("voice_recording_enabled", it) }
+            }
+            val request = Request.Builder()
+                .url(url)
+                .put(okhttp3.RequestBody.create(
+                    "application/json".toMediaTypeOrNull(),
+                    body.toString()
+                ))
+                .build()
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: ""
+            if (!response.isSuccessful) {
+                val detail = try { JSONObject(responseBody).optString("detail", "") } catch (_: Exception) { "" }
+                val msg = detail.ifBlank { "HTTP ${response.code}" }
+                Log.e(TAG, "updateAssistantConfig failed: $msg")
+                return@withContext Result.failure(Exception(msg))
+            }
+            val cfg = parseAssistantConfig(JSONObject(responseBody))
+                ?: return@withContext Result.failure(Exception("Invalid response"))
+            Result.success(cfg)
+        } catch (e: Exception) {
+            Log.e(TAG, "updateAssistantConfig error: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /** GET /api/mcp/servers */
+    suspend fun listMcpServers(): Map<String, McpServerConfig> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/mcp/servers")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return@withContext emptyMap()
+            val json = JSONObject(response.body?.string() ?: return@withContext emptyMap())
+            val serversJson = json.optJSONObject("servers") ?: return@withContext emptyMap()
+            val out = mutableMapOf<String, McpServerConfig>()
+            serversJson.keys().forEach { name ->
+                val s = serversJson.optJSONObject(name) ?: return@forEach
+                val args = s.optJSONArray("args")?.let { arr ->
+                    (0 until arr.length()).map { arr.optString(it, "") }
+                } ?: emptyList()
+                val env = s.optJSONObject("env")?.let { envObj ->
+                    envObj.keys().asSequence().associateWith { k -> envObj.optString(k, "") }
+                } ?: emptyMap()
+                out[name] = McpServerConfig(
+                    type = if (s.isNull("type")) null else s.optString("type"),
+                    command = s.optString("command", ""),
+                    args = args,
+                    env = env,
+                )
+            }
+            out
+        } catch (e: Exception) {
+            Log.e(TAG, "listMcpServers error: ${e.message}", e)
+            emptyMap()
+        }
+    }
+
+    /** GET /api/orchestrator/models */
+    suspend fun listOrchestratorModels(): List<ModelInfo> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/orchestrator/models")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return@withContext emptyList()
+            val json = JSONObject(response.body?.string() ?: return@withContext emptyList())
+            val arr = json.optJSONArray("models") ?: return@withContext emptyList()
+            (0 until arr.length()).map { i ->
+                val m = arr.getJSONObject(i)
+                ModelInfo(
+                    provider = m.optString("provider", ""),
+                    modelId = m.optString("model_id", ""),
+                    displayName = m.optString("display_name", m.optString("model_id", "")),
+                    supportsAudio = m.optBoolean("supports_audio", false),
+                    supportsVision = m.optBoolean("supports_vision", false),
+                    supportsTools = m.optBoolean("supports_tools", true),
+                    maxTokens = m.optInt("max_tokens", 0),
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "listOrchestratorModels error: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    /** GET /api/orchestrator/voice/models */
+    suspend fun listVoiceModels(): Map<String, List<VoiceModelEntry>> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/orchestrator/voice/models")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return@withContext emptyMap()
+            val json = JSONObject(response.body?.string() ?: return@withContext emptyMap())
+            val providers = json.optJSONObject("providers") ?: return@withContext emptyMap()
+            val out = mutableMapOf<String, List<VoiceModelEntry>>()
+            providers.keys().forEach { providerId ->
+                val arr = providers.optJSONArray(providerId) ?: return@forEach
+                out[providerId] = (0 until arr.length()).map { parseVoiceModelEntry(arr.getJSONObject(it)) }
+            }
+            out
+        } catch (e: Exception) {
+            Log.e(TAG, "listVoiceModels error: ${e.message}", e)
+            emptyMap()
+        }
+    }
+
+    /** GET /api/config/voice/google/models */
+    suspend fun listGoogleVoiceModels(): List<VoiceModelEntry> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/config/voice/google/models")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return@withContext emptyList()
+            val json = JSONObject(response.body?.string() ?: return@withContext emptyList())
+            val arr = json.optJSONArray("models") ?: return@withContext emptyList()
+            (0 until arr.length()).map { parseVoiceModelEntry(arr.getJSONObject(it)) }
+        } catch (e: Exception) {
+            Log.e(TAG, "listGoogleVoiceModels error: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    /** GET /api/config/harness/qwen/models */
+    suspend fun listQwenHarnessModels(): List<QwenModelInfo> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/config/harness/qwen/models")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return@withContext emptyList()
+            val json = JSONObject(response.body?.string() ?: return@withContext emptyList())
+            val arr = json.optJSONArray("models") ?: return@withContext emptyList()
+            (0 until arr.length()).map { i ->
+                val m = arr.getJSONObject(i)
+                QwenModelInfo(
+                    id = m.optString("id", ""),
+                    displayName = m.optString("display_name", m.optString("id", "")),
+                    provider = m.optString("provider", ""),
+                    baseUrl = if (m.isNull("base_url")) null else m.optString("base_url"),
+                    contextWindow = if (m.isNull("context_window")) null else m.optInt("context_window"),
+                    supportsVision = m.optBoolean("supports_vision", false),
+                    supportsVideo = m.optBoolean("supports_video", false),
+                    supportsThinking = m.optBoolean("supports_thinking", false),
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "listQwenHarnessModels error: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    /** GET /api/config/providers */
+    suspend fun listSessionProviders(): List<SessionProviderSpec> = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/config/providers")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return@withContext emptyList()
+            val json = JSONObject(response.body?.string() ?: return@withContext emptyList())
+            val arr = json.optJSONArray("providers") ?: return@withContext emptyList()
+            (0 until arr.length()).map { i ->
+                val p = arr.getJSONObject(i)
+                SessionProviderSpec(
+                    id = p.optString("id", ""),
+                    label = p.optString("label", p.optString("id", "")),
+                    description = p.optString("description", ""),
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "listSessionProviders error: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    private fun parseAssistantConfig(json: JSONObject): AssistantConfig? {
+        return try {
+            val historyArr = json.optJSONArray("working_directory_history") ?: JSONArray()
+            val history = (0 until historyArr.length()).map { i ->
+                val e = historyArr.getJSONObject(i)
+                WorkingDirectoryEntry(
+                    id = e.optString("id", ""),
+                    path = e.optString("path", ""),
+                    label = if (e.isNull("label")) null else e.optString("label", null),
+                    sshHost = if (e.isNull("ssh_host")) null else e.optString("ssh_host", null),
+                    sshUser = if (e.isNull("ssh_user")) null else e.optString("ssh_user", null),
+                )
+            }
+            val mcpsArr = json.optJSONArray("enabled_mcps") ?: JSONArray()
+            val enabledMcps = (0 until mcpsArr.length()).map { mcpsArr.optString(it, "") }
+            val harnessObj = json.optJSONObject("harness_model") ?: JSONObject()
+            val harness = harnessObj.keys().asSequence().associateWith { k -> harnessObj.optString(k, "") }
+            AssistantConfig(
+                workingDirectory = json.optString("working_directory", ""),
+                workingDirectoryHistory = history,
+                enabledMcps = enabledMcps,
+                chromeExtension = json.optBoolean("chrome_extension", false),
+                provider = json.optString("provider", "claude"),
+                defaultModel = json.optString("default_model", ""),
+                harnessModel = harness,
+                defaultVoiceProvider = json.optString("default_voice_provider", ""),
+                defaultVoiceModel = json.optString("default_voice_model", ""),
+                defaultVoiceName = json.optString("default_voice_name", ""),
+                defaultVoiceTranscriptionLanguage = json.optString("default_voice_transcription_language", ""),
+                voiceRecordingEnabled = json.optBoolean("voice_recording_enabled", false),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "parseAssistantConfig error: ${e.message}", e)
+            null
+        }
+    }
+
+    private fun parseVoiceModelEntry(m: JSONObject): VoiceModelEntry {
+        val voicesArr = m.optJSONArray("voices") ?: JSONArray()
+        val voices = (0 until voicesArr.length()).map { i ->
+            val v = voicesArr.getJSONObject(i)
+            VoiceEntry(
+                id = v.optString("id", ""),
+                label = v.optString("label", v.optString("id", "")),
+                description = v.optString("description", ""),
+            )
+        }
+        val langsArr = m.optJSONArray("transcription_languages") ?: JSONArray()
+        val langs = (0 until langsArr.length()).map { i ->
+            val l = langsArr.getJSONObject(i)
+            TranscriptionLanguageEntry(
+                id = l.optString("id", ""),
+                label = l.optString("label", l.optString("id", "")),
+                description = l.optString("description", ""),
+            )
+        }
+        return VoiceModelEntry(
+            id = m.optString("id", ""),
+            label = m.optString("label", m.optString("id", "")),
+            voice = m.optString("voice", ""),
+            voices = voices,
+            transcriptionLanguages = langs,
+            defaultTranscriptionLanguage = m.optString("default_transcription_language", ""),
+            isDefault = m.optBoolean("default", false),
+        )
+    }
 }
 
 /**

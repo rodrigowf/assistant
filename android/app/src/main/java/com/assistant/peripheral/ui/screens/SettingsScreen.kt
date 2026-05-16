@@ -10,17 +10,22 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.assistant.peripheral.data.AppSettings
 import com.assistant.peripheral.data.AudioOutput
+import com.assistant.peripheral.data.ConfigPatch
 import com.assistant.peripheral.data.ConnectionState
 import com.assistant.peripheral.data.SavedServer
+import com.assistant.peripheral.data.SystemConfigState
 import com.assistant.peripheral.data.ThemeMode
 import com.assistant.peripheral.network.DiscoveredServer
 import kotlin.math.roundToInt
+
+private enum class SettingsTab { APP, SYSTEM }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -29,6 +34,7 @@ fun SettingsScreen(
     connectionState: ConnectionState,
     discoveredServers: List<DiscoveredServer>,
     isScanning: Boolean,
+    systemConfig: SystemConfigState,
     onUpdateServerUrl: (String) -> Unit,
     onUpdateThemeMode: (ThemeMode) -> Unit,
     onUpdateAutoConnect: (Boolean) -> Unit,
@@ -49,26 +55,116 @@ fun SettingsScreen(
     onAddSavedServer: (String, String) -> Unit,
     onRemoveSavedServer: (String) -> Unit,
     onSelectSavedServer: (SavedServer) -> Unit,
+    onLoadSystemConfig: () -> Unit,
+    onUpdateSystemConfig: (ConfigPatch) -> Unit,
+    onToggleMcp: (String) -> Unit,
     modifier: Modifier = Modifier
+) {
+    var selectedTab by rememberSaveable { mutableStateOf(SettingsTab.APP) }
+
+    Scaffold(
+        topBar = {
+            Column {
+                TopAppBar(title = { Text("Settings") })
+                TabRow(selectedTabIndex = selectedTab.ordinal) {
+                    LeadingIconTab(
+                        selected = selectedTab == SettingsTab.APP,
+                        onClick = { selectedTab = SettingsTab.APP },
+                        text = { Text("App") },
+                        icon = { Icon(Icons.Default.PhoneAndroid, contentDescription = null) }
+                    )
+                    LeadingIconTab(
+                        selected = selectedTab == SettingsTab.SYSTEM,
+                        onClick = {
+                            selectedTab = SettingsTab.SYSTEM
+                            if (systemConfig.config == null && !systemConfig.loading) {
+                                onLoadSystemConfig()
+                            }
+                        },
+                        text = { Text("System") },
+                        icon = { Icon(Icons.Default.Dns, contentDescription = null) }
+                    )
+                }
+            }
+        }
+    ) { padding ->
+        when (selectedTab) {
+            SettingsTab.APP -> AppSettingsTabContent(
+                settings = settings,
+                connectionState = connectionState,
+                discoveredServers = discoveredServers,
+                isScanning = isScanning,
+                onUpdateThemeMode = onUpdateThemeMode,
+                onUpdateAutoConnect = onUpdateAutoConnect,
+                onUpdateMicGainLevel = onUpdateMicGainLevel,
+                onUpdateWakeWordMicGainLevel = onUpdateWakeWordMicGainLevel,
+                onUpdateSpeakerVolumeLevel = onUpdateSpeakerVolumeLevel,
+                onUpdateEchoDuckingGain = onUpdateEchoDuckingGain,
+                onUpdateAudioOutput = onUpdateAudioOutput,
+                isBluetoothAvailable = isBluetoothAvailable,
+                onUpdateEnableWakeWord = onUpdateEnableWakeWord,
+                onUpdateWakeWord = onUpdateWakeWord,
+                onUpdateVoiceWord = onUpdateVoiceWord,
+                onUpdateEnableButtonTrigger = onUpdateEnableButtonTrigger,
+                onConnect = onConnect,
+                onDisconnect = onDisconnect,
+                onScanForServers = onScanForServers,
+                onConnectToServer = onConnectToServer,
+                onAddSavedServer = onAddSavedServer,
+                onRemoveSavedServer = onRemoveSavedServer,
+                onSelectSavedServer = onSelectSavedServer,
+                modifier = modifier.padding(padding)
+            )
+            SettingsTab.SYSTEM -> SystemSettingsTabContent(
+                connectionState = connectionState,
+                state = systemConfig,
+                onReload = onLoadSystemConfig,
+                onUpdate = onUpdateSystemConfig,
+                onToggleMcp = onToggleMcp,
+                modifier = modifier.padding(padding)
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppSettingsTabContent(
+    settings: AppSettings,
+    connectionState: ConnectionState,
+    discoveredServers: List<DiscoveredServer>,
+    isScanning: Boolean,
+    onUpdateThemeMode: (ThemeMode) -> Unit,
+    onUpdateAutoConnect: (Boolean) -> Unit,
+    onUpdateMicGainLevel: (Float) -> Unit,
+    onUpdateWakeWordMicGainLevel: (Float) -> Unit,
+    onUpdateSpeakerVolumeLevel: (Float) -> Unit,
+    onUpdateEchoDuckingGain: (Float) -> Unit,
+    onUpdateAudioOutput: (AudioOutput) -> Unit,
+    isBluetoothAvailable: Boolean,
+    onUpdateEnableWakeWord: (Boolean) -> Unit,
+    onUpdateWakeWord: (String) -> Unit,
+    onUpdateVoiceWord: (String) -> Unit,
+    onUpdateEnableButtonTrigger: (Boolean) -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onScanForServers: () -> Unit,
+    onConnectToServer: (DiscoveredServer) -> Unit,
+    onAddSavedServer: (String, String) -> Unit,
+    onRemoveSavedServer: (String) -> Unit,
+    onSelectSavedServer: (SavedServer) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     var wakeWordText by remember(settings.wakeWord) { mutableStateOf(settings.wakeWord) }
     var voiceWordText by remember(settings.voiceWord) { mutableStateOf(settings.voiceWord) }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Settings") }
-            )
-        }
-    ) { padding ->
-        Column(
-            modifier = modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
             // Connection Section
             Card(
                 modifier = Modifier.fillMaxWidth()
@@ -637,7 +733,6 @@ fun SettingsScreen(
                     )
                 }
             }
-        }
     }
 }
 
