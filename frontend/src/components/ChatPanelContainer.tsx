@@ -185,8 +185,13 @@ function OrchestratorChatPanel({
  */
 export function ChatPanelContainer({
   onSessionChange,
+  onMutationBusy,
 }: {
   onSessionChange: () => void;
+  /** Called with a label while a longer mutation (rewind / fork) is in
+   *  flight, then again with null when it finishes. Lets the app render a
+   *  whole-viewport busy overlay so the user doesn't keep clicking. */
+  onMutationBusy?: (label: string | null) => void;
 }) {
   const { tabs, activeTabId, openTab, closeTab } = useTabsContext();
   const instancesRef = useRef<Map<string, ChatInstance>>(new Map());
@@ -223,6 +228,7 @@ export function ChatPanelContainer({
     if (!pendingAction) return;
     const action = pendingAction;
     setPendingAction(null);
+    onMutationBusy?.(action.kind === "rewind" ? "Rewinding…" : "Forking…");
     try {
       if (action.kind === "rewind") {
         // Close the pool session first — the backend rejects truncate while
@@ -247,8 +253,10 @@ export function ChatPanelContainer({
     } catch (err) {
       console.error(`${action.kind} failed:`, err);
       alert(`${action.kind === "rewind" ? "Rewind" : "Fork"} failed: ${(err as Error).message}`);
+    } finally {
+      onMutationBusy?.(null);
     }
-  }, [pendingAction, closeTab, openTab, onSessionChange]);
+  }, [pendingAction, closeTab, openTab, onSessionChange, onMutationBusy]);
 
   // Track which models support audio
   const [modelsInfo, setModelsInfo] = useState<ModelsResponse | null>(null);

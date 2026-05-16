@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, lazy, Suspense } from "react";
 import "./App.css";
 import { AuthGate } from "./components/AuthGate";
+import { BusyOverlay } from "./components/BusyOverlay";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { ChatPanelContainer } from "./components/ChatPanelContainer";
@@ -14,8 +15,12 @@ import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
 import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
-  const { sessions, deleting, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
+  const { sessions, deleting, duplicating, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
   useReconnectPoolSessions();
+  // Mutation in flight from ChatPanelContainer (rewind / fork). Shown as a
+  // whole-app spinner overlay so the user can't queue a second mutation
+  // while the first is still talking to the backend + reopening tabs.
+  const [chatMutationBusy, setChatMutationBusy] = useState<string | null>(null);
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
   // Pending orchestrator action: either open new or resume existing
@@ -139,7 +144,7 @@ function AppContent() {
           </button>
           <TabBar />
         </div>
-        <ChatPanelContainer onSessionChange={refresh} />
+        <ChatPanelContainer onSessionChange={refresh} onMutationBusy={setChatMutationBusy} />
         {/* Config floats over everything — chat instances stay mounted */}
         <Suspense fallback={null}>
           <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
@@ -167,6 +172,10 @@ function AppContent() {
           onCancel={() => setPendingDelete(null)}
         />
       )}
+      <BusyOverlay
+        show={duplicating || chatMutationBusy !== null}
+        label={chatMutationBusy ?? "Duplicating…"}
+      />
     </>
   );
 }
