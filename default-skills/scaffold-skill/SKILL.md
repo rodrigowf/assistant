@@ -1,6 +1,6 @@
 ---
 name: scaffold-skill
-description: Create a new skill from a conversation or idea. Use this when you've learned how to do something and want to turn it into a reusable skill.
+description: Quickly scaffold a project-local skill for this assistant — writes context/skills/<name>/SKILL.md and any helper scripts into context/scripts/, following the public/private layout this repo uses. Use when you want to capture something we just figured out as a reusable /<name> slash command, without the full eval/iterate loop. For Anthropic's rigorous draft-test-grade-iterate framework, use anthropic-skill-creator instead.
 argument-hint: "[skill-name]"
 allowed-tools: Write, Read, Bash(mkdir *), Bash(chmod *), AskUserQuestion
 ---

@@ -1,6 +1,6 @@
 ---
-name: skill-creator
-description: Create new skills, modify and improve existing skills, and measure skill performance. Use when users want to create a skill from scratch, edit, or optimize an existing skill, run evals to test a skill, benchmark skill performance with variance analysis, or optimize a skill's description for better triggering accuracy.
+name: anthropic-skill-creator
+description: Anthropic's full skill-authoring framework — draft, run test prompts, grade outputs, iterate with quantitative and qualitative evals, and optimize the description for triggering accuracy. Use when the user wants to rigorously build, benchmark, or improve a skill (especially one meant to ship beyond this project). For a quick project-local scaffold inside this assistant, use scaffold-skill instead.
 ---
 
 # Skill Creator
