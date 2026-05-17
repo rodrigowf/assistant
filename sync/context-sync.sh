@@ -53,7 +53,10 @@ RSYNC_EXCLUDES=(
 )
 
 rsync_to_remote() {
-  rsync -az --update --delete \
+  local with_delete="${1:-0}"
+  local delete_flag=()
+  [[ "$with_delete" == "1" ]] && delete_flag=(--delete)
+  rsync -az --update "${delete_flag[@]}" \
     "${RSYNC_EXCLUDES[@]}" \
     -e "ssh $SSH_OPTS" \
     "$LOCAL_DIR/" \
@@ -74,7 +77,7 @@ while ! remote_reachable; do
   sleep "$RETRY_INTERVAL"
 done
 log "Initial sync..."
-if rsync_to_remote; then
+if rsync_to_remote 1; then
   log "Initial sync complete."
 else
   err "Initial sync failed, continuing anyway."
@@ -87,6 +90,15 @@ fi
 
 PENDING=0
 LAST_EVENT=0
+SAW_DELETE=0
+
+# Returns 0 if the event field contains DELETE or MOVED_FROM
+is_delete_event() {
+  case "$1" in
+    *DELETE*|*MOVED_FROM*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 inotifywait \
   --monitor \
@@ -104,17 +116,27 @@ while IFS= read -r line; do
   NOW=$(date +%s)
   LAST_EVENT=$NOW
   PENDING=1
+  SAW_DELETE=0
+  # line format: "<timestamp> <EVENT[,EVENT...]> <path>"
+  EVENT_FIELD=$(awk '{print $2}' <<<"$line")
+  is_delete_event "$EVENT_FIELD" && SAW_DELETE=1
 
   # Read any additional queued events (drain the buffer)
-  while IFS= read -r -t "$DEBOUNCE_SECONDS" _; do
+  while IFS= read -r -t "$DEBOUNCE_SECONDS" extra; do
     LAST_EVENT=$(date +%s)
+    EXTRA_EVENT_FIELD=$(awk '{print $2}' <<<"$extra")
+    is_delete_event "$EXTRA_EVENT_FIELD" && SAW_DELETE=1
   done
 
   if [[ $PENDING -eq 1 ]]; then
     PENDING=0
     if remote_reachable; then
-      if rsync_to_remote 2>/dev/null; then
-        log "Synced after change."
+      if rsync_to_remote "$SAW_DELETE" 2>/dev/null; then
+        if [[ $SAW_DELETE -eq 1 ]]; then
+          log "Synced after change (with --delete)."
+        else
+          log "Synced after change (no --delete)."
+        fi
       else
         err "Sync failed after change."
       fi
