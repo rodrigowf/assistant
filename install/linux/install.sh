@@ -1172,6 +1172,61 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 12b: Probe Gemini Live voice backends
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The Google voice provider has two backends with different gates: AI
+# Studio (free, sometimes revoked by Google) and Vertex AI (billed,
+# stable, IAM-auth via ADC).  Both probes are best-effort — neither one
+# being available is fine, the user just doesn't get Gemini voice
+# until they configure one.  We surface actionable hints in either
+# case so the user knows exactly what to do.
+#
+# Probe is skipped if the venv lacks ``websockets`` (would happen if
+# requirements.txt failed earlier — we'd be warning twice).
+if .venv/bin/python -c "import websockets" 2>/dev/null; then
+    echo ""
+    info "Probing Gemini Live backends (AI Studio + Vertex AI)..."
+    # probe-gemini-voice-to-shell.py emits eval-safe single-quoted
+    # KEY=VALUE lines for us, so this stays a one-line eval and the
+    # f-string escape gymnastics live in the Python side.
+    eval "$(.venv/bin/python install/probe-gemini-voice-to-shell.py 2>/dev/null)"
+    if [ "$VERTEX_STATUS" = "ok" ]; then
+        info "Gemini Live (Vertex AI) — reachable ✓"
+    else
+        warn "Gemini Live (Vertex AI) — $VERTEX_STATUS: $VERTEX_REASON"
+    fi
+    if [ "$AISTUDIO_STATUS" = "ok" ]; then
+        info "Gemini Live (AI Studio) — reachable ✓"
+    else
+        warn "Gemini Live (AI Studio) — $AISTUDIO_STATUS: $AISTUDIO_REASON"
+    fi
+    if [ -n "$RECOMMENDED" ]; then
+        info "Recommended default voice endpoint: $RECOMMENDED"
+        # Patch assistant_config.json if it exists and the field is
+        # empty or still on the install template's default ("vertex").
+        # Don't override a user-set value.
+        if [ -f assistant_config.json ]; then
+            REC="$RECOMMENDED" .venv/bin/python - <<'PYEOF'
+import json, os, pathlib
+p = pathlib.Path("assistant_config.json")
+try: cfg = json.loads(p.read_text())
+except Exception: cfg = {}
+rec = os.environ.get("REC", "")
+current = cfg.get("default_voice_endpoint")
+if rec and current in (None, "", "vertex"):
+    cfg["default_voice_endpoint"] = rec
+    p.write_text(json.dumps(cfg, indent=2) + "\n")
+PYEOF
+        fi
+    else
+        warn "Neither Gemini Live backend is reachable — voice in the Google provider won't work until one is configured."
+        echo "       See https://aistudio.google.com/apikey (AI Studio) or"
+        echo "       https://console.cloud.google.com/apis/library/aiplatform.googleapis.com (Vertex AI)."
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Completion
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

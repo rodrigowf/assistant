@@ -61,6 +61,7 @@ The wrappers at the project root (`install.sh`, `install-with-agent.sh`, `instal
 > 5. **Log your progress to `context/install.log` continuously.**  At the start of each step, append a line like `[2026-05-16 14:32] step 4: creating venv ...`.  Append the outcome on completion or error.  If the install crashes, this log lets the user (or a future agent) resume manually.
 > 6. **Never invent steps.**  If the per-OS installer doesn't do something, neither should you.  If you're unsure, read the relevant block and follow it literally.
 > 7. **Never skip the API key reminders.**  Step 12 warns about missing keys for the axes the user picked — do the same warning.
+> 7b. **Help the user actually obtain keys when they're missing.**  This is where you add value over the deterministic installer.  For each missing key you'd warn about: tell the user *what* it's for, *where* to get it, and offer to walk them through the signup / console flow.  Voice especially — Vertex AI vs. AI Studio is a real choice with real trade-offs (see "Voice provider selection (Gemini Live)" further down this file).  Don't just say "set `GEMINI_API_KEY`"; ask what they want voice for, propose the right backend, and stay with them through the console clicks.  Re-run `install/probe-gemini-voice.py` after the user pastes a key — its JSON output tells you immediately whether the new key works, and if not, the `reason` field has the actionable next step (billing, ADC, allowlist enablement) you should surface verbatim.  The deterministic installer runs the probe once at Step 12b; you should run it again whenever the user changes a relevant env var so the verdict tracks reality.
 > 8. **Windows-specific**: if you're on Windows, check whether symlink creation works before attempting any link steps (the installer's `Test-Symlinks` does this).  If it fails, tell the user about Developer Mode before falling back to junctions + copies.  Path mangling for the CLI project dirs replaces both `\` and `:` with `-`.
 > 9. **When everything is done**, ask the user if they'd like you to start the backend (`context/scripts/run.sh -m uvicorn api.app:create_app --factory --host 0.0.0.0 --port 8765` on POSIX, or `.venv\Scripts\python.exe -m uvicorn api.app:create_app --factory --port 8765` on Windows) and/or the frontend (`cd frontend && npm run dev`) in the background.  If yes, launch them in background mode so they survive your exit, then tell the user the install is complete and they can press Ctrl-C to exit this session.  Confirm the services are reachable before declaring victory.
 >
@@ -102,6 +103,7 @@ You'll also need at least one of these API keys *somewhere* — either obtained 
 - **Qwen Code** — either OAuth (interactive on first `qwen` run) or `DASHSCOPE_API_KEY` in `context/.env`.
 - **Gemini CLI** — either Google OAuth (interactive on first `gemini` run) or `GEMINI_API_KEY` in `context/.env`.
 - **Orchestrator backends** — `OPENAI_API_KEY` for OpenAI/GPT/Qwen-via-compatible/Gemini-via-compatible; `ANTHROPIC_API_KEY` for Anthropic Claude models in the orchestrator.
+- **Gemini Live voice** (optional) — see [Voice provider selection](#voice-provider-selection-gemini-live) below.  Two interchangeable backends, neither required, but at least one needs config if you want Google voice.
 
 You don't need every key — only the ones for axes you opt into.
 
@@ -142,6 +144,49 @@ The orchestrator agent (text + voice) is independent of the harness.  Which API 
 2. **Anthropic only** — Claude models in the orchestrator picker.
 3. **Both** — full flexibility.
 4. **Neither** — orchestrator disabled, chats only.
+
+---
+
+## Voice provider selection (Gemini Live)
+
+The Google voice provider has **two interchangeable backends** for the same Live API.  You can switch between them at any time from the Config page (Voice mode → Endpoint dropdown), but the installer asks Google which one your account currently has access to so it can pick a sensible default.
+
+| Backend | URL | Auth | Stability | When to use |
+|--|--|--|--|--|
+| **Vertex AI** (default) | `wss://{location}-aiplatform.googleapis.com` | OAuth Bearer token from Application Default Credentials (GCP IAM) | Stable — gated by your project's Vertex AI API enablement + billing | Recommended.  Once set up, doesn't get revoked. |
+| **AI Studio** (legacy) | `wss://generativelanguage.googleapis.com` | `?key=$GEMINI_API_KEY` query param | Unstable — Google periodically revokes preview-model access (WS close 1008 *"Your project has been denied access"*) | Use when AI Studio happens to have a preview model Vertex doesn't yet mirror (e.g. `gemini-3.1-flash-live-preview` as of mid-2026). |
+
+You don't have to choose between them.  Set up whichever has working access, and the assistant uses that one.  Both is fine too — the Config page dropdown lets you flip per session.
+
+### Setting up Vertex AI (recommended)
+
+1. **Cloud project** — [create one](https://console.cloud.google.com/projectcreate) or pick an existing one.
+2. **Enable Vertex AI API** — [console link](https://console.cloud.google.com/apis/library/aiplatform.googleapis.com) (substitute your project in the picker at the top).  Click "Enable".
+3. **Link billing** — Vertex AI Live requires a billing account, even with no spend.  [Billing link](https://console.cloud.google.com/billing/linkedaccount).
+4. **Application Default Credentials**:
+   ```bash
+   gcloud auth application-default login
+   gcloud auth application-default set-quota-project <PROJECT_ID>
+   ```
+   This writes `~/.config/gcloud/application_default_credentials.json`.  No service-account key file required.
+5. **Fill in `context/.env`**:
+   ```
+   GCP_PROJECT_ID=<numeric project id, e.g. 493034518147>
+   GCP_LOCATION=us-central1
+   ```
+
+### Setting up AI Studio (legacy)
+
+1. **Get an API key** at [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+2. **Fill in `context/.env`**: `GEMINI_API_KEY=AIzaSy...`.
+
+That's it — no project setup needed (AI Studio creates one for you).  Just be aware Google may revoke preview-model access without notice; if voice suddenly stops working with WS 1008, switch the Config page Endpoint dropdown to Vertex.
+
+### How the installer picks a default
+
+`install.sh` Step 12b runs `install/probe-gemini-voice.py` after env-key checks.  The script opens both upstream WebSockets in parallel and looks for `setupComplete`.  If both work, it picks Vertex.  If one works, it picks that one.  If neither does, it warns and leaves `default_voice_endpoint=vertex` (so it'll be tried first when you finish configuration later).
+
+You can re-run the probe anytime: `.venv/bin/python install/probe-gemini-voice.py` prints a JSON report telling you exactly what's broken and how to fix it.
 
 ---
 
@@ -287,6 +332,16 @@ For each axis the user opted into, check that the required env key is set in `co
 - `--with-openai` needs `OPENAI_API_KEY`
 - `--with-qwen` needs either `DASHSCOPE_API_KEY` or for OAuth login to have happened
 - `--with-gemini` needs either `GEMINI_API_KEY` or for OAuth login to have happened
+
+### Step 12b: Voice backend probe
+
+Runs `install/probe-gemini-voice.py` to ask both Gemini Live backends (AI Studio + Vertex) whether they answer.  The probe is independent of which axes the user picked — voice is always available in the orchestrator.  Outcomes:
+
+- **Both work** — set `assistant_config.json:default_voice_endpoint = "vertex"` (more stable).
+- **Only one works** — set that one as default.
+- **Neither works** — print actionable hints from the probe's `reason` fields (e.g. *"GCP_PROJECT_ID not set — create a Cloud project at ..."* or *"Run `gcloud auth application-default login`"*) and leave the default as `vertex` so it'll be tried first once configured.
+
+The probe respects existing user choices: it only writes `default_voice_endpoint` if it's missing or still on the install template's default (`"vertex"`).
 
 ### After install
 

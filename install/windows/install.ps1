@@ -1127,6 +1127,70 @@ if (Test-Path 'context\.env') {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 12b: Probe Gemini Live voice backends
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Same logic as the Linux / macOS installers — see those for the
+# rationale.  PowerShell doesn't have ``eval``, so we read the probe's
+# JSON output directly instead of going through the shell-quoted
+# wrapper.
+$venvPython = Join-Path '.venv' 'Scripts\python.exe'
+if (Test-Path $venvPython) {
+    $hasWebsockets = $false
+    try {
+        & $venvPython -c "import websockets" 2>$null
+        if ($LASTEXITCODE -eq 0) { $hasWebsockets = $true }
+    } catch {}
+    if ($hasWebsockets) {
+        Write-Host ""
+        Write-Info "Probing Gemini Live backends (AI Studio + Vertex AI)..."
+        $probeRaw = & $venvPython 'install\probe-gemini-voice.py' 2>$null
+        if ($probeRaw) {
+            try { $probe = $probeRaw | Out-String | ConvertFrom-Json } catch { $probe = $null }
+        }
+        if ($probe) {
+            if ($probe.vertex.status -eq 'ok') {
+                Write-Info "Gemini Live (Vertex AI) - reachable [OK]"
+            } else {
+                Write-Warn "Gemini Live (Vertex AI) - $($probe.vertex.status): $($probe.vertex.reason)"
+            }
+            if ($probe.aistudio.status -eq 'ok') {
+                Write-Info "Gemini Live (AI Studio) - reachable [OK]"
+            } else {
+                Write-Warn "Gemini Live (AI Studio) - $($probe.aistudio.status): $($probe.aistudio.reason)"
+            }
+            $recommended = $probe.recommended_default
+            if ($recommended) {
+                Write-Info "Recommended default voice endpoint: $recommended"
+                if (Test-Path 'assistant_config.json') {
+                    try {
+                        $cfg = Get-Content 'assistant_config.json' -Raw | ConvertFrom-Json
+                    } catch { $cfg = $null }
+                    if ($cfg) {
+                        $current = $null
+                        if ($cfg.PSObject.Properties.Match('default_voice_endpoint').Count -gt 0) {
+                            $current = $cfg.default_voice_endpoint
+                        }
+                        if (-not $current -or $current -eq 'vertex') {
+                            if ($cfg.PSObject.Properties.Match('default_voice_endpoint').Count -gt 0) {
+                                $cfg.default_voice_endpoint = $recommended
+                            } else {
+                                $cfg | Add-Member -NotePropertyName default_voice_endpoint -NotePropertyValue $recommended
+                            }
+                            $cfg | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath 'assistant_config.json' -Encoding UTF8
+                        }
+                    }
+                }
+            } else {
+                Write-Warn "Neither Gemini Live backend is reachable - voice in the Google provider won't work until one is configured."
+                Write-Host "       See https://aistudio.google.com/apikey (AI Studio) or" -ForegroundColor DarkGray
+                Write-Host "       https://console.cloud.google.com/apis/library/aiplatform.googleapis.com (Vertex AI)." -ForegroundColor DarkGray
+            }
+        }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Completion
 # ─────────────────────────────────────────────────────────────────────────────
 Write-Host ""

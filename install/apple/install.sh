@@ -1192,6 +1192,50 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 12b: Probe Gemini Live voice backends
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Same logic as the Linux installer — see the comment block there for
+# the rationale.  We use install/probe-gemini-voice-to-shell.py which
+# wraps install/probe-gemini-voice.py and emits eval-safe single-quoted
+# KEY=VALUE lines.
+if .venv/bin/python -c "import websockets" 2>/dev/null; then
+    echo ""
+    info "Probing Gemini Live backends (AI Studio + Vertex AI)..."
+    eval "$(.venv/bin/python install/probe-gemini-voice-to-shell.py 2>/dev/null)"
+    if [ "$VERTEX_STATUS" = "ok" ]; then
+        info "Gemini Live (Vertex AI) — reachable ✓"
+    else
+        warn "Gemini Live (Vertex AI) — $VERTEX_STATUS: $VERTEX_REASON"
+    fi
+    if [ "$AISTUDIO_STATUS" = "ok" ]; then
+        info "Gemini Live (AI Studio) — reachable ✓"
+    else
+        warn "Gemini Live (AI Studio) — $AISTUDIO_STATUS: $AISTUDIO_REASON"
+    fi
+    if [ -n "$RECOMMENDED" ]; then
+        info "Recommended default voice endpoint: $RECOMMENDED"
+        if [ -f assistant_config.json ]; then
+            REC="$RECOMMENDED" .venv/bin/python - <<'PYEOF'
+import json, os, pathlib
+p = pathlib.Path("assistant_config.json")
+try: cfg = json.loads(p.read_text())
+except Exception: cfg = {}
+rec = os.environ.get("REC", "")
+current = cfg.get("default_voice_endpoint")
+if rec and current in (None, "", "vertex"):
+    cfg["default_voice_endpoint"] = rec
+    p.write_text(json.dumps(cfg, indent=2) + "\n")
+PYEOF
+        fi
+    else
+        warn "Neither Gemini Live backend is reachable — voice in the Google provider won't work until one is configured."
+        echo "       See https://aistudio.google.com/apikey (AI Studio) or"
+        echo "       https://console.cloud.google.com/apis/library/aiplatform.googleapis.com (Vertex AI)."
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Completion
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
