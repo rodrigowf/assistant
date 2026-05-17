@@ -312,9 +312,16 @@ async def _handle_start(
         except Exception:
             logger.exception("Failed to load voice defaults from assistant_config.json")
 
+    # Note: we deliberately do NOT inject ``ws.app.state.config`` here.
+    # That snapshot is built once at app startup and never refreshed, so
+    # tools that used it (notably ``open_agent_session`` historically)
+    # ignored later edits to ``assistant_config.json`` / ``.manager.json``
+    # — the orchestrator would spawn local sessions even after the user
+    # pointed the UI at an SSH host.  Tools that need a ``ManagerConfig``
+    # now call ``api.session_factory.build_session_config()`` which
+    # re-reads the live files on every call.
     context: dict = {
         "store": ws.app.state.store,
-        "manager_config": ws.app.state.config,
         "pool": pool,
         "project_dir": project_dir,
         "index_dir": str(Path(project_dir) / "index" / "chroma"),

@@ -294,50 +294,23 @@ async def _handle_start(
         }))
         return sm, local_id
 
-    # Create a new session via the pool
-    from manager.config import ManagerConfig
-    from api.routes.config import _load_config as _load_assistant_config, _find_active_entry
-    config = ManagerConfig.load()
-    assistant_cfg = _load_assistant_config()
-    from dataclasses import replace
+    # Create a new session via the pool.
+    #
+    # The orchestrator's ``open_agent_session`` tool shares this exact
+    # resolution path via ``api.session_factory.build_session_config`` so
+    # SSH targets / harness picks / chrome flag / global enabled_mcps all
+    # propagate through both surfaces consistently.  When the UI passes a
+    # literal MCP dict in the WS message (the "restart with MCPs" flow),
+    # we honour it verbatim and skip the factory's enabled_mcps lookup.
+    from api.session_factory import build_session_config
 
-    # Apply per-session config overrides (session config takes precedence over global)
-    from api.routes.session_config import load_session_config
-    session_cfg = load_session_config(resume_sdk_id) if resume_sdk_id else {}
-
-    # Resolve working directory: session-specific entry id → global active → fallback
-    session_wd_id = session_cfg.get("working_directory")
-    if session_wd_id:
-        # Find the entry in global history by id
-        history = assistant_cfg.get("working_directory_history", [])
-        active_entry = next((e for e in history if e["id"] == session_wd_id), None)
-    else:
-        active_entry = _find_active_entry(assistant_cfg)
-
-    if active_entry:
-        config = replace(
-            config,
-            project_dir=active_entry["path"],
-            ssh_host=active_entry.get("ssh_host") or None,
-            ssh_user=active_entry.get("ssh_user") or None,
-            ssh_key=active_entry.get("ssh_key") or None,
-            ssh_claude_config_dir=active_entry.get("claude_config_dir") or None,
-        )
-    else:
-        config = replace(config, project_dir=assistant_cfg.get("working_directory", config.project_dir))
-
-    # Resolve provider + harness model from per-session / global / detected
-    # sources.  Extracted as a helper so the precedence rules can be tested
-    # in isolation without spinning up the WS handler.
-    resolved_provider, resolved_model, persist_provider = _resolve_session_provider(
+    config, factory_mcps, info = build_session_config(
         resume_sdk_id=resume_sdk_id,
-        session_cfg=session_cfg,
-        assistant_cfg=assistant_cfg,
+        mcp_override=None,  # never override from this path — let the factory
+                            # consult per-session + global enabled_mcps.
     )
-    if resolved_provider:
-        config = replace(config, provider=resolved_provider)
-    if resolved_model is not None:
-        config = replace(config, model=resolved_model)
+    if mcp_servers is None:
+        mcp_servers = factory_mcps
 
     # Persist the resolved provider into the session config so future
     # resumes are deterministic — even if the global default flips or
@@ -346,10 +319,10 @@ async def _handle_start(
     # session id yet, so there's no stable key to file the config under.
     # (The user can pin a provider for a fresh session after its first
     # turn via the per-session gear panel, which calls PUT /sessions/{id}/config.)
-    if persist_provider and resume_sdk_id:
+    if resume_sdk_id and info.get("persist_provider"):
         from api.routes.session_config import save_session_config
         try:
-            save_session_config(resume_sdk_id, {"provider": persist_provider})
+            save_session_config(resume_sdk_id, {"provider": info["persist_provider"]})
         except Exception as e:
             # Persistence is best-effort — losing it means the next resume
             # falls back to detection again, which is still correct.
@@ -357,26 +330,6 @@ async def _handle_start(
                 "Failed to persist resolved provider for session %s: %s",
                 resume_sdk_id, e,
             )
-
-    # If no per-session MCPs provided, use session-level or global enabled MCPs.
-    # An empty list in enabled_mcps means "no MCPs" (opt-in); None means "use defaults".
-    if mcp_servers is None:
-        # Session config takes precedence over global config (None = inherit)
-        raw_mcps = session_cfg.get("enabled_mcps")
-        if raw_mcps is None:
-            raw_mcps = assistant_cfg.get("enabled_mcps", [])
-        enabled_mcps: list[str] = raw_mcps or []
-        if enabled_mcps:
-            # Load full MCP configs from .claude.json and filter to enabled ones
-            from api.routes.mcp import _load_mcp_servers
-            all_mcps = _load_mcp_servers()
-            mcp_servers = {k: v for k, v in all_mcps.items() if k in enabled_mcps} or None
-    # Apply chrome extension flag if enabled (session config overrides global)
-    chrome = session_cfg.get("chrome_extension")
-    if chrome is None:
-        chrome = assistant_cfg.get("chrome_extension", False)
-    if chrome:
-        config = replace(config, extra_args={"chrome": None})
 
     try:
         await ws.send_bytes(orjson.dumps({

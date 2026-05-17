@@ -116,14 +116,24 @@ async def open_agent_session(
     resume_sdk_id: str = "",
     mcp_servers: list[str] | None = None,
 ) -> str:
-    from manager.config import ManagerConfig
+    """Spawn an agent session honouring the live global config.
+
+    Working directory (local or SSH), session-harness, harness model, and
+    chrome flag all come from ``assistant_config.json`` via
+    :func:`api.session_factory.build_session_config` — the same path the
+    UI's "+" button uses.  ``mcp_servers`` is the only per-call override:
+    when ``None``, the factory falls back to the global ``enabled_mcps``;
+    when a list (possibly empty), it replaces the inherited value
+    verbatim, matching the per-session config the UI exposes via the gear
+    panel.
+    """
+    from api.session_factory import build_session_config
 
     pool = context["pool"]
     store = context["store"]
-    config = context.get("manager_config") or ManagerConfig.load()
     sdk_id = resume_sdk_id if resume_sdk_id else None
 
-    # Validate that the session actually exists before trying to resume
+    # Validate that the session actually exists before trying to resume.
     if sdk_id:
         session_info = store.get_session_info(sdk_id)
         if session_info is None:
@@ -138,19 +148,14 @@ async def open_agent_session(
                 "from list_history can be resumed."
             })
 
-    # Build MCP servers dict if names provided
-    mcp_servers_config: dict[str, dict] | None = None
+    # Eagerly validate any explicit MCP names against the live catalogue
+    # so the model gets a precise error before pool.create is invoked.
+    # The factory drops unknown names silently; here we *want* the loud
+    # signal because the user-visible failure mode is "the model invented
+    # a name and the tool reported success on an empty MCP set".
     if mcp_servers:
-        mcp_servers_config = get_mcp_configs(mcp_servers)
-        if not mcp_servers_config:
-            available = sorted(load_available_mcps().keys())
-            return json.dumps({
-                "error": (
-                    f"No valid MCP servers found from: {mcp_servers}. "
-                    f"Available: {available or '(none configured)'}."
-                )
-            })
-        missing = [n for n in mcp_servers if n not in mcp_servers_config]
+        resolved = get_mcp_configs(mcp_servers)
+        missing = [n for n in mcp_servers if n not in resolved]
         if missing:
             available = sorted(load_available_mcps().keys())
             return json.dumps({
@@ -161,14 +166,49 @@ async def open_agent_session(
             })
 
     try:
-        local_id = await pool.create(config, resume_sdk_id=sdk_id, mcp_servers=mcp_servers_config)
+        config, resolved_mcps, info = build_session_config(
+            resume_sdk_id=sdk_id,
+            mcp_override=mcp_servers,
+        )
+    except Exception as e:
+        return json.dumps({"error": f"Failed to build session config: {e}"})
+
+    try:
+        local_id = await pool.create(
+            config, resume_sdk_id=sdk_id, mcp_servers=resolved_mcps,
+        )
     except Exception as e:
         return json.dumps({"error": f"Failed to start session: {e}"})
 
-    result = {"session_id": local_id, "status": "started"}
-    if mcp_servers_config:
-        result["mcp_servers"] = list(mcp_servers_config.keys())
-    return json.dumps(result)
+    # Mirror chat.py's persist-on-detect behaviour so a legacy resumed
+    # session gets its provider pinned for future deterministic resumes.
+    if sdk_id and info.get("persist_provider"):
+        from api.routes.session_config import save_session_config
+        try:
+            save_session_config(sdk_id, {"provider": info["persist_provider"]})
+        except Exception as e:
+            logger.warning(
+                "Failed to persist resolved provider for session %s: %s",
+                sdk_id, e,
+            )
+
+    # Surface the resolved config back to the model so it can see what
+    # global settings landed (working dir, provider, MCPs, ssh target).
+    # Without this the model has no way to verify that its expectations
+    # match reality without calling get_assistant_config separately.
+    return json.dumps({
+        "session_id": local_id,
+        "status": "started",
+        "resolved_config": {
+            "working_directory": info["working_directory"],
+            "project_dir": info["project_dir"],
+            "ssh_host": info["ssh_host"],
+            "provider": info["provider"],
+            "model": info["model"],
+            "chrome_extension": info["chrome_extension"],
+            "mcp_servers": info["mcp_servers"],
+        },
+    })
 
 
 @registry.register(

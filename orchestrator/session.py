@@ -289,6 +289,7 @@ class OrchestratorSession:
         """
         # Import tools to ensure they're registered
         import orchestrator.tools.agent_sessions  # noqa: F401
+        import orchestrator.tools.assistant_config  # noqa: F401
         import orchestrator.tools.audio_playback  # noqa: F401
         import orchestrator.tools.files  # noqa: F401
         import orchestrator.tools.search  # noqa: F401

@@ -379,6 +379,14 @@ def _guidelines_section() -> str:
 - **Use the returned session_id immediately**: When `open_agent_session` returns `{"session_id": "<id>", "status": "started"}`, the very next `send_to_agent_session` call for that work MUST pass that exact `<id>`. Do not reuse an older session_id from earlier in the conversation — that silently delivers the work to the wrong agent and the user sees the original task respond, not the new one.
 - **Check tool results**: When a tool returns `{"error": "..."}`, treat it as a failure even if the error sounds recoverable. Do not narrate "I've opened a new session" if `open_agent_session` errored — tell the user what failed and pick a valid input (e.g. an MCP from the Available MCPs list) before retrying.
 
+### Session Configuration
+Sessions inherit their settings from `assistant_config.json` — the same file the Config page in the UI edits. Every `open_agent_session` call resolves working directory (local path or SSH target), session harness (`claude` / `qwen`), harness model, chrome flag, and enabled MCPs from that file at the moment of the call. The orchestrator does NOT carry a separate config: editing the file via the UI or the tools below changes what the next spawned session sees, immediately.
+
+- **Before spawning with non-default settings**: call `get_assistant_config` to inspect the current values. Each `open_agent_session` response also echoes the `resolved_config` it actually used, so you can verify after the fact.
+- **To change settings**: call `update_assistant_config` with only the fields you want to change. Same validation as the Config page (working-directory ids must exist in `working_directory_history`, harness must be registered, etc.). Changes take effect on the next `open_agent_session`.
+- **For one-off MCP overrides**: pass `mcp_servers` to `open_agent_session` directly — that replaces the inherited list for that session only, without touching the global config.
+- **Confirm with the user first** before changing global config in ways that persist across sessions (switching working directory, switching provider, enabling chrome). The user owns the Config page; surprise edits will confuse them.
+
 ### Memory Maintenance
 - **Update the shared index** when you or agents modify skills or create memory files
 - **Remind agents** to report back when their work affects the index
