@@ -1,13 +1,22 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTabsContext, getTabStatusIcon } from "../context/TabsContext";
-import { closePoolSession, renameSession } from "../api/rest";
+import { closePoolSession } from "../api/rest";
 import { ConfirmCloseModal } from "./ConfirmCloseModal";
-import type { TabState } from "../types";
+import type { SessionInfo, TabState } from "../types";
 
 const ACTIVE_STATUSES = new Set(["streaming", "thinking", "tool_use"]);
 
-export function TabBar() {
-  const { tabs, activeTabId, switchTab, closeTab, updateTab } = useTabsContext();
+interface Props {
+  /** Authoritative session list (drives tab titles so rename/orchestrator-opened
+   *  tabs stay in sync with the sidebar — they share one source of truth). */
+  sessions: SessionInfo[];
+  /** Persist a rename via the same path the sidebar uses — keeps both UIs and
+   *  `.titles.json` aligned. */
+  onRename: (sdkSessionId: string, title: string) => Promise<void> | void;
+}
+
+export function TabBar({ sessions, onRename }: Props) {
+  const { tabs, activeTabId, switchTab, closeTab } = useTabsContext();
   const [pendingClose, setPendingClose] = useState<TabState | null>(null);
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState("");
@@ -20,19 +29,42 @@ export function TabBar() {
     }
   }, [editingTabId]);
 
+  // Build lookups so each tab can find its session entry by either join key.
+  const { bySdk, byLocal } = useMemo(() => {
+    const bySdk = new Map<string, SessionInfo>();
+    const byLocal = new Map<string, SessionInfo>();
+    for (const s of sessions) {
+      bySdk.set(s.session_id, s);
+      if (s.local_id) byLocal.set(s.local_id, s);
+    }
+    return { bySdk, byLocal };
+  }, [sessions]);
+
+  // Tab title is derived: prefer the persisted/computed title from the session
+  // list (matches the sidebar), fall back to the tab's own placeholder.
+  const titleFor = (tab: TabState): string => {
+    const info =
+      (tab.resumeSdkId && bySdk.get(tab.resumeSdkId)) ||
+      byLocal.get(tab.sessionId);
+    return info?.title || tab.title || "New session";
+  };
+
   const startEdit = (tab: TabState) => {
-    setDraftTitle(tab.title || "");
+    setDraftTitle(titleFor(tab));
     setEditingTabId(tab.sessionId);
   };
 
   const commitEdit = (tab: TabState) => {
     const trimmed = draftTitle.trim();
     setEditingTabId(null);
-    if (!trimmed || trimmed === tab.title) return;
-    updateTab(tab.sessionId, { title: trimmed });
+    if (!trimmed || trimmed === titleFor(tab)) return;
+    // Persist through the shared sidebar path so both UIs refresh from the
+    // same authoritative state. Requires the SDK session id — pre-first-turn
+    // tabs (no resumeSdkId yet) silently no-op rather than writing a title
+    // that won't have anywhere to land in `.titles.json`.
     if (tab.resumeSdkId) {
-      renameSession(tab.resumeSdkId, trimmed).catch(() => {
-        // Title only lives in memory if persistence fails — user can retry.
+      Promise.resolve(onRename(tab.resumeSdkId, trimmed)).catch(() => {
+        // best-effort — user can retry
       });
     }
   };
@@ -107,7 +139,7 @@ export function TabBar() {
                     startEdit(tab);
                   }}
                 >
-                  {tab.title || "New session"}
+                  {titleFor(tab)}
                 </span>
               )}
               <button
@@ -128,6 +160,7 @@ export function TabBar() {
       {pendingClose && (
         <ConfirmCloseModal
           tab={pendingClose}
+          title={titleFor(pendingClose)}
           onConfirm={() => {
             doClose(pendingClose.sessionId);
             setPendingClose(null);

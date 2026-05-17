@@ -12,7 +12,7 @@ import {
   type ModelsResponse,
 } from "../api/rest";
 import { generateUUID } from "../utils/uuid";
-import type { SessionStatus, ConnectionState } from "../types";
+import type { SessionInfo, SessionStatus, ConnectionState } from "../types";
 
 const SessionConfigPage = lazy(() => import("./SessionConfigPage").then(m => ({ default: m.SessionConfigPage })));
 
@@ -184,9 +184,13 @@ function OrchestratorChatPanel({
  * Container that manages all tab instances and renders the active tab's ChatPanel.
  */
 export function ChatPanelContainer({
+  sessions,
   onSessionChange,
   onMutationBusy,
 }: {
+  /** Authoritative session list — used to resolve titles for tabs opened by
+   *  the orchestrator (where we'd otherwise fall back to "Agent xxxxxxxx"). */
+  sessions: SessionInfo[];
   onSessionChange: () => void;
   /** Called with a label while a longer mutation (rewind / fork) is in
    *  flight, then again with null when it finishes. Lets the app render a
@@ -194,6 +198,8 @@ export function ChatPanelContainer({
   onMutationBusy?: (label: string | null) => void;
 }) {
   const { tabs, activeTabId, openTab, closeTab } = useTabsContext();
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const instancesRef = useRef<Map<string, ChatInstance>>(new Map());
   const [, setInstanceVersion] = useState(0);
   const notifyUpdate = useCallback(() => setInstanceVersion(v => v + 1), []);
@@ -268,9 +274,21 @@ export function ChatPanelContainer({
 
   const handleAgentSessionOpened = useCallback(
     (agentSessionId: string, sdkSessionId?: string) => {
-      openTab(agentSessionId, `Agent ${agentSessionId.slice(0, 8)}`, false, sdkSessionId);
+      // Prefer the title already known in the session list (orchestrator
+      // resuming an existing JSONL). For brand-new agent sessions there
+      // won't be an entry yet — fall back to a short placeholder. Once the
+      // first turn completes, `onSessionChange` refreshes `sessions[]` and
+      // the TabBar (which derives titles from it) updates automatically.
+      const known = sdkSessionId
+        ? sessionsRef.current.find((s) => s.session_id === sdkSessionId)
+        : undefined;
+      const title = known?.title || `Agent ${agentSessionId.slice(0, 8)}`;
+      openTab(agentSessionId, title, false, sdkSessionId);
+      // Kick the sidebar to pick up brand-new sessions that may already have
+      // a JSONL (resumed sessions land in the list immediately on next refresh).
+      onSessionChange();
     },
-    [openTab]
+    [openTab, onSessionChange]
   );
 
   const handleAgentSessionClosed = useCallback(

@@ -124,9 +124,9 @@ function AppContent() {
               <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
             </svg>
           </button>
-          <TabBar />
+          <TabBar sessions={sessions} onRename={renameSession} />
         </div>
-        <ChatPanelContainer onSessionChange={refresh} onMutationBusy={setChatMutationBusy} />
+        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onMutationBusy={setChatMutationBusy} />
         <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
       </main>
       {showOrchestratorModal && (
