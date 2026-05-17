@@ -566,6 +566,93 @@ class TestTruncateSession:
         out = [json.loads(l) for l in (context_dir / "chats" / "qs.jsonl").read_text().strip().split("\n")]
         assert [l.get("uuid", l["type"]) for l in out] == ["u1", "system", "a1"]
 
+    def test_gemini_flat_content_counted_as_visible(self, tmp_path):
+        """Gemini JSONL uses ``{type, content}`` flat (no ``message`` wrapper)
+        and ``type: "gemini"`` for the assistant role.  The truncate path
+        must delegate to the Gemini adapter so those turns count as visible —
+        before the fix, every line was classified internal and any non-zero
+        ``drop_last_n`` failed with 'out of range'."""
+        from unittest.mock import patch
+        from manager.config import ManagerConfig
+
+        context_dir = tmp_path / "context"
+        chats_dir = context_dir / "chats"
+        chats_dir.mkdir(parents=True)
+
+        # session id whose 8-char prefix matches the file name (mimics the
+        # real Gemini layout: session-<iso>-<uuid-prefix>.jsonl).
+        sid = "6e38da2a-e9ea-4032-bd18-04040f878227"
+        gemini_lines = [
+            {"sessionId": sid, "projectHash": "abc", "startTime": "2026-05-16T14:48:11Z",
+             "lastUpdated": "2026-05-16T14:48:11Z", "kind": "main"},
+            {"id": "m1", "timestamp": "2026-05-16T14:48:12Z",
+             "type": "user", "content": [{"text": "Hello!"}]},
+            {"$set": {"lastUpdated": "2026-05-16T14:48:12Z"}},
+            {"id": "m2", "timestamp": "2026-05-16T14:48:13Z",
+             "type": "gemini", "content": "Hi there!"},
+            {"id": "m3", "timestamp": "2026-05-16T14:48:14Z",
+             "type": "user", "content": [{"text": "Bye"}]},
+        ]
+        jsonl_path = chats_dir / f"session-2026-05-16T14-48-{sid[:8]}.jsonl"
+        jsonl_path.write_text("\n".join(json.dumps(l) for l in gemini_lines) + "\n")
+
+        # Point ManagerConfig.load() at this tmp project so the Gemini
+        # jsonl_path_resolver finds the right chats/ directory.
+        cfg = ManagerConfig(project_dir=str(tmp_path))
+        with patch("utils.paths.PROJECT_ROOT", tmp_path), \
+             patch("manager.config.ManagerConfig.load", return_value=cfg):
+            store = SessionStore(tmp_path)
+            # 3 visible turns (m1, m2, m3). drop_last_n=1 → keep m1, $set, m2.
+            assert store.truncate_session(sid, 1) is True
+
+        out = [json.loads(l) for l in jsonl_path.read_text().strip().split("\n")]
+        # Header + m1 + $set + m2; m3 dropped.
+        assert out[0].get("sessionId") == sid
+        ids_or_keys = [l.get("id") or ("$set" if "$set" in l else None) for l in out[1:]]
+        assert ids_or_keys == ["m1", "$set", "m2"]
+
+    def test_gemini_empty_content_with_thoughts_is_visible(self, tmp_path):
+        """Most Gemini assistant lines carry an empty ``content`` string and
+        store the real payload in ``thoughts`` / ``toolCalls``.  Those must
+        still count as visible turns — early returns on ``content == ""``
+        previously made them all invisible and forks failed instantly."""
+        from unittest.mock import patch
+        from manager.config import ManagerConfig
+
+        context_dir = tmp_path / "context"
+        chats_dir = context_dir / "chats"
+        chats_dir.mkdir(parents=True)
+
+        sid = "abc12345-0000-0000-0000-000000000000"
+        gemini_lines = [
+            {"sessionId": sid, "projectHash": "x", "startTime": "2026-05-16T14:48:11Z",
+             "lastUpdated": "2026-05-16T14:48:11Z", "kind": "main"},
+            {"id": "u1", "timestamp": "2026-05-16T14:48:12Z",
+             "type": "user", "content": [{"text": "go"}]},
+            {"id": "g1", "timestamp": "2026-05-16T14:48:13Z",
+             "type": "gemini", "content": "",
+             "thoughts": [{"subject": "Plan", "description": "..."}]},
+            {"id": "g2", "timestamp": "2026-05-16T14:48:14Z",
+             "type": "gemini", "content": "",
+             "toolCalls": [{"id": "t1", "name": "x", "args": {}, "status": "ok"}]},
+            {"id": "u2", "timestamp": "2026-05-16T14:48:15Z",
+             "type": "user", "content": [{"text": "next"}]},
+        ]
+        jsonl_path = chats_dir / f"session-2026-05-16T14-48-{sid[:8]}.jsonl"
+        jsonl_path.write_text("\n".join(json.dumps(l) for l in gemini_lines) + "\n")
+
+        cfg = ManagerConfig(project_dir=str(tmp_path))
+        with patch("utils.paths.PROJECT_ROOT", tmp_path), \
+             patch("manager.config.ManagerConfig.load", return_value=cfg):
+            store = SessionStore(tmp_path)
+            # 4 visible turns: u1, g1 (thoughts), g2 (toolCalls), u2.
+            # drop_last_n=3 → keep just u1.
+            assert store.truncate_session(sid, 3) is True
+
+        out = [json.loads(l) for l in jsonl_path.read_text().strip().split("\n")]
+        ids = [l.get("id") for l in out[1:] if l.get("id")]
+        assert ids == ["u1"]
+
     def test_keeps_orchestrator_internal_lines(self, tmp_path):
         """Orchestrator JSONL has tool_use / tool_result as their own line types;
         they should be preserved when they precede the cutoff visible message."""

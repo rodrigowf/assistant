@@ -96,6 +96,49 @@ class ProviderAdapter(ABC):
             ))
         return previews
 
+    def is_visible_message(self, obj: dict) -> bool:
+        """Return True if *obj* is a raw JSONL line representing a user-visible
+        message (a real conversation turn), not an internal/protocol line.
+
+        Used by :meth:`SessionStore.truncate_session` to count visible turns
+        from the bottom of a file so it can drop the last *N* of them.
+        Providers whose raw line shape diverges (e.g. Gemini, which uses
+        flat ``content`` instead of ``message.content``) override this; the
+        default delegates to :func:`is_visible_message_default`.
+        """
+        return is_visible_message_default(obj)
+
+
+def is_visible_message_default(obj: dict) -> bool:
+    """Default visibility check for the normalized message shape.
+
+    Matches Claude / Qwen / orchestrator native formats — all three
+    normalize a "user" line whose entire content is tool_result blocks as
+    internal (a protocol wrapper, not a real turn).  Exposed at module
+    level so callers without an adapter (unrecognized files) can still
+    apply the common rule instead of treating everything as invisible.
+    """
+    if not isinstance(obj, dict):
+        return False
+    msg_type = obj.get("type")
+    if msg_type == "assistant":
+        return True
+    if msg_type != "user":
+        return False
+    msg = obj.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    # Qwen native format puts blocks under `parts`, not `content`.
+    if (not content) and isinstance(msg, dict):
+        content = msg.get("parts")
+    if isinstance(content, list):
+        # Claude embeds tool_result as user-message content blocks;
+        # those wrap a tool result and aren't a real user turn.
+        return any(
+            isinstance(b, dict) and b.get("type") != "tool_result"
+            for b in content
+        )
+    return bool(content)
+
 
 # ---------------------------------------------------------------------------
 # Normalized-shape helpers — operate on the common format produced by all

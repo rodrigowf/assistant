@@ -31,6 +31,7 @@ from .protocol import (
     detect_provider,
     ensure_all_registered,
     extract_text as _extract_text,  # backward-compat re-export
+    is_visible_message_default,
 )
 from .types import MessagePreview, SessionDetail, SessionInfo
 
@@ -405,6 +406,12 @@ class SessionStore:
         except OSError:
             return False
 
+        # Visibility classification is provider-specific (Gemini's raw shape
+        # differs from Claude / Qwen).  Delegate to the adapter when we can
+        # detect one; fall back to the protocol default for unrecognized
+        # files so a missing detector doesn't silently zero out the count.
+        adapter = self._resolve_adapter(jsonl_path)
+
         def is_visible_message(line: str) -> bool:
             if not line.strip():
                 return False
@@ -414,24 +421,9 @@ class SessionStore:
                 return False
             if not isinstance(obj, dict):
                 return False
-            msg_type = obj.get("type")
-            if msg_type == "assistant":
-                return True
-            if msg_type != "user":
-                return False
-            msg = obj.get("message")
-            content = msg.get("content") if isinstance(msg, dict) else None
-            # Qwen native format puts blocks under `parts`, not `content`.
-            if (not content) and isinstance(msg, dict):
-                content = msg.get("parts")
-            if isinstance(content, list):
-                # Claude embeds tool_result as user-message content blocks;
-                # those wrap a tool result and aren't a real user turn.
-                return any(
-                    isinstance(b, dict) and b.get("type") != "tool_result"
-                    for b in content
-                )
-            return bool(content)
+            if adapter is not None:
+                return adapter.is_visible_message(obj)
+            return is_visible_message_default(obj)
 
         visible_line_indices = [
             i for i, line in enumerate(raw_lines) if is_visible_message(line)
@@ -483,8 +475,11 @@ class SessionStore:
             return None
         if not self.truncate_session(new_id, drop_last_n):
             # Roll back the duplicate so we don't leave orphan JSONLs around.
+            # The copy was never added to the vector index, so skip the
+            # chromadb cleanup — it's a multi-second cold start on the
+            # Jetson and would otherwise dominate the failure response time.
             try:
-                self.delete_session(new_id)
+                self.delete_session(new_id, skip_index_cleanup=True)
             except Exception:
                 pass
             return None

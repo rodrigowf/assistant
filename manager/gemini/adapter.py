@@ -273,6 +273,40 @@ class GeminiAdapter(ProviderAdapter):
             pass
         return False
 
+    def is_visible_message(self, obj: dict) -> bool:
+        """Gemini's native shape is flat: ``{type, content, ...}`` with no
+        ``message`` wrapper, and the assistant role is ``"gemini"`` rather
+        than ``"assistant"``. The default protocol implementation (built for
+        Claude / Qwen) misses both, so override here.
+
+        For ``type: "gemini"`` lines the CLI almost always writes
+        ``content: ""`` and stores the real payload in ``thoughts`` and/or
+        ``toolCalls``, so empty ``content`` is *not* a signal of an invisible
+        line — we check the other carriers before concluding the turn is
+        empty.
+        """
+        if not isinstance(obj, dict):
+            return False
+        raw_type = obj.get("type")
+        if raw_type not in ("user", "gemini"):
+            return False
+        content = obj.get("content")
+        if isinstance(content, str) and content:
+            return True
+        if isinstance(content, list):
+            # User content is [{text: ...}] segments; visible if any non-empty
+            # text segment is present.
+            if any(
+                isinstance(p, dict) and p.get("text")
+                for p in content
+            ):
+                return True
+        # An assistant turn often carries thoughts and/or tool calls only
+        # (empty ``content`` string).  Those are real turns — surface them.
+        if raw_type == "gemini":
+            return bool(obj.get("toolCalls") or obj.get("thoughts"))
+        return False
+
     def read_messages(self, jsonl_path: Path) -> list[dict]:
         """Read user/assistant messages from a Gemini JSONL file, normalized.
 
