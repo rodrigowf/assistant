@@ -36,8 +36,12 @@ def _resolve_qwen_voice():
 
 
 def _resolve_google_voice():
-    from orchestrator.providers.gemini_voice import GeminiLiveVoiceProvider
-    return GeminiLiveVoiceProvider
+    # Concrete class is picked at instantiation time based on the
+    # ``endpoint`` argument (see :func:`instantiate_provider`). The
+    # resolver returns the default backend so type-only callers (e.g.
+    # ``isinstance`` checks) still work.
+    from orchestrator.providers.gemini_voice import select_backend
+    return select_backend(None)
 
 
 class VoiceEntry(TypedDict):
@@ -323,22 +327,33 @@ VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
          "default": False},
     ],
     # Curated fallback list for Gemini Live. The Config-page dropdown
-    # prefers the dynamic /api/config/voice/google/models endpoint
-    # (which queries Google's models.list for any model supporting
-    # bidiGenerateContent); this static list is the fallback when the
-    # dynamic query fails (e.g. GEMINI_API_KEY unset, transient
-    # network error). Keep at least one stable + one preview model
-    # entry so the UI shows something useful even offline.
+    # prefers the dynamic ``/api/config/voice/google/models?endpoint=...``
+    # endpoint (which queries either AI Studio or Vertex depending on
+    # ``endpoint``); this static list is the fallback when both upstream
+    # calls fail and exists to satisfy ``get_model_entry`` lookups for
+    # either backend's canonical model id.
+    #
+    # Entries map to Live models on:
+    # - Vertex AI: ``gemini-live-2.5-flash-native-audio`` (default)
+    # - AI Studio: ``gemini-2.5-flash-native-audio-latest`` +
+    #   ``gemini-3.1-flash-live-preview`` (not mirrored to Vertex yet).
     "google": [
-        {"id": "gemini-2.5-flash-native-audio-latest",
-         "label": "Gemini 2.5 Flash Native Audio",
+        {"id": "gemini-live-2.5-flash-native-audio",
+         "label": "Gemini Live 2.5 Flash Native Audio",
          "voice": "Puck",
          "voices": _GEMINI_LIVE_VOICES,
          "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
          "default_transcription_language": "",
          "default": True},
+        {"id": "gemini-2.5-flash-native-audio-latest",
+         "label": "Gemini 2.5 Flash Native Audio (AI Studio)",
+         "voice": "Puck",
+         "voices": _GEMINI_LIVE_VOICES,
+         "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
+         "default_transcription_language": "",
+         "default": False},
         {"id": "gemini-3.1-flash-live-preview",
-         "label": "Gemini 3.1 Flash Live (preview)",
+         "label": "Gemini 3.1 Flash Live (AI Studio, preview)",
          "voice": "Puck",
          "voices": _GEMINI_LIVE_VOICES,
          "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
@@ -450,9 +465,19 @@ def instantiate_provider(
     model: str,
     voice: str | None = None,
     transcription_language: str | None = None,
+    endpoint: str | None = None,
 ) -> BaseVoiceProvider:
-    """Construct a provider instance from a (provider, model) pair."""
-    cls = get_provider_class(provider)
+    """Construct a provider instance from a (provider, model) pair.
+
+    The ``endpoint`` argument is only meaningful for the ``"google"``
+    provider (where it selects between AI Studio and Vertex backends);
+    other providers ignore it.
+    """
+    if provider == "google":
+        from orchestrator.providers.gemini_voice import select_backend
+        cls = select_backend(endpoint)
+    else:
+        cls = get_provider_class(provider)
     entry = get_model_entry(provider, model)
     voices = entry.get("voices") or []
     voice_ids = {v["id"] for v in voices}

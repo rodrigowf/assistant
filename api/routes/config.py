@@ -138,8 +138,20 @@ def _default_config() -> dict[str, Any]:
         "default_voice_model": DEFAULT_VOICE_MODEL,
         "default_voice_name": default_voice,
         "default_voice_transcription_language": default_lang,
+        # For the ``google`` voice provider only: which backend to talk
+        # to. ``"vertex"`` (default) uses the Vertex AI Live endpoint;
+        # ``"aistudio"`` falls back to the older
+        # ``generativelanguage.googleapis.com`` path. Other providers
+        # ignore this field.
+        "default_voice_endpoint": _default_voice_endpoint(),
         "voice_recording_enabled": False,  # save raw audio from voice sessions
     }
+
+
+def _default_voice_endpoint() -> str:
+    """Resolve the default Gemini-backend id (see ``gemini_voice``)."""
+    from orchestrator.providers.gemini_voice import resolve_endpoint_id
+    return resolve_endpoint_id(None)
 
 
 def _find_active_entry(config: dict[str, Any]) -> dict | None:
@@ -224,6 +236,9 @@ class ConfigUpdate(BaseModel):
     default_voice_model: str | None = None     # default model for voice sessions
     default_voice_name: str | None = None      # default voice/speaker for voice sessions
     default_voice_transcription_language: str | None = None  # "" = auto-detect
+    # Backend for the ``google`` provider only — "vertex" | "aistudio".
+    # ``None`` falls back to the env / module default.
+    default_voice_endpoint: str | None = None
     voice_recording_enabled: bool | None = None  # save raw audio from voice sessions
 
 
@@ -273,7 +288,14 @@ async def list_harness_qwen_models() -> dict[str, Any]:
 # models frequently — refresh every 60s so a new model becomes
 # available without a server restart, but page loads don't hammer
 # models.list.
-_GEMINI_LIVE_MODELS_CACHE: dict[str, Any] = {"at": 0.0, "models": None}
+# Per-backend Gemini Live model-catalog cache. Keyed by endpoint id
+# ("aistudio" / "vertex"); each entry stores the timestamp + list. Both
+# upstreams are reasonably stable but expensive to hit on every page
+# load, so we cache for 60s. ``None`` means "not yet fetched".
+_GEMINI_LIVE_MODELS_CACHE: dict[str, dict[str, Any]] = {
+    "aistudio": {"at": 0.0, "models": None},
+    "vertex": {"at": 0.0, "models": None},
+}
 _GEMINI_LIVE_MODELS_CACHE_TTL_S = 60.0
 
 
@@ -313,26 +335,58 @@ def _humanize_gemini_model_name(model_id: str) -> str:
 
 
 @router.get("/voice/google/models")
-async def list_voice_google_models() -> dict[str, Any]:
-    """Return the Gemini Live model catalog queried from Google's models.list.
+async def list_voice_google_models(endpoint: str | None = None) -> dict[str, Any]:
+    """Return the Gemini Live model catalog for the selected backend.
 
-    Filters for models advertising ``bidiGenerateContent`` in their
-    ``supportedGenerationMethods``. Cached in-memory for 60s so page
-    loads don't hammer the upstream API. Returns ``{models: []}`` when
-    ``GEMINI_API_KEY`` is missing or the upstream call fails — the
-    frontend falls back to ``VOICE_MODELS["google"]`` from the static
-    registry in that case.
+    The ``endpoint`` query param picks which Google backend to query:
+
+    - ``vertex`` (default): queries Vertex's
+      ``publishers/google/models`` catalog. Auth via Application
+      Default Credentials.
+    - ``aistudio``: queries
+      ``generativelanguage.googleapis.com/v1beta/models``. Auth via the
+      ``GEMINI_API_KEY`` env var.
+
+    Both responses are name-filtered for Live-capable models, cached in
+    memory for 60s (per backend), and shaped into the
+    ``VoiceModelEntry``-compatible JSON the Config page consumes. On any
+    failure the route returns ``{models: []}`` and the frontend falls
+    back to the static ``VOICE_MODELS["google"]`` entry.
     """
-    from orchestrator.providers.gemini_voice import GEMINI_LIVE_VOICES
+    from orchestrator.providers.gemini_voice import resolve_endpoint_id
+
+    backend = resolve_endpoint_id(endpoint)
+    cache = _GEMINI_LIVE_MODELS_CACHE[backend]
 
     now = time.monotonic()
-    cached = _GEMINI_LIVE_MODELS_CACHE
-    if cached["models"] is not None and (now - cached["at"]) < _GEMINI_LIVE_MODELS_CACHE_TTL_S:
-        return {"models": cached["models"]}
+    if (
+        cache["models"] is not None
+        and (now - cache["at"]) < _GEMINI_LIVE_MODELS_CACHE_TTL_S
+    ):
+        return {"models": cache["models"]}
+
+    if backend == "vertex":
+        out = await _fetch_vertex_gemini_models()
+    else:
+        out = await _fetch_aistudio_gemini_models()
+
+    # Mark the first entry default — Config page assumes exactly one
+    # default entry per provider.
+    if out:
+        out[0]["default"] = True
+
+    cache["models"] = out
+    cache["at"] = now
+    return {"models": out}
+
+
+async def _fetch_aistudio_gemini_models() -> list[dict[str, Any]]:
+    """Fetch the AI Studio Live catalog. Returns [] on any failure."""
+    from orchestrator.providers.gemini_voice import GEMINI_LIVE_VOICES
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return {"models": []}
+        return []
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -342,14 +396,16 @@ async def list_voice_google_models() -> dict[str, Any]:
             )
         if resp.status_code != 200:
             logger.warning(
-                "Gemini models.list returned %s; falling back to static registry",
+                "AI Studio models.list returned %s; falling back to static registry",
                 resp.status_code,
             )
-            return {"models": []}
+            return []
         data = resp.json()
     except Exception:  # noqa: BLE001
-        logger.exception("Gemini models.list failed; falling back to static registry")
-        return {"models": []}
+        logger.exception(
+            "AI Studio models.list failed; falling back to static registry",
+        )
+        return []
 
     voices_list = [{"id": v, "label": v, "description": ""} for v in GEMINI_LIVE_VOICES]
     out: list[dict[str, Any]] = []
@@ -357,30 +413,92 @@ async def list_voice_google_models() -> dict[str, Any]:
         methods = m.get("supportedGenerationMethods", [])
         if "bidiGenerateContent" not in methods:
             continue
-        # Strip the "models/" prefix Gemini uses on the `name` field.
-        name = m.get("name", "")
+        name = m.get("name", "")  # "models/<id>"
         mid = name.split("/", 1)[1] if "/" in name else name
         if not mid:
             continue
-        out.append({
-            "id": mid,
-            "label": _humanize_gemini_model_name(mid),
-            "voice": GEMINI_LIVE_VOICES[0],
-            "voices": voices_list,
-            "transcription_languages": [],
-            "default_transcription_language": "",
-            "default": False,
-            "description": m.get("description", ""),
-        })
+        out.append(_voice_model_entry(mid, voices_list, m.get("description", "")))
+    return out
 
-    # Mark the first entry default — preserves the Config-page assumption
-    # that exactly one entry per provider is the default.
-    if out:
-        out[0]["default"] = True
 
-    _GEMINI_LIVE_MODELS_CACHE["models"] = out
-    _GEMINI_LIVE_MODELS_CACHE["at"] = now
-    return {"models": out}
+async def _fetch_vertex_gemini_models() -> list[dict[str, Any]]:
+    """Fetch the Vertex publisher-model catalog. Returns [] on any failure.
+
+    Vertex doesn't expose ``supportedGenerationMethods`` on the
+    publisher-models endpoint, so we name-match instead.
+    """
+    from orchestrator.providers.gemini_voice import (
+        DEFAULT_GCP_LOCATION,
+        GEMINI_LIVE_VOICES,
+        get_adc_access_token,
+    )
+
+    project_id = os.environ.get("GCP_PROJECT_ID")
+    if not project_id:
+        return []
+    location = os.environ.get("GCP_LOCATION", DEFAULT_GCP_LOCATION)
+
+    try:
+        token = await get_adc_access_token()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Vertex AI ADC token mint failed; returning empty model list",
+        )
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"https://{location}-aiplatform.googleapis.com/v1beta1/publishers/google/models",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "x-goog-user-project": project_id,
+                },
+                params={"view": "PUBLISHER_MODEL_VIEW_BASIC"},
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "Vertex publishers/google/models returned %s; falling back to static registry",
+                resp.status_code,
+            )
+            return []
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Vertex publishers/google/models failed; falling back to static registry",
+        )
+        return []
+
+    voices_list = [{"id": v, "label": v, "description": ""} for v in GEMINI_LIVE_VOICES]
+    out: list[dict[str, Any]] = []
+    for m in data.get("publisherModels", []):
+        name = m.get("name", "")  # "publishers/google/models/<id>"
+        mid = name.rsplit("/", 1)[-1] if name else ""
+        lower = mid.lower()
+        if "live" not in lower and "native-audio" not in lower:
+            continue
+        if not mid:
+            continue
+        out.append(_voice_model_entry(mid, voices_list, m.get("description", "")))
+    return out
+
+
+def _voice_model_entry(
+    model_id: str,
+    voices_list: list[dict[str, str]],
+    description: str = "",
+) -> dict[str, Any]:
+    """Shape a Gemini model id into the dict the Config page expects."""
+    return {
+        "id": model_id,
+        "label": _humanize_gemini_model_name(model_id),
+        "voice": voices_list[0]["id"] if voices_list else "",
+        "voices": voices_list,
+        "transcription_languages": [],
+        "default_transcription_language": "",
+        "default": False,
+        "description": description,
+    }
 
 
 @router.put("")
@@ -542,6 +660,19 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
         config["default_voice_model"] = model_entry["id"]
         config["default_voice_name"] = voice_id
         config["default_voice_transcription_language"] = lang_id
+
+    if body.default_voice_endpoint is not None:
+        from orchestrator.providers.gemini_voice import KNOWN_ENDPOINTS
+        endpoint = body.default_voice_endpoint.strip()
+        if endpoint not in KNOWN_ENDPOINTS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown voice endpoint {endpoint!r}; "
+                    f"expected one of {list(KNOWN_ENDPOINTS)}"
+                ),
+            )
+        config["default_voice_endpoint"] = endpoint
 
     if body.voice_recording_enabled is not None:
         config["voice_recording_enabled"] = body.voice_recording_enabled

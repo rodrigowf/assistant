@@ -1,606 +1,234 @@
-"""Google Gemini Live realtime voice provider.
+"""Concrete Gemini Live voice backends.
 
-Connects to Google's `generativelanguage.googleapis.com` BidiGenerateContent
-WebSocket. The protocol shape is wholly different from OpenAI / Qwen
-(which mirror each other) — message names use camelCase (``setup``,
-``realtimeInput``, ``serverContent``, ``toolCall``, ``toolResponse``) and
-audio is shipped as ``inlineData`` parts inside ``modelTurn``.
+This module exposes the two concrete classes implementing the Gemini
+Live protocol — one per Google backend — plus a small ``select_backend``
+helper used by the voice registry to pick between them at instantiation
+time.
 
-Reference: https://ai.google.dev/api/live
+- :class:`GeminiAIStudioBackend` — talks to
+  ``generativelanguage.googleapis.com`` using ``?key=$GEMINI_API_KEY``.
+- :class:`VertexAIBackend` — talks to
+  ``{location}-aiplatform.googleapis.com`` using a Bearer token from
+  Application Default Credentials.
 
-Architecture vs the other providers:
+Both speak the same JSON protocol on the wire — the differences are
+URL, auth, and the ``setup.model`` qualifier. All of that protocol-level
+machinery lives in :mod:`gemini_voice_base`.
 
-- WebSocket transport (same as Qwen). The backend owns the upstream WS;
-  audio flows browser → orchestrator WS → backend → Gemini WS, and back.
-- Auth is an API key passed as ``?key=<KEY>`` on the WS URL. Free-tier
-  dev key in ``context/.env`` is fine; productionising would route
-  through Vertex AI's IAM-based auth (out of scope).
-- Audio formats: 16kHz PCM in, 24kHz PCM out. The frontend's pcmPlayer
-  already handles both rates — we just advertise them via
-  ``get_connection_info``.
-- Tool calls arrive in ``toolCall.functionCalls[]`` with an ``id`` we
-  must echo back in ``toolResponse.functionResponses[].id``, plus the
-  ``name`` (the orchestrator's ``format_tool_result(call_id, output)``
-  doesn't pass the name through, so we track ``id → name`` internally
-  during ``translate_event``).
-- No DashScope-style URL-validator pathology — no payload sanitisation
-  needed.
-
-Out of scope for this provider:
-- Video input (Gemini Live supports it; our frontend doesn't capture).
-- Voice cloning (separate endpoint).
-- Function-calling beyond the realtime audio flow (text-only Gemini is
-  a separate provider class).
+Selection precedence (used by ``select_backend``):
+1. explicit ``endpoint`` argument (``"aistudio"`` or ``"vertex"``),
+2. ``GEMINI_VOICE_BACKEND`` env var,
+3. fallback :data:`DEFAULT_ENDPOINT` (Vertex — the stable one).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-from collections.abc import AsyncIterator
-from typing import Any
 
 import websockets
 
-from orchestrator.providers.voice_base import BaseVoiceProvider
-from orchestrator.types import (
-    ErrorEvent,
-    OrchestratorEvent,
-    TextDelta,
-    TextComplete,
-    ToolUseStart,
-    TurnComplete,
-    VoiceInterrupted,
+from orchestrator.providers.gemini_voice_base import (
+    GeminiVoiceProviderBase,
+    GEMINI_LIVE_VOICES,
 )
 
 logger = logging.getLogger(__name__)
 
-# Default model + voice (overridable via constructor).
-GEMINI_VOICE_MODEL = "gemini-2.5-flash-native-audio-latest"
-GEMINI_VOICE_NAME = "Puck"
+# Backend identifiers — these are the values stored in
+# ``assistant_config.json:default_voice_endpoint`` and the
+# ``endpoint=`` query param on voice routes.
+ENDPOINT_AISTUDIO = "aistudio"
+ENDPOINT_VERTEX = "vertex"
+KNOWN_ENDPOINTS = (ENDPOINT_AISTUDIO, ENDPOINT_VERTEX)
+DEFAULT_ENDPOINT = ENDPOINT_VERTEX
 
-# WebSocket endpoint — the API key is appended as a query param.
-GEMINI_LIVE_WS = (
+# --- AI Studio constants -----------------------------------------------------
+AI_STUDIO_LIVE_WS = (
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
+AI_STUDIO_DEFAULT_MODEL = "gemini-2.5-flash-native-audio-latest"
 
-# Prebuilt voice IDs Gemini Live ships today (Sept–Dec 2025 catalogue).
-# The Live API doesn't expose a per-model voice list dynamically; this
-# is a static catalogue used as a fallback. The dynamic-models endpoint
-# attaches this same list to every Live model entry.
-GEMINI_LIVE_VOICES = (
-    "Puck",
-    "Charon",
-    "Kore",
-    "Fenrir",
-    "Aoede",
-    "Leda",
-    "Orus",
-    "Zephyr",
+# --- Vertex AI constants -----------------------------------------------------
+VERTEX_LIVE_WS_TEMPLATE = (
+    "wss://{location}-aiplatform.googleapis.com/ws/"
+    "google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
 )
+VERTEX_DEFAULT_MODEL = "gemini-live-2.5-flash-native-audio"
+DEFAULT_GCP_LOCATION = "us-central1"
 
 
-class GeminiLiveVoiceProvider(BaseVoiceProvider):
-    """Google Gemini Live realtime voice provider (WebSocket)."""
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        model: str = GEMINI_VOICE_MODEL,
-        voice: str = GEMINI_VOICE_NAME,
-        transcription_language: str = "",
-    ) -> None:
-        self._model = model
-        self._voice = voice
-        # Gemini Live auto-detects language from audio; this parameter
-        # exists for signature parity with QwenVoiceProvider /
-        # OpenAIVoiceProvider but is currently unused.
-        self._transcription_language = transcription_language
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        # Tool-name lookup: Gemini Live emits ``toolCall.functionCalls[]``
-        # with ``id`` and ``name`` we need to remember, because the
-        # canonical ``format_tool_result(call_id, output)`` signature
-        # doesn't include the tool name but Gemini's ``toolResponse``
-        # demands it.
-        self._pending_call_names: dict[str, str] = {}
-        # Running transcript for interruption events.
-        self._current_transcript: str = ""
 
-    # --- identity ---------------------------------------------------------
+class GeminiAIStudioBackend(GeminiVoiceProviderBase):
+    """Gemini Live via AI Studio (``generativelanguage.googleapis.com``).
+
+    Auth: ``?key=$GEMINI_API_KEY`` query param on the WS URL. No project
+    ID needed — the key encodes the project. Note Google has been known
+    to revoke Live access at this endpoint without warning (see module
+    docstring of ``gemini_voice_base``); :class:`VertexAIBackend` is the
+    recommended default.
+    """
+
+    DEFAULT_MODEL = AI_STUDIO_DEFAULT_MODEL
 
     @property
-    def provider_name(self) -> str:
-        return "google"
+    def endpoint_id(self) -> str:
+        return ENDPOINT_AISTUDIO
 
-    @property
-    def connection_type(self) -> str:
-        return "websocket"
+    def _qualify_model(self, model_id: str) -> str:
+        return f"models/{model_id}"
 
-    @property
-    def model(self) -> str:
-        return self._model
+    def _get_endpoint_url(self) -> str:
+        return AI_STUDIO_LIVE_WS
 
-    @property
-    def voice(self) -> str:
-        return self._voice
-
-    @property
-    def transcription_language(self) -> str:
-        return self._transcription_language
-
-    @property
-    def pending_calls(self) -> dict[str, str]:
-        return self._pending_call_names
-
-    # --- ingestion --------------------------------------------------------
-
-    async def inject_event(self, raw_event: dict[str, Any]) -> None:
-        await self._queue.put(raw_event)
-
-    async def inject_audio(self, pcm_b64: str, sample_rate: int) -> None:
-        """Frontend mic chunk → backend → relayed to Gemini via realtimeInput.
-
-        The relay shapes the wire frame via :meth:`format_audio_in`; this
-        method just keeps the topology-agnostic ``inject_audio`` contract.
-        """
-        await self.inject_event({
-            "type": "_internal_audio_in_relayed",
-            "audio": pcm_b64,
-            "sample_rate": sample_rate,
-        })
-
-    # --- streaming --------------------------------------------------------
-
-    async def create_message(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        system: str,
-    ) -> AsyncIterator[OrchestratorEvent]:
-        """Drain queued provider events and yield canonical ones.
-
-        Runs until a ``turnComplete`` or an error event is observed.
-        """
-        self._current_transcript = ""
-        while True:
-            try:
-                event = await asyncio.wait_for(self._queue.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                yield ErrorEvent(error="voice_timeout", detail="No event received within 30s")
-                return
-
-            # Side effects: track tool-call names + transcript before translating.
-            tool_calls = event.get("toolCall", {}).get("functionCalls", [])
-            for call in tool_calls:
-                cid = call.get("id", "")
-                name = call.get("name", "")
-                if cid and name:
-                    self._pending_call_names[cid] = name
-
-            server_content = event.get("serverContent", {})
-            parts = server_content.get("modelTurn", {}).get("parts", [])
-            for p in parts:
-                t = p.get("text")
-                if t:
-                    self._current_transcript += t
-
-            translated = self.translate_event(event)
-            if translated is not None:
-                yield translated
-
-            if server_content.get("turnComplete"):
-                self._current_transcript = ""
-                return
-            if event.get("type") == "error" or "error" in event:
-                return
-
-    def translate_event(self, raw_event: dict[str, Any]) -> OrchestratorEvent | None:
-        """Translate a Gemini Live event to a canonical orchestrator event.
-
-        Pure-ish (no transcript bookkeeping — :meth:`create_message`
-        accumulates that). Returns ``None`` for events that don't map to
-        anything user-visible (e.g. ``setupComplete``).
-        """
-        # Setup acknowledgement — nothing to surface.
-        if "setupComplete" in raw_event:
-            return None
-
-        server_content = raw_event.get("serverContent")
-        if server_content is not None:
-            # Interrupted mid-response (user spoke over the model).
-            if server_content.get("interrupted"):
-                return VoiceInterrupted(partial_text=self._current_transcript)
-
-            # Input ASR transcription — what the user said. Live API
-            # ships this either as ``serverContent.inputTranscription``
-            # (current docs) or at the top level (older docs); we
-            # accept both.
-            input_t = server_content.get("inputTranscription")
-            if isinstance(input_t, dict):
-                txt = input_t.get("text", "")
-                if txt:
-                    return TextDelta(text=txt)
-
-            # Output ASR transcription — the model's spoken reply as text.
-            # Surfaces in the chat as a streaming assistant message
-            # alongside the audio.
-            output_t = server_content.get("outputTranscription")
-            if output_t is not None:
-                txt = output_t.get("text", "")
-                if txt:
-                    return TextDelta(text=txt)
-
-            # Streaming text via parts[].text (rare with native-audio
-            # models but supported by the half-cascade Live preview).
-            parts = server_content.get("modelTurn", {}).get("parts", [])
-            for p in parts:
-                txt = p.get("text")
-                if txt:
-                    return TextDelta(text=txt)
-
-            # Turn complete — emit a TurnComplete (usage isn't included
-            # by the Live API in turnComplete; report zeros).
-            if server_content.get("turnComplete"):
-                # Some Gemini Live builds attach usage info to outputTokensDetails;
-                # try opportunistically.
-                usage = server_content.get("usageMetadata", {})
-                return TurnComplete(
-                    input_tokens=usage.get("promptTokenCount", 0),
-                    output_tokens=usage.get("candidatesTokenCount", 0),
-                )
-
-        # Top-level inputTranscription — older Live API shape.  Newer
-        # builds nest it under serverContent (handled above); we accept
-        # either since the docs disagree across versions.
-        input_t = raw_event.get("inputTranscription")
-        if isinstance(input_t, dict):
-            txt = input_t.get("text", "")
-            if txt:
-                return TextDelta(text=txt)
-
-        # Tool call: track id→name so format_tool_result can echo the
-        # name back (Gemini's toolResponse requires it; our canonical
-        # format_tool_result(call_id, output) signature doesn't pass it
-        # through). Then surface the first call as ToolUseStart.
-        tool_call = raw_event.get("toolCall")
-        if tool_call is not None:
-            calls = tool_call.get("functionCalls", [])
-            first: ToolUseStart | None = None
-            for call in calls:
-                cid = call.get("id", "")
-                name = call.get("name", "")
-                args = call.get("args", {}) or {}
-                if cid and name:
-                    self._pending_call_names[cid] = name
-                    if first is None:
-                        first = ToolUseStart(
-                            tool_call_id=cid,
-                            tool_name=name,
-                            tool_input=args,
-                        )
-            return first
-
-        # Top-level error.
-        if "error" in raw_event:
-            err = raw_event["error"]
-            if isinstance(err, dict):
-                return ErrorEvent(
-                    error=err.get("code", "gemini_error") if isinstance(err.get("code"), str) else "gemini_error",
-                    detail=err.get("message", str(err)),
-                )
-            return ErrorEvent(error="gemini_error", detail=str(err))
-
-        return None
-
-    # --- command formatters ----------------------------------------------
-
-    def format_tool_result(
-        self,
-        call_id: str,
-        output: str,
-    ) -> list[dict[str, Any]]:
-        """Wrap a tool result in Gemini Live's ``toolResponse`` frame.
-
-        The tool name is required by the protocol — we look it up from
-        the per-session ``_pending_call_names`` map that ``translate_event``
-        populated when the ``toolCall`` arrived.
-        """
-        name = self._pending_call_names.pop(call_id, "")
-        return [{
-            "toolResponse": {
-                "functionResponses": [{
-                    "id": call_id,
-                    "name": name,
-                    "response": {"output": output},
-                }],
-            },
-        }]
-
-    def format_session_config(
-        self,
-        system: str,
-        tools: list[dict[str, Any]],
-        voice: str | None = None,
-        vad: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Build the ``setup`` payload — Gemini Live's session.update equivalent.
-
-        Sent once after the WS opens. Includes the model id, the response
-        modality (we always want audio), the voice, the system prompt, and
-        the available tools as function declarations.
-        """
-        # Tools arrive in OpenAI/Anthropic-flavoured shape (the orchestrator's
-        # ToolRegistry produces both); Gemini wants {"functionDeclarations":
-        # [...]}. Drop entries that don't carry a name (defensive — the
-        # registry shouldn't emit such, but be permissive).
-        function_declarations = []
-        for t in tools or []:
-            # Tool registry produces either OpenAI-style
-            # {"type": "function", "function": {"name", "description", "parameters"}}
-            # or Anthropic-style {"name", "description", "input_schema"}.
-            if "function" in t and isinstance(t["function"], dict):
-                fn = t["function"]
-                function_declarations.append({
-                    "name": fn.get("name"),
-                    "description": fn.get("description", ""),
-                    "parameters": _sanitize_schema_for_gemini(fn.get("parameters", {})),
-                })
-            elif "name" in t:
-                function_declarations.append({
-                    "name": t.get("name"),
-                    "description": t.get("description", ""),
-                    "parameters": _sanitize_schema_for_gemini(
-                        t.get("input_schema") or t.get("parameters") or {}
-                    ),
-                })
-
-        setup: dict[str, Any] = {
-            "model": f"models/{self._model}",
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {
-                            "voiceName": voice or self._voice,
-                        },
-                    },
-                },
-            },
-            # Surface both ASR streams so the orchestrator can persist
-            # user speech as ``[voice]`` JSONL entries and the model's
-            # spoken reply as TextDelta/TextComplete events alongside
-            # the audio.  Without these the Live API ships audio only
-            # and our chat window has nothing to show.
-            "inputAudioTranscription": {},
-            "outputAudioTranscription": {},
-            # Tune activity (VAD) detection.  The defaults are
-            # aggressive enough that an open mic with ambient noise
-            # keeps resetting the model's pending turn and the second
-            # reply never lands.  Higher-sensitivity end-of-speech and
-            # a longer silence gap let the model actually finish.
-            "realtimeInputConfig": {
-                "automaticActivityDetection": {
-                    "disabled": False,
-                    "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
-                    "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
-                    "prefixPaddingMs": 300,
-                    # Wait 1.5s of silence before deciding the user is
-                    # done; matches our Qwen tuning so users can pause
-                    # mid-sentence without the model cutting in.
-                    "silenceDurationMs": 1500,
-                },
-            },
-        }
-        if system:
-            setup["systemInstruction"] = {"parts": [{"text": system}]}
-        if function_declarations:
-            setup["tools"] = [{"functionDeclarations": function_declarations}]
-        return {"setup": setup}
-
-    # Back-compat alias — matches OpenAI / Qwen providers.
-    def get_session_update_payload(
-        self,
-        system: str,
-        tools: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return self.format_session_config(system, tools)
-
-    # --- relay hook overrides --------------------------------------------
-
-    def format_audio_in(self, pcm_b64: str) -> dict[str, Any]:
-        """Wrap a PCM chunk in Gemini Live's ``realtimeInput.audio`` frame."""
-        return {
-            "realtimeInput": {
-                "audio": {
-                    "data": pcm_b64,
-                    "mimeType": "audio/pcm;rate=16000",
-                },
-            },
-        }
-
-    @classmethod
-    def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
-        """Pull base64-PCM from ``serverContent.modelTurn.parts[].inlineData.data``."""
-        sc = raw_event.get("serverContent")
-        if not isinstance(sc, dict):
-            return None
-        parts = sc.get("modelTurn", {}).get("parts", [])
-        for p in parts:
-            inline = p.get("inlineData") or {}
-            mime = inline.get("mimeType", "")
-            if mime.startswith("audio/"):
-                data = inline.get("data")
-                if data:
-                    return data
-        return None
-
-    @property
-    def handshake_direction(self) -> str:
-        """Gemini Live: client sends ``setup`` first, server acks with ``setupComplete``."""
-        return "client_first"
-
-    # No keepalive needed empirically — Gemini Live doesn't have Qwen's
-    # ASR-timeout pathology. If a similar problem surfaces, override
-    # build_keepalive_chunk() to return a short silent PCM chunk.
-    #
-    # is_recoverable_error / should_gate_event / on_inbound_event all
-    # default to the base-class no-op behaviour. Gemini Live doesn't
-    # reject concurrent client messages the way Qwen does, and we
-    # haven't (yet) seen any close codes that benefit from automatic
-    # reconnect. Add overrides here if either pattern emerges in
-    # production.
-
-    # --- connection metadata ---------------------------------------------
-
-    async def get_connection_info(self) -> dict[str, Any]:
-        """Return the metadata the frontend needs.
-
-        Gemini Live uses long-lived API keys appended as ``?key=`` on the
-        WS URL — no ephemeral exchange. The backend holds the key; the
-        URL surfaced to the frontend is observability-only.
-        """
+    async def _open_upstream_ws(self) -> websockets.ClientConnection:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not configured")
-        return {
-            "connection_type": "websocket",
-            "endpoint": f"{GEMINI_LIVE_WS}?model={self._model}",
-            "ephemeral_token": None,
-            "expires_at": None,
-            "audio_in_format": {"sample_rate": 16000, "encoding": "pcm16"},
-            "audio_out_format": {"sample_rate": 24000, "encoding": "pcm16"},
-            "model": self._model,
-            "voice": self._voice,
-            "audio_relay": "backend",
-        }
-
-    # --- direct WS lifecycle (used by the relay layer) -------------------
-
-    async def open_upstream(self) -> websockets.ClientConnection:
-        """Open the upstream Gemini Live WebSocket.
-
-        Called once per session by ``orchestrator/voice_relay.py``. The
-        relay keeps the connection alive for the session's lifetime.
-        """
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not configured")
-        url = f"{GEMINI_LIVE_WS}?key={api_key}"
+            raise RuntimeError(
+                "GEMINI_API_KEY not configured — set it in context/.env or "
+                "switch the voice endpoint to 'vertex'."
+            )
+        url = f"{AI_STUDIO_LIVE_WS}?key={api_key}"
         return await websockets.connect(
             url,
             open_timeout=15,
-            max_size=2**24,  # 16 MB — accommodate large audio frames
+            max_size=2**24,
         )
 
 
-# JSON Schema keywords Gemini's OpenAPI 3.0 Schema doesn't accept on
-# function-declaration parameters. Stripping rather than rejecting:
-# we want to send the best schema we can, not refuse to call the tool.
-_GEMINI_SCHEMA_STRIP_KEYS = frozenset({
-    "$schema",
-    "$id",
-    "$ref",
-    "$defs",
-    "definitions",
-    "additionalProperties",
-    "patternProperties",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "if",
-    "then",
-    "else",
-    "not",
-    "dependencies",
-    "dependentSchemas",
-    "dependentRequired",
-})
+class VertexAIBackend(GeminiVoiceProviderBase):
+    """Gemini Live via Vertex AI (``{location}-aiplatform.googleapis.com``).
 
+    Auth: OAuth Bearer token from Application Default Credentials,
+    minted per session. Required configuration:
 
-def _sanitize_schema_for_gemini(schema: dict[str, Any]) -> dict[str, Any]:
-    """Convert a JSON Schema to the subset Gemini's Live API accepts.
-
-    Gemini's ``functionDeclarations[].parameters`` follows OpenAPI 3.0
-    Schema, which is a strict subset of JSON Schema Draft 7.
-    Mismatches the orchestrator's tool schemas tend to hit:
-
-    - ``"type": ["X", "null"]`` (union types) → split into
-      ``"type": "X", "nullable": true``.
-    - ``anyOf`` / ``oneOf`` / ``allOf`` containing exactly one schema
-      and one ``{"type": "null"}`` (the OpenAPI pattern for optionals)
-      → flatten to the non-null branch + ``nullable: true``.
-    - ``additionalProperties``, ``$schema``, ``$ref``, etc. → strip.
-
-    Everything else (``type``, ``description``, ``properties``,
-    ``required``, ``items``, ``enum``, ``format``, ``minimum``,
-    ``maximum``, ``nullable``) passes through. Recurses into
-    ``properties``, ``items``, ``anyOf``/``oneOf``/``allOf``.
-
-    Returns a new dict — does not mutate the input.
+    - ``GCP_PROJECT_ID`` — numeric Cloud project ID hosting Vertex AI.
+    - ``GCP_LOCATION`` — region (defaults to ``us-central1``).
+    - ADC source: ``gcloud auth application-default login`` *or*
+      ``GOOGLE_APPLICATION_CREDENTIALS`` pointing at a service-account
+      JSON key.
     """
-    if not isinstance(schema, dict):
-        return schema
 
-    out: dict[str, Any] = {}
-    nullable = False
+    DEFAULT_MODEL = VERTEX_DEFAULT_MODEL
 
-    # Handle anyOf/oneOf/allOf with a null branch (optional pattern).
-    for combinator in ("anyOf", "oneOf", "allOf"):
-        if combinator in schema:
-            branches = schema[combinator]
-            if isinstance(branches, list):
-                non_null = [b for b in branches if not (isinstance(b, dict) and b.get("type") == "null")]
-                has_null = len(non_null) < len(branches)
-                if has_null:
-                    nullable = True
-                if len(non_null) == 1:
-                    # Pattern: anyOf:[{...}, {type: null}] → merge the
-                    # single non-null branch directly into ``out`` and
-                    # drop the combinator (Gemini still rejects raw
-                    # anyOf even of length 1 in practice).
-                    out.update(_sanitize_schema_for_gemini(non_null[0]))
-                elif len(non_null) > 1:
-                    # Multi-branch union — keep as anyOf with each
-                    # branch sanitized. Gemini accepts anyOf in some
-                    # cases; if it still rejects, the caller will see
-                    # the error and refine.
-                    out[combinator] = [_sanitize_schema_for_gemini(b) for b in non_null]
-                # Mark this combinator handled.
-                # (Falls through — we don't break since multiple combinators
-                # are rare; we sanitize each.)
+    @property
+    def endpoint_id(self) -> str:
+        return ENDPOINT_VERTEX
 
-    for k, v in schema.items():
-        if k in _GEMINI_SCHEMA_STRIP_KEYS:
-            continue
-        if k in ("anyOf", "oneOf", "allOf"):
-            # Already handled above.
-            continue
-        if k == "type":
-            if isinstance(v, list):
-                # ["X", "null"] → "X" + nullable=True; ["X", "Y"] →
-                # keep first non-null (best-effort — Gemini wants a
-                # scalar type).
-                non_null = [t for t in v if t != "null"]
-                nullable = nullable or ("null" in v)
-                out["type"] = non_null[0] if non_null else "string"
-            else:
-                out["type"] = v
-        elif k == "properties" and isinstance(v, dict):
-            out["properties"] = {
-                pname: _sanitize_schema_for_gemini(pschema)
-                for pname, pschema in v.items()
-            }
-        elif k == "items" and isinstance(v, dict):
-            out["items"] = _sanitize_schema_for_gemini(v)
-        elif k == "items" and isinstance(v, list):
-            # Tuple-form items — Gemini doesn't support; collapse to
-            # the first entry as a best-effort.
-            if v:
-                out["items"] = _sanitize_schema_for_gemini(v[0])
-        else:
-            out[k] = v
+    def _qualify_model(self, model_id: str) -> str:
+        project_id = _require_gcp_project_id()
+        location = os.environ.get("GCP_LOCATION", DEFAULT_GCP_LOCATION)
+        return (
+            f"projects/{project_id}/locations/{location}"
+            f"/publishers/google/models/{model_id}"
+        )
 
-    if nullable:
-        out["nullable"] = True
-    return out
+    def _get_endpoint_url(self) -> str:
+        location = os.environ.get("GCP_LOCATION", DEFAULT_GCP_LOCATION)
+        return VERTEX_LIVE_WS_TEMPLATE.format(location=location)
+
+    async def _open_upstream_ws(self) -> websockets.ClientConnection:
+        _require_gcp_project_id()  # fail fast if missing
+        token = await get_adc_access_token()
+        return await websockets.connect(
+            self._get_endpoint_url(),
+            additional_headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            open_timeout=15,
+            max_size=2**24,
+        )
+
+
+# Backwards-compat alias. ``voice_registry`` imports this name as the
+# "Google" provider class; the registry's ``instantiate_provider`` calls
+# :func:`select_backend` to pick the concrete subclass at construction
+# time, so the alias is mostly cosmetic — but keeping it avoids a chain
+# of import renames in callers that already do
+# ``from gemini_voice import GeminiLiveVoiceProvider``.
+GeminiLiveVoiceProvider = VertexAIBackend
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+
+_BACKEND_CLASSES: dict[str, type[GeminiVoiceProviderBase]] = {
+    ENDPOINT_AISTUDIO: GeminiAIStudioBackend,
+    ENDPOINT_VERTEX: VertexAIBackend,
+}
+
+
+def resolve_endpoint_id(endpoint: str | None) -> str:
+    """Pick the active backend id from (explicit arg, env, default)."""
+    if endpoint and endpoint in _BACKEND_CLASSES:
+        return endpoint
+    env_value = (os.environ.get("GEMINI_VOICE_BACKEND") or "").strip()
+    if env_value and env_value in _BACKEND_CLASSES:
+        return env_value
+    return DEFAULT_ENDPOINT
+
+
+def select_backend(endpoint: str | None) -> type[GeminiVoiceProviderBase]:
+    """Return the concrete backend class for ``endpoint`` (or default)."""
+    return _BACKEND_CLASSES[resolve_endpoint_id(endpoint)]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_gcp_project_id() -> str:
+    project_id = os.environ.get("GCP_PROJECT_ID")
+    if not project_id:
+        raise RuntimeError(
+            "GCP_PROJECT_ID not configured — set it in context/.env to the "
+            "numeric Cloud project ID hosting Vertex AI (e.g. 493034518147)."
+        )
+    return project_id
+
+
+async def get_adc_access_token() -> str:
+    """Mint an OAuth access token from Application Default Credentials.
+
+    Runs the synchronous ``google.auth`` flow in a thread so it doesn't
+    block the event loop. ADC discovery order is standard:
+    ``GOOGLE_APPLICATION_CREDENTIALS`` → ``gcloud auth
+    application-default login`` file → GCE metadata server.
+    """
+    def _refresh() -> str:
+        from google.auth import default
+        from google.auth.transport.requests import Request
+
+        creds, _project = default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        creds.refresh(Request())
+        return creds.token
+
+    return await asyncio.to_thread(_refresh)
+
+
+__all__ = [
+    "GeminiAIStudioBackend",
+    "VertexAIBackend",
+    "GeminiLiveVoiceProvider",
+    "ENDPOINT_AISTUDIO",
+    "ENDPOINT_VERTEX",
+    "KNOWN_ENDPOINTS",
+    "DEFAULT_ENDPOINT",
+    "DEFAULT_GCP_LOCATION",
+    "GEMINI_LIVE_VOICES",
+    "resolve_endpoint_id",
+    "select_backend",
+    "get_adc_access_token",
+]

@@ -229,11 +229,12 @@ async def _handle_start(
     voice_lang_req: str | None = (
         msg.get("voice_transcription_language") if voice else None
     )
+    voice_endpoint_req: str | None = msg.get("voice_endpoint") if voice else None
 
     if voice:
         logger.info(
-            "voice_session start_requested local_id=%s resume_id=%s provider=%s model=%s voice=%s lang=%s",
-            local_id, resume_id, voice_provider_req, voice_model_req, voice_name_req, voice_lang_req,
+            "voice_session start_requested local_id=%s resume_id=%s provider=%s model=%s voice=%s lang=%s endpoint=%s",
+            local_id, resume_id, voice_provider_req, voice_model_req, voice_name_req, voice_lang_req, voice_endpoint_req,
         )
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
@@ -299,6 +300,8 @@ async def _handle_start(
             voice_name_req = voice_name_req or app_cfg.get("default_voice_name")
             if voice_lang_req is None:
                 voice_lang_req = app_cfg.get("default_voice_transcription_language")
+            if voice_endpoint_req is None:
+                voice_endpoint_req = app_cfg.get("default_voice_endpoint")
         except Exception:
             logger.exception("Failed to load voice defaults from assistant_config.json")
 
@@ -320,6 +323,7 @@ async def _handle_start(
         voice_model=voice_model_req,
         voice_name=voice_name_req,
         voice_transcription_language=voice_lang_req,
+        voice_endpoint=voice_endpoint_req,
     )
 
     await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))

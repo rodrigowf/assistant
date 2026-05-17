@@ -1,9 +1,12 @@
-"""Unit tests for :class:`GeminiLiveVoiceProvider`.
+"""Unit tests for the Gemini Live voice provider.
 
-Covers the translator + format_* methods + relay hook surface. Upstream
-WebSocket calls are not exercised here (no real Gemini Live mock) —
-those live in tests/test_voice_relay_hooks.py which drives a generic
-WS double through the relay.
+Exercises the AI Studio backend (the legacy default) for protocol-level
+behaviour shared by both backends — translator + format_* methods +
+relay hook surface. Vertex-specific tests live next to these as
+:func:`test_vertex_*`. Upstream WebSocket calls are not exercised here
+(no real Gemini Live mock) — those live in
+``tests/test_voice_relay_hooks.py`` which drives a generic WS double
+through the relay.
 """
 
 from __future__ import annotations
@@ -15,8 +18,11 @@ import pytest
 
 from orchestrator.providers.gemini_voice import (
     GEMINI_LIVE_VOICES,
+    GeminiAIStudioBackend,
     GeminiLiveVoiceProvider,
+    VertexAIBackend,
 )
+from orchestrator.providers.gemini_voice_base import _sanitize_schema_for_gemini
 from orchestrator.types import (
     ErrorEvent,
     TextDelta,
@@ -26,8 +32,9 @@ from orchestrator.types import (
 )
 
 
-def _make_provider(**kwargs) -> GeminiLiveVoiceProvider:
-    return GeminiLiveVoiceProvider(**kwargs)
+def _make_provider(**kwargs) -> GeminiAIStudioBackend:
+    """Make an AI Studio backend (default test target)."""
+    return GeminiAIStudioBackend(**kwargs)
 
 
 # --- identity ---------------------------------------------------------------
@@ -191,18 +198,18 @@ def test_extract_audio_out_pulls_inline_data():
             },
         },
     }
-    assert GeminiLiveVoiceProvider.extract_audio_out(raw) == "DEADBEEF"
+    assert GeminiAIStudioBackend.extract_audio_out(raw) == "DEADBEEF"
 
 
 def test_extract_audio_out_ignores_text_parts():
     raw = {"serverContent": {"modelTurn": {"parts": [{"text": "hello"}]}}}
-    assert GeminiLiveVoiceProvider.extract_audio_out(raw) is None
+    assert GeminiAIStudioBackend.extract_audio_out(raw) is None
 
 
 def test_extract_audio_out_returns_none_for_non_server_content():
-    assert GeminiLiveVoiceProvider.extract_audio_out({"setupComplete": {}}) is None
-    assert GeminiLiveVoiceProvider.extract_audio_out({"toolCall": {}}) is None
-    assert GeminiLiveVoiceProvider.extract_audio_out({}) is None
+    assert GeminiAIStudioBackend.extract_audio_out({"setupComplete": {}}) is None
+    assert GeminiAIStudioBackend.extract_audio_out({"toolCall": {}}) is None
+    assert GeminiAIStudioBackend.extract_audio_out({}) is None
 
 
 def test_extract_audio_out_skips_non_audio_inline_data():
@@ -213,7 +220,7 @@ def test_extract_audio_out_skips_non_audio_inline_data():
             },
         },
     }
-    assert GeminiLiveVoiceProvider.extract_audio_out(raw) is None
+    assert GeminiAIStudioBackend.extract_audio_out(raw) is None
 
 
 # --- translate_event --------------------------------------------------------
@@ -335,12 +342,13 @@ def test_build_keepalive_chunk_default_none():
 
 
 @pytest.mark.asyncio
-async def test_get_connection_info_requires_api_key():
+async def test_open_upstream_requires_api_key():
+    """API key is checked at WS-open time, not at get_connection_info."""
     p = _make_provider()
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("GEMINI_API_KEY", None)
         with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
-            await p.get_connection_info()
+            await p.open_upstream()
 
 
 @pytest.mark.asyncio
@@ -376,7 +384,11 @@ def test_registry_resolves_google_to_gemini_provider():
     )
 
     cls = get_provider_class("google")
-    assert cls is GeminiLiveVoiceProvider
+    # ``get_provider_class`` returns the *default* concrete backend
+    # (Vertex). The dispatcher in ``instantiate_provider`` picks the
+    # right class based on the ``endpoint`` argument; this lookup is
+    # only used by type-only callers.
+    assert cls is VertexAIBackend
 
     # VOICE_MODELS["google"] is populated and has at least one default entry.
     google_models = VOICE_MODELS["google"]
@@ -384,6 +396,31 @@ def test_registry_resolves_google_to_gemini_provider():
     default = next(m for m in google_models if m["default"])
     assert default["voice"] == "Puck"
     assert default["voices"]
+
+
+def test_instantiate_provider_dispatches_on_endpoint():
+    """Picking endpoint=aistudio yields the AI Studio backend."""
+    from orchestrator.providers.voice_registry import instantiate_provider
+
+    aistudio = instantiate_provider(
+        "google",
+        "gemini-2.5-flash-native-audio-latest",
+        "Puck",
+        "",
+        endpoint="aistudio",
+    )
+    assert isinstance(aistudio, GeminiAIStudioBackend)
+    assert aistudio.endpoint_id == "aistudio"
+
+    vertex = instantiate_provider(
+        "google",
+        "gemini-live-2.5-flash-native-audio",
+        "Puck",
+        "",
+        endpoint="vertex",
+    )
+    assert isinstance(vertex, VertexAIBackend)
+    assert vertex.endpoint_id == "vertex"
 
 
 # --- JSON Schema sanitization ----------------------------------------------
@@ -397,8 +434,6 @@ def test_registry_resolves_google_to_gemini_provider():
 
 
 def test_sanitize_passes_through_simple_schema():
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "type": "object",
         "properties": {
@@ -414,8 +449,6 @@ def test_sanitize_passes_through_simple_schema():
 
 def test_sanitize_collapses_type_array_with_null_to_nullable():
     """The exact bug that failed the first live Gemini smoke test."""
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "type": "object",
         "properties": {
@@ -433,8 +466,6 @@ def test_sanitize_collapses_type_array_with_null_to_nullable():
 
 
 def test_sanitize_strips_disallowed_keywords():
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -451,8 +482,6 @@ def test_sanitize_strips_disallowed_keywords():
 
 def test_sanitize_flattens_optional_anyof_pattern():
     """anyOf:[{...}, {"type": "null"}] → flatten + nullable."""
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "anyOf": [
             {"type": "string", "enum": ["a", "b"]},
@@ -467,8 +496,6 @@ def test_sanitize_flattens_optional_anyof_pattern():
 
 
 def test_sanitize_recurses_into_items():
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "type": "array",
         "items": {
@@ -482,8 +509,6 @@ def test_sanitize_recurses_into_items():
 
 
 def test_sanitize_collapses_tuple_form_items():
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "type": "array",
         "items": [{"type": "string"}, {"type": "integer"}],
@@ -494,8 +519,6 @@ def test_sanitize_collapses_tuple_form_items():
 
 
 def test_sanitize_nested_properties_recurse():
-    from orchestrator.providers.gemini_voice import _sanitize_schema_for_gemini
-
     src = {
         "type": "object",
         "properties": {

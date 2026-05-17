@@ -43,6 +43,7 @@ async def create_voice_session(
     model: str | None = None,
     voice: str | None = None,
     transcription_language: str | None = None,
+    endpoint: str | None = None,
 ) -> dict:
     """Return ephemeral connection metadata for a voice provider.
 
@@ -72,6 +73,7 @@ async def create_voice_session(
     try:
         provider_obj = instantiate_provider(
             provider_id, model_entry["id"], voice_name, language,
+            endpoint=endpoint,
         )
         info = await provider_obj.get_connection_info()
     except RuntimeError as e:

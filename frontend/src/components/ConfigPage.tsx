@@ -52,17 +52,19 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, modelsRes, voiceRes, googleVoiceRes, qwenHarnessRes, providersRes] = await Promise.all([
-        getConfig(),
+      // First fetch config so we know which Google backend to query.
+      const cfg = await getConfig();
+      const [mcpRes, modelsRes, voiceRes, googleVoiceRes, qwenHarnessRes, providersRes] = await Promise.all([
         listMcpServers(),
         listModels(),
         listVoiceModels(),
-        // Dynamic Gemini Live list — backend queries models.list and
-        // caches for 60s.  Tolerate failure: if GEMINI_API_KEY is unset
-        // or upstream is broken, the route returns {models: []} and we
-        // fall back to the static VOICE_MODELS["google"] from
-        // listVoiceModels() below.
-        listGoogleVoiceModels().catch(e => {
+        // Dynamic Gemini Live list — backend queries the catalog for
+        // the requested endpoint (vertex / aistudio) and caches for
+        // 60s.  Tolerate failure: if ADC isn't set up or the upstream
+        // is broken, the route returns {models: []} and we fall back
+        // to the static VOICE_MODELS["google"] from listVoiceModels()
+        // below.
+        listGoogleVoiceModels(cfg.default_voice_endpoint).catch(e => {
           console.warn("listGoogleVoiceModels failed:", e);
           return { models: [] };
         }),
@@ -108,6 +110,28 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     return () => document.removeEventListener("keydown", handler);
   }, [isOpen, onClose]);
 
+  // Refetch the Google voice catalog when the user flips the endpoint
+  // selector mid-session — the two backends (AI Studio / Vertex) have
+  // different model lists.  Skipped on first render: ``load`` already
+  // fetched the right catalog from the initial config.
+  const endpointRef = useRef<string | null>(null);
+  useEffect(() => {
+    const ep = config?.default_voice_endpoint;
+    if (!ep) return;
+    if (endpointRef.current === null) {
+      endpointRef.current = ep;
+      return;
+    }
+    if (endpointRef.current === ep) return;
+    endpointRef.current = ep;
+    listGoogleVoiceModels(ep)
+      .then(res => {
+        if (res.models.length === 0) return;
+        setVoiceProviders(prev => ({ ...prev, google: res.models }));
+      })
+      .catch(e => console.warn("listGoogleVoiceModels refetch failed:", e));
+  }, [config?.default_voice_endpoint]);
+
   const showSaved = () => {
     setSavedMsg(true);
     if (savedMsgTimer.current) clearTimeout(savedMsgTimer.current);
@@ -147,6 +171,8 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   // Derived voice-provider/model/voice/language state for dropdowns
   const voiceProviderIds = Object.keys(voiceProviders);
   const selectedVoiceProvider = config?.default_voice_provider ?? voiceProviderIds[0] ?? "";
+  // Endpoint sub-selector — applies only when provider === "google".
+  const selectedVoiceEndpoint = config?.default_voice_endpoint ?? "vertex";
   const voiceModels: VoiceModelEntry[] = voiceProviders[selectedVoiceProvider] ?? [];
   const selectedVoiceModel: VoiceModelEntry | undefined =
     voiceModels.find(m => m.id === config?.default_voice_model) ?? voiceModels[0];
@@ -276,6 +302,24 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                           ))}
                         </select>
                       </div>
+                      {selectedVoiceProvider === "google" && (
+                        <div className="model-dropdown-field">
+                          <label className="model-dropdown-label">Endpoint</label>
+                          <select
+                            className="model-dropdown-select"
+                            value={selectedVoiceEndpoint}
+                            disabled={saving}
+                            onChange={(e) =>
+                              save({ default_voice_endpoint: e.target.value })
+                                .catch(err => setError(String(err)))
+                            }
+                            title="Which Google backend serves Gemini Live. Vertex AI is the stable default; AI Studio (generativelanguage.googleapis.com) is the legacy path and may return 1008 denials for preview models."
+                          >
+                            <option value="vertex">Vertex AI (recommended)</option>
+                            <option value="aistudio">AI Studio (legacy)</option>
+                          </select>
+                        </div>
+                      )}
                       <div className="model-dropdown-field">
                         <label className="model-dropdown-label">Model</label>
                         <select

@@ -141,6 +141,7 @@ class OrchestratorSession:
         voice_model: str | None = None,
         voice_name: str | None = None,
         voice_transcription_language: str | None = None,
+        voice_endpoint: str | None = None,
     ) -> None:
         self._config = config
         self._context = context
@@ -155,6 +156,10 @@ class OrchestratorSession:
         self._voice_model_id: str | None = voice_model
         self._voice_name: str | None = voice_name
         self._voice_transcription_language: str | None = voice_transcription_language
+        # Backend selector for the "google" voice provider (AI Studio vs
+        # Vertex). Ignored by other providers. ``None`` means "use the
+        # registry default" (currently Vertex).
+        self._voice_endpoint: str | None = voice_endpoint
         self._voice_relay = None  # Set lazily for websocket providers
         self._history_summary: str | None = None
         self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
@@ -306,6 +311,7 @@ class OrchestratorSession:
             self._voice_transcription_language = language
             self._voice_provider = instantiate_provider(
                 provider_id, model_entry["id"], voice_name, language,
+                endpoint=self._voice_endpoint,
             )
             provider = self._voice_provider
         else:

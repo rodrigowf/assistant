@@ -189,10 +189,12 @@ def test_gemini_voice_models_returns_empty_without_api_key(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     # Reset module-level cache so prior tests don't poison this one.
     import api.routes.config as cfg
-    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
-    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+    # Cache is now per-backend; reset both.
+    for c in cfg._GEMINI_LIVE_MODELS_CACHE.values():
+        c["models"] = None
+        c["at"] = 0.0
 
-    r = client.get("/api/config/voice/google/models")
+    r = client.get("/api/config/voice/google/models?endpoint=aistudio")
     assert r.status_code == 200
     assert r.json() == {"models": []}
 
@@ -203,8 +205,10 @@ def test_gemini_voice_models_returns_empty_on_upstream_failure(
     """Upstream non-200 / connection error → empty list, not a crash."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     import api.routes.config as cfg
-    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
-    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+    # Cache is now per-backend; reset both.
+    for c in cfg._GEMINI_LIVE_MODELS_CACHE.values():
+        c["models"] = None
+        c["at"] = 0.0
 
     # Patch the httpx call to raise.
     import httpx
@@ -218,7 +222,7 @@ def test_gemini_voice_models_returns_empty_on_upstream_failure(
 
     monkeypatch.setattr(httpx, "AsyncClient", _BrokenClient)
 
-    r = client.get("/api/config/voice/google/models")
+    r = client.get("/api/config/voice/google/models?endpoint=aistudio")
     assert r.status_code == 200
     assert r.json() == {"models": []}
 
@@ -231,8 +235,10 @@ def test_gemini_voice_models_filters_bidi_and_parses(
     first becomes the default."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     import api.routes.config as cfg
-    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
-    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+    # Cache is now per-backend; reset both.
+    for c in cfg._GEMINI_LIVE_MODELS_CACHE.values():
+        c["models"] = None
+        c["at"] = 0.0
 
     class _StubResp:
         status_code = 200
@@ -268,7 +274,7 @@ def test_gemini_voice_models_filters_bidi_and_parses(
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
 
-    r = client.get("/api/config/voice/google/models")
+    r = client.get("/api/config/voice/google/models?endpoint=aistudio")
     assert r.status_code == 200
     models = r.json()["models"]
     assert len(models) == 2
@@ -295,8 +301,10 @@ def test_gemini_voice_models_caches_response(
     """Two successive calls within the TTL hit the upstream once."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     import api.routes.config as cfg
-    cfg._GEMINI_LIVE_MODELS_CACHE["models"] = None
-    cfg._GEMINI_LIVE_MODELS_CACHE["at"] = 0.0
+    # Cache is now per-backend; reset both.
+    for c in cfg._GEMINI_LIVE_MODELS_CACHE.values():
+        c["models"] = None
+        c["at"] = 0.0
 
     call_count = {"n": 0}
 
@@ -323,8 +331,8 @@ def test_gemini_voice_models_caches_response(
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", _CountingClient)
 
-    r1 = client.get("/api/config/voice/google/models")
-    r2 = client.get("/api/config/voice/google/models")
+    r1 = client.get("/api/config/voice/google/models?endpoint=aistudio")
+    r2 = client.get("/api/config/voice/google/models?endpoint=aistudio")
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert r1.json() == r2.json()

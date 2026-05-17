@@ -172,6 +172,7 @@ export interface AssistantConfig {
   default_voice_model: string;
   default_voice_name: string;
   default_voice_transcription_language: string;  // "" = auto-detect
+  default_voice_endpoint: string;                // "vertex" | "aistudio" — google provider only
   voice_recording_enabled: boolean;              // save raw audio from voice sessions
 }
 
@@ -187,6 +188,7 @@ export interface ConfigUpdate {
   default_voice_model?: string;
   default_voice_name?: string;
   default_voice_transcription_language?: string;
+  default_voice_endpoint?: string;
   voice_recording_enabled?: boolean;
 }
 
@@ -280,17 +282,22 @@ export function listVoiceModels(): Promise<VoiceModelsResponse> {
   return json(`${BASE}/orchestrator/voice/models`);
 }
 
-// Dynamic Gemini Live model listing — queries Google's models.list at
-// request time, filtering for bidiGenerateContent. Backend caches for
-// 60s. Returns ``{models: []}`` when GEMINI_API_KEY is unset or the
-// upstream call fails; callers should fall back to the static
-// ``VOICE_MODELS["google"]`` from ``listVoiceModels()`` in that case.
+// Dynamic Gemini Live model listing. The Google provider has two
+// backends — Vertex AI (default, stable) and AI Studio (legacy, prone
+// to 1008 denials). Pass ``endpoint`` to pick which catalog to query;
+// omit to use the backend's default. Backend caches per-endpoint for
+// 60s. Returns ``{models: []}`` on any failure; callers should fall
+// back to the static ``VOICE_MODELS["google"]`` from
+// ``listVoiceModels()`` in that case.
 export interface GoogleVoiceModelsResponse {
   models: VoiceModelEntry[];
 }
 
-export function listGoogleVoiceModels(): Promise<GoogleVoiceModelsResponse> {
-  return json(`${BASE}/config/voice/google/models`);
+export function listGoogleVoiceModels(
+  endpoint?: string,
+): Promise<GoogleVoiceModelsResponse> {
+  const qs = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
+  return json(`${BASE}/config/voice/google/models${qs}`);
 }
 
 // Per-session config
