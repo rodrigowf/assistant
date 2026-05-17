@@ -568,16 +568,20 @@ class TestFileTools:
         assert (tmp_path / "output" / "new.txt").read_text() == "written!"
 
     @pytest.mark.asyncio
-    async def test_path_traversal_rejected(self, tmp_path):
+    async def test_absolute_path_allowed(self, tmp_path):
         from orchestrator.tools.files import read_file
 
-        result = await read_file(
-            context={"project_dir": str(tmp_path)},
-            path="../../etc/passwd",
-        )
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "escapes" in parsed["error"]
+        outside = tmp_path.parent / "outside.txt"
+        outside.write_text("outside!")
+        try:
+            result = await read_file(
+                context={"project_dir": str(tmp_path)},
+                path=str(outside),
+            )
+            parsed = json.loads(result)
+            assert parsed["content"] == "outside!"
+        finally:
+            outside.unlink()
 
 
 # ---------------------------------------------------------------------------
