@@ -134,6 +134,16 @@ class VoiceRelay:
         # inside :class:`QwenVoiceProvider` via the gate-hook pair.
         self._deferred_events: list[dict[str, Any]] = []
 
+        # Latched flag — set when the provider asked us to close the
+        # upstream WS via :meth:`BaseVoiceProvider.should_close_after_event`
+        # (Gemini Live's ``goAway``). The close we issue is a clean 1000,
+        # which the drain loop sees as an orderly exit (no exception), so
+        # we'd otherwise silently return without reconnecting. Reading
+        # this flag at the drain's natural exit routes us into the
+        # reconnect path the same way an unrecoverable upstream error
+        # would.
+        self._pending_reconnect: bool = False
+
         # --- observability state ---
         self._started_at: float = 0.0  # set in start()
         self._first_audio_in_at: float | None = None
@@ -653,21 +663,66 @@ class VoiceRelay:
                 # Some inbound signals require the client to close the
                 # upstream WS per protocol — Gemini Live's ``goAway`` is
                 # the motivating case. Closing here (clean 1000) makes
-                # the drain loop catch ConnectionClosedOK and route into
-                # the recoverable-error path, instead of waiting for
-                # Gemini's punitive 1008 "policy violation" force-close.
+                # the drain loop exit naturally; the ``_pending_reconnect``
+                # flag below routes us into the reconnect path instead
+                # of waiting for Gemini's punitive 1008 "policy violation"
+                # force-close (which the drain would catch as an error).
                 if self._provider.should_close_after_event(event) and self._ws is not None:
                     self._slog("provider requested upstream close; closing 1000 to trigger reconnect")
                     logger.info(
                         "voice_relay provider-requested close session_id=%s",
                         self._session_id,
                     )
+                    # Latch BEFORE the await so a fast clean-close + drain
+                    # exit can't race us out of the loop with the flag unset.
+                    self._pending_reconnect = True
                     try:
                         await self._ws.close(code=1000, reason="provider-requested close")
                     except Exception:  # noqa: BLE001
                         logger.exception("voice_relay close failed after provider request")
-                    # Drain loop will exit on the next iteration; the
-                    # exception handler below picks up reconnect.
+                    # Drain's ``async for`` exits naturally next iteration;
+                    # the post-loop block reads ``_pending_reconnect``.
+
+            # ``async for`` exited cleanly (clean close — typically the
+            # one we issued in response to ``goAway``). If we asked for
+            # it, route into the reconnect path the same way an
+            # exception would. Otherwise the upstream simply went away
+            # and we treat that as the end of the relay's life.
+            if self._pending_reconnect:
+                self._pending_reconnect = False
+                synthetic = ConnectionError(
+                    "provider-requested reconnect after goAway"
+                )
+                self._slog(f"DRAIN END clean (pending reconnect): {synthetic}")
+                logger.info(
+                    "voice_relay drain exited cleanly with pending reconnect session_id=%s",
+                    self._session_id,
+                )
+                reconnected = await self._try_reconnect(synthetic)
+                if reconnected:
+                    self._drain_task = asyncio.create_task(
+                        self._drain(),
+                        name=f"voice-relay-{self._provider.provider_name}-reconnect{self._reconnect_count}",
+                    )
+                    return
+                # Fall through to the close path below: the reconnect
+                # was refused (max_reconnects hit, no handle, etc.). We
+                # don't have an exception object here, so synthesize the
+                # close summary without one.
+                self._closed.set()
+                self._log_close_summary("clean close, reconnect refused")
+                self._close_session_log()
+                await self._on_event_for_frontend({
+                    "type": "error",
+                    "error": {
+                        "code": "voice_relay_failed",
+                        "message": (
+                            f"Upstream {self._provider.provider_name} "
+                            "reconnect refused after goAway"
+                        ),
+                    },
+                })
+                return
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
