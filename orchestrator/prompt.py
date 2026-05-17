@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import OrchestratorConfig
+from utils.mcp_config import load_available_mcps
 
 # Limits for content injection
 MAX_MEMORY_CHARS = 12000
@@ -20,36 +21,6 @@ MEMORY_INDEX_FILENAME = "MEMORY.md"
 # ---------------------------------------------------------------------------
 # MCP Configuration Loading
 # ---------------------------------------------------------------------------
-
-def _load_available_mcps() -> dict[str, dict[str, Any]]:
-    """Load available MCP servers from .claude.json config.
-
-    Returns a dict mapping MCP name to its full configuration.
-    """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    if config_dir:
-        config_path = Path(config_dir) / ".claude.json"
-    else:
-        project_root = Path(__file__).resolve().parent.parent
-        config_path = project_root / ".claude_config" / ".claude.json"
-
-    if not config_path.is_file():
-        return {}
-
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
-
-    # Get project-specific MCP servers
-    project_root = Path(__file__).resolve().parent.parent
-    project_dir = str(project_root)
-    projects = config.get("projects", {})
-    project_config = projects.get(project_dir, {})
-
-    return project_config.get("mcpServers", {})
-
 
 def _load_mcp_descriptions() -> dict[str, str]:
     """Load MCP descriptions from the descriptions config file."""
@@ -257,11 +228,14 @@ def _active_sessions_section(context: dict[str, Any]) -> str:
 
 
 def _mcp_section() -> str:
-    """Build the MCP orchestration section with dynamically loaded server info."""
-    available_mcps = _load_available_mcps()
+    """Build the MCP orchestration section with dynamically loaded server info.
 
-    if not available_mcps:
-        return ""
+    Renders the live list of MCP servers available in this project. When the
+    list is empty, the section still appears (so the model knows MCP support
+    *exists* but there's nothing to load) — without this, the open_agent_session
+    tool's hardcoded examples used to lead the model to invent server names.
+    """
+    available_mcps = load_available_mcps()
 
     lines = [
         "## MCP Orchestration",
@@ -273,19 +247,27 @@ def _mcp_section() -> str:
         "",
     ]
 
-    for name in sorted(available_mcps.keys()):
-        description = _get_mcp_description(name, available_mcps[name])
-        lines.append(f"- **{name}**: {description}")
+    if available_mcps:
+        for name in sorted(available_mcps.keys()):
+            description = _get_mcp_description(name, available_mcps[name])
+            lines.append(f"- **{name}**: {description}")
+        usage_examples = [
+            f"- `mcp_servers=['{name}']` — load only `{name}`"
+            for name in sorted(available_mcps.keys())[:2]
+        ]
+    else:
+        lines.append("- _(none configured for this project)_")
+        usage_examples = []
 
     lines.extend([
         "",
         "### Usage",
         "",
         "When calling `open_agent_session`, pass the `mcp_servers` parameter with a list of MCP names:",
-        "- `mcp_servers=['obs']` — OBS integration only",
-        "- `mcp_servers=['chrome-devtools', 'ubuntu-desktop-control']` — Browser + desktop automation",
+        *usage_examples,
         "- Omit parameter or pass `[]` — Default Claude Code tools only",
         "",
+        "**Only pass names from the list above.** Inventing names will fail the call.",
         "Load only the MCPs needed for each task to minimize resource usage.",
     ])
 
@@ -394,6 +376,8 @@ def _guidelines_section() -> str:
 - **Open sessions only when needed**: Don't open sessions speculatively
 - **Close sessions when done**: Free resources after tasks complete
 - **Report progress**: Keep the user informed of status and results
+- **Use the returned session_id immediately**: When `open_agent_session` returns `{"session_id": "<id>", "status": "started"}`, the very next `send_to_agent_session` call for that work MUST pass that exact `<id>`. Do not reuse an older session_id from earlier in the conversation — that silently delivers the work to the wrong agent and the user sees the original task respond, not the new one.
+- **Check tool results**: When a tool returns `{"error": "..."}`, treat it as a failure even if the error sounds recoverable. Do not narrate "I've opened a new session" if `open_agent_session` errored — tell the user what failed and pick a valid input (e.g. an MCP from the Available MCPs list) before retrying.
 
 ### Memory Maintenance
 - **Update the shared index** when you or agents modify skills or create memory files

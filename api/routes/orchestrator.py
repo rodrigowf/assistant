@@ -731,6 +731,26 @@ async def _dispatch_voice_commands(
             await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
 
 
+def _tool_result_is_error(output: str) -> bool:
+    """True when a tool's stringified JSON output carries an ``error`` field.
+
+    Orchestrator tools (``open_agent_session``, ``send_to_agent_session``, …)
+    signal failure by returning ``json.dumps({"error": "..."})`` rather than
+    raising — historically the route layer always stamped ``is_error: False``
+    on the broadcast, so the chat UI rendered the bubble as if the call had
+    succeeded even when it hadn't. This helper flips that around so the
+    user sees a red error bubble that matches Gemini's spoken (often
+    misleadingly confident) follow-up.
+    """
+    if not output:
+        return False
+    try:
+        parsed = orjson.loads(output)
+    except (orjson.JSONDecodeError, ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
+
+
 async def _handle_voice_tool_call(
     pool: SessionPool, session: OrchestratorSession, event: dict,
     *,
@@ -777,11 +797,12 @@ async def _handle_voice_tool_call(
             if cmd.get("type") == "conversation.item.create":
                 item = cmd.get("item", {})
                 if item.get("type") == "function_call_output":
+                    output = item.get("output", "")
                     await pool.broadcast_orchestrator({
                         "type": "tool_result",
                         "tool_use_id": item.get("call_id", ""),
-                        "output": item.get("output", ""),
-                        "is_error": False,
+                        "output": output,
+                        "is_error": _tool_result_is_error(output),
                     })
 
         await _dispatch_voice_commands(pool, session, commands)
@@ -832,7 +853,7 @@ async def _handle_gemini_voice_tool_call(
                     "type": "tool_result",
                     "tool_use_id": fr.get("id", ""),
                     "output": output,
-                    "is_error": False,
+                    "is_error": _tool_result_is_error(output),
                 })
 
         await _dispatch_voice_commands(pool, session, commands)

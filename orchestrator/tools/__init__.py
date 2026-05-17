@@ -9,20 +9,32 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
 
+SchemaBuilder = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 @dataclass
 class ToolDef:
-    """A registered tool definition."""
+    """A registered tool definition.
+
+    ``schema_builder`` lets a tool refresh its declared schema at
+    serialization time — e.g. populate an ``enum:`` from live state that
+    isn't known at import time (the MCP server list, available agent
+    sessions, etc.). It receives the registered ``input_schema`` and must
+    return a (possibly new) schema dict. When ``None``, the static
+    schema is used verbatim.
+    """
 
     name: str
     description: str
     input_schema: dict[str, Any]
     handler: Callable[..., Awaitable[str]]
+    schema_builder: SchemaBuilder | None = None
 
 
 class ToolRegistry:
@@ -55,8 +67,14 @@ class ToolRegistry:
         name: str,
         description: str,
         input_schema: dict[str, Any],
+        schema_builder: SchemaBuilder | None = None,
     ) -> Callable:
-        """Decorator to register an async tool handler."""
+        """Decorator to register an async tool handler.
+
+        ``schema_builder`` is invoked every time the registry serializes
+        tool definitions, so it can inject live state (e.g. the current
+        MCP server list as an ``enum``) into the declared schema.
+        """
 
         def decorator(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
             self._tools[name] = ToolDef(
@@ -64,10 +82,24 @@ class ToolRegistry:
                 description=description,
                 input_schema=input_schema,
                 handler=fn,
+                schema_builder=schema_builder,
             )
             return fn
 
         return decorator
+
+    def _resolve_schema(self, tool: ToolDef) -> dict[str, Any]:
+        """Return the schema to advertise, applying ``schema_builder`` if set."""
+        if tool.schema_builder is None:
+            return tool.input_schema
+        try:
+            return tool.schema_builder(tool.input_schema)
+        except Exception:
+            logger.exception(
+                "schema_builder for tool %r failed; falling back to static schema",
+                tool.name,
+            )
+            return tool.input_schema
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Return tool definitions in Anthropic API format."""
@@ -75,7 +107,7 @@ class ToolRegistry:
             {
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": tool.input_schema,
+                "input_schema": self._resolve_schema(tool),
             }
             for tool in self._tools.values()
         ]
@@ -87,7 +119,7 @@ class ToolRegistry:
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema,
+                "parameters": self._resolve_schema(tool),
             }
             for tool in self._tools.values()
         ]
