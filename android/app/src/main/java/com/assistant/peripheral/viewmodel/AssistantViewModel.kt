@@ -70,11 +70,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         var currentSessionIdForPagination: String? = null
         var paginationStartIndex: Int = 0
         val hasMoreMessages = MutableStateFlow(false)
-        // Streaming-message scratchpad — owned by this endpoint.
+        // Streaming-message scratchpad — owned by this endpoint. Blocks are
+        // mutated in arrival order on the message itself; see mutateStreamingBlocks.
         var streamingMessageId: String? = null
-        val streamingContent = MutableStateFlow("")
-        var currentThinkingContent = ""
-        val currentToolBlocks = mutableMapOf<String, MessageBlock.ToolUse>()
         // Session lifecycle.
         val sessionStatus = MutableStateFlow("idle")
         // Used so SessionStarted can fetch history for the right sdk id.
@@ -317,9 +315,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         b.currentSessionIdForPagination = null
                         b.paginationStartIndex = 0
                         b.streamingMessageId = null
-                        b.streamingContent.value = ""
-                        b.currentThinkingContent = ""
-                        b.currentToolBlocks.clear()
                         b.sessionStatus.value = "idle"
                     }
                 }
@@ -583,15 +578,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // Reset the disconnected endpoint's streaming scratchpad. Other
                 // endpoint's bucket is untouched.
                 b.streamingMessageId = null
-                b.streamingContent.value = ""
                 b.sessionStatus.value = "disconnected"
             }
 
             is WebSocketEvent.MessageStart -> {
                 b.streamingMessageId = event.messageId
-                b.streamingContent.value = ""
-                b.currentThinkingContent = ""
-                b.currentToolBlocks.clear()
 
                 val newMessage = ChatMessage(
                     id = event.messageId,
@@ -607,57 +598,97 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             is WebSocketEvent.TextDelta -> {
                 // Ensure streaming message exists (orchestrator doesn't send message_start)
                 ensureStreamingMessage(b)
-                b.streamingContent.update { it + event.text }
-                updateStreamingMessage(b)
+                mutateStreamingBlocks(b) { blocks ->
+                    val last = blocks.lastOrNull()
+                    if (last is MessageBlock.Text && last.isStreaming) {
+                        blocks.dropLast(1) + last.copy(text = last.text + event.text)
+                    } else {
+                        blocks + MessageBlock.Text(event.text, isStreaming = true)
+                    }
+                }
             }
 
             is WebSocketEvent.TextComplete -> {
                 ensureStreamingMessage(b)
-                b.streamingContent.value = event.text
-                updateStreamingMessage(b)
+                mutateStreamingBlocks(b) { blocks ->
+                    val last = blocks.lastOrNull()
+                    if (last is MessageBlock.Text && last.isStreaming) {
+                        blocks.dropLast(1) + MessageBlock.Text(event.text, isStreaming = false)
+                    } else {
+                        blocks + MessageBlock.Text(event.text, isStreaming = false)
+                    }
+                }
             }
 
             is WebSocketEvent.ThinkingDelta -> {
                 ensureStreamingMessage(b)
-                b.currentThinkingContent += event.text
-                updateStreamingMessage(b)
+                mutateStreamingBlocks(b) { blocks ->
+                    val last = blocks.lastOrNull()
+                    if (last is MessageBlock.Thinking && last.isStreaming) {
+                        blocks.dropLast(1) + last.copy(text = last.text + event.text)
+                    } else {
+                        blocks + MessageBlock.Thinking(event.text, isStreaming = true)
+                    }
+                }
             }
 
             is WebSocketEvent.ThinkingComplete -> {
                 ensureStreamingMessage(b)
-                b.currentThinkingContent = event.text
-                updateStreamingMessage(b)
+                mutateStreamingBlocks(b) { blocks ->
+                    val last = blocks.lastOrNull()
+                    if (last is MessageBlock.Thinking && last.isStreaming) {
+                        blocks.dropLast(1) + MessageBlock.Thinking(event.text, isStreaming = false)
+                    } else {
+                        blocks + MessageBlock.Thinking(event.text, isStreaming = false)
+                    }
+                }
             }
 
             is WebSocketEvent.ToolUse -> {
                 ensureStreamingMessage(b)
-                b.currentToolBlocks[event.toolUseId] = MessageBlock.ToolUse(
-                    toolUseId = event.toolUseId,
-                    toolName = event.toolName,
-                    toolInput = event.toolInput,
-                    isExecuting = false,
-                    isComplete = false
-                )
-                updateStreamingMessage(b)
+                // Finalize any trailing streaming text/thinking block so its
+                // progress indicator clears when the model switches to a tool.
+                mutateStreamingBlocks(b) { blocks ->
+                    val finalized = when (val last = blocks.lastOrNull()) {
+                        is MessageBlock.Text -> if (last.isStreaming)
+                            blocks.dropLast(1) + last.copy(isStreaming = false) else blocks
+                        is MessageBlock.Thinking -> if (last.isStreaming)
+                            blocks.dropLast(1) + last.copy(isStreaming = false) else blocks
+                        else -> blocks
+                    }
+                    finalized + MessageBlock.ToolUse(
+                        toolUseId = event.toolUseId,
+                        toolName = event.toolName,
+                        toolInput = event.toolInput,
+                        isExecuting = false,
+                        isComplete = false
+                    )
+                }
                 b.sessionStatus.value = "tool_use"
             }
 
             is WebSocketEvent.ToolExecuting -> {
-                b.currentToolBlocks[event.toolUseId]?.let { block ->
-                    b.currentToolBlocks[event.toolUseId] = block.copy(isExecuting = true)
-                    updateStreamingMessage(b)
+                mutateStreamingBlocks(b) { blocks ->
+                    blocks.map { block ->
+                        if (block is MessageBlock.ToolUse && block.toolUseId == event.toolUseId) {
+                            block.copy(isExecuting = true)
+                        } else block
+                    }
                 }
             }
 
             is WebSocketEvent.ToolResult -> {
-                b.currentToolBlocks[event.toolUseId]?.let { block ->
-                    b.currentToolBlocks[event.toolUseId] = block.copy(
-                        result = event.output,
-                        isError = event.isError,
-                        isExecuting = false,
-                        isComplete = true
-                    )
-                    updateStreamingMessage(b)
+                mutateStreamingBlocks(b) { blocks ->
+                    blocks.map { block ->
+                        if (block is MessageBlock.ToolUse && block.toolUseId == event.toolUseId) {
+                            block.copy(
+                                result = event.output,
+                                isError = event.isError,
+                                isExecuting = false,
+                                isComplete = true
+                            )
+                        } else block
+                    }
                 }
             }
 
@@ -666,15 +697,21 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     b.messages.update { messages ->
                         messages.map { msg ->
                             if (msg.id == messageId) {
-                                msg.copy(isStreaming = false)
+                                msg.copy(
+                                    isStreaming = false,
+                                    blocks = msg.blocks.map { block ->
+                                        when (block) {
+                                            is MessageBlock.Text -> block.copy(isStreaming = false)
+                                            is MessageBlock.Thinking -> block.copy(isStreaming = false)
+                                            else -> block
+                                        }
+                                    }
+                                )
                             } else msg
                         }
                     }
                 }
                 b.streamingMessageId = null
-                b.streamingContent.value = ""
-                b.currentThinkingContent = ""
-                b.currentToolBlocks.clear()
                 b.sessionStatus.value = "idle"
 
                 // Update cache with new messages — only meaningful for the
@@ -735,14 +772,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 b.streamingMessageId?.let { messageId ->
                     b.messages.update { messages ->
                         messages.map { msg ->
-                            if (msg.id == messageId) msg.copy(isStreaming = false) else msg
+                            if (msg.id == messageId) {
+                                msg.copy(
+                                    isStreaming = false,
+                                    blocks = msg.blocks.map { block ->
+                                        when (block) {
+                                            is MessageBlock.Text -> block.copy(isStreaming = false)
+                                            is MessageBlock.Thinking -> block.copy(isStreaming = false)
+                                            else -> block
+                                        }
+                                    }
+                                )
+                            } else msg
                         }
                     }
                 }
                 b.streamingMessageId = null
-                b.streamingContent.value = ""
-                b.currentThinkingContent = ""
-                b.currentToolBlocks.clear()
                 b.sessionStatus.value = "idle"
                 stopVoiceSession()
             }
@@ -758,29 +803,23 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    private fun updateStreamingMessage(b: ChatStateBucket) {
+    /**
+     * Mutate the in-flight assistant message's block list in place, preserving
+     * arrival order. The web frontend's reducer in useChatInstance.ts works
+     * the same way: each new text delta either extends the trailing streaming
+     * text block or starts a new one after whatever tool blocks were emitted
+     * since the last text. This is the source of truth for ordering — never
+     * rebuild blocks from per-type scratchpad buffers, which loses the order
+     * between text and tool calls.
+     */
+    private fun mutateStreamingBlocks(
+        b: ChatStateBucket,
+        transform: (List<MessageBlock>) -> List<MessageBlock>
+    ) {
         val messageId = b.streamingMessageId ?: return
-
-        val blocks = mutableListOf<MessageBlock>()
-
-        if (b.currentThinkingContent.isNotEmpty()) {
-            blocks.add(MessageBlock.Thinking(b.currentThinkingContent, isStreaming = true))
-        }
-
-        if (b.streamingContent.value.isNotEmpty()) {
-            blocks.add(MessageBlock.Text(b.streamingContent.value, isStreaming = true))
-        }
-
-        blocks.addAll(b.currentToolBlocks.values)
-
         b.messages.update { messages ->
             messages.map { msg ->
-                if (msg.id == messageId) {
-                    msg.copy(
-                        content = b.streamingContent.value,
-                        blocks = blocks
-                    )
-                } else msg
+                if (msg.id == messageId) msg.copy(blocks = transform(msg.blocks)) else msg
             }
         }
     }
