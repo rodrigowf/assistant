@@ -253,6 +253,7 @@ class ApiClient(private val baseUrl: String) {
                 model = json.optString("default_voice_model", VoiceConfig.DEFAULT.model),
                 voice = json.optString("default_voice_name", VoiceConfig.DEFAULT.voice),
                 transcriptionLanguage = json.optString("default_voice_transcription_language", ""),
+                endpoint = json.optString("default_voice_endpoint", ""),
             )
         } catch (e: Exception) {
             Log.e(TAG, "getVoiceConfig error: ${e.message}", e)
@@ -294,6 +295,7 @@ class ApiClient(private val baseUrl: String) {
         model: String? = null,
         voice: String? = null,
         transcriptionLanguage: String? = null,
+        endpoint: String? = null,
     ): VoiceConnectionInfo? = withContext(Dispatchers.IO) {
         try {
             val q = mutableListOf<String>()
@@ -302,6 +304,9 @@ class ApiClient(private val baseUrl: String) {
             voice?.let { q.add("voice=${URLEncoder.encode(it, "UTF-8")}") }
             transcriptionLanguage?.let {
                 q.add("transcription_language=${URLEncoder.encode(it, "UTF-8")}")
+            }
+            endpoint?.takeIf { it.isNotBlank() }?.let {
+                q.add("endpoint=${URLEncoder.encode(it, "UTF-8")}")
             }
             val qs = if (q.isEmpty()) "" else "?" + q.joinToString("&")
             val url = buildHttpUrl("/api/orchestrator/voice/session$qs")
@@ -746,6 +751,7 @@ class ApiClient(private val baseUrl: String) {
                 patch.defaultVoiceTranscriptionLanguage?.let {
                     put("default_voice_transcription_language", it)
                 }
+                patch.defaultVoiceEndpoint?.let { put("default_voice_endpoint", it) }
                 patch.voiceRecordingEnabled?.let { put("voice_recording_enabled", it) }
             }
             val request = Request.Builder()
@@ -852,10 +858,12 @@ class ApiClient(private val baseUrl: String) {
         }
     }
 
-    /** GET /api/config/voice/google/models */
-    suspend fun listGoogleVoiceModels(): List<VoiceModelEntry> = withContext(Dispatchers.IO) {
+    /** GET /api/config/voice/google/models[?endpoint=vertex|aistudio] */
+    suspend fun listGoogleVoiceModels(endpoint: String? = null): List<VoiceModelEntry> = withContext(Dispatchers.IO) {
         try {
-            val url = buildHttpUrl("/api/config/voice/google/models")
+            val qs = endpoint?.takeIf { it.isNotBlank() }
+                ?.let { "?endpoint=${URLEncoder.encode(it, "UTF-8")}" } ?: ""
+            val url = buildHttpUrl("/api/config/voice/google/models$qs")
             val request = Request.Builder().url(url).get().build()
             val response = client.newCall(request).execute()
             if (!response.isSuccessful) return@withContext emptyList()
@@ -948,6 +956,7 @@ class ApiClient(private val baseUrl: String) {
                 defaultVoiceModel = json.optString("default_voice_model", ""),
                 defaultVoiceName = json.optString("default_voice_name", ""),
                 defaultVoiceTranscriptionLanguage = json.optString("default_voice_transcription_language", ""),
+                defaultVoiceEndpoint = json.optString("default_voice_endpoint", "vertex"),
                 voiceRecordingEnabled = json.optBoolean("voice_recording_enabled", false),
             )
         } catch (e: Exception) {

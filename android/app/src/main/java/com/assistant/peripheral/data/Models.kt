@@ -179,6 +179,9 @@ sealed class WebSocketMessage {
         val voiceModel: String? = null,
         val voiceName: String? = null,
         val voiceTranscriptionLanguage: String? = null,
+        // Google-only backend selector ("vertex" | "aistudio"); ignored by
+        // other providers. Required for Gemini AI-Studio-only models.
+        val voiceEndpoint: String? = null,
     ) : WebSocketMessage()
     object VoiceStop : WebSocketMessage()
     data class VoiceEvent(val event: Map<String, Any?>) : WebSocketMessage()

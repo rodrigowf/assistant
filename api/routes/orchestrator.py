@@ -284,13 +284,20 @@ async def _handle_start(
     config = OrchestratorConfig.load()
     project_dir = config.project_dir
 
-    # If voice mode and any of provider/model/voice/language missing from
-    # the start message, fall back to what's saved in assistant_config.json.
+    # If voice mode and any of provider/model/voice/language/endpoint missing
+    # from the start message, fall back to what's saved in
+    # assistant_config.json. Endpoint must be included in the gate, otherwise
+    # clients that pass provider/model/voice/lang but omit endpoint (e.g. the
+    # Android peripheral before the voice_endpoint field was added) get
+    # endpoint=None → Vertex default, even when the user has configured AI
+    # Studio. That breaks AI-Studio-only models like
+    # ``gemini-3.1-flash-live-preview`` with a Vertex policy error.
     if voice and (
         voice_provider_req is None
         or voice_model_req is None
         or voice_name_req is None
         or voice_lang_req is None
+        or voice_endpoint_req is None
     ):
         try:
             from api.routes.config import _load_config as _load_app_config

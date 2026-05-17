@@ -1373,6 +1373,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     voiceModel = cfg.model,
                     voiceName = cfg.voice,
                     voiceTranscriptionLanguage = cfg.transcriptionLanguage,
+                    voiceEndpoint = cfg.endpoint.takeIf { it.isNotBlank() },
                 ),
                 endpoint = WebSocketEndpoint.ORCHESTRATOR
             )
@@ -1626,7 +1627,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 val mcpDef = async(Dispatchers.IO) { client.listMcpServers() }
                 val modelsDef = async(Dispatchers.IO) { client.listOrchestratorModels() }
                 val voiceDef = async(Dispatchers.IO) { client.listVoiceModels() }
-                val googleVoiceDef = async(Dispatchers.IO) { client.listGoogleVoiceModels() }
                 val qwenDef = async(Dispatchers.IO) { client.listQwenHarnessModels() }
                 val providersDef = async(Dispatchers.IO) { client.listSessionProviders() }
 
@@ -1638,10 +1638,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                     return@launch
                 }
-                // Merge dynamic Gemini Live list into static voice providers
-                // (replaces the static "google" entries only when non-empty).
+                // Merge dynamic Gemini Live list into static voice providers.
+                // The endpoint (vertex / aistudio) decides which Google backend
+                // the catalog is fetched from — mirrors the web ConfigPage.
+                val googleVoice = client.listGoogleVoiceModels(cfg.defaultVoiceEndpoint)
                 val voiceProviders = voiceDef.await().toMutableMap()
-                val googleVoice = googleVoiceDef.await()
                 if (googleVoice.isNotEmpty()) voiceProviders["google"] = googleVoice
 
                 _systemConfig.value = SystemConfigState(
@@ -1671,12 +1672,27 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateSystemConfig(patch: ConfigPatch) {
         val client = apiClient ?: return
         viewModelScope.launch {
+            val prevEndpoint = _systemConfig.value.config?.defaultVoiceEndpoint
             _systemConfig.value = _systemConfig.value.copy(saving = true, error = null)
             val result = client.updateAssistantConfig(patch)
             result.fold(
                 onSuccess = { newCfg ->
+                    // Refetch the Google voice catalog when the user flips the
+                    // backend, since the model list is per-endpoint. Mirrors
+                    // the web ConfigPage useEffect.
+                    val voiceProviders = if (
+                        newCfg.defaultVoiceEndpoint != prevEndpoint
+                    ) {
+                        val googleVoice = client.listGoogleVoiceModels(newCfg.defaultVoiceEndpoint)
+                        val merged = _systemConfig.value.voiceProviders.toMutableMap()
+                        if (googleVoice.isNotEmpty()) merged["google"] = googleVoice
+                        merged
+                    } else {
+                        _systemConfig.value.voiceProviders
+                    }
                     _systemConfig.value = _systemConfig.value.copy(
                         config = newCfg,
+                        voiceProviders = voiceProviders,
                         saving = false,
                         savedFlash = true,
                     )

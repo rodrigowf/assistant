@@ -63,6 +63,11 @@ data class VoiceConfig(
     val model: String,              // provider-specific model id
     val voice: String,              // voice/speaker id
     val transcriptionLanguage: String,  // ISO-639-1; "" = auto-detect
+    // Google-only backend selector: "vertex" or "aistudio". Empty/null for
+    // other providers — they ignore it. Critical for Gemini Live because
+    // some Live models (e.g. ``gemini-3.1-flash-live-preview``) only exist
+    // on AI Studio and get rejected by Vertex with a policy error.
+    val endpoint: String = "",
 ) {
     companion object {
         /** Conservative default — matches the backend's hard-coded fallback. */
@@ -71,6 +76,7 @@ data class VoiceConfig(
             model = "gpt-realtime",
             voice = "cedar",
             transcriptionLanguage = "",
+            endpoint = "",
         )
     }
 }

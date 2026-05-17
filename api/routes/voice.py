@@ -70,6 +70,18 @@ async def create_voice_session(
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Mirror the WebSocket orchestrator route: if endpoint wasn't passed,
+    # fall back to the saved ``default_voice_endpoint``. Without this, a
+    # Google-provider call with no ``endpoint=`` param defaults to Vertex
+    # even when the user has AI Studio configured, breaking AI-Studio-only
+    # models with a policy error.
+    if endpoint is None:
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            endpoint = _load_app_config().get("default_voice_endpoint")
+        except Exception:
+            logger.exception("Failed to load default_voice_endpoint from config")
+
     try:
         provider_obj = instantiate_provider(
             provider_id, model_entry["id"], voice_name, language,

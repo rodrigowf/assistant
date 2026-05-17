@@ -164,6 +164,7 @@ class VoiceManager(
             model = cfg.model,
             voice = cfg.voice,
             transcriptionLanguage = cfg.transcriptionLanguage,
+            endpoint = cfg.endpoint.takeIf { it.isNotBlank() },
         )
         if (info == null) {
             val msg = "Failed to start voice session (no connection info)"

@@ -219,6 +219,9 @@ class WebSocketManager {
                 message.voiceModel?.let { put("voice_model", it) }
                 message.voiceName?.let { put("voice_name", it) }
                 message.voiceTranscriptionLanguage?.let { put("voice_transcription_language", it) }
+                message.voiceEndpoint?.takeIf { it.isNotBlank() }?.let {
+                    put("voice_endpoint", it)
+                }
             }
             is WebSocketMessage.VoiceStop -> JSONObject().apply {
                 put("type", "voice_stop")

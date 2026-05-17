@@ -28,6 +28,9 @@ data class AssistantConfig(
     val defaultVoiceModel: String,
     val defaultVoiceName: String,
     val defaultVoiceTranscriptionLanguage: String,
+    // For the ``google`` voice provider only: "vertex" or "aistudio".
+    // Other providers ignore this field. Default is "vertex".
+    val defaultVoiceEndpoint: String,
     val voiceRecordingEnabled: Boolean,
 )
 
@@ -119,5 +122,6 @@ data class ConfigPatch(
     val defaultVoiceModel: String? = null,
     val defaultVoiceName: String? = null,
     val defaultVoiceTranscriptionLanguage: String? = null,
+    val defaultVoiceEndpoint: String? = null,
     val voiceRecordingEnabled: Boolean? = null,
 )

@@ -21,6 +21,15 @@ private val VOICE_PROVIDER_LABELS = mapOf(
     "google" to "Google Gemini",
 )
 
+// Backends for the Google voice provider only — selects between
+// Vertex AI (recommended) and AI Studio (legacy). Mirrors the web
+// ConfigPage dropdown.
+private val GOOGLE_VOICE_ENDPOINTS = listOf("vertex", "aistudio")
+private val GOOGLE_VOICE_ENDPOINT_LABELS = mapOf(
+    "vertex" to "Vertex AI (recommended)",
+    "aistudio" to "AI Studio (legacy)",
+)
+
 /**
  * Mirrors the web frontend's `ConfigPage` — exposes backend (assistant_config.json)
  * settings: orchestrator text/voice model, voice recording, session provider,
@@ -238,6 +247,18 @@ private fun OrchestratorCard(state: SystemConfigState, onUpdate: (ConfigPatch) -
                 enabled = !state.saving,
                 onSelect = { onUpdate(ConfigPatch(defaultVoiceProvider = it)) },
             )
+            if (vProv == "google") {
+                Spacer(Modifier.height(8.dp))
+                val vEndpoint = cfg.defaultVoiceEndpoint.ifBlank { "vertex" }
+                DropdownField(
+                    label = "Backend",
+                    options = GOOGLE_VOICE_ENDPOINTS,
+                    selected = vEndpoint,
+                    optionLabel = { GOOGLE_VOICE_ENDPOINT_LABELS[it] ?: it },
+                    enabled = !state.saving,
+                    onSelect = { onUpdate(ConfigPatch(defaultVoiceEndpoint = it)) },
+                )
+            }
             Spacer(Modifier.height(8.dp))
             DropdownField(
                 label = "Model",
