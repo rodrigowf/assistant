@@ -70,6 +70,7 @@ def list_sessions(
             title=s.title,
             message_count=s.message_count,
             is_orchestrator=s.is_orchestrator,
+            provider=s.provider,
             local_id=sdk_to_local.get(s.session_id),
         )
         for s in store_sessions
@@ -81,6 +82,7 @@ def list_sessions(
     for s in pool.list_sessions():
         sdk_id = s.get("sdk_session_id")
         local_id = s.get("session_id")
+        provider = s.get("provider", "claude")
         if sdk_id and sdk_id not in store_sdk_ids:
             # Session is live but has no local history — show it with minimal metadata
             result.insert(0, SessionInfoResponse(
@@ -90,6 +92,7 @@ def list_sessions(
                 title="(active session)",
                 message_count=s.get("turns", 0),
                 is_orchestrator=False,
+                provider=provider,
                 local_id=local_id,
             ))
         elif not sdk_id and local_id:
@@ -104,6 +107,7 @@ def list_sessions(
                 title="(active session)",
                 message_count=s.get("turns", 0),
                 is_orchestrator=False,
+                provider=provider,
                 local_id=local_id,
             ))
 
@@ -186,6 +190,8 @@ def get_session(session_id: str, store: SessionStore = Depends(get_store)):
         last_activity=detail.last_activity.isoformat(),
         title=detail.title,
         message_count=detail.message_count,
+        is_orchestrator=detail.is_orchestrator,
+        provider=detail.provider,
         messages=[
             MessagePreviewResponse(
                 role=m.role,
@@ -264,9 +270,118 @@ def rename_session(session_id: str, body: dict, store: SessionStore = Depends(ge
 
 
 @router.delete("/{session_id}", status_code=204)
-def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
-    if not store.delete_session(session_id):
+async def delete_session(session_id: str, store: SessionStore = Depends(get_store)):
+    # Move the JSONL into trash synchronously (fast — a single rename) so
+    # the next list_sessions() call already reflects the deletion.  Defer
+    # the vector-index cleanup to a background task: it spawns a chromadb
+    # subprocess that takes 2–10s to cold-start, which would otherwise
+    # block the HTTP response and freeze the sidebar.  Cleanup is
+    # best-effort by design (failures are swallowed and logged) so
+    # fire-and-forget is safe — at worst a stale chunk sits in the index
+    # until the next re-index pass removes it.
+    if not store.delete_session(session_id, skip_index_cleanup=True):
         raise HTTPException(404, detail=f"Session {session_id!r} not found")
+
+    import asyncio
+    from manager.index_utils import remove_session_from_index
+    asyncio.create_task(asyncio.to_thread(
+        remove_session_from_index, session_id, "history"
+    ))
+
+
+def _is_live_session(session_id: str, pool: SessionPool) -> bool:
+    """True if the given session_id is currently open in the pool.
+
+    Matches both the regular-agent SDK session id and the orchestrator's
+    jsonl_id, so the on-disk JSONL is not mutated while a process may be
+    appending to it.
+    """
+    if pool.has_orchestrator():
+        orc_session = pool.get_orchestrator()
+        jsonl_id = (
+            getattr(orc_session, "jsonl_id", pool.orchestrator_id)
+            if orc_session
+            else pool.orchestrator_id
+        )
+        if jsonl_id == session_id or pool.orchestrator_id == session_id:
+            return True
+    for s in pool.list_sessions():
+        if s.get("sdk_session_id") == session_id or s.get("session_id") == session_id:
+            return True
+    return False
+
+
+@router.post("/{session_id}/duplicate", status_code=201)
+def duplicate_session(
+    session_id: str,
+    store: SessionStore = Depends(get_store),
+):
+    """Copy a session's JSONL + title under a fresh UUID. Returns the new session_id.
+
+    Safe even when the source session is open: this is a read of the JSONL,
+    so concurrent appends just mean the duplicate may or may not catch the
+    very latest line. The new file is independent.
+    """
+    new_id = store.duplicate_session(session_id)
+    if new_id is None:
+        raise HTTPException(404, detail=f"Session {session_id!r} not found")
+    return {"session_id": new_id}
+
+
+@router.post("/{session_id}/truncate", status_code=200)
+def truncate_session(
+    session_id: str,
+    body: dict,
+    store: SessionStore = Depends(get_store),
+    pool: SessionPool = Depends(get_pool),
+):
+    """Rewind a session by dropping the last ``drop_last_n`` visible messages.
+
+    Body: ``{"drop_last_n": <N>}`` — counted from the bottom so the request
+    survives pagination (the frontend may only have the most recent page
+    loaded, so absolute indices from the top would be unreliable).
+
+    Rejected with 409 when the session is currently open in the pool — the
+    in-memory CLI state would diverge from the truncated file.
+    """
+    if _is_live_session(session_id, pool):
+        raise HTTPException(
+            409,
+            detail="Session is currently open. Close the tab before rewinding.",
+        )
+    drop_last_n = body.get("drop_last_n")
+    if not isinstance(drop_last_n, int) or drop_last_n < 0:
+        raise HTTPException(400, detail="drop_last_n (non-negative int) is required")
+    if not store.truncate_session(session_id, drop_last_n):
+        raise HTTPException(
+            404,
+            detail=f"Session {session_id!r} not found or drop_last_n out of range",
+        )
+    return {"session_id": session_id}
+
+
+@router.post("/{session_id}/fork", status_code=201)
+def fork_session(
+    session_id: str,
+    body: dict,
+    store: SessionStore = Depends(get_store),
+):
+    """Duplicate ``session_id`` and rewind the copy by ``drop_last_n``.
+
+    Body: ``{"drop_last_n": <N>}``. The original session is untouched (only
+    the copy is truncated), so this is safe even if the source is open.
+    Returns ``{"session_id": <new_uuid>}``.
+    """
+    drop_last_n = body.get("drop_last_n")
+    if not isinstance(drop_last_n, int) or drop_last_n < 0:
+        raise HTTPException(400, detail="drop_last_n (non-negative int) is required")
+    new_id = store.fork_session(session_id, drop_last_n)
+    if new_id is None:
+        raise HTTPException(
+            404,
+            detail=f"Session {session_id!r} not found or drop_last_n out of range",
+        )
+    return {"session_id": new_id}
 
 
 @router.post("/{local_id}/close", status_code=204)

@@ -40,6 +40,36 @@ export async function deleteSession(id: string): Promise<void> {
   if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
 }
 
+async function postJson<T>(url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      detail = (await res.json())?.detail || "";
+    } catch {
+      // ignore
+    }
+    throw new Error(detail || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export function duplicateSession(id: string): Promise<{ session_id: string }> {
+  return postJson(`${BASE}/sessions/${id}/duplicate`);
+}
+
+export function truncateSession(id: string, dropLastN: number): Promise<{ session_id: string }> {
+  return postJson(`${BASE}/sessions/${id}/truncate`, { drop_last_n: dropLastN });
+}
+
+export function forkSession(id: string, dropLastN: number): Promise<{ session_id: string }> {
+  return postJson(`${BASE}/sessions/${id}/fork`, { drop_last_n: dropLastN });
+}
+
 export async function closePoolSession(localId: string): Promise<void> {
   const res = await fetch(`${BASE}/sessions/${localId}/close`, { method: "POST" });
   if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
@@ -111,12 +141,39 @@ export interface WorkingDirectoryEntry {
   claude_config_dir?: string | null; // Override CLAUDE_CONFIG_DIR on the remote machine
 }
 
+// Session-harness id — the canonical list comes from /api/config/providers
+// at runtime, so this is plain `string` rather than a closed union.  Use
+// `listSessionProviders()` to populate UI pickers; never hardcode the set.
+export type AssistantProvider = string;
+
+export interface SessionProviderSpec {
+  id: string;            // registry id (e.g. "claude", "qwen")
+  label: string;         // human-readable picker label
+  description: string;   // one-line description shown under the picker
+}
+
+export interface SessionProvidersResponse {
+  providers: SessionProviderSpec[];
+}
+
+export function listSessionProviders(): Promise<SessionProvidersResponse> {
+  return json(`${BASE}/config/providers`);
+}
+
 export interface AssistantConfig {
   working_directory: string;                     // active entry id
   working_directory_history: WorkingDirectoryEntry[];
   enabled_mcps: string[];
   chrome_extension: boolean;
+  provider: AssistantProvider;                   // session provider for new chats
   default_model: string;
+  harness_model: Partial<Record<AssistantProvider, string>>; // per-provider; "" = CLI default
+  default_voice_provider: string;
+  default_voice_model: string;
+  default_voice_name: string;
+  default_voice_transcription_language: string;  // "" = auto-detect
+  default_voice_endpoint: string;                // "vertex" | "aistudio" — google provider only
+  voice_recording_enabled: boolean;              // save raw audio from voice sessions
 }
 
 export interface ConfigUpdate {
@@ -124,7 +181,15 @@ export interface ConfigUpdate {
   working_directory_history?: WorkingDirectoryEntry[];   // full list replacement
   enabled_mcps?: string[];
   chrome_extension?: boolean;
+  provider?: AssistantProvider;
   default_model?: string;
+  harness_model?: Partial<Record<AssistantProvider, string>>; // shallow-merged server-side
+  default_voice_provider?: string;
+  default_voice_model?: string;
+  default_voice_name?: string;
+  default_voice_transcription_language?: string;
+  default_voice_endpoint?: string;
+  voice_recording_enabled?: boolean;
 }
 
 export function getConfig(): Promise<AssistantConfig> {
@@ -161,12 +226,94 @@ export function listModels(): Promise<ModelsResponse> {
   return json(`${BASE}/orchestrator/models`);
 }
 
+// Harness model catalog (currently Qwen only — Claude has no programmatic
+// equivalent of ~/.qwen/settings.json, so we leave that picker hidden).
+
+export interface QwenModelInfo {
+  id: string;
+  display_name: string;
+  provider: string;             // key under modelProviders in settings.json
+  base_url: string | null;
+  context_window: number | null;
+  supports_vision: boolean;
+  supports_video: boolean;
+  supports_thinking: boolean;
+}
+
+export interface QwenModelsResponse {
+  models: QwenModelInfo[];
+}
+
+export function listQwenHarnessModels(): Promise<QwenModelsResponse> {
+  return json(`${BASE}/config/harness/qwen/models`);
+}
+
+// Voice Provider Configuration
+
+export interface VoiceEntry {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export interface TranscriptionLanguageEntry {
+  id: string;          // ISO code, or "" for auto-detect
+  label: string;
+  description: string;
+}
+
+export interface VoiceModelEntry {
+  id: string;
+  label: string;
+  voice: string;             // default voice
+  voices: VoiceEntry[];      // selectable voices
+  transcription_languages: TranscriptionLanguageEntry[];
+  default_transcription_language: string;
+  default: boolean;
+}
+
+export interface VoiceModelsResponse {
+  providers: Record<string, VoiceModelEntry[]>;
+  default_provider: string;
+  default_model: string;
+}
+
+export function listVoiceModels(): Promise<VoiceModelsResponse> {
+  return json(`${BASE}/orchestrator/voice/models`);
+}
+
+// Dynamic Gemini Live model listing. The Google provider has two
+// backends — Vertex AI (default, stable) and AI Studio (legacy, prone
+// to 1008 denials). Pass ``endpoint`` to pick which catalog to query;
+// omit to use the backend's default. Backend caches per-endpoint for
+// 60s. Returns ``{models: []}`` on any failure; callers should fall
+// back to the static ``VOICE_MODELS["google"]`` from
+// ``listVoiceModels()`` in that case.
+export interface GoogleVoiceModelsResponse {
+  models: VoiceModelEntry[];
+}
+
+export function listGoogleVoiceModels(
+  endpoint?: string,
+): Promise<GoogleVoiceModelsResponse> {
+  const qs = endpoint ? `?endpoint=${encodeURIComponent(endpoint)}` : "";
+  return json(`${BASE}/config/voice/google/models${qs}`);
+}
+
 // Per-session config
 
 export interface SessionConfig {
   working_directory: string | null;  // null = inherit active from global
   enabled_mcps: string[] | null;     // null = inherit from global
   chrome_extension: boolean | null;  // null = inherit from global
+  // Per-session provider pin.  null = inherit from global; otherwise the
+  // resume path treats this as authoritative (you can't safely switch the
+  // CLI behind an existing JSONL).
+  provider: AssistantProvider | null;
+  // Per-session harness model override.  null = inherit from global
+  // harness_model[provider];  "" = explicit "CLI default" for this session;
+  // any other string is the model id passed to the CLI.
+  harness_model: string | null;
 }
 
 export type SessionConfigUpdate = Partial<SessionConfig>;

@@ -11,10 +11,11 @@ fixed model for the session duration (WebRTC constraint).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,8 +31,13 @@ from orchestrator.config import (
     get_model_info,
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
-from orchestrator.providers.anthropic import AnthropicProvider
-from orchestrator.providers.openai_text import OpenAITextProvider, create_audio_message
+from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
+# Provider classes are imported lazily inside the methods that need them so
+# this module remains importable on machines where the corresponding SDK
+# (``anthropic`` for Claude, ``openai`` for GPT/Qwen/Gemini) isn't installed.
+# Missing SDKs surface as a 400 at config-save time and a friendly runtime
+# error at send time — never as a backend that won't boot.
+from orchestrator.runner import BackgroundAgentRunner, Notification, NotificationQueue
 from orchestrator.token_budget import (
     RECENT_VERBATIM_TOKENS,
     estimate_message_tokens,
@@ -50,6 +56,38 @@ from orchestrator.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _render_notifications(notes: list[Notification]) -> str:
+    """Render a batch of background-agent notifications as a status block.
+
+    Status lines only (per design choice): the orchestrator must call
+    read_agent_session or peek_agent_session to retrieve actual content.
+    Keeps the synthetic prompt cheap and forces explicit follow-up reads.
+    """
+    if not notes:
+        return ""
+    lines: list[str] = [f"[Background events — {len(notes)} update{'s' if len(notes) != 1 else ''}]"]
+    for n in notes:
+        sid_short = n.session_id[:8]
+        title_part = f' ("{n.session_title}")' if n.session_title else ""
+        bits = [
+            f"[SESSION {sid_short}{title_part}",
+            f"event: turn {n.turn_id[:8]} {n.status}",
+            f"duration={n.duration_seconds:.1f}s",
+        ]
+        if n.cost:
+            bits.append(f"cost=${n.cost:.4f}")
+        if n.turns:
+            bits.append(f"turns={n.turns}")
+        if n.error:
+            bits.append(f'error="{n.error}"')
+        lines.append(", ".join(bits) + "]")
+    lines.append(
+        "(Use read_agent_session(session_id) for persisted output, "
+        "peek_agent_session(session_id, turn_id) for live in-flight events.)"
+    )
+    return "\n".join(lines)
 
 
 class OrchestratorSession:
@@ -99,6 +137,11 @@ class OrchestratorSession:
         session_id: str | None = None,
         local_id: str | None = None,
         voice: bool = False,
+        voice_provider: str | None = None,
+        voice_model: str | None = None,
+        voice_name: str | None = None,
+        voice_transcription_language: str | None = None,
+        voice_endpoint: str | None = None,
     ) -> None:
         self._config = config
         self._context = context
@@ -109,10 +152,49 @@ class OrchestratorSession:
         self._writer: HistoryWriter | None = None
         self._voice = voice
         self._voice_provider = None  # Set in start() if voice=True
+        self._voice_provider_id: str | None = voice_provider
+        self._voice_model_id: str | None = voice_model
+        self._voice_name: str | None = voice_name
+        self._voice_transcription_language: str | None = voice_transcription_language
+        # Backend selector for the "google" voice provider (AI Studio vs
+        # Vertex). Ignored by other providers. ``None`` means "use the
+        # registry default" (currently Vertex).
+        self._voice_endpoint: str | None = voice_endpoint
+        self._voice_relay = None  # Set lazily for websocket providers
         self._history_summary: str | None = None
+        self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
 
         # Track current provider for model switching
         self._current_provider = None
+
+        # Background agent runner — owns fire-and-forget agent turns spawned
+        # by the send_to_agent_session tool.  Notifications drain at the top
+        # of every send() call; the route layer installs a wake_callback that
+        # synthesises an empty-prompt turn when one arrives while idle.
+        self._notifications = NotificationQueue()
+        store = context.get("store")
+        pool = context.get("pool")
+        if store is not None and pool is not None:
+            self._runner: BackgroundAgentRunner | None = BackgroundAgentRunner(
+                pool, store, self._notifications,
+            )
+            # Make the runner reachable from tools that get only the
+            # context dict (e.g. send_to_agent_session, peek_agent_session).
+            context["runner"] = self._runner
+            context["notifications"] = self._notifications
+        else:
+            self._runner = None
+        # Held while a send() / send_audio() / _run_agent is in flight.  The
+        # wake callback uses is_busy to decide whether to schedule a
+        # synthetic turn now or let the next user prompt drain notifications.
+        self._busy_lock = asyncio.Lock()
+
+        # Injection window — set by the listen_recording tool while it's
+        # pumping past audio into the live voice WS.  See the is_injecting
+        # property for the full list of behaviours this gates.
+        self._injection_until: float = 0.0
+        self._injection_active: bool = False
+        self._injection_watchdog: asyncio.Task[None] | None = None
 
     @property
     def local_id(self) -> str:
@@ -127,6 +209,61 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def voice_provider_id(self) -> str | None:
+        """Provider id (``openai`` | ``google`` | ``qwen``) when voice mode is active."""
+        if self._voice_provider is not None:
+            return self._voice_provider.provider_name
+        return self._voice_provider_id
+
+    @property
+    def voice_model_id(self) -> str | None:
+        """Model id when voice mode is active."""
+        if self._voice_provider is not None:
+            return self._voice_provider.model
+        return self._voice_model_id
+
+    @property
+    def voice_name_id(self) -> str | None:
+        """Selected voice/speaker id when voice mode is active."""
+        if self._voice_provider is not None:
+            return self._voice_provider.voice
+        return self._voice_name
+
+    @property
+    def voice_transcription_language(self) -> str | None:
+        """Transcription language hint when voice mode is active.
+
+        Empty string ``""`` means auto-detect (no language hint sent).
+        """
+        if self._voice_provider is not None:
+            return getattr(self._voice_provider, "transcription_language", None)
+        return self._voice_transcription_language
+
+    @property
+    def is_busy(self) -> bool:
+        """True while a send/send_audio/_run_agent turn holds the busy lock.
+
+        The wake callback (installed by the route layer) consults this to
+        decide whether to fire a synthetic-prompt turn for queued
+        notifications immediately or wait for the in-flight turn to finish.
+        """
+        return self._busy_lock.locked()
+
+    @property
+    def notifications(self) -> NotificationQueue:
+        """Queue of pending background-agent notifications.
+
+        Drained at the start of every text-mode turn; route layer installs
+        a wake_callback so that a notification arriving while idle triggers
+        a synthetic empty-prompt turn.
+        """
+        return self._notifications
+
+    @property
+    def runner(self) -> BackgroundAgentRunner | None:
+        return self._runner
 
     @property
     def current_model(self) -> str:
@@ -152,18 +289,39 @@ class OrchestratorSession:
         """
         # Import tools to ensure they're registered
         import orchestrator.tools.agent_sessions  # noqa: F401
-        import orchestrator.tools.search  # noqa: F401
+        import orchestrator.tools.assistant_config  # noqa: F401
+        import orchestrator.tools.audio_playback  # noqa: F401
         import orchestrator.tools.files  # noqa: F401
+        import orchestrator.tools.search  # noqa: F401
         import orchestrator.tools.voice_control  # noqa: F401
 
         if self._voice:
-            from orchestrator.providers.openai_voice import OpenAIVoiceProvider
-            self._voice_provider = OpenAIVoiceProvider()
+            from orchestrator.providers.voice_registry import (
+                instantiate_provider,
+                resolve_voice_target,
+            )
+            provider_id, model_entry, voice_name, language = resolve_voice_target(
+                self._voice_provider_id,
+                self._voice_model_id,
+                self._voice_name,
+                self._voice_transcription_language,
+            )
+            self._voice_provider_id = provider_id
+            self._voice_model_id = model_entry["id"]
+            self._voice_name = voice_name
+            self._voice_transcription_language = language
+            self._voice_provider = instantiate_provider(
+                provider_id, model_entry["id"], voice_name, language,
+                endpoint=self._voice_endpoint,
+            )
             provider = self._voice_provider
         else:
             provider = self._create_provider()
 
         self._current_provider = provider
+
+        # Make the session accessible from tools via context
+        self._context["session"] = self
 
         self._agent = OrchestratorAgent(
             config=self._config,
@@ -193,27 +351,62 @@ class OrchestratorSession:
                 "provider": self._config.provider.value,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            if self._voice:
-                from orchestrator.providers.openai_voice import VOICE_MODEL, VOICE_NAME
+            if self._voice and self._voice_provider is not None:
                 meta["voice"] = True
-                meta["openai_model"] = VOICE_MODEL
-                meta["voice_name"] = VOICE_NAME
+                meta["voice_provider"] = self._voice_provider.provider_name
+                meta["voice_model"] = self._voice_provider.model
+                meta["voice_name"] = self._voice_provider.voice
+                lang = getattr(self._voice_provider, "transcription_language", None)
+                if lang is not None:
+                    meta["voice_transcription_language"] = lang or "auto"
+                # Legacy field — kept for back-compat with older readers.
+                if self._voice_provider.provider_name == "openai":
+                    meta["openai_model"] = self._voice_provider.model
             self._writer.append(meta)
+
+        # Start audio recorder if voice mode and recording is enabled
+        if self._voice and is_recording_enabled():
+            self._audio_recorder = AudioRecorder(
+                session_id=self._local_id,
+                provider=self._voice_provider_id or "",
+                model=self._voice_model_id or "",
+                voice=self._voice_name or "",
+            )
+            self._audio_recorder.start()
+            logger.info("Audio recorder started for session %s", self._local_id)
 
         return self._local_id
 
     def _create_provider(self):
-        """Create a provider instance based on current config."""
+        """Create a provider instance based on current config.
+
+        Imports the underlying SDK lazily so a Qwen-only deployment can
+        still load this module — the SDK is only required at the moment
+        we actually need to talk to its API.
+        """
         if self._config.provider == Provider.OPENAI:
+            try:
+                from orchestrator.providers.openai_text import OpenAITextProvider
+            except ImportError as e:
+                raise RuntimeError(
+                    "OpenAI provider requested but `openai` package is not installed. "
+                    "Install it with: pip install -r requirements-openai.txt"
+                ) from e
             return OpenAITextProvider(
                 model=self._config.model,
                 max_tokens=self._config.max_tokens,
             )
-        else:
-            return AnthropicProvider(
-                model=self._config.model,
-                max_tokens=self._config.max_tokens,
-            )
+        try:
+            from orchestrator.providers.anthropic import AnthropicProvider
+        except ImportError as e:
+            raise RuntimeError(
+                "Anthropic provider requested but `anthropic` package is not installed. "
+                "Install it with: pip install -r requirements-anthropic.txt"
+            ) from e
+        return AnthropicProvider(
+            model=self._config.model,
+            max_tokens=self._config.max_tokens,
+        )
 
     def set_model(self, model_id: str) -> bool:
         """Switch to a different model mid-conversation.
@@ -319,7 +512,173 @@ class OrchestratorSession:
         self._history_summary = summary
         return recent, summary
 
-    async def process_voice_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+    @property
+    def needs_voice_relay(self) -> bool:
+        """True for WS providers (Qwen/Gemini/locals) that relay through backend."""
+        return (
+            self._voice
+            and self._voice_provider is not None
+            and self._voice_provider.connection_type == "websocket"
+        )
+
+    async def start_voice_relay(
+        self,
+        on_audio_out: Callable[[str], Awaitable[None]],
+        on_event_for_frontend: Callable[[dict[str, Any]], Awaitable[None]],
+        session_update: dict[str, Any] | None = None,
+    ) -> None:
+        """Open the upstream provider WS for non-WebRTC voice providers.
+
+        The handler layer wires the two callbacks so audio chunks become
+        ``voice_audio_out`` payloads on the orchestrator broadcast and
+        provider events are mirrored to subscribers.
+
+        ``session_update`` may be passed in if the caller already built it
+        (e.g. to send to the frontend in the same handler) — saves a second
+        round-trip through the LLM-backed history summarizer, which on the
+        Jetson costs enough to blow the frontend's 10s start timeout.
+        """
+        if not self.needs_voice_relay:
+            return
+        from orchestrator.voice_relay import VoiceRelay
+        if session_update is None:
+            session_update = await self.get_session_update()
+        if session_update is None:
+            raise RuntimeError("Voice provider did not produce a session.update payload")
+
+        async def _rebuild_session_update() -> dict[str, Any]:
+            # Used by the relay to recover from DashScope's misleading
+            # "InvalidParameter" close mid-session.  Rebuilds with the
+            # current history so the model picks up where it left off.
+            payload = await self.get_session_update()
+            if payload is None:
+                raise RuntimeError("rebuild_session_update returned None")
+            return payload
+
+        relay = VoiceRelay(
+            self._voice_provider,
+            on_audio_out=on_audio_out,
+            on_event_for_frontend=on_event_for_frontend,
+            session_id=self._local_id,
+            rebuild_session_update=_rebuild_session_update,
+        )
+        await relay.start(session_update)
+        self._voice_relay = relay
+
+    async def stop_voice_relay(self) -> None:
+        if self._voice_relay is not None:
+            await self._voice_relay.stop()
+            self._voice_relay = None
+
+    async def send_voice_audio_in(self, pcm_b64: str) -> None:
+        """Forward a frontend mic chunk upstream (WS providers only).
+
+        While an injection window is active (``listen_recording`` is
+        replaying past audio into the WS), do NOT also write the chunk into
+        the audio recorder — the injected bytes are not the user's
+        microphone, and persisting them would corrupt the recording with
+        material that already exists elsewhere.
+        """
+        if self._voice_relay is None:
+            return
+        if (
+            not self.is_injecting
+            and self._audio_recorder is not None
+            and self._audio_recorder.is_recording
+        ):
+            self._audio_recorder.write_user_audio(pcm_b64)
+        await self._voice_relay.send_audio(pcm_b64)
+
+    @property
+    def is_injecting(self) -> bool:
+        """True while listen_recording is replaying past audio into the WS.
+
+        Three call sites consult this flag, all backend-side:
+        - ``send_voice_audio_in`` skips writing the chunk into the audio
+          recorder (the bytes are a replay, not the user's mic).
+        - ``process_voice_event`` skips persisting voice_transcription /
+          voice_interrupted JSONL entries fired by the provider's VAD/ASR
+          chewing on the injected audio.
+        - The route-layer mirror (``_on_event_for_frontend``) skips
+          forwarding the corresponding ``input_audio_buffer.*`` and
+          ``transcription.completed`` events to the frontend, so the UI
+          never tries to barge-in on a replay it didn't actually hear.
+        """
+        return self._injection_active
+
+    def extend_injection_window(self, seconds: float) -> None:
+        """Mark the injection window as active for at least ``seconds`` more.
+
+        Idempotent and safe to call repeatedly: the deadline only ever
+        moves forward.  A single watchdog task watches the deadline and
+        clears the flag when it expires; calling
+        ``extend_injection_window`` again from the tool keeps pushing the
+        deadline out, so a long playback (or one with a generous
+        ASR-completion grace window) stays suppressed.
+
+        Must be called from inside the asyncio loop.
+        """
+        loop = asyncio.get_running_loop()
+        new_deadline = loop.time() + max(0.1, seconds)
+        if new_deadline > self._injection_until:
+            self._injection_until = new_deadline
+        if not self._injection_active:
+            self._injection_active = True
+        if self._injection_watchdog is None or self._injection_watchdog.done():
+            self._injection_watchdog = asyncio.create_task(
+                self._injection_watchdog_loop(),
+                name="voice-injection-watchdog",
+            )
+
+    async def _injection_watchdog_loop(self) -> None:
+        """Sleep until the injection deadline, then clear the flag.
+
+        Re-checks the deadline on each wake so an extension done while we
+        were sleeping just reschedules the next check rather than ending
+        suppression early.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            while True:
+                remaining = self._injection_until - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            self._injection_active = False
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("injection watchdog crashed")
+            # Fail closed: clear the flag so suppression doesn't leak.
+            self._injection_active = False
+
+    def record_assistant_audio(self, pcm_b64: str) -> None:
+        """Record assistant audio chunk (called from route layer for WS providers)."""
+        if self._audio_recorder is not None and self._audio_recorder.is_recording:
+            self._audio_recorder.write_assistant_audio(pcm_b64)
+
+    @property
+    def audio_recorder(self) -> AudioRecorder | None:
+        """The audio recorder instance, if recording is active."""
+        return self._audio_recorder
+
+    async def send_voice_event_upstream(self, event: dict[str, Any]) -> None:
+        """Forward a frontend control event to the upstream provider WS.
+
+        Used for tool results and any other commands the model expects to
+        receive from the client. WebRTC providers ignore this — the
+        frontend sends those directly via the data channel.
+        """
+        if self._voice_relay is None:
+            return
+        await self._voice_relay.send_event(event)
+
+    async def process_voice_event(
+        self,
+        event: dict[str, Any],
+        *,
+        inject: bool = True,
+    ) -> list[dict[str, Any]]:
         """Process a single mirrored OpenAI Realtime event.
 
         Injects the event into the VoiceProvider queue, then processes any
@@ -334,20 +693,153 @@ class OrchestratorSession:
 
         commands: list[dict[str, Any]] = []
 
-        await self._voice_provider.inject_event(event)
+        if inject:
+            await self._voice_provider.inject_event(event)
 
         event_type = event.get("type", "")
 
-        # User speech transcript — arrives when Whisper transcription completes
-        if event_type == "conversation.item.input_audio_transcription.completed":
-            transcript = event.get("transcript", "")
-            if transcript:
+        # --- Gemini Live event shape -----------------------------------
+        # Gemini Live doesn't carry a top-level ``type`` field — it uses
+        # camelCase top-level keys (``setupComplete``, ``serverContent``,
+        # ``toolCall``, ``toolResponse``) and nests transcription /
+        # turn-complete / interruption signals under ``serverContent``.
+        # Translate to the same persistence behaviour the OpenAI / Qwen
+        # branches below provide.
+        if not event_type and self._voice_provider.provider_name == "google":
+            sc = event.get("serverContent") or {}
+            input_t = sc.get("inputTranscription") if isinstance(sc, dict) else None
+            output_t = sc.get("outputTranscription") if isinstance(sc, dict) else None
+            tool_call = event.get("toolCall")
+
+            # User speech transcript — persist a [voice] JSONL entry.
+            if isinstance(input_t, dict) and not self.is_injecting:
+                transcript = input_t.get("text", "")
+                if transcript:
+                    segment = None
+                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                        segment = self._audio_recorder.mark_user_turn_end(transcript)
+                    if segment:
+                        content = (
+                            f"[voice, recording: {self._local_id} "
+                            f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+                        )
+                    else:
+                        content = f"[voice] {transcript}"
+                    entry: dict[str, Any] = {
+                        "type": "user",
+                        "message": {"role": "user", "content": content},
+                        "source": "voice_transcription",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if segment:
+                        entry["audio_segment"] = segment
+                    self._writer.append(entry)
+
+            # Assistant transcript delta — accumulate; persist on turnComplete.
+            if isinstance(output_t, dict):
+                delta = output_t.get("text", "")
+                if delta:
+                    staged = getattr(self, "_pending_assistant_transcript", None) or ""
+                    self._pending_assistant_transcript = staged + delta
+
+            # Turn complete — persist staged assistant transcript.
+            if isinstance(sc, dict) and sc.get("turnComplete"):
+                staged = getattr(self, "_pending_assistant_transcript", None)
+                if staged:
+                    segment = None
+                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                        segment = self._audio_recorder.mark_assistant_turn_end(staged)
+                    if segment:
+                        content = (
+                            f"[voice, recording: {self._local_id} "
+                            f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
+                        )
+                    else:
+                        content = staged
+                    entry = {
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": content},
+                        "source": "voice_response",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if segment:
+                        entry["audio_segment"] = segment
+                    self._writer.append(entry)
+                self._pending_assistant_transcript = None
+
+            # Interrupted — mark in JSONL like OpenAI's speech_started.
+            if isinstance(sc, dict) and sc.get("interrupted") and not self.is_injecting:
                 self._writer.append({
-                    "type": "user",
-                    "message": {"role": "user", "content": f"[voice] {transcript}"},
-                    "source": "voice_transcription",
+                    "type": "voice_interrupted",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
+
+            # Tool call — execute synchronously, ship the toolResponse back.
+            if isinstance(tool_call, dict):
+                for call in tool_call.get("functionCalls", []):
+                    call_id = call.get("id", "")
+                    name = call.get("name", "")
+                    args = call.get("args", {}) or {}
+                    if not (call_id and name):
+                        continue
+                    result = await registry.execute(name, args, self._context)
+                    self._writer.append({
+                        "type": "tool_use",
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "tool_input": args,
+                        "source": "voice",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    self._writer.append({
+                        "type": "tool_result",
+                        "tool_call_id": call_id,
+                        "output": result,
+                        "is_error": False,
+                        "source": "voice",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    commands.extend(self._voice_provider.format_tool_result(call_id, result))
+
+            return commands
+
+        # --- OpenAI / Qwen event shape (uses top-level ``type``) -------
+
+        # User speech transcript — arrives when Whisper transcription completes.
+        # Skip while listen_recording is replaying past audio into the WS:
+        # the provider's ASR is transcribing those bytes and firing this
+        # event for each fragment, and persisting them as user turns would
+        # corrupt history with phantom messages that the user never spoke.
+        if (
+            event_type == "conversation.item.input_audio_transcription.completed"
+            and not self.is_injecting
+        ):
+            transcript = event.get("transcript", "")
+            if transcript:
+                # Build message content with optional audio segment reference
+                segment = None
+                if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                    segment = self._audio_recorder.mark_user_turn_end(transcript)
+
+                if segment:
+                    # Include audio reference in the message text itself.
+                    # Wall-clock range — pass straight to listen_recording.
+                    content = (
+                        f"[voice, recording: {self._local_id} "
+                        f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+                    )
+                else:
+                    content = f"[voice] {transcript}"
+
+                entry: dict[str, Any] = {
+                    "type": "user",
+                    "message": {"role": "user", "content": content},
+                    "source": "voice_transcription",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                if segment:
+                    entry["audio_segment"] = segment
+                self._writer.append(entry)
 
         # User text input (typed messages in voice sessions, if applicable)
         elif event_type == "conversation.item.created":
@@ -405,50 +897,133 @@ class OrchestratorSession:
                     "source": "voice",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
-                commands.append({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": result,
-                    },
-                })
-                commands.append({"type": "response.create"})
+                # Provider-specific command sequence to ship the result back
+                # and ask for the next response.
+                commands.extend(self._voice_provider.format_tool_result(call_id, result))
 
-        # Assistant transcript complete — persist to JSONL
-        elif event_type == "response.audio_transcript.done":
+        # Assistant transcript complete — STAGE it; we only persist if the
+        # turn ended in status="completed" (response.done below). Otherwise
+        # the transcript is a fragment cut off by barge-in or response.cancel
+        # and would pollute history with sentences like "Yeah, I think".
+        # GA OpenAI gpt-realtime emits ``response.output_audio_transcript.done``;
+        # legacy beta models and Qwen still emit ``response.audio_transcript.done``.
+        elif event_type in (
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.done",
+        ):
             transcript = event.get("transcript", "")
             if transcript:
-                self._writer.append({
+                self._pending_assistant_transcript = transcript
+
+        # Turn complete — decide whether to persist the staged transcript.
+        elif event_type == "response.done":
+            response = event.get("response", {})
+            status = response.get("status", "completed")
+            staged = getattr(self, "_pending_assistant_transcript", None)
+            if staged and status == "completed":
+                # Build message content with optional audio segment reference
+                segment = None
+                if self._audio_recorder is not None and self._audio_recorder.is_recording:
+                    segment = self._audio_recorder.mark_assistant_turn_end(staged)
+
+                if segment:
+                    # Include audio reference in the message text itself.
+                    # Wall-clock range — pass straight to listen_recording.
+                    content = (
+                        f"[voice, recording: {self._local_id} "
+                        f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
+                    )
+                else:
+                    content = staged
+
+                entry: dict[str, Any] = {
                     "type": "assistant",
-                    "message": {"role": "assistant", "content": transcript},
+                    "message": {"role": "assistant", "content": content},
                     "source": "voice_response",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
+                }
+                if segment:
+                    entry["audio_segment"] = segment
+                self._writer.append(entry)
+            self._pending_assistant_transcript = None
 
-        # Barge-in interruption — mark in JSONL
+        # Barge-in interruption — mark in JSONL.  While injecting past
+        # audio via listen_recording, the provider's VAD fires this event
+        # for every chunk it detects in the replay; those are not real
+        # interruptions and must not be persisted.
         elif event_type == "input_audio_buffer.speech_started":
-            self._writer.append({
-                "type": "voice_interrupted",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            if not self.is_injecting:
+                self._writer.append({
+                    "type": "voice_interrupted",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
 
         return commands
 
     async def send(self, prompt: str) -> AsyncIterator[OrchestratorEvent]:
-        """Send a text message and yield events. Persists to JSONL. (Text mode only)"""
+        """Send a text message and yield events. Persists to JSONL. (Text mode only)
+
+        Drains any queued background-agent notifications first.  An empty
+        prompt with no pending notifications is a spurious wake (e.g. the
+        wake-callback fired between is_busy check and notification arrival)
+        — short-circuit before grabbing the lock.
+
+        The whole turn is wrapped in self._busy_lock so the route layer's
+        wake_callback can reliably tell whether the orchestrator is mid-turn
+        and queue notifications for the next idle window instead.
+        """
         if self._agent is None:
             raise RuntimeError("Session not started")
 
-        # Persist user message
-        self._writer.append({
-            "type": "user",
-            "message": {"role": "user", "content": prompt},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        # Cheap pre-check: if there's nothing to do, don't even take the lock.
+        # (The deeper check is also done after the lock is held, in case a
+        # racing push() arrived in between.)
+        if not prompt and not self._notifications.has_pending():
+            return
 
-        async for event in self._run_agent(prompt):
-            yield event
+        async with self._busy_lock:
+            pending = self._notifications.drain()
+            if not prompt and not pending:
+                return  # racing wake; nothing to deliver
+            # Persist a JSONL line for each drained notification so the run
+            # is replayable (ties back to the originating tool_use_id).
+            for n in pending:
+                self._writer.append({
+                    "type": "background_notification",
+                    "notification_id": n.notification_id,
+                    "turn_id": n.turn_id,
+                    "session_id": n.session_id,
+                    "session_title": n.session_title,
+                    "origin_tool_use_id": n.origin_tool_use_id,
+                    "status": n.status,
+                    "cost": n.cost,
+                    "turns": n.turns,
+                    "duration_seconds": n.duration_seconds,
+                    "error": n.error,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            # Build the actual prompt the LLM sees.  Notifications go FIRST
+            # so the model reads them before anything the user typed.
+            rendered = _render_notifications(pending)
+            if rendered and prompt:
+                effective_prompt = rendered + "\n\n" + prompt
+            elif rendered:
+                effective_prompt = rendered
+            else:
+                effective_prompt = prompt
+
+            # Persist user message (the unmodified original; notification
+            # lines are recorded separately as background_notification entries
+            # above so the JSONL stays clean).
+            if prompt:
+                self._writer.append({
+                    "type": "user",
+                    "message": {"role": "user", "content": prompt},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
+            async for event in self._run_agent(effective_prompt):
+                yield event
 
     async def send_audio(
         self,
@@ -472,6 +1047,54 @@ class OrchestratorSession:
         if self._agent is None:
             raise RuntimeError("Session not started")
 
+        # Audio mode is OpenAI-only — import lazily so a Qwen-only install
+        # can still import this module.
+        try:
+            from orchestrator.providers.openai_text import (
+                OpenAITextProvider, create_audio_message,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "Audio mode requires the `openai` package. "
+                "Install it with: pip install -r requirements-openai.txt"
+            ) from e
+
+        # Audio mode also drains notifications — prepend them to the audio's
+        # accompanying text prompt so the LLM sees them first in this turn.
+        async with self._busy_lock:
+            pending = self._notifications.drain()
+            if pending:
+                for n in pending:
+                    self._writer.append({
+                        "type": "background_notification",
+                        "notification_id": n.notification_id,
+                        "turn_id": n.turn_id,
+                        "session_id": n.session_id,
+                        "session_title": n.session_title,
+                        "origin_tool_use_id": n.origin_tool_use_id,
+                        "status": n.status,
+                        "cost": n.cost,
+                        "turns": n.turns,
+                        "duration_seconds": n.duration_seconds,
+                        "error": n.error,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                rendered = _render_notifications(pending)
+                text_prompt = (rendered + "\n\n" + text_prompt) if text_prompt else rendered
+
+            async for event in self._send_audio_inner(audio_data, audio_format, text_prompt):
+                yield event
+
+    async def _send_audio_inner(
+        self,
+        audio_data: bytes | str,
+        audio_format: str,
+        text_prompt: str | None,
+    ) -> AsyncIterator[OrchestratorEvent]:
+        """The original send_audio body, called inside the busy_lock.
+
+        Split out so the notification-drain wrapper above can stay readable.
+        """
         if not self._config.supports_audio:
             # Switch to audio-capable model automatically.
             # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview.
@@ -613,7 +1236,40 @@ class OrchestratorSession:
         return {"tokens_before": tokens_before, "tokens_after": tokens_after}
 
     async def stop(self) -> None:
-        """Clean up the session."""
+        """Clean up the session.
+
+        Cancels every in-flight background-agent turn (with SDK interrupts so
+        the bundled ``claude`` subprocesses actually stop) and unsubscribes
+        the wake callback so notifications fired during shutdown go nowhere.
+        """
+        self._notifications.set_wake_callback(None)
+        if self._runner is not None:
+            try:
+                await self._runner.cancel_all()
+            except Exception:  # noqa: BLE001
+                logger.exception("BackgroundAgentRunner.cancel_all failed during stop")
+        try:
+            await self.stop_voice_relay()
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_voice_relay failed during session stop")
+        # Cancel the injection watchdog if it's still scheduled
+        if self._injection_watchdog is not None and not self._injection_watchdog.done():
+            self._injection_watchdog.cancel()
+            try:
+                await self._injection_watchdog
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._injection_watchdog = None
+        self._injection_active = False
+        self._injection_until = 0.0
+        # Stop audio recorder
+        if self._audio_recorder is not None:
+            try:
+                self._audio_recorder.stop()
+                logger.info("Audio recorder stopped for session %s", self._local_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("Audio recorder stop failed during session stop")
+            self._audio_recorder = None
         self._agent = None
         self._voice_provider = None
         self._current_provider = None
@@ -628,11 +1284,15 @@ class OrchestratorSession:
         messages: list[dict[str, Any]],
         max_tokens: int = 2048,
     ) -> str:
-        """Summarize older conversation messages using a fast Anthropic call.
+        """Summarize older conversation messages using the orchestrator's current model.
 
         Produces a structured digest so that when voice mode resumes the
         orchestrator can pick up the thread coherently. ``max_tokens`` scales
         with the prefix size (see ``scale_summary_max_tokens``).
+
+        Routes through whichever provider the orchestrator is currently using
+        (Anthropic or OpenAI) so summarization works regardless of which API
+        keys are configured in the environment.
         """
         if not messages or max_tokens <= 0:
             return ""
@@ -687,17 +1347,30 @@ class OrchestratorSession:
             f"Conversation:\n{transcript}"
         )
 
+        model = self._config.model
+        provider = self._config.provider
         try:
-            import anthropic
-            client = anthropic.AsyncAnthropic()
-            response = await client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": instructions}],
-            )
-            return response.content[0].text if response.content else ""
+            if provider == Provider.OPENAI:
+                import openai
+                client = openai.AsyncOpenAI()
+                response = await client.chat.completions.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": instructions}],
+                )
+                choice = response.choices[0] if response.choices else None
+                return (choice.message.content or "") if choice else ""
+            else:
+                import anthropic
+                client = anthropic.AsyncAnthropic()
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": instructions}],
+                )
+                return response.content[0].text if response.content else ""
         except Exception as e:
-            logger.warning("Failed to summarize history: %s", e)
+            logger.warning("Failed to summarize history with %s/%s: %s", provider.value, model, e)
             return ""
 
     def _get_jsonl_path(self) -> Path:

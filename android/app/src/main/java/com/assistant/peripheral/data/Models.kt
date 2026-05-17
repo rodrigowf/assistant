@@ -62,7 +62,10 @@ data class SessionInfo(
     val startedAt: String,
     val lastActivity: String,
     val messageCount: Int,
-    val isOrchestrator: Boolean = false
+    val isOrchestrator: Boolean = false,
+    // Which agent harness backed this session — "claude" or "qwen".
+    // Orchestrator sessions don't go through either CLI; ignore for them.
+    val provider: String = "claude"
 )
 
 /**
@@ -130,11 +133,9 @@ sealed class WebSocketEvent {
     // Error
     data class Error(val message: String, val detail: String? = null) : WebSocketEvent()
 
-    // Connection — endpoint identifies which socket connected/disconnected.
-    // Use a string ("ORCHESTRATOR" / "AGENT") to avoid pulling the network-layer
-    // enum into this data module.
-    data class Connected(val endpoint: String) : WebSocketEvent()
-    data class Disconnected(val endpoint: String) : WebSocketEvent()
+    // Connection
+    object Connected : WebSocketEvent()
+    object Disconnected : WebSocketEvent()
 
     // Session list (from REST API via ViewModel)
     data class SessionList(val sessions: List<SessionInfo>) : WebSocketEvent()
@@ -146,6 +147,11 @@ sealed class WebSocketEvent {
     data class VoiceCommand(val command: Map<String, Any?>) : WebSocketEvent()
     data class VoiceTranscript(val text: String, val isFinal: Boolean) : WebSocketEvent()
     object VoiceStopped : WebSocketEvent()  // AI-initiated clean session end
+
+    /** Provider event mirrored from backend (WebSocket providers only). */
+    data class VoiceProviderEvent(val event: Map<String, Any?>) : WebSocketEvent()
+    /** Speaker chunk from WS-path voice providers.  Base64-encoded PCM. */
+    data class VoiceAudioOut(val audioBase64: String) : WebSocketEvent()
 
     // Compaction
     data class CompactComplete(val summary: String) : WebSocketEvent()
@@ -162,13 +168,25 @@ sealed class WebSocketMessage {
     ) : WebSocketMessage()
     object Stop : WebSocketMessage()
 
-    // Voice session (WebRTC)
+    // Voice session (transport-agnostic — WebRTC for OpenAI, WebSocket for Qwen, etc.)
     data class VoiceStart(
         val localId: String? = null,
-        val resumeSdkId: String? = null
+        val resumeSdkId: String? = null,
+        // Voice provider/model/voice/language fields the backend uses to
+        // pick the upstream provider.  Null/empty = use backend default
+        // (resolved from assistant_config.json).
+        val voiceProvider: String? = null,
+        val voiceModel: String? = null,
+        val voiceName: String? = null,
+        val voiceTranscriptionLanguage: String? = null,
+        // Google-only backend selector ("vertex" | "aistudio"); ignored by
+        // other providers. Required for Gemini AI-Studio-only models.
+        val voiceEndpoint: String? = null,
     ) : WebSocketMessage()
     object VoiceStop : WebSocketMessage()
     data class VoiceEvent(val event: Map<String, Any?>) : WebSocketMessage()
+    /** Mic chunk for WS-path voice providers (Qwen).  Base64-encoded PCM16. */
+    data class VoiceAudioIn(val audioBase64: String) : WebSocketMessage()
 
     // Chat messages
     data class Send(val text: String) : WebSocketMessage()

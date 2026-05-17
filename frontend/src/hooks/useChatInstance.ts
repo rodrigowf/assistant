@@ -15,8 +15,29 @@ import { getMessagesPaginated } from "../api/rest";
 // State
 // -------------------------------------------------------------------
 
-// Context window sizes (tokens) — used to compute usage percentage
-const CONTEXT_WINDOW = 200_000; // Claude models (conservative default)
+// Conservative default context window in tokens when the backend hasn't yet
+// told us this session's actual limit. Claude models cap out at 200K, so this
+// is the smallest "real" limit we'd encounter — better to under- than
+// over-report usage on the compact button.
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+
+interface StallState {
+  /** Seconds since the SDK last produced a message in the active turn. */
+  elapsedSeconds: number;
+  /** Tool the SDK appears stuck on, if known. */
+  toolName: string | null;
+  /** Tool-use id the SDK appears stuck on, if known. */
+  toolUseId: string | null;
+}
+
+export interface PendingPermission {
+  /** Backend request_id — must be echoed back when answering. */
+  requestId: string;
+  /** Tool the SDK is asking permission to run. */
+  toolName: string;
+  /** Raw tool input — the modal renders a tool-specific view. */
+  toolInput: Record<string, unknown>;
+}
 
 interface ChatState {
   messages: ChatMessage[];
@@ -26,6 +47,13 @@ interface ChatState {
   turns: number;
   error: string | null;
   contextTokens: number; // latest input_tokens count
+  /** Provider/model-specific context window in tokens, set on session_started.
+   * ``null`` until the backend reports one — falls back to DEFAULT_CONTEXT_WINDOW. */
+  contextWindow: number | null;
+  /** Set when the backend has reported a stall on the in-flight turn. */
+  stall: StallState | null;
+  /** Set when the SDK is awaiting a permission decision (modal is open). */
+  pendingPermission: PendingPermission | null;
 }
 
 const INITIAL_STATE: ChatState = {
@@ -36,6 +64,9 @@ const INITIAL_STATE: ChatState = {
   turns: 0,
   error: null,
   contextTokens: 0,
+  contextWindow: null,
+  stall: null,
+  pendingPermission: null,
 };
 
 // -------------------------------------------------------------------
@@ -46,7 +77,7 @@ type Action =
   | { type: "RESET" }
   | { type: "LOAD_HISTORY"; messages: MessagePreview[] }
   | { type: "PREPEND_HISTORY"; messages: MessagePreview[] }
-  | { type: "SESSION_STARTED"; sessionId: string }
+  | { type: "SESSION_STARTED"; sessionId: string; contextWindow?: number | null }
   | { type: "USER_MESSAGE"; text: string }
   | { type: "TEXT_DELTA"; text: string }
   | { type: "TEXT_COMPLETE"; text: string }
@@ -57,6 +88,9 @@ type Action =
   | { type: "TURN_COMPLETE"; cost: number | null; turns: number; sessionId: string; inputTokens?: number }
   | { type: "COMPACT_COMPLETE"; summary: string }
   | { type: "STATUS"; status: SessionStatus }
+  | { type: "STALL"; elapsedSeconds: number; toolName: string | null; toolUseId: string | null }
+  | { type: "PERMISSION_REQUEST"; requestId: string; toolName: string; toolInput: Record<string, unknown> }
+  | { type: "PERMISSION_RESOLVED"; requestId: string; decision: "allow" | "deny"; responder: string; message?: string | null }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
   | { type: "VOICE_ASSISTANT_DELTA"; text: string }
@@ -156,7 +190,14 @@ function reducer(state: ChatState, action: Action): ChatState {
       return { ...state, messages: [...convertPreviews(action.messages), ...state.messages] };
 
     case "SESSION_STARTED":
-      return { ...state, sessionId: action.sessionId, status: "idle", error: null };
+      return {
+        ...state,
+        sessionId: action.sessionId,
+        status: "idle",
+        error: null,
+        contextWindow:
+          action.contextWindow !== undefined ? action.contextWindow : state.contextWindow,
+      };
 
     case "USER_MESSAGE":
       return {
@@ -231,6 +272,7 @@ function reducer(state: ChatState, action: Action): ChatState {
       return {
         ...state,
         status: "tool_use",
+        stall: null,
         messages: updateLastAssistantBlock(state.messages, (blocks) => [
           ...blocks,
           {
@@ -246,6 +288,7 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "TOOL_RESULT":
       return {
         ...state,
+        stall: null,
         messages: updateLastAssistantBlock(state.messages, (blocks) =>
           blocks.map((b) =>
             b.type === "tool_use" && b.toolUseId === action.toolUseId
@@ -259,6 +302,7 @@ function reducer(state: ChatState, action: Action): ChatState {
       return {
         ...state,
         status: "idle",
+        stall: null,
         cost: state.cost + (action.cost ?? 0),
         turns: state.turns + action.turns,
         sessionId: action.sessionId || state.sessionId,
@@ -281,6 +325,68 @@ function reducer(state: ChatState, action: Action): ChatState {
 
     case "STATUS":
       return { ...state, status: action.status };
+
+    case "STALL":
+      return {
+        ...state,
+        stall: {
+          elapsedSeconds: action.elapsedSeconds,
+          toolName: action.toolName,
+          toolUseId: action.toolUseId,
+        },
+      };
+
+    case "PERMISSION_REQUEST": {
+      const pending = {
+        requestId: action.requestId,
+        toolName: action.toolName,
+        toolInput: action.toolInput,
+      };
+      // ExitPlanMode is special: render the plan as an assistant text block
+      // so the user sees it inline (the modal only carries Approve/Reject).
+      // Other gated tools just get the modal — their input is already shown
+      // by the regular tool_use rendering.
+      if (action.toolName === "ExitPlanMode") {
+        const planText = (action.toolInput?.plan as string) || "";
+        if (planText) {
+          return {
+            ...state,
+            pendingPermission: pending,
+            messages: updateLastAssistantBlock(state.messages, (blocks) => [
+              ...blocks,
+              { type: "text", content: planText, streaming: false },
+            ]),
+          };
+        }
+      }
+      return { ...state, pendingPermission: pending };
+    }
+
+    case "PERMISSION_RESOLVED": {
+      // Only clear if the resolved request matches the open one — a stale
+      // resolved event for a previous request shouldn't dismiss a newer
+      // modal.  Append a one-liner so the conversation history records what
+      // was decided and by whom.
+      const matches = state.pendingPermission?.requestId === action.requestId;
+      const decisionNote = (() => {
+        const who = action.responder === "orchestrator" ? "Orchestrator" : "User";
+        const what = action.decision === "allow" ? "approved" : "rejected";
+        const reason = action.message ? ` — ${action.message}` : "";
+        return `[${who} ${what} the request${reason}]`;
+      })();
+      return {
+        ...state,
+        pendingPermission: matches ? null : state.pendingPermission,
+        messages: [
+          ...state.messages,
+          {
+            id: nextId(),
+            role: "user" as const,
+            blocks: [{ type: "text", content: decisionNote, streaming: false }],
+          },
+        ],
+      };
+    }
 
     case "ERROR":
       return { ...state, error: action.error };
@@ -318,9 +424,15 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         messages: updateLastAssistantBlock(state.messages, (blocks) => {
           const last = blocks[blocks.length - 1];
+          // Empty text → just finalize the currently-streaming block
+          // without overwriting (Gemini Live signals turn-complete via
+          // serverContent.turnComplete with no final transcript; the
+          // text has already been delivered via delta events).
           if (last?.type === "text" && last.streaming) {
-            return [...blocks.slice(0, -1), { ...last, content: action.text, streaming: false }];
+            const content = action.text || last.content;
+            return [...blocks.slice(0, -1), { ...last, content, streaming: false }];
           }
+          if (!action.text) return blocks;
           return [...blocks, { type: "text", content: action.text, streaming: false }];
         }),
       };
@@ -334,6 +446,15 @@ function reducer(state: ChatState, action: Action): ChatState {
 // Hook
 // -------------------------------------------------------------------
 
+export interface StallInfo {
+  /** Seconds since the SDK last produced a message in the active turn. */
+  elapsedSeconds: number;
+  /** Tool the SDK appears stuck on, if known. */
+  toolName: string | null;
+  /** Tool-use id the SDK appears stuck on, if known. */
+  toolUseId: string | null;
+}
+
 export interface ChatInstance {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -342,6 +463,13 @@ export interface ChatInstance {
   cost: number;
   turns: number;
   error: string | null;
+  /** Set when the backend reports a stall on the in-flight turn. */
+  stall: StallInfo | null;
+  /** Set when the SDK is awaiting a permission decision (modal is open). */
+  pendingPermission: PendingPermission | null;
+  /** Resolve the open permission request. First call wins; later calls are
+   * no-ops (the backend's permission_resolved broadcast closes the modal). */
+  respondToPermission: (decision: "allow" | "deny", message?: string) => void;
   /** Context usage as a percentage of the context window (0–100). */
   contextUsage: number;
   /** Currently selected MCP server names */
@@ -441,15 +569,31 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   // Track status changes and notify parent
   const prevStatusRef = useRef<{ status: SessionStatus; conn: ConnectionState } | null>(null);
 
+  // Mirror pendingPermission so respondToPermission (a stable useCallback)
+  // can read the latest request_id without rebuilding on every render.
+  const pendingPermissionRef = useRef<PendingPermission | null>(null);
+  pendingPermissionRef.current = state.pendingPermission;
+
   const handleEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
-      case "session_started":
-        dispatch({ type: "SESSION_STARTED", sessionId: event.session_id });
+      case "session_started": {
+        // Chat sessions carry the window directly; orchestrator nests it under
+        // model_info. Either may be null/undefined — the reducer keeps the
+        // previous value (or null → falls back to DEFAULT_CONTEXT_WINDOW).
+        const ctxWindow =
+          event.context_window ??
+          (event.model_info?.context_window as number | null | undefined);
+        dispatch({
+          type: "SESSION_STARTED",
+          sessionId: event.session_id,
+          contextWindow: ctxWindow,
+        });
         // Voice mode: send session.update to OpenAI via voice bridge
         if (event.voice_session_update) {
           onVoiceCommandRef.current?.(event.voice_session_update as Record<string, unknown>);
         }
         break;
+      }
       case "text_delta":
         dispatch({ type: "TEXT_DELTA", text: event.text });
         break;
@@ -495,6 +639,31 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "compact_complete":
         dispatch({ type: "COMPACT_COMPLETE", summary: (event.summary as string) || "" });
+        break;
+      case "session_stalled":
+        dispatch({
+          type: "STALL",
+          elapsedSeconds: (event as { elapsed_seconds?: number }).elapsed_seconds ?? 0,
+          toolName: (event as { last_tool_name?: string | null }).last_tool_name ?? null,
+          toolUseId: (event as { last_tool_use_id?: string | null }).last_tool_use_id ?? null,
+        });
+        break;
+      case "permission_request":
+        dispatch({
+          type: "PERMISSION_REQUEST",
+          requestId: event.request_id,
+          toolName: event.tool_name,
+          toolInput: event.tool_input,
+        });
+        break;
+      case "permission_resolved":
+        dispatch({
+          type: "PERMISSION_RESOLVED",
+          requestId: event.request_id,
+          decision: event.decision,
+          responder: event.responder,
+          message: event.message,
+        });
         break;
       case "status":
         dispatch({ type: "STATUS", status: event.status as SessionStatus });
@@ -751,7 +920,28 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     wsSend({ type: "compact" });
   }, [wsSend]);
 
-  const contextUsage = Math.min(100, Math.round((state.contextTokens / CONTEXT_WINDOW) * 100));
+  const respondToPermission = useCallback(
+    (decision: "allow" | "deny", message?: string) => {
+      // Optimistically clear so the modal closes instantly even if our
+      // permission_resolved broadcast races behind another tab's render.
+      // If the orchestrator already won, the backend treats this as a no-op.
+      const pending = pendingPermissionRef.current;
+      if (!pending) return;
+      pendingPermissionRef.current = null;
+      wsSend({
+        type: "permission_response",
+        request_id: pending.requestId,
+        decision,
+        ...(message ? { message } : {}),
+      });
+    },
+    [wsSend]
+  );
+
+  const effectiveWindow = state.contextWindow && state.contextWindow > 0
+    ? state.contextWindow
+    : DEFAULT_CONTEXT_WINDOW;
+  const contextUsage = Math.min(100, Math.round((state.contextTokens / effectiveWindow) * 100));
 
   return {
     messages: state.messages,
@@ -761,6 +951,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     cost: state.cost,
     turns: state.turns,
     error: state.error,
+    stall: state.stall,
+    pendingPermission: state.pendingPermission,
+    respondToPermission,
     contextUsage,
     selectedMcps,
     hasMoreMessages,

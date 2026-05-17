@@ -71,9 +71,17 @@ class TestOrchestratorConfig:
         monkeypatch.delenv("ORCHESTRATOR_MAX_TOKENS", raising=False)
         monkeypatch.delenv("ORCHESTRATOR_PROJECT_DIR", raising=False)
 
+        # Default model is the one declared as DEFAULT_MODEL_ID in
+        # orchestrator/config.py — whatever it currently is.  We don't pin a
+        # specific id here so this test doesn't break every time the default
+        # rolls forward; we just check the load path actually resolves
+        # something coherent.
+        from orchestrator.config import DEFAULT_MODEL_ID, get_model_info
         config = OrchestratorConfig.load()
-        assert config.model == "claude-sonnet-4-5-20250929"
-        assert config.provider.value == "anthropic"
+        assert config.model == DEFAULT_MODEL_ID
+        info = get_model_info(DEFAULT_MODEL_ID)
+        assert info is not None, f"DEFAULT_MODEL_ID {DEFAULT_MODEL_ID!r} not in AVAILABLE_MODELS"
+        assert config.provider.value == info.provider.value
         assert config.max_tokens == 8192
         assert "ORCHESTRATOR_MEMORY.md" in config.memory_path
 
@@ -89,24 +97,27 @@ class TestOrchestratorConfig:
         assert "context/memory/ORCHESTRATOR_MEMORY.md" in config.memory_path
 
     def test_set_model_switches_provider(self):
-        config = OrchestratorConfig()
+        # Start from a known Anthropic model so the assertion below is
+        # independent of whatever DEFAULT_MODEL_ID currently is.
+        config = OrchestratorConfig(model="claude-sonnet-4-5-20250929")
         assert config.provider.value == "anthropic"
 
-        # Switch to OpenAI model
-        success = config.set_model("gpt-4o")
+        # Switch to OpenAI's audio-capable model
+        success = config.set_model("gpt-4o-audio-preview")
         assert success is True
-        assert config.model == "gpt-4o"
+        assert config.model == "gpt-4o-audio-preview"
         assert config.provider.value == "openai"
         assert config.supports_audio is True
 
-        # Switch back to Anthropic
+        # Switch back to Anthropic (no audio support on Claude models)
         success = config.set_model("claude-sonnet-4-5-20250929")
         assert success is True
         assert config.provider.value == "anthropic"
         assert config.supports_audio is False
 
     def test_set_model_unknown_returns_false(self):
-        config = OrchestratorConfig()
+        # Pin the starting model so this test is also default-agnostic.
+        config = OrchestratorConfig(model="claude-sonnet-4-5-20250929")
         success = config.set_model("unknown-model-xyz")
         assert success is False
         # Model should not change
@@ -271,7 +282,13 @@ class TestOpenAITextProvider:
         assert result[2]["content"] == "Hi there!"
 
     def test_message_conversion_with_tool_use(self):
-        """Test message conversion with tool calls."""
+        """Test message conversion with tool calls.
+
+        Includes the matching tool_result so the orphan-tool-call
+        sanitizer keeps the assistant's tool_calls intact (otherwise it
+        would strip them — that's correct OpenAI-compatibility behavior
+        and there's a separate test for it).
+        """
         from orchestrator.providers.openai_text import convert_messages_for_openai
 
         messages = [
@@ -288,14 +305,31 @@ class TestOpenAITextProvider:
                     },
                 ],
             },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tc1",
+                        "content": "found: X exists",
+                    },
+                ],
+            },
         ]
 
         result = convert_messages_for_openai(messages, "")
-        # Should have: user, assistant with tool_calls
-        assistant_msg = result[-1]
-        assert assistant_msg["role"] == "assistant"
+        # Find the assistant message; the converter renumbers, so look it
+        # up by role instead of trusting position.
+        assistant_msgs = [m for m in result if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 1
+        assistant_msg = assistant_msgs[0]
         assert "tool_calls" in assistant_msg
         assert assistant_msg["tool_calls"][0]["function"]["name"] == "search"
+        assert assistant_msg["tool_calls"][0]["id"] == "tc1"
+        # And the tool result is also present
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "tc1"
 
     def test_audio_content_creation(self):
         """Test audio content block creation."""
@@ -322,12 +356,19 @@ class TestOpenAITextProvider:
         assert msg["content"][1]["type"] == "input_audio"
 
     def test_model_supports_audio(self):
-        """Test audio capability detection."""
+        """Test audio capability detection.
+
+        Only the dedicated ``*-audio-preview`` model IDs support audio
+        input — vanilla ``gpt-4o`` and ``gpt-4o-mini`` don't.
+        """
         from orchestrator.providers.openai_text import OpenAIModel
 
-        assert OpenAIModel.GPT_4O.supports_audio is True
-        assert OpenAIModel.GPT_4O_MINI.supports_audio is True
+        assert OpenAIModel.GPT_4O.supports_audio is False
+        assert OpenAIModel.GPT_4O_MINI.supports_audio is False
         assert OpenAIModel.GPT_4_TURBO.supports_audio is False
+        # The dedicated audio-preview variants are the only ones that do.
+        assert OpenAIModel.GPT_4O_AUDIO.supports_audio is True
+        assert OpenAIModel.GPT_4O_MINI_AUDIO.supports_audio is True
 
 
 # ---------------------------------------------------------------------------
@@ -527,16 +568,20 @@ class TestFileTools:
         assert (tmp_path / "output" / "new.txt").read_text() == "written!"
 
     @pytest.mark.asyncio
-    async def test_path_traversal_rejected(self, tmp_path):
+    async def test_absolute_path_allowed(self, tmp_path):
         from orchestrator.tools.files import read_file
 
-        result = await read_file(
-            context={"project_dir": str(tmp_path)},
-            path="../../etc/passwd",
-        )
-        parsed = json.loads(result)
-        assert "error" in parsed
-        assert "escapes" in parsed["error"]
+        outside = tmp_path.parent / "outside.txt"
+        outside.write_text("outside!")
+        try:
+            result = await read_file(
+                context={"project_dir": str(tmp_path)},
+                path=str(outside),
+            )
+            parsed = json.loads(result)
+            assert parsed["content"] == "outside!"
+        finally:
+            outside.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -578,19 +623,32 @@ class TestPromptBuilder:
         assert "No agent sessions" in prompt
 
     def test_shows_active_sessions(self):
+        """The prompt builder reads sessions from ``context['pool']`` via
+        ``pool.list_sessions()`` — the same dict shape ``SessionPool``
+        returns to the API.  Build a minimal stub that conforms."""
         from orchestrator.prompt import build_system_prompt
         from orchestrator.config import OrchestratorConfig
-        from manager.types import SessionStatus
 
-        mock_sm = MagicMock()
-        mock_sm.status = SessionStatus.IDLE
-        mock_sm.turns = 3
-        mock_sm.cost = 0.05
+        class _StubPool:
+            def list_sessions(self):
+                return [{
+                    "session_id": "sess-1",
+                    "status": "idle",
+                    "turns": 3,
+                    "cost": 0.05,
+                    "sdk_session_id": "",
+                    "provider": "claude",
+                }]
+
+            def get(self, sid):
+                # The prompt builder reaches for pool.get(sid).pending_permission_ids()
+                # to surface pending modals.  Return a stub with the same shape
+                # so we exercise the read path without spinning up a real
+                # session manager.
+                return MagicMock(pending_permission_ids=lambda: [])
 
         config = OrchestratorConfig(project_dir="/tmp/test", memory_path="/tmp/nonexistent")
-        prompt = build_system_prompt(config, context={
-            "orchestrator_sessions": {"sess-1": mock_sm},
-        })
+        prompt = build_system_prompt(config, context={"pool": _StubPool()})
         assert "sess-1" in prompt
         assert "idle" in prompt
 
@@ -710,7 +768,7 @@ class TestOrchestratorSession:
         session = OrchestratorSession(config=config, context={"orchestrator_sessions": {}})
 
         # Patch the provider creation to avoid real API calls
-        with patch("orchestrator.session.AnthropicProvider"):
+        with patch("orchestrator.providers.anthropic.AnthropicProvider"):
             sid = await session.start()
 
         assert sid is not None
@@ -736,7 +794,7 @@ class TestOrchestratorSession:
 
         # Create initial session
         session1 = OrchestratorSession(config=config, context={"orchestrator_sessions": {}})
-        with patch("orchestrator.session.AnthropicProvider"):
+        with patch("orchestrator.providers.anthropic.AnthropicProvider"):
             sid = await session1.start()
 
         # Manually write some history
@@ -758,7 +816,7 @@ class TestOrchestratorSession:
             config=config, context={"orchestrator_sessions": {}},
             session_id=sid, local_id="new-tab-id",
         )
-        with patch("orchestrator.session.AnthropicProvider"):
+        with patch("orchestrator.providers.anthropic.AnthropicProvider"):
             local_id2 = await session2.start()
 
         assert local_id2 == "new-tab-id"

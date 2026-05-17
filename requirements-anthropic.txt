@@ -1,0 +1,8 @@
+# Anthropic orchestrator backend — install this if you want the
+# orchestrator to talk to the Anthropic API directly (claude-* models).
+#
+# Loaded lazily by orchestrator.providers; without this package the
+# Anthropic provider simply doesn't register and Claude models won't
+# appear in the orchestrator model picker.
+
+anthropic>=0.40.0

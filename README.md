@@ -2,9 +2,11 @@
 
 **A transparent, hackable AI assistant that evolves with you.**
 
-Most AI assistants are black boxes—frozen binaries that do what they do and nothing more. This one is different: it's ~6,400 lines of readable code that you can understand, modify, and extend. It can chat, execute commands, remember context, coordinate multiple AI agents, and even edit its own source code while running.
+Most AI assistants are black boxes—frozen binaries that do what they do and nothing more. This one is different: it's a small, readable codebase that you can understand, modify, and extend. It can chat, execute commands, remember context, coordinate multiple AI agents, and even edit its own source code while running.
 
 The entire system runs locally. Your conversations, memory, and credentials never leave your machine.
+
+**Two backends, your choice.** Chat sessions can be backed by either [Claude Code](https://docs.claude.com/claude-code) or [Qwen Code](https://github.com/QwenLM/Qwen-Code) (or both — pick at session creation). The orchestrator can use the Anthropic SDK, the OpenAI SDK, or both — Qwen / Gemini / GLM models route through the OpenAI-compatible endpoint. No provider is mandatory; install only the SDKs you need.
 
 ---
 
@@ -12,17 +14,26 @@ The entire system runs locally. Your conversations, memory, and credentials neve
 
 ### 🔍 **Radical Transparency**
 The entire codebase is small enough to read in an afternoon:
-- **Backend**: ~2,400 lines of Python (orchestrator + API + Claude SDK wrapper)
-- **Frontend**: ~4,000 lines of TypeScript/React (multi-tab UI with voice)
+- **Backend**: Python — orchestrator + API + a thin session-manager layer around the agent CLIs
+- **Frontend**: TypeScript / React — multi-tab UI with WebRTC voice
 
 No enterprise frameworks, no hidden abstraction layers. Every line that touches your files or executes commands is right there to inspect.
 
+### 🔀 **Pick Your Agent Backend**
+The session harness (the thing that runs your chats) is a thin layer above either the Claude Code SDK or the Qwen Code CLI. They share a common base and the UI lets you flip between them per session:
+- **Claude Code** — Anthropic's CLI with OAuth, Claude Sonnet/Opus models, plan-mode permission gating
+- **Qwen Code** — Alibaba's open-weights CLI, DashScope or OAuth auth, Qwen 3 models served via the OpenAI-compatible endpoint
+- **Both** — installed side by side, picked at session creation time
+
+The orchestrator is independent: it can talk to Anthropic (Claude models) or OpenAI (GPT, plus Qwen / Gemini / GLM through the compatible endpoint), or both. Install only the SDKs you need.
+
 ### 🎭 **Multi-Agent Orchestration**
-An orchestrator agent coordinates multiple Claude Code instances simultaneously. It's like having a conductor who thinks strategically while specialized agents execute deeply:
+An orchestrator agent coordinates multiple chat sessions simultaneously. It's like having a conductor who thinks strategically while specialized agents execute deeply:
 - Break complex tasks into parallel workstreams
 - Delegate work to specialized agents (code review, testing, documentation)
 - Search across all past conversations for relevant context
 - Each agent appears as its own tab in the browser UI
+- Fire-and-forget delegation — the orchestrator stays responsive while delegated turns run in the background and report completion via a notification queue
 
 This mirrors how humans actually work on complex projects—you don't context-switch constantly, you coordinate parallel efforts.
 
@@ -60,9 +71,10 @@ Teach it something once, and it can codify that knowledge into a reusable automa
 
 ### Regular Agent Sessions
 - Execute code, manage files, run shell commands
-- Full Claude Code capabilities in each tab
+- Full Claude Code or Qwen Code capabilities in each tab (picked per session)
 - Stream responses with thinking blocks and tool execution visible
 - Real-time cost and token tracking
+- Permission gating for sensitive tools (e.g. `ExitPlanMode`) — backed by an in-chat modal and recoverable from a conversational "no, do it this way instead" reply
 
 ### Orchestrator Coordination
 - **Open multiple agents**: `"Open two agents—one writes tests, the other writes implementation"`
@@ -106,96 +118,190 @@ Type `/standup` and it runs. Ask the assistant to "turn this into a skill" after
 
 ```
 assistant/
-├── orchestrator/     # Orchestrator agent (~800 lines)
-│   ├── agent.py      # Main loop with tool execution
-│   ├── session.py    # JSONL persistence, dual-mode support
-│   ├── providers/    # Anthropic (text) + OpenAI (voice)
-│   └── tools/        # 8 tools: agent control, search, files
-├── api/              # FastAPI backend (~1000 lines)
-│   ├── app.py        # Server with WebSocket routes
-│   ├── pool.py       # Unified session pool
-│   ├── indexer.py    # Background memory/history indexing
-│   └── routes/       # REST + WebSocket endpoints
-├── manager/          # Claude SDK wrapper (~600 lines)
-│   ├── session.py    # Dual ID system, event streaming
-│   └── store.py      # JSONL session reader
-├── frontend/         # React multi-tab UI (~4000 lines)
-│   ├── context/      # TabsContext (global state)
-│   ├── hooks/        # useChatInstance, useVoiceOrchestrator
-│   └── components/   # ChatPanel, VoiceButton, TabBar
-├── default-skills/   # General-purpose skills (shareable)
-├── default-scripts/  # General-purpose scripts (shareable)
-├── default-agents/   # General-purpose agents (shareable)
-├── context/          # PRIVATE - Standalone git repo, gitignored here (assistant-context repo)
-│   ├── *.jsonl       # Session files (SDK writes directly)
-│   ├── <uuid>/       # SDK state dirs (subagents, tool-results)
-│   ├── memory/       # Memory markdown files
-│   ├── skills/       # Symlinks to default-skills + personalized
-│   ├── scripts/      # Symlinks to default-scripts + personalized
-│   ├── agents/       # Symlinks to default-agents + personalized
-│   ├── secrets/      # OAuth credentials and tokens
-│   └── .env          # Environment variables
-├── utils/            # Shared Python utilities (paths.py)
-└── .claude_config/   # SDK config (symlink to context/)
+├── orchestrator/         # Orchestrator agent (text + voice)
+│   ├── agent.py          # Main loop with tool execution
+│   ├── session.py        # JSONL persistence, dual-mode support
+│   ├── providers/        # Anthropic / OpenAI (text) + OpenAI / Qwen (voice)
+│   │                     #   — lazy-loaded, no SDK is mandatory
+│   └── tools/            # Tools: agent control, search, files, permissions
+├── api/                  # FastAPI backend
+│   ├── app.py            # Server with WebSocket routes
+│   ├── pool.py           # Unified session pool (Claude + Qwen)
+│   ├── indexer.py        # Background memory/history indexing
+│   └── routes/           # REST + WebSocket endpoints
+├── manager/              # Session managers (per-provider)
+│   ├── base_session.py   # BaseSessionManager, dual ID, lifecycle, permission gating
+│   ├── claude_session.py # ClaudeSessionManager — Claude Code SDK wrapper
+│   ├── qwen_session.py   # QwenSessionManager — Qwen Code CLI driver
+│   ├── _proc.py          # Provider-agnostic process helpers
+│   └── store.py          # JSONL session reader (handles both providers)
+├── frontend/             # React multi-tab UI (main, Node/Vite)
+│   ├── context/          # TabsContext (global state)
+│   ├── hooks/            # useChatInstance, useVoiceOrchestrator
+│   └── components/       # ChatPanel, VoiceButton, TabBar, PermissionModal
+├── frontend-compat/      # React 18 compat build for Safari 12 / iOS 12,
+│                         #   served at /compat/
+├── android/              # Native Android peripheral (Kotlin + Jetpack Compose)
+├── install/              # Templates copied into place on fresh installs
+│                         #   (AGENTS.md, MEMORY.md, .env, configs, sync.env)
+├── default-skills/       # General-purpose skills (shareable)
+├── default-scripts/      # General-purpose scripts (shareable)
+├── default-agents/       # General-purpose agents (shareable)
+├── context/              # PRIVATE — standalone git repo, gitignored here
+│   ├── AGENTS.md         # Project instructions (symlinked from root as CLAUDE.md / QWEN.md)
+│   ├── *.jsonl           # Session files (SDKs write directly)
+│   ├── <uuid>/           # SDK state dirs (subagents, tool-results)
+│   ├── memory/           # Memory markdown files
+│   ├── skills/           # Symlinks to default-skills + personalized
+│   ├── scripts/          # Symlinks to default-scripts + personalized
+│   ├── agents/           # Symlinks to default-agents + personalized
+│   ├── secrets/          # OAuth credentials and tokens
+│   └── .env              # Environment variables
+├── utils/                # Shared Python utilities (paths.py)
+├── .claude_config/       # Claude SDK config (only when --with-claude)
+└── ~/.qwen/projects/<m>/ # Qwen project dir (symlinked to context/, only when --with-qwen)
 ```
 
 ### Key Design Decisions
 
-**Dual Session IDs**: Each session has two IDs:
+**Two independent provider axes.** The session harness (which CLI runs your chats) and the orchestrator backend (which API SDK the orchestrator calls) are picked separately at install time and configured independently at runtime. A pure "Qwen everywhere" install is one flag away; a mixed install (Claude harness + OpenAI orchestrator) is also fine.
+
+**Lazy SDK loading.** `manager/__init__.py` and `orchestrator/providers/__init__.py` use PEP 562 `__getattr__` so importing `claude_agent_sdk`, `anthropic`, or `openai` only happens when you actually use that provider. If an SDK isn't installed, the backend still boots — the affected provider just stays disabled and the Config UI returns a 400 with an install hint when you try to pick it.
+
+**Dual Session IDs.** Each session has two IDs:
 - `local_id`: Stable UUID from frontend (primary key everywhere)
-- `sdk_session_id`: Claude SDK's ID (for JSONL files and resume)
+- `provider_session_id`: The underlying CLI/SDK's ID (for JSONL files and resume)
 
 This eliminated the "triple-ID-change problem" where tabs would go: `new-N` → placeholder UUID → SDK UUID.
 
-**Headless Instances**: Tab state is separated from presentation. All tabs stay mounted (with `display: none`) to preserve WebSocket/WebRTC connections when inactive. Tab switching is instant.
+**Headless Instances.** Tab state is separated from presentation. All tabs stay mounted (with `display: none`) to preserve WebSocket/WebRTC connections when inactive. Tab switching is instant.
 
-**Event-Queue Voice**: Frontend mirrors OpenAI Realtime events to backend via WebSocket. Backend only handles tool execution—audio never touches the server. This keeps latency sub-100ms.
+**Event-Queue Voice.** Frontend mirrors OpenAI Realtime events to backend via WebSocket. Backend only handles tool execution—audio never touches the server. This keeps latency sub-100ms.
 
-**Single Orchestrator**: Only one orchestrator can be active at a time (enforced via modal). This prevents conflicting commands to agent sessions and maintains a clear mental model.
+**Single Orchestrator.** Only one orchestrator can be active at a time (enforced via modal). This prevents conflicting commands to agent sessions and maintains a clear mental model.
+
+**Shared project instructions.** `context/AGENTS.md` is the canonical project-instructions file. `CLAUDE.md` and `QWEN.md` at the repo root are symlinks pointing at it, so both CLIs read the same content from the location they each natively expect.
 
 ---
 
 ## Installation
 
-The assistant is **ready to deploy** on any machine with the prerequisites installed. The installation script handles everything automatically.
+The assistant is **ready to deploy** on any machine with the prerequisites installed. The installer asks two questions — which agent CLI(s) to set up and which orchestrator SDK(s) to install — then does the rest automatically.
 
 ### Prerequisites
 
 - **Python 3.12+**
-- **Node.js 20+**
-- **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code && claude auth login`
-- **API Keys** — `ANTHROPIC_API_KEY` (required), `OPENAI_API_KEY` (for voice mode)
+- **Node.js 20+** (Qwen Code and Gemini CLI both depend on Node)
+- **At least one agent CLI** — the installer can install and walk you through login for any combination:
+  - Claude Code (Anthropic) — `@anthropic-ai/claude-code`, OAuth via `claude auth login`
+  - Qwen Code (Alibaba) — `@qwen-code/qwen-code`, OAuth or DashScope key
+  - Gemini CLI (Google) — `@google/gemini-cli`, OAuth or `GEMINI_API_KEY`
+- **API keys** for the axes you opted into (see [Environment Variables](#environment-variables)):
+  - `ANTHROPIC_API_KEY` — only if you picked the Anthropic orchestrator backend (Claude Code itself uses OAuth)
+  - `OPENAI_API_KEY` — for the OpenAI orchestrator backend and realtime voice
+  - `DASHSCOPE_API_KEY` — for the Qwen harness, Qwen voice, and Qwen models served via the OpenAI-compatible endpoint
+  - `GEMINI_API_KEY` — for the Gemini CLI harness (when not using OAuth) and the `/generate-image` skill
 
-Check prerequisites:
+Check prerequisites (pick the script for your OS):
+
 ```bash
-./default-scripts/install-prerequisites.sh
+./install/linux/install-prerequisites.sh    # Linux
+./install/apple/install-prerequisites.sh    # macOS
+.\install\windows\install-prerequisites.ps1 # Windows (PowerShell)
 ```
 
-### One-Command Installation
+On macOS and Windows the prereq script also offers to bootstrap missing tools via Homebrew / winget respectively.
+
+For the full step-by-step procedure (used by both `install.sh` and `install-with-agent.sh`, on every OS), see [INSTALL.md](INSTALL.md).
+
+### Two ways to install
+
+Pick whichever feels right — both arrive at the same end state on every supported OS (Linux, macOS, Windows).  Full details for either are in [INSTALL.md](INSTALL.md).
 
 ```bash
 git clone https://github.com/rodrigowf/assistant.git
 cd assistant
-./install.sh
 ```
 
-The interactive installer will:
-1. ✓ Check system prerequisites (Python, Node.js, Claude CLI)
-2. ✓ Set up your context (fresh install or import existing)
-3. ✓ Create symlinks to default skills, scripts, and agents
-4. ✓ Configure Claude SDK compatibility
-5. ✓ Install Python dependencies (FastAPI, ChromaDB, etc.)
-6. ✓ Install frontend dependencies (React, Vite)
-7. ✓ Verify the installation
+The installer entry points at the project root auto-detect the host OS and dispatch to the right per-OS implementation under `install/<os>/`.  Pick the appropriate command for your platform:
+
+|  | Linux / macOS | Windows (PowerShell) |
+|---|---|---|
+| **Option A — Conversational installer (recommended for first-time users)** | `./install-with-agent.sh` | `.\install-with-agent.ps1` |
+| **Option B — Deterministic installer** | `./install.sh` | `.\install.ps1` |
+
+**Option A** launches one of the agent CLIs (Claude Code / Qwen Code / Gemini CLI) and lets it walk you through the install conversationally — asking each question, running each step, and writing progress to `context/install.log`.  Reads the appropriate per-OS `install.sh` / `install.ps1` as its recipe.  If no agent CLI is installed yet, the script offers to `npm install -g` one and walks you through first-run login before handing off.
+
+**Option B** asks two questions up front (harness + orchestrator) then runs every step automatically.  No agent involved.  Recommended if you already know what you want or prefer to see every action as plain shell.
+
+Either way, the installer asks two questions:
+
+1. **Session harness** — which agent CLI(s) should run your chats: Claude Code, Qwen Code, Gemini CLI, or any combination.
+2. **Orchestrator backends** — which API SDK(s) the orchestrator should use: OpenAI, Anthropic, both, or neither (orchestrator disabled).
+
+Then it:
+
+1. ✓ Checks system prerequisites (Python, Node.js, the agent CLI(s) you picked)
+2. ✓ Sets up your context (fresh install or import existing)
+3. ✓ Copies fresh-install templates from `install/` into `context/` (AGENTS.md, MEMORY.md, `.env`, configs)
+4. ✓ Creates symlinks to default skills, scripts, and agents
+5. ✓ Configures the agent CLI(s) you picked (Claude SDK config dir and/or Qwen / Gemini project dirs)
+6. ✓ Wires `CLAUDE.md` and `QWEN.md` symlinks → `context/AGENTS.md` so both CLIs read the same instructions
+7. ✓ Seeds the per-CLI runtime dirs (`.claude/`, `.qwen/`, `.gemini/`) from `install/cli-runtime/` templates
+8. ✓ Installs core Python dependencies and only the provider SDKs for the axes you picked
+9. ✓ Installs frontend dependencies (React, Vite)
+10. ✓ Installs and walks you through first-run login for each agent CLI you picked (skippable via `--skip-auth`)
+11. ✓ Verifies the installation (warns about missing API keys for the keys your axes actually need)
 
 **Installation Options:**
+
 ```bash
-./install.sh                                    # Interactive (recommended)
-./install.sh --new-context                      # Fresh install, no prompts
+./install.sh                                    # Interactive — asks both questions
+./install.sh --new-context                      # Fresh install, no context prompt
 ./install.sh --import-context URL               # Import existing context repo
-./install.sh --dev                              # Include dev dependencies
+./install.sh --dev                              # Include dev dependencies (ruff, mypy)
 ./install.sh --skip-prereqs                     # Skip prerequisite checks
+./install.sh --skip-auth                        # Skip the agent CLI install/login step
 ```
+
+**Skip the two questions** by pinning the axes from the command line:
+
+```bash
+# Session harness
+--with-claude         --without-claude
+--with-qwen           --without-qwen
+
+# Orchestrator backends
+--with-anthropic      --without-anthropic
+--with-openai         --without-openai
+
+# Shortcut: everything Qwen-backed
+--qwen-only           # = --with-qwen --without-claude --with-openai --without-anthropic
+```
+
+Examples:
+
+```bash
+./install.sh --qwen-only                                       # Qwen harness + OpenAI orchestrator (Qwen routes via OpenAI-compatible endpoint)
+./install.sh --with-claude --with-anthropic --with-openai      # Default power-user setup, no prompts
+./install.sh --with-claude --with-qwen --with-openai --without-anthropic
+                                                               # Both CLIs, OpenAI-only orchestrator
+```
+
+### Fresh-Install Templates (`install/`)
+
+The `install/` directory holds the **template files** the installer copies into a fresh checkout. Edit them to change the defaults a clean install lands on:
+
+| Template | Copied to | Purpose |
+|----------|-----------|---------|
+| `AGENTS.md` | `context/AGENTS.md` | Project instructions (read via `CLAUDE.md` / `QWEN.md` symlinks). |
+| `MEMORY.md` | `context/memory/MEMORY.md` | The shared memory index. |
+| `context.env` | `context/.env` | API keys + runtime config. The installer uncomments the keys for the axes you picked. |
+| `assistant_config.json` | `assistant_config.json` (repo root) | Default working dir, provider, model. Placeholders substituted at install time. |
+| `manager.json` | `.manager.json` (repo root) | Session-manager defaults. |
+| `sync.env` | `sync/config.env` (manual copy) | Optional — for the `context-sync` two-machine service. |
+
+See [install/README.md](install/README.md) for details.
 
 ### Run
 
@@ -210,6 +316,14 @@ cd frontend && npm run dev
 Open **https://localhost:5432** and start chatting.
 
 **Tip**: Use `/debug-app` to launch both backend and frontend with browser automation.
+
+### Switching Providers Later
+
+The provider selection at install time is not a one-way door:
+
+- **Flip the harness for an individual chat** — Configuration → Session provider (only installed providers appear in the selector).
+- **Add a provider you didn't install** — run `./install.sh --with-<provider>` again; it only does the per-axis steps for what's newly enabled. Or `pip install -r requirements-<axis>.txt` directly.
+- **Default for new chats** — edit the `provider` field in `assistant_config.json`, or use the Configuration UI.
 
 ### Migrate to Another Machine
 
@@ -226,6 +340,15 @@ Your personal data lives in `context/` (conversations, memory, credentials). To 
    - `context/secrets/` — OAuth tokens
    - `context/.env` — API keys
    - `context/certs/` — SSL certificates
+
+For continuous two-machine sync (e.g. laptop ↔ home server), see `sync/README.md` — the `context-sync` systemd user service mirrors `context/` in real time via `inotifywait` + `rsync` over SSH.
+
+### Peripheral Frontends
+
+Beyond the main web UI, the project ships two additional frontend surfaces — both speak the same REST + WebSocket API:
+
+- **`frontend-compat/`** — React 18 compat build served at `/compat/`. Targets Safari 12 / iOS 12 (iPad mini 2 etc.).
+- **`android/`** — Full native Android peripheral (Kotlin + Jetpack Compose). Chat, sessions, and WebRTC voice. Targets Android 5.0+. Build with `cd android && ./gradlew assembleDebug`; the `/android-dev` skill handles build + deploy + debug.
 
 ---
 
@@ -296,6 +419,14 @@ Skills are YAML + markdown files in the `context/skills/` directory. They define
 | `/debug-app` | Launch backend + frontend with browser automation |
 | `/keybindings-help` | Customize keyboard shortcuts |
 | `/wrapper-guide` | Understand the wrapper application internals |
+| `/android-dev` | Build, deploy, and debug the Android peripheral app |
+| `/tv-remote` `/connect-tv` `/create-viz` | Fire TV control (media, navigation, visualizations) |
+| `/youtube` | Full YouTube Data API access (search, playlists, videos) |
+| `/generate-image` | Generate images via Google's Nano Banana (Gemini Image) |
+| `/iphone-photos` | Connect to the iOS photo server and browse media |
+| `/music-video-editor` | Multitrack-to-composite music video workflow (sync + Remotion) |
+
+Run `/help` inside the assistant for the full list (it changes as you add skills) or browse `default-skills/` directly.
 
 ### Creating Custom Skills
 
@@ -360,26 +491,56 @@ memory/
 ## Configuration
 
 ### Session Settings (`.manager.json`)
+Session-manager defaults (model, permissions, budget). Seeded from `install/manager.json` at install time:
 ```json
 {
   "model": "claude-sonnet-4-20250514",
   "permission_mode": "default",
   "max_budget_usd": 10.0,
-  "max_turns": 50
+  "max_turns": null
 }
 ```
 
-### Environment Variables
-```bash
-# Required
-ANTHROPIC_API_KEY=sk-...        # Claude SDK
-OPENAI_API_KEY=sk-...           # Voice mode
+### Default Provider (`assistant_config.json`)
+The `provider` field decides which CLI new chats use (`claude` or `qwen`). The Configuration UI flips it at runtime; this file is just the seed. `default_model` is provider-appropriate (Claude Sonnet vs. Qwen 3 Plus).
 
-# Optional
-CLAUDE_CONFIG_DIR=.claude_config       # Local data directory
-ORCHESTRATOR_MODEL=claude-sonnet-4-6   # Orchestrator model
-ORCHESTRATOR_MAX_TOKENS=8192           # Max tokens per turn
+### Environment Variables
+
+API keys are kept in `context/.env`. The installer uncomments the keys for the axes you opted into; the others stay commented so they're a one-liner away if you flip an axis on later.
+
+```bash
+# Orchestrator + voice (OpenAI / GPT, Qwen via OpenAI-compatible endpoint, Gemini)
+OPENAI_API_KEY=sk-proj-...
+
+# Orchestrator Claude models. Not needed if you only use Claude Code as the
+# harness — Claude Code authenticates with its own OAuth.
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Qwen harness + Qwen voice + Qwen orchestrator models via the OpenAI-compatible endpoint.
+DASHSCOPE_API_KEY=sk-...
+
+# Google Gemini — used by:
+#   - the /generate-image (Nano Banana) skill
+#   - the Gemini CLI harness (if installed via --with-gemini and using API key auth instead of OAuth)
+#   - the Gemini Live realtime voice provider (when enabled)
+# This is the canonical name Google's own SDKs and the gemini CLI expect.
+GEMINI_API_KEY=...
+
+# Session harness default (env var only applies when assistant_config.json hasn't been
+# written yet — the Configuration UI is the primary way to flip this).
+# Options: claude, qwen
+# ASSISTANT_PROVIDER=claude
+
+# Path to the qwen CLI — only if `qwen` isn't on $PATH for the user the backend runs as
+# (e.g. NVM installs it under a versioned node directory).
+# QWEN_CLI_PATH=/home/you/.nvm/versions/node/vXX.YY.ZZ/bin/qwen
+
+# Orchestrator defaults (UI can change per session).
+# ORCHESTRATOR_MODEL=gpt-4o
+# REALTIME_MODEL=gpt-realtime
 ```
+
+`CLAUDE_CONFIG_DIR` is set to `.claude_config/` automatically by `context/scripts/run.sh` — no need to set it yourself.
 
 ---
 
@@ -450,17 +611,17 @@ npm run lint      # ESLint
 ### Regular Agent Flow
 1. User sends message → Frontend (React) with stable `local_id`
 2. Frontend → WebSocket (`/api/sessions/chat`) → SessionPool
-3. Pool → SessionManager → Claude SDK
-4. Claude streams response → Pool broadcasts to all subscribers
-5. Events rendered in ChatPanel with real-time updates
+3. Pool → `ClaudeSessionManager` or `QwenSessionManager` (based on the session's `provider`) → agent CLI subprocess
+4. Agent streams response → Pool broadcasts to all subscribers
+5. Events rendered in ChatPanel with real-time updates (text deltas, tool calls, permission requests)
 
 ### Orchestrator Flow (Text)
 1. User sends message → Frontend with `local_id`
 2. Frontend → Orchestrator WebSocket
-3. OrchestratorSession → AnthropicProvider
-4. Tool calls executed (e.g., open agent session)
-5. Results streamed back to frontend
-6. Agent tabs auto-spawn when sessions opened
+3. `OrchestratorSession` → `AnthropicProvider` or `OpenAITextProvider` (based on the selected model)
+4. Tool calls executed concurrently (e.g. open agent session, search history)
+5. Background-agent turns delegated via `BackgroundAgentRunner` — orchestrator stays responsive; completions reported via `Notification` queue prepended to the next prompt
+6. Results streamed back to frontend; agent tabs auto-spawn when sessions opened
 
 ### Orchestrator Flow (Voice)
 1. Frontend establishes WebRTC to OpenAI (via ephemeral token)
@@ -494,9 +655,17 @@ The assistant is **production-ready** and can be deployed on any machine:
 | Cost and usage tracking | ✅ Complete |
 | Dynamic agent tab management | ✅ Complete |
 | WebRTC voice mode | ✅ Complete |
-| **One-command installation** | ✅ Complete |
-| **Public/private separation** | ✅ Complete |
-| **Cross-machine migration** | ✅ Complete |
+| Permission gating (with conversational + modal paths) | ✅ Complete |
+| Fire-and-forget delegated agent turns | ✅ Complete |
+| SSH remote-session execution | ✅ Complete |
+| **Claude Code + Qwen Code harnesses (interchangeable)** | ✅ Complete |
+| **No provider mandatory — install only the SDKs you need** | ✅ Complete |
+| **Two-axis installer (harness × orchestrator backend)** | ✅ Complete |
+| **`install/` directory of fresh-install templates** | ✅ Complete |
+| **Frontend-compat for Safari 12 / iOS 12** | ✅ Complete |
+| **Native Android peripheral app** | ✅ Complete |
+| Public/private separation | ✅ Complete |
+| Cross-machine migration + real-time sync | ✅ Complete |
 
 ### 🎯 Deployment Options
 

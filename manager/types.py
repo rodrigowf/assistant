@@ -98,6 +98,47 @@ class CompactComplete(Event):
     summary: str = ""  # The summary text generated during compaction
 
 
+@dataclass(frozen=True, slots=True)
+class PermissionRequest(Event):
+    """The SDK is asking us whether a tool may run.
+
+    Emitted when the bundled CLI's permission gate fires (e.g. ``ExitPlanMode``).
+    The wrapper resolves these via :meth:`SessionManager.resolve_permission`;
+    until then the SDK is blocked waiting for our reply.
+    """
+
+    request_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionResolved(Event):
+    """A pending permission request was answered — emitted so subscribers can
+    close any open UI / orchestrator state. ``decision`` is "allow" or "deny";
+    ``responder`` identifies who answered ("user" | "orchestrator")."""
+
+    request_id: str
+    decision: str
+    responder: str
+    message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionStalled(Event):
+    """Emitted when the SDK has produced no message for an extended period.
+
+    The underlying stream is *not* aborted — the watchdog is purely advisory
+    so the UI can surface a "this looks stuck" banner with an interrupt
+    affordance.  Repeated emissions while the stall persists carry the
+    cumulative ``elapsed_seconds`` since the last received message.
+    """
+
+    elapsed_seconds: float
+    last_tool_name: str | None = None
+    last_tool_use_id: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Session metadata — used by SessionStore
 # ---------------------------------------------------------------------------
@@ -112,6 +153,7 @@ class SessionInfo:
     title: str  # first user prompt, truncated
     message_count: int
     is_orchestrator: bool = False
+    provider: str = "claude"  # registered harness id — detected or from marker
 
 
 @dataclass(slots=True)
@@ -135,6 +177,7 @@ class MessagePreview:
     text: str  # primary text content (for backwards compat / display)
     blocks: list[ContentBlock] = field(default_factory=list)
     timestamp: datetime | None = None
+    provider: str = "claude"  # registered harness id — inherited from session
 
 
 @dataclass(slots=True)
@@ -148,6 +191,7 @@ class SessionDetail:
     message_count: int
     messages: list[MessagePreview] = field(default_factory=list)
     is_orchestrator: bool = False
+    provider: str = "claude"  # registered harness id
 
 
 # ---------------------------------------------------------------------------

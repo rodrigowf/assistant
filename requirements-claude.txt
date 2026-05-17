@@ -1,0 +1,8 @@
+# Claude Code harness — install this if you want to run sessions backed
+# by the bundled `claude` CLI.  Skip it for a Qwen-only deployment.
+#
+# Loaded lazily by manager/__init__.py via PEP 562, so installing this
+# does NOT change what's imported at backend startup — the SDK is only
+# loaded the first time a Claude session is created.
+
+claude-agent-sdk>=0.1.0

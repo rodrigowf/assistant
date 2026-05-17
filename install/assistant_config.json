@@ -1,0 +1,18 @@
+{
+  "working_directory": "@@SCRIPT_DIR@@",
+  "working_directory_history": [
+    {
+      "id": "@@SCRIPT_DIR@@",
+      "path": "@@SCRIPT_DIR@@",
+      "label": "Local",
+      "ssh_host": null,
+      "ssh_user": null,
+      "ssh_key": null,
+      "claude_config_dir": null
+    }
+  ],
+  "enabled_mcps": [],
+  "chrome_extension": false,
+  "provider": "@@DEFAULT_PROVIDER@@",
+  "default_model": "@@DEFAULT_MODEL@@"
+}

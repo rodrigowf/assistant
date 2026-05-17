@@ -41,6 +41,7 @@ class ModelInfo:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dict."""
+        from manager.context_windows import context_window_for
         return {
             "provider": self.provider.value,
             "model_id": self.model_id,
@@ -49,6 +50,7 @@ class ModelInfo:
             "supports_vision": self.supports_vision,
             "supports_tools": self.supports_tools,
             "max_tokens": self.max_tokens,
+            "context_window": context_window_for(self.provider.value, self.model_id),
         }
 
 
@@ -143,6 +145,45 @@ def get_audio_capable_models() -> list[ModelInfo]:
     return [m for m in AVAILABLE_MODELS.values() if m.supports_audio]
 
 
+def _infer_model_info(model_id: str) -> ModelInfo | None:
+    """Infer provider + capabilities for a model ID not in AVAILABLE_MODELS.
+
+    Used when the user picks a live-discovered model that this static
+    registry doesn't know about. Returns None for IDs that don't match
+    any known provider naming convention.
+    """
+    mid = model_id.lower()
+    if mid.startswith("claude-"):
+        return ModelInfo(
+            provider=Provider.ANTHROPIC,
+            model_id=model_id,
+            display_name=model_id,
+            supports_vision=True,
+            max_tokens=8192,
+        )
+    if (
+        mid.startswith("gpt-")
+        or mid.startswith("chatgpt-")
+        or mid.startswith("o1")
+        or mid.startswith("o3")
+        or mid.startswith("o4")
+        # Qwen and other OpenAI-compatible models share the openai SDK
+        # transport — route them through the same provider.
+        or mid.startswith("qwen")
+        or mid.startswith("glm-")
+        or mid.startswith("gemini-")  # served via OpenAI-compatible endpoint
+    ):
+        return ModelInfo(
+            provider=Provider.OPENAI,
+            model_id=model_id,
+            display_name=model_id,
+            supports_audio="audio" in mid,
+            supports_vision=True,
+            max_tokens=16384,
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator Configuration
 # ---------------------------------------------------------------------------
@@ -173,8 +214,7 @@ class OrchestratorConfig:
         """Initialize model info from model ID."""
         self._model_info = AVAILABLE_MODELS.get(self.model)
         if self._model_info is None:
-            # Default to Anthropic for unknown models
-            self._model_info = ModelInfo(
+            self._model_info = _infer_model_info(self.model) or ModelInfo(
                 provider=Provider.ANTHROPIC,
                 model_id=self.model,
                 display_name=self.model,
@@ -198,15 +238,25 @@ class OrchestratorConfig:
     def set_model(self, model_id: str) -> bool:
         """Change the current model.
 
+        Accepts any non-empty model ID. Unknown IDs are classified by
+        prefix (claude-* → Anthropic, gpt-*/o*/chatgpt-* → OpenAI) so the
+        live-discovered model lists work without requiring a static entry.
+
         Args:
             model_id: The model identifier to switch to
 
         Returns:
-            True if model was found and set, False if unknown model
+            True if a provider could be inferred, False otherwise
         """
+        if not model_id:
+            return False
+
         info = AVAILABLE_MODELS.get(model_id)
         if info is None:
-            return False
+            inferred = _infer_model_info(model_id)
+            if inferred is None:
+                return False
+            info = inferred
 
         self.model = model_id
         self._model_info = info

@@ -10,17 +10,22 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import com.assistant.peripheral.data.AppSettings
 import com.assistant.peripheral.data.AudioOutput
+import com.assistant.peripheral.data.ConfigPatch
 import com.assistant.peripheral.data.ConnectionState
 import com.assistant.peripheral.data.SavedServer
+import com.assistant.peripheral.data.SystemConfigState
 import com.assistant.peripheral.data.ThemeMode
 import com.assistant.peripheral.network.DiscoveredServer
 import kotlin.math.roundToInt
+
+private enum class SettingsTab { APP, SYSTEM }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -29,6 +34,7 @@ fun SettingsScreen(
     connectionState: ConnectionState,
     discoveredServers: List<DiscoveredServer>,
     isScanning: Boolean,
+    systemConfig: SystemConfigState,
     onUpdateServerUrl: (String) -> Unit,
     onUpdateThemeMode: (ThemeMode) -> Unit,
     onUpdateAutoConnect: (Boolean) -> Unit,
@@ -49,27 +55,116 @@ fun SettingsScreen(
     onAddSavedServer: (String, String) -> Unit,
     onRemoveSavedServer: (String) -> Unit,
     onSelectSavedServer: (SavedServer) -> Unit,
+    onLoadSystemConfig: () -> Unit,
+    onUpdateSystemConfig: (ConfigPatch) -> Unit,
+    onToggleMcp: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var serverUrl by remember(settings.serverUrl) { mutableStateOf(settings.serverUrl) }
-    var wakeWordText by remember(settings.wakeWord) { mutableStateOf(settings.wakeWord) }
-    var voiceWordText by remember(settings.voiceWord) { mutableStateOf(settings.voiceWord) }
+    var selectedTab by rememberSaveable { mutableStateOf(SettingsTab.APP) }
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Settings") }
-            )
+            Column {
+                TopAppBar(title = { Text("Settings") })
+                TabRow(selectedTabIndex = selectedTab.ordinal) {
+                    LeadingIconTab(
+                        selected = selectedTab == SettingsTab.APP,
+                        onClick = { selectedTab = SettingsTab.APP },
+                        text = { Text("App") },
+                        icon = { Icon(Icons.Default.PhoneAndroid, contentDescription = null) }
+                    )
+                    LeadingIconTab(
+                        selected = selectedTab == SettingsTab.SYSTEM,
+                        onClick = {
+                            selectedTab = SettingsTab.SYSTEM
+                            if (systemConfig.config == null && !systemConfig.loading) {
+                                onLoadSystemConfig()
+                            }
+                        },
+                        text = { Text("System") },
+                        icon = { Icon(Icons.Default.Dns, contentDescription = null) }
+                    )
+                }
+            }
         }
     ) { padding ->
-        Column(
-            modifier = modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
+        when (selectedTab) {
+            SettingsTab.APP -> AppSettingsTabContent(
+                settings = settings,
+                connectionState = connectionState,
+                discoveredServers = discoveredServers,
+                isScanning = isScanning,
+                onUpdateThemeMode = onUpdateThemeMode,
+                onUpdateAutoConnect = onUpdateAutoConnect,
+                onUpdateMicGainLevel = onUpdateMicGainLevel,
+                onUpdateWakeWordMicGainLevel = onUpdateWakeWordMicGainLevel,
+                onUpdateSpeakerVolumeLevel = onUpdateSpeakerVolumeLevel,
+                onUpdateEchoDuckingGain = onUpdateEchoDuckingGain,
+                onUpdateAudioOutput = onUpdateAudioOutput,
+                isBluetoothAvailable = isBluetoothAvailable,
+                onUpdateEnableWakeWord = onUpdateEnableWakeWord,
+                onUpdateWakeWord = onUpdateWakeWord,
+                onUpdateVoiceWord = onUpdateVoiceWord,
+                onUpdateEnableButtonTrigger = onUpdateEnableButtonTrigger,
+                onConnect = onConnect,
+                onDisconnect = onDisconnect,
+                onScanForServers = onScanForServers,
+                onConnectToServer = onConnectToServer,
+                onAddSavedServer = onAddSavedServer,
+                onRemoveSavedServer = onRemoveSavedServer,
+                onSelectSavedServer = onSelectSavedServer,
+                modifier = modifier.padding(padding)
+            )
+            SettingsTab.SYSTEM -> SystemSettingsTabContent(
+                connectionState = connectionState,
+                state = systemConfig,
+                onReload = onLoadSystemConfig,
+                onUpdate = onUpdateSystemConfig,
+                onToggleMcp = onToggleMcp,
+                modifier = modifier.padding(padding)
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppSettingsTabContent(
+    settings: AppSettings,
+    connectionState: ConnectionState,
+    discoveredServers: List<DiscoveredServer>,
+    isScanning: Boolean,
+    onUpdateThemeMode: (ThemeMode) -> Unit,
+    onUpdateAutoConnect: (Boolean) -> Unit,
+    onUpdateMicGainLevel: (Float) -> Unit,
+    onUpdateWakeWordMicGainLevel: (Float) -> Unit,
+    onUpdateSpeakerVolumeLevel: (Float) -> Unit,
+    onUpdateEchoDuckingGain: (Float) -> Unit,
+    onUpdateAudioOutput: (AudioOutput) -> Unit,
+    isBluetoothAvailable: Boolean,
+    onUpdateEnableWakeWord: (Boolean) -> Unit,
+    onUpdateWakeWord: (String) -> Unit,
+    onUpdateVoiceWord: (String) -> Unit,
+    onUpdateEnableButtonTrigger: (Boolean) -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onScanForServers: () -> Unit,
+    onConnectToServer: (DiscoveredServer) -> Unit,
+    onAddSavedServer: (String, String) -> Unit,
+    onRemoveSavedServer: (String) -> Unit,
+    onSelectSavedServer: (SavedServer) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var wakeWordText by remember(settings.wakeWord) { mutableStateOf(settings.wakeWord) }
+    var voiceWordText by remember(settings.voiceWord) { mutableStateOf(settings.voiceWord) }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
             // Connection Section
             Card(
                 modifier = Modifier.fillMaxWidth()
@@ -94,133 +189,60 @@ fun SettingsScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Connection status
-                    ConnectionStatusCard(connectionState)
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Saved Servers section
-                    SavedServersSection(
+                    // Unified servers list (saved + discovered, de-duplicated by URL)
+                    ServersSection(
                         savedServers = settings.savedServers,
+                        discoveredServers = discoveredServers,
                         currentUrl = settings.serverUrl,
-                        onSelect = onSelectSavedServer,
+                        isScanning = isScanning,
+                        onSelectSaved = onSelectSavedServer,
+                        onConnectDiscovered = onConnectToServer,
                         onRemove = onRemoveSavedServer,
-                        onAdd = onAddSavedServer
+                        onAddOrUpdate = onAddSavedServer,
+                        onScan = onScanForServers
                     )
 
                     Spacer(modifier = Modifier.height(16.dp))
+                    Divider()
+                    Spacer(modifier = Modifier.height(16.dp))
 
-                    // Scan for servers button
+                    // Status + connect button on a single row.
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        OutlinedButton(
-                            onClick = onScanForServers,
-                            enabled = !isScanning,
+                        ConnectionStatusPill(
+                            connectionState = connectionState,
                             modifier = Modifier.weight(1f)
-                        ) {
-                            if (isScanning) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp
-                                )
-                            } else {
-                                Icon(Icons.Default.NetworkWifi, contentDescription = null, modifier = Modifier.size(18.dp))
-                            }
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(if (isScanning) "Scanning..." else "Scan Network")
-                        }
-                    }
-
-                    // Discovered servers list
-                    if (discoveredServers.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Found ${discoveredServers.size} server${if (discoveredServers.size > 1) "s" else ""}:",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        discoveredServers.forEach { server ->
-                            val isSelected = settings.serverUrl == server.wsUrl
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onConnectToServer(server) },
-                                color = if (isSelected)
-                                    MaterialTheme.colorScheme.primaryContainer
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Button(
+                            onClick = {
+                                if (connectionState is ConnectionState.Connected) onDisconnect()
+                                else onConnect()
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (connectionState is ConnectionState.Connected)
+                                    MaterialTheme.colorScheme.errorContainer
                                 else
-                                    MaterialTheme.colorScheme.surfaceVariant,
-                                shape = MaterialTheme.shapes.small
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Computer,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp),
-                                        tint = if (isSelected)
-                                            MaterialTheme.colorScheme.primary
-                                        else
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Column {
-                                        Text(
-                                            text = server.ip,
-                                            style = MaterialTheme.typography.bodyMedium
-                                        )
-                                        Text(
-                                            text = server.wsUrl,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
+                                    MaterialTheme.colorScheme.primary,
+                                contentColor = if (connectionState is ConnectionState.Connected)
+                                    MaterialTheme.colorScheme.onErrorContainer
+                                else
+                                    MaterialTheme.colorScheme.onPrimary
+                            )
+                        ) {
+                            Text(
+                                text = when (connectionState) {
+                                    is ConnectionState.Connected -> "Disconnect"
+                                    is ConnectionState.Connecting -> "Connecting…"
+                                    else -> "Connect"
                                 }
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
+                            )
                         }
-                    } else if (!isScanning) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "No servers found yet. Tap Scan Network to discover.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
-
-                    // Server URL input
-                    OutlinedTextField(
-                        value = serverUrl,
-                        onValueChange = { serverUrl = it },
-                        label = { Text("Server URL") },
-                        placeholder = { Text("ws://192.168.0.28:8765") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        leadingIcon = {
-                            Icon(Icons.Default.Link, contentDescription = null)
-                        }
-                    )
-
-                    // Save URL button
-                    if (serverUrl != settings.serverUrl) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        TextButton(
-                            onClick = { onUpdateServerUrl(serverUrl) }
-                        ) {
-                            Icon(Icons.Default.Save, contentDescription = null)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Save URL")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
 
                     // Auto-connect toggle
                     Row(
@@ -228,7 +250,7 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = "Auto-connect",
                                 style = MaterialTheme.typography.bodyMedium
@@ -242,43 +264,6 @@ fun SettingsScreen(
                         Switch(
                             checked = settings.autoConnect,
                             onCheckedChange = onUpdateAutoConnect
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Connect/Disconnect button
-                    Button(
-                        onClick = {
-                            if (connectionState is ConnectionState.Connected) {
-                                onDisconnect()
-                            } else {
-                                onUpdateServerUrl(serverUrl)
-                                onConnect()
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (connectionState is ConnectionState.Connected)
-                                MaterialTheme.colorScheme.error
-                            else
-                                MaterialTheme.colorScheme.primary
-                        )
-                    ) {
-                        Icon(
-                            imageVector = if (connectionState is ConnectionState.Connected)
-                                Icons.Default.CloudOff
-                            else
-                                Icons.Default.CloudDone,
-                            contentDescription = null
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = when (connectionState) {
-                                is ConnectionState.Connected -> "Disconnect"
-                                is ConnectionState.Connecting -> "Connecting..."
-                                else -> "Connect"
-                            }
                         )
                     }
                 }
@@ -312,143 +297,74 @@ fun SettingsScreen(
                     val volumeSteps = (0..150 step 10).map { it.toFloat() }
                     val defaultVolumeIndex = volumeSteps.indexOf(100f).toFloat()
 
-                    // --- Microphone Gain ---
-                    val currentGainPercent = (settings.micGainLevel * 100).roundToInt().toFloat()
-                    var micSliderIndex by remember(settings.micGainLevel) {
-                        val closest = volumeSteps.minByOrNull { kotlin.math.abs(it - currentGainPercent) }
-                        mutableFloatStateOf(volumeSteps.indexOf(closest).coerceAtLeast(0).toFloat())
-                    }
-                    val micDisplayPercent = volumeSteps.getOrElse(micSliderIndex.roundToInt()) { 100f }.roundToInt()
-
-                    Text("Microphone Gain: $micDisplayPercent%", style = MaterialTheme.typography.bodyMedium)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Slider(
-                            value = micSliderIndex,
-                            onValueChange = { micSliderIndex = it },
-                            onValueChangeFinished = { onUpdateMicGainLevel(volumeSteps.getOrElse(micSliderIndex.roundToInt()) { 100f } / 100f) },
-                            valueRange = 0f..(volumeSteps.size - 1).toFloat(),
-                            steps = volumeSteps.size - 2,
-                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
-                        )
-                        Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    if (micDisplayPercent != 100) {
-                        TextButton(onClick = { micSliderIndex = defaultVolumeIndex; onUpdateMicGainLevel(1.0f) }) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Reset to 100%")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // --- Speaker Volume ---
-                    val currentSpeakerPercent = (settings.speakerVolumeLevel * 100).roundToInt().toFloat()
-                    var speakerSliderIndex by remember(settings.speakerVolumeLevel) {
-                        val closest = volumeSteps.minByOrNull { kotlin.math.abs(it - currentSpeakerPercent) }
-                        mutableFloatStateOf(volumeSteps.indexOf(closest).coerceAtLeast(0).toFloat())
-                    }
-                    val speakerDisplayPercent = volumeSteps.getOrElse(speakerSliderIndex.roundToInt()) { 100f }.roundToInt()
-
-                    Text("Speaker Volume: $speakerDisplayPercent%", style = MaterialTheme.typography.bodyMedium)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Slider(
-                            value = speakerSliderIndex,
-                            onValueChange = { speakerSliderIndex = it },
-                            onValueChangeFinished = { onUpdateSpeakerVolumeLevel(volumeSteps.getOrElse(speakerSliderIndex.roundToInt()) { 100f } / 100f) },
-                            valueRange = 0f..(volumeSteps.size - 1).toFloat(),
-                            steps = volumeSteps.size - 2,
-                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
-                        )
-                        Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    if (speakerDisplayPercent != 100) {
-                        TextButton(onClick = { speakerSliderIndex = defaultVolumeIndex; onUpdateSpeakerVolumeLevel(1.0f) }) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Reset to 100%")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // --- Echo Ducking Gain ---
-                    // Steps: 0.0%, 0.5%, 1.0%, ..., 10.0% (21 steps)
-                    // gain sent to VoiceManager = duckDisplayValue / 100f (e.g. 5.0% → 0.05)
-                    val duckSteps = (0..20).map { it * 0.5f }  // 0.0..10.0 representing percent
-                    val currentDuckPercent = settings.echoDuckingGain * 100f  // e.g. 0.05 → 5.0%
-                    var duckSliderIndex by remember(settings.echoDuckingGain) {
-                        val closest = duckSteps.minByOrNull { kotlin.math.abs(it - currentDuckPercent) }
-                        mutableFloatStateOf(duckSteps.indexOf(closest).coerceAtLeast(0).toFloat())
-                    }
-                    val duckDisplayValue = duckSteps.getOrElse(duckSliderIndex.roundToInt()) { 5.0f }
-
-                    Text("Echo Ducking: ${"%.1f".format(duckDisplayValue)}%", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "Mic gain while agent speaks — lower reduces echo, higher allows interruption",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    LevelSlider(
+                        icon = Icons.Default.Mic,
+                        title = "Mic",
+                        value = settings.micGainLevel * 100f,
+                        steps = volumeSteps,
+                        defaultIndex = defaultVolumeIndex,
+                        formatValue = { "${it.roundToInt()}%" },
+                        defaultValue = 100f,
+                        onCommit = { onUpdateMicGainLevel(it / 100f) }
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Slider(
-                            value = duckSliderIndex,
-                            onValueChange = { duckSliderIndex = it },
-                            onValueChangeFinished = {
-                                val gain = duckSteps.getOrElse(duckSliderIndex.roundToInt()) { 5.0f } / 100f
-                                onUpdateEchoDuckingGain(gain)
-                            },
-                            valueRange = 0f..(duckSteps.size - 1).toFloat(),
-                            steps = duckSteps.size - 2,
-                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
-                        )
-                        Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    if (duckDisplayValue != 5.0f) {
-                        TextButton(onClick = {
-                            // Reset to 5% default (gain 0.05, step index 10)
-                            duckSliderIndex = 10f
-                            onUpdateEchoDuckingGain(0.05f)
-                        }) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Reset to 5%")
-                        }
-                    }
 
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    LevelSlider(
+                        icon = Icons.Default.VolumeUp,
+                        title = "Speaker",
+                        value = settings.speakerVolumeLevel * 100f,
+                        steps = volumeSteps,
+                        defaultIndex = defaultVolumeIndex,
+                        formatValue = { "${it.roundToInt()}%" },
+                        defaultValue = 100f,
+                        onCommit = { onUpdateSpeakerVolumeLevel(it / 100f) }
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Echo ducking: 0.0%..10.0% in 0.5% steps. Stored value is the fraction
+                    // (0.05 = 5%), so multiply incoming/outgoing by 100.
+                    val duckSteps = (0..20).map { it * 0.5f }
+                    LevelSlider(
+                        icon = Icons.Default.GraphicEq,
+                        title = "Echo Ducking",
+                        value = settings.echoDuckingGain * 100f,
+                        steps = duckSteps,
+                        defaultIndex = duckSteps.indexOf(5.0f).toFloat(),
+                        formatValue = { "%.1f%%".format(it) },
+                        defaultValue = 5.0f,
+                        supporting = "Mic gain while agent speaks — lower reduces echo",
+                        onCommit = { onUpdateEchoDuckingGain(it / 100f) }
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Divider()
                     Spacer(modifier = Modifier.height(16.dp))
 
                     // Audio output routing — 3 options: Earpiece, Loudspeaker, Bluetooth.
-                    // Bluetooth is grayed out when no BT audio device is connected.
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = "Audio Output",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Text(
-                            text = when (settings.audioOutput) {
-                                AudioOutput.EARPIECE -> "Audio routed to earpiece"
-                                AudioOutput.LOUDSPEAKER -> "Audio routed to loudspeaker"
-                                AudioOutput.BLUETOOTH ->
-                                    if (isBluetoothAvailable) "Audio routed to Bluetooth device"
-                                    else "No Bluetooth device connected"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        // Round icon-only toggle buttons. Selection is communicated by the
-                        // filled background; the subtitle above spells out the current choice.
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Audio Output",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Text(
+                                text = when (settings.audioOutput) {
+                                    AudioOutput.EARPIECE -> "Earpiece"
+                                    AudioOutput.LOUDSPEAKER -> "Loudspeaker"
+                                    AudioOutput.BLUETOOTH ->
+                                        if (isBluetoothAvailable) "Bluetooth"
+                                        else "No Bluetooth device connected"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             val options = listOf(
                                 Triple(AudioOutput.EARPIECE, "Earpiece", Icons.Default.Hearing),
                                 Triple(AudioOutput.LOUDSPEAKER, "Speaker", Icons.Default.VolumeUp),
@@ -460,12 +376,12 @@ fun SettingsScreen(
                                     checked = settings.audioOutput == output,
                                     onCheckedChange = { if (it) onUpdateAudioOutput(output) },
                                     enabled = enabled,
-                                    modifier = Modifier.size(56.dp)
+                                    modifier = Modifier.size(44.dp)
                                 ) {
                                     Icon(
                                         imageVector = icon,
                                         contentDescription = label,
-                                        modifier = Modifier.size(24.dp)
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
                             }
@@ -552,40 +468,17 @@ fun SettingsScreen(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        // Wake word mic sensitivity slider — uniform 0..150% in steps of 10
-                        val currentWakeGainPercent = (settings.wakeWordMicGainLevel * 100).roundToInt().toFloat()
-                        var wakeSliderIndex by remember(settings.wakeWordMicGainLevel) {
-                            val closest = volumeSteps.minByOrNull { kotlin.math.abs(it - currentWakeGainPercent) }
-                            mutableFloatStateOf(volumeSteps.indexOf(closest).coerceAtLeast(0).toFloat())
-                        }
-                        val wakeDisplayPercent = volumeSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f }.roundToInt()
-
-                        Text("Wake Word Sensitivity: $wakeDisplayPercent%", style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            "Higher = easier to trigger (independent of voice session gain)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        LevelSlider(
+                            icon = Icons.Default.Hearing,
+                            title = "Wake Word Sensitivity",
+                            value = settings.wakeWordMicGainLevel * 100f,
+                            steps = volumeSteps,
+                            defaultIndex = defaultVolumeIndex,
+                            formatValue = { "${it.roundToInt()}%" },
+                            defaultValue = 100f,
+                            supporting = "Higher = easier to trigger (independent of voice session gain)",
+                            onCommit = { onUpdateWakeWordMicGainLevel(it / 100f) }
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.VolumeDown, contentDescription = "Low", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Slider(
-                                value = wakeSliderIndex,
-                                onValueChange = { wakeSliderIndex = it },
-                                onValueChangeFinished = { onUpdateWakeWordMicGainLevel(volumeSteps.getOrElse(wakeSliderIndex.roundToInt()) { 100f } / 100f) },
-                                valueRange = 0f..(volumeSteps.size - 1).toFloat(),
-                                steps = volumeSteps.size - 2,
-                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
-                            )
-                            Icon(Icons.Default.VolumeUp, contentDescription = "High", modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        if (wakeDisplayPercent != 100) {
-                            TextButton(onClick = { wakeSliderIndex = defaultVolumeIndex; onUpdateWakeWordMicGainLevel(1.0f) }) {
-                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Reset to 100%")
-                            }
-                        }
 
                         Spacer(modifier = Modifier.height(4.dp))
 
@@ -748,210 +641,354 @@ fun SettingsScreen(
                     )
                 }
             }
+    }
+}
+
+private sealed class ServerEntry {
+    abstract val url: String
+    abstract val label: String
+
+    data class Saved(val server: SavedServer, val alsoDiscovered: Boolean) : ServerEntry() {
+        override val url: String get() = server.url
+        override val label: String get() = server.label
+    }
+
+    data class Discovered(val server: DiscoveredServer) : ServerEntry() {
+        override val url: String get() = server.wsUrl
+        override val label: String get() = server.ip
+    }
+}
+
+/**
+ * Compact slider row used throughout the Audio section.
+ *
+ * Layout: icon + title on the left, current value + (when non-default) a small
+ * reset icon-button on the right; slider directly below; optional supporting
+ * caption underneath.
+ *
+ * `value` is the *current* numeric value (already in display units — e.g. 20
+ * for 20%); the parent converts to/from storage units via `onCommit`.
+ */
+@Composable
+private fun LevelSlider(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    value: Float,
+    steps: List<Float>,
+    defaultIndex: Float,
+    formatValue: (Float) -> String,
+    defaultValue: Float,
+    onCommit: (Float) -> Unit,
+    supporting: String? = null,
+) {
+    var sliderIndex by remember(value) {
+        val closest = steps.minByOrNull { kotlin.math.abs(it - value) }
+        mutableFloatStateOf(steps.indexOf(closest).coerceAtLeast(0).toFloat())
+    }
+    val displayValue = steps.getOrElse(sliderIndex.roundToInt()) { defaultValue }
+    val isDefault = kotlin.math.abs(displayValue - defaultValue) < 0.001f
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = formatValue(displayValue),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!isDefault) {
+                Spacer(modifier = Modifier.width(4.dp))
+                IconButton(
+                    onClick = {
+                        sliderIndex = defaultIndex
+                        onCommit(defaultValue)
+                    },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Reset $title",
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+        Slider(
+            value = sliderIndex,
+            onValueChange = { sliderIndex = it },
+            onValueChangeFinished = {
+                onCommit(steps.getOrElse(sliderIndex.roundToInt()) { defaultValue })
+            },
+            valueRange = 0f..(steps.size - 1).toFloat(),
+            steps = steps.size - 2
+        )
+        if (supporting != null) {
+            Text(
+                text = supporting,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
 
 @Composable
-private fun SavedServersSection(
+private fun ServersSection(
     savedServers: List<SavedServer>,
+    discoveredServers: List<DiscoveredServer>,
     currentUrl: String,
-    onSelect: (SavedServer) -> Unit,
+    isScanning: Boolean,
+    onSelectSaved: (SavedServer) -> Unit,
+    onConnectDiscovered: (DiscoveredServer) -> Unit,
     onRemove: (String) -> Unit,
-    onAdd: (String, String) -> Unit
+    onAddOrUpdate: (String, String) -> Unit,
+    onScan: () -> Unit
 ) {
-    var showAddForm by remember { mutableStateOf(false) }
-    var newLabel by remember { mutableStateOf("") }
-    var newUrl by remember { mutableStateOf("") }
-    var editingUrl by remember { mutableStateOf<String?>(null) }
-    var editLabel by remember { mutableStateOf("") }
-    var editUrl by remember { mutableStateOf("") }
+    // Dialog state. `null` = closed; non-null carries prefill values.
+    var editor by remember { mutableStateOf<ServerEditorState?>(null) }
 
-    Text(
-        text = "Saved Servers",
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-    Spacer(modifier = Modifier.height(6.dp))
+    // Merge: saved first (sorted by label), then any discovered URLs we haven't saved.
+    val savedUrls = savedServers.map { it.url }.toSet()
+    val discoveredUrls = discoveredServers.map { it.wsUrl }.toSet()
+    val entries: List<ServerEntry> =
+        savedServers.map { ServerEntry.Saved(it, alsoDiscovered = it.url in discoveredUrls) } +
+            discoveredServers.filter { it.wsUrl !in savedUrls }.map { ServerEntry.Discovered(it) }
 
-    if (savedServers.isEmpty() && !showAddForm) {
+    if (entries.isEmpty()) {
         Text(
-            text = "No saved servers. Add one for quick switching (e.g. Tailscale IP).",
+            text = "No servers yet. Scan the network or add one manually.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        Spacer(modifier = Modifier.height(8.dp))
     } else {
-        savedServers.forEach { server ->
-            val isSelected = currentUrl == server.url
-            val isEditing = editingUrl == server.url
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .then(
-                        if (isEditing) Modifier
-                        else Modifier.clickable { onSelect(server) }
-                    ),
-                color = if (isSelected)
-                    MaterialTheme.colorScheme.primaryContainer
-                else
-                    MaterialTheme.colorScheme.surfaceVariant,
-                shape = MaterialTheme.shapes.small
-            ) {
-                if (isEditing) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = editLabel,
-                            onValueChange = { editLabel = it },
-                            label = { Text("Label") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        OutlinedTextField(
-                            value = editUrl,
-                            onValueChange = { editUrl = it },
-                            label = { Text("WebSocket URL") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true
-                        )
-                        Row {
-                            TextButton(onClick = {
-                                editingUrl = null
-                                editLabel = ""
-                                editUrl = ""
-                            }) { Text("Cancel") }
-                            Spacer(modifier = Modifier.width(4.dp))
-                            TextButton(
-                                onClick = {
-                                    val originalUrl = server.url
-                                    val cleanLabel = editLabel.trim()
-                                    val cleanUrl = editUrl.trim()
-                                    if (cleanLabel.isNotBlank() && cleanUrl.isNotBlank()) {
-                                        if (cleanUrl != originalUrl) {
-                                            onRemove(originalUrl)
-                                        }
-                                        onAdd(cleanLabel, cleanUrl)
-                                        editingUrl = null
-                                        editLabel = ""
-                                        editUrl = ""
-                                    }
-                                },
-                                enabled = editLabel.isNotBlank() && editUrl.isNotBlank() &&
-                                    (editLabel.trim() != server.label || editUrl.trim() != server.url)
-                            ) {
-                                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Save")
-                            }
-                        }
+        entries.forEachIndexed { index, entry ->
+            ServerRow(
+                entry = entry,
+                isSelected = currentUrl == entry.url,
+                onClick = {
+                    when (entry) {
+                        is ServerEntry.Saved -> onSelectSaved(entry.server)
+                        is ServerEntry.Discovered -> onConnectDiscovered(entry.server)
                     }
-                } else {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Dns,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                            tint = if (isSelected)
-                                MaterialTheme.colorScheme.primary
-                            else
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = server.label,
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = server.url,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        IconButton(onClick = {
-                            editingUrl = server.url
-                            editLabel = server.label
-                            editUrl = server.url
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.Edit,
-                                contentDescription = "Edit ${server.label}",
-                                modifier = Modifier.size(18.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        IconButton(onClick = { onRemove(server.url) }) {
-                            Icon(
-                                imageVector = Icons.Default.Delete,
-                                contentDescription = "Remove ${server.label}",
-                                modifier = Modifier.size(18.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-            }
-            Spacer(modifier = Modifier.height(4.dp))
+                },
+                onEdit = {
+                    val s = (entry as ServerEntry.Saved).server
+                    editor = ServerEditorState(originalUrl = s.url, label = s.label, url = s.url)
+                },
+                onSave = {
+                    val d = (entry as ServerEntry.Discovered).server
+                    editor = ServerEditorState(originalUrl = null, label = d.ip, url = d.wsUrl)
+                },
+                onRemove = { onRemove(entry.url) }
+            )
+            if (index < entries.lastIndex) Spacer(modifier = Modifier.height(6.dp))
         }
     }
 
-    Spacer(modifier = Modifier.height(4.dp))
+    Spacer(modifier = Modifier.height(12.dp))
 
-    if (showAddForm) {
-        OutlinedTextField(
-            value = newLabel,
-            onValueChange = { newLabel = it },
-            label = { Text("Label") },
-            placeholder = { Text("e.g. Laptop (Tailscale)") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        OutlinedTextField(
-            value = newUrl,
-            onValueChange = { newUrl = it },
-            label = { Text("WebSocket URL") },
-            placeholder = { Text("ws://100.111.80.128:8765") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-        Row {
-            TextButton(onClick = {
-                showAddForm = false
-                newLabel = ""
-                newUrl = ""
-            }) { Text("Cancel") }
-            Spacer(modifier = Modifier.width(4.dp))
-            TextButton(
-                onClick = {
-                    onAdd(newLabel, newUrl)
-                    showAddForm = false
-                    newLabel = ""
-                    newUrl = ""
-                },
-                enabled = newLabel.isNotBlank() && newUrl.isNotBlank()
-            ) {
-                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Save")
+    // Action row: Scan + Add manually
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        OutlinedButton(
+            onClick = onScan,
+            enabled = !isScanning,
+            modifier = Modifier.weight(1f)
+        ) {
+            if (isScanning) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(Icons.Default.NetworkWifi, contentDescription = null, modifier = Modifier.size(18.dp))
             }
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(if (isScanning) "Scanning…" else "Scan")
         }
-    } else {
-        TextButton(onClick = { showAddForm = true }) {
-            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(modifier = Modifier.width(4.dp))
-            Text("Add server")
+        OutlinedButton(
+            onClick = { editor = ServerEditorState(originalUrl = null, label = "", url = "") },
+            modifier = Modifier.weight(1f)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Add")
         }
+    }
+
+    editor?.let { state ->
+        ServerEditorDialog(
+            state = state,
+            onDismiss = { editor = null },
+            onSubmit = { label, url ->
+                if (state.originalUrl != null && state.originalUrl != url) {
+                    onRemove(state.originalUrl)
+                }
+                onAddOrUpdate(label, url)
+                editor = null
+            }
+        )
     }
 }
 
 @Composable
-private fun ConnectionStatusCard(connectionState: ConnectionState) {
+private fun ServerRow(
+    entry: ServerEntry,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onEdit: () -> Unit,
+    onSave: () -> Unit,
+    onRemove: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        color = if (isSelected)
+            MaterialTheme.colorScheme.primaryContainer
+        else
+            MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.medium
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val (leadingIcon, iconTint) = when {
+                isSelected -> Icons.Default.CheckCircle to MaterialTheme.colorScheme.primary
+                entry is ServerEntry.Discovered -> Icons.Default.NetworkWifi to MaterialTheme.colorScheme.onSurfaceVariant
+                else -> Icons.Default.Dns to MaterialTheme.colorScheme.onSurfaceVariant
+            }
+            Icon(
+                imageVector = leadingIcon,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+                tint = iconTint
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = entry.label,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    if (entry is ServerEntry.Saved && entry.alsoDiscovered) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(
+                            imageVector = Icons.Default.NetworkWifi,
+                            contentDescription = "On network",
+                            modifier = Modifier.size(12.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Text(
+                    text = entry.url,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            when (entry) {
+                is ServerEntry.Saved -> {
+                    IconButton(onClick = onEdit) {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "Edit ${entry.label}",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(onClick = onRemove) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Remove ${entry.label}",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                is ServerEntry.Discovered -> {
+                    TextButton(onClick = onSave) {
+                        Icon(Icons.Default.BookmarkBorder, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Save")
+                    }
+                }
+            }
+        }
+    }
+}
+
+private data class ServerEditorState(
+    val originalUrl: String?,
+    val label: String,
+    val url: String
+)
+
+@Composable
+private fun ServerEditorDialog(
+    state: ServerEditorState,
+    onDismiss: () -> Unit,
+    onSubmit: (String, String) -> Unit
+) {
+    var label by remember(state) { mutableStateOf(state.label) }
+    var url by remember(state) { mutableStateOf(state.url) }
+    val isEditing = state.originalUrl != null
+    val canSubmit = label.isNotBlank() && url.isNotBlank()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (isEditing) "Edit server" else "Add server") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    label = { Text("Label") },
+                    placeholder = { Text("e.g. Laptop (Tailscale)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    label = { Text("WebSocket URL") },
+                    placeholder = { Text("ws://192.168.0.200:80") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSubmit(label.trim(), url.trim()) },
+                enabled = canSubmit
+            ) { Text(if (isEditing) "Save" else "Add") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun ConnectionStatusPill(
+    connectionState: ConnectionState,
+    modifier: Modifier = Modifier
+) {
     val (icon, text, color) = when (connectionState) {
         is ConnectionState.Connected -> Triple(
             Icons.Default.CheckCircle,
@@ -960,42 +997,36 @@ private fun ConnectionStatusCard(connectionState: ConnectionState) {
         )
         is ConnectionState.Connecting -> Triple(
             Icons.Default.Sync,
-            "Connecting...",
+            "Connecting…",
             MaterialTheme.colorScheme.tertiary
         )
         is ConnectionState.Disconnected -> Triple(
             Icons.Default.Cancel,
             "Disconnected",
-            MaterialTheme.colorScheme.error
+            MaterialTheme.colorScheme.onSurfaceVariant
         )
         is ConnectionState.Error -> Triple(
             Icons.Default.Error,
-            "Error: ${connectionState.message}",
+            connectionState.message.ifBlank { "Error" },
             MaterialTheme.colorScheme.error
         )
     }
 
-    Surface(
-        color = color.copy(alpha = 0.1f),
-        shape = MaterialTheme.shapes.small
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = color
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = color
-            )
-        }
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(18.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyMedium,
+            color = color
+        )
     }
 }

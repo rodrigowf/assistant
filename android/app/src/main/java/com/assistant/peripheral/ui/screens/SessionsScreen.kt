@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.assistant.peripheral.data.SessionInfo
 import java.text.SimpleDateFormat
 import java.util.*
@@ -35,10 +36,11 @@ fun SessionsScreen(
     currentSessionId: String?,
     liveSessionIds: Set<String>,
     isLoading: Boolean,
-    onSessionClick: (String, Boolean) -> Unit,  // (sessionId, isOrchestrator)
+    onSessionClick: (String, Boolean, String?) -> Unit,  // (sessionId, isOrchestrator, liveLocalId)
     onNewSession: () -> Unit,
     onRenameSession: (String, String) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onDuplicateSession: (String) -> Unit,
     onCloseSession: (String) -> Unit,
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier
@@ -118,9 +120,10 @@ fun SessionsScreen(
                             session = session,
                             isSelected = session.sessionId == currentSessionId,
                             isOpen = liveSessionIds.contains(session.sessionId),
-                            onClick = { onSessionClick(session.sessionId, session.isOrchestrator) },
+                            onClick = { onSessionClick(session.sessionId, session.isOrchestrator, session.localId) },
                             onRename = { newTitle -> onRenameSession(session.sessionId, newTitle) },
                             onDelete = { onDeleteSession(session.sessionId) },
+                            onDuplicate = { onDuplicateSession(session.sessionId) },
                             onClose = { onCloseSession(session.sessionId) }
                         )
                     }
@@ -147,6 +150,7 @@ private fun SessionItem(
     onClick: () -> Unit,
     onRename: (String) -> Unit,
     onDelete: () -> Unit,
+    onDuplicate: () -> Unit,
     onClose: () -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
@@ -288,7 +292,8 @@ private fun SessionItem(
                         )
 
                         // Labels row
-                        if (session.isOrchestrator || isOpen) {
+                        val showProviderTag = !session.isOrchestrator
+                        if (session.isOrchestrator || isOpen || showProviderTag) {
                             Spacer(modifier = Modifier.width(8.dp))
 
                             if (isOpen) {
@@ -312,11 +317,46 @@ private fun SessionItem(
                                     color = MaterialTheme.colorScheme.tertiaryContainer
                                 ) {
                                     Text(
-                                        text = "orchestrator",
+                                        text = "orch",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onTertiaryContainer,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                     )
+                                }
+                            }
+
+                            if (showProviderTag) {
+                                if (isOpen) Spacer(modifier = Modifier.width(4.dp))
+                                // Badge is binary today (Claude / non-Claude) — the desktop
+                                // app uses the same shorthand.  A third harness lands as a
+                                // generic "secondary" badge with its first letter; that's
+                                // good enough until we wire up per-spec colors over the
+                                // /api/config/providers endpoint.
+                                val isClaude = session.provider == "claude" || session.provider.isEmpty()
+                                val bg = if (isClaude) {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.secondaryContainer
+                                }
+                                val fg = if (isClaude) {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.onSecondaryContainer
+                                }
+                                val initial = (session.provider.firstOrNull()?.uppercaseChar() ?: 'C').toString()
+                                Surface(
+                                    shape = CircleShape,
+                                    color = bg,
+                                    modifier = Modifier.size(16.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = initial,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                            color = fg,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -383,6 +423,16 @@ private fun SessionItem(
                             },
                             leadingIcon = {
                                 Icon(Icons.Default.Edit, contentDescription = null)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Duplicate") },
+                            onClick = {
+                                showMenu = false
+                                onDuplicate()
+                            },
+                            leadingIcon = {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null)
                             }
                         )
                         if (isOpen) {

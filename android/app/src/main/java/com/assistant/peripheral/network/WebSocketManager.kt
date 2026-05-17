@@ -26,6 +26,17 @@ enum class WebSocketEndpoint {
  */
 class WebSocketManager {
 
+    /**
+     * Cheap heuristic to skip logging audio frames.  Looks for the
+     * `voice_audio_in` / `voice_audio_out` type prefix near the start
+     * of the message — much faster than parsing JSON for every frame.
+     */
+    private fun isAudioPayload(text: String): Boolean {
+        if (text.length < 32) return false
+        val head = text.substring(0, minOf(64, text.length))
+        return head.contains("\"voice_audio_in\"") || head.contains("\"voice_audio_out\"")
+    }
+
     companion object {
         private const val TAG = "WebSocketManager"
         private const val RECONNECT_DELAY_MS = 3000L
@@ -53,8 +64,14 @@ class WebSocketManager {
     fun connectionState(endpoint: WebSocketEndpoint): StateFlow<ConnectionState> =
         connections.getValue(endpoint).state.asStateFlow()
 
-    private val _events = MutableSharedFlow<WebSocketEvent>(extraBufferCapacity = 64)
-    val events: SharedFlow<WebSocketEvent> = _events.asSharedFlow()
+    /**
+     * Per-endpoint event stream. Every emission carries the endpoint that
+     * produced the event so consumers can route updates to the correct
+     * per-tab state bucket and never cross-contaminate (e.g. orchestrator
+     * voice text streaming into a Claude Code session view).
+     */
+    private val _events = MutableSharedFlow<Pair<WebSocketEndpoint, WebSocketEvent>>(extraBufferCapacity = 64)
+    val events: SharedFlow<Pair<WebSocketEndpoint, WebSocketEvent>> = _events.asSharedFlow()
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -91,18 +108,24 @@ class WebSocketManager {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "WebSocket connected ($endpoint)")
                 conn.state.value = ConnectionState.Connected
-                _events.tryEmit(WebSocketEvent.Connected(endpoint.name))
+                _events.tryEmit(endpoint to WebSocketEvent.Connected)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "Received text ($endpoint): $text")
-                parseMessage(text)
+                // Skip logging high-rate audio frames; they're 4 KB each
+                // at ~50 Hz and the logging cost alone causes UI freezes.
+                if (!isAudioPayload(text)) {
+                    Log.d(TAG, "Received text ($endpoint): $text")
+                }
+                parseMessage(text, endpoint)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
                 val text = bytes.utf8()
-                Log.d(TAG, "Received binary ($endpoint): $text")
-                parseMessage(text)
+                if (!isAudioPayload(text)) {
+                    Log.d(TAG, "Received binary ($endpoint): $text")
+                }
+                parseMessage(text, endpoint)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -118,7 +141,7 @@ class WebSocketManager {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket failure ($endpoint): ${t.message}", t)
                 conn.state.value = ConnectionState.Error(t.message ?: "Connection failed")
-                _events.tryEmit(WebSocketEvent.Error(t.message ?: "Connection failed"))
+                _events.tryEmit(endpoint to WebSocketEvent.Error(t.message ?: "Connection failed"))
                 handleDisconnect(endpoint)
             }
         })
@@ -145,7 +168,7 @@ class WebSocketManager {
     private fun handleDisconnect(endpoint: WebSocketEndpoint) {
         val conn = connections.getValue(endpoint)
         conn.state.value = ConnectionState.Disconnected
-        _events.tryEmit(WebSocketEvent.Disconnected(endpoint.name))
+        _events.tryEmit(endpoint to WebSocketEvent.Disconnected)
 
         if (conn.shouldReconnect) {
             scope.launch {
@@ -190,6 +213,15 @@ class WebSocketManager {
                 put("type", "voice_start")
                 message.localId?.let { put("local_id", it) }
                 message.resumeSdkId?.let { put("resume_sdk_id", it) }
+                // Voice provider/model/voice/language — when present,
+                // the backend overrides the configured defaults.
+                message.voiceProvider?.let { put("voice_provider", it) }
+                message.voiceModel?.let { put("voice_model", it) }
+                message.voiceName?.let { put("voice_name", it) }
+                message.voiceTranscriptionLanguage?.let { put("voice_transcription_language", it) }
+                message.voiceEndpoint?.takeIf { it.isNotBlank() }?.let {
+                    put("voice_endpoint", it)
+                }
             }
             is WebSocketMessage.VoiceStop -> JSONObject().apply {
                 put("type", "voice_stop")
@@ -197,6 +229,10 @@ class WebSocketManager {
             is WebSocketMessage.VoiceEvent -> JSONObject().apply {
                 put("type", "voice_event")
                 put("event", JSONObject(message.event))
+            }
+            is WebSocketMessage.VoiceAudioIn -> JSONObject().apply {
+                put("type", "voice_audio_in")
+                put("audio", message.audioBase64)
             }
             is WebSocketMessage.Send -> JSONObject().apply {
                 put("type", "send")
@@ -227,15 +263,21 @@ class WebSocketManager {
         }
 
         val jsonString = json.toString()
-        Log.d(TAG, "Sending ($endpoint): $jsonString")
+        // Don't log audio chunks — they fire ~50/s with ~4KB payloads
+        // each, which floods logcat and causes UI freezes via the
+        // logging subsystem alone.
+        if (message !is WebSocketMessage.VoiceAudioIn) {
+            Log.d(TAG, "Sending ($endpoint): $jsonString")
+        }
         connections.getValue(endpoint).webSocket?.send(jsonString)
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun parseMessage(text: String) {
+    private fun parseMessage(text: String, endpoint: WebSocketEndpoint) {
         try {
             val json = JSONObject(text)
             val type = json.optString("type", "")
+            fun emit(ev: WebSocketEvent) { _events.tryEmit(endpoint to ev) }
 
             when (type) {
                 // Session lifecycle
@@ -243,104 +285,118 @@ class WebSocketManager {
                     val sessionId = json.optString("session_id", "")
                     val voice = json.optBoolean("voice", false)
                     val voiceUpdate = json.optJSONObject("voice_session_update")?.let { jsonObjectToMap(it) }
-                    _events.tryEmit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
+                    emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
                 }
-                "session_stopped" -> {
-                    _events.tryEmit(WebSocketEvent.SessionStopped)
-                }
+                "session_stopped" -> emit(WebSocketEvent.SessionStopped)
 
                 // Status updates
-                "status" -> {
-                    val status = json.optString("status", "")
-                    _events.tryEmit(WebSocketEvent.Status(status))
-                }
+                "status" -> emit(WebSocketEvent.Status(json.optString("status", "")))
 
                 // Text streaming
                 "text_delta" -> {
                     val delta = json.optString("text", "")
                     val messageId = json.optString("message_id", null)
-                    _events.tryEmit(WebSocketEvent.TextDelta(delta, messageId))
+                    emit(WebSocketEvent.TextDelta(delta, messageId))
                 }
-                "text_complete" -> {
-                    val completeText = json.optString("text", "")
-                    _events.tryEmit(WebSocketEvent.TextComplete(completeText))
-                }
+                "text_complete" -> emit(WebSocketEvent.TextComplete(json.optString("text", "")))
 
                 // Thinking (extended thinking for o1 models)
-                "thinking_delta" -> {
-                    val delta = json.optString("text", "")
-                    _events.tryEmit(WebSocketEvent.ThinkingDelta(delta))
-                }
-                "thinking_complete" -> {
-                    val completeText = json.optString("text", "")
-                    _events.tryEmit(WebSocketEvent.ThinkingComplete(completeText))
-                }
+                "thinking_delta" -> emit(WebSocketEvent.ThinkingDelta(json.optString("text", "")))
+                "thinking_complete" -> emit(WebSocketEvent.ThinkingComplete(json.optString("text", "")))
 
                 // Tool events
                 "tool_use" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val toolName = json.optString("tool_name", "")
                     val toolInput = jsonObjectToMap(json.optJSONObject("tool_input"))
-                    _events.tryEmit(WebSocketEvent.ToolUse(toolUseId, toolName, toolInput))
+                    emit(WebSocketEvent.ToolUse(toolUseId, toolName, toolInput))
                 }
                 "tool_executing" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val toolName = json.optString("tool_name", "")
-                    _events.tryEmit(WebSocketEvent.ToolExecuting(toolUseId, toolName))
+                    emit(WebSocketEvent.ToolExecuting(toolUseId, toolName))
                 }
                 "tool_progress" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val message = json.optString("message", "")
-                    _events.tryEmit(WebSocketEvent.ToolProgress(toolUseId, message))
+                    emit(WebSocketEvent.ToolProgress(toolUseId, message))
                 }
                 "tool_result" -> {
                     val toolUseId = json.optString("tool_use_id", "")
                     val output = json.optString("output", "")
                     val isError = json.optBoolean("is_error", false)
-                    _events.tryEmit(WebSocketEvent.ToolResult(toolUseId, output, isError))
+                    emit(WebSocketEvent.ToolResult(toolUseId, output, isError))
                 }
 
                 // Turn complete
                 "turn_complete" -> {
                     val inputTokens = json.optInt("input_tokens", 0)
                     val outputTokens = json.optInt("output_tokens", 0)
-                    _events.tryEmit(WebSocketEvent.TurnComplete(inputTokens, outputTokens))
+                    emit(WebSocketEvent.TurnComplete(inputTokens, outputTokens))
                 }
 
                 // Voice events
                 "voice_command" -> {
                     val command = jsonObjectToMap(json.optJSONObject("command"))
-                    _events.tryEmit(WebSocketEvent.VoiceCommand(command))
+                    emit(WebSocketEvent.VoiceCommand(command))
                 }
-                "voice_stopped" -> {
-                    _events.tryEmit(WebSocketEvent.VoiceStopped)
+                "voice_event" -> {
+                    // Provider event mirrored from backend (WebSocket
+                    // providers only — for WebRTC the data channel
+                    // receives these directly).
+                    //
+                    // Drop high-frequency delta events HERE so the
+                    // entire downstream pipeline (Flow emit, ViewModel
+                    // dispatch, provider parse) doesn't wake up for
+                    // them.  Qwen streams ~50–100 deltas per assistant
+                    // response; we accumulate them in
+                    // response.audio_transcript.done anyway.
+                    val inner = json.optJSONObject("event")
+                    val innerType = inner?.optString("type", "")
+                    if (innerType == "response.output_audio_transcript.delta" ||
+                        innerType == "response.audio_transcript.delta" ||
+                        innerType == "response.text.delta" ||
+                        innerType == "response.function_call_arguments.delta") {
+                        // No-op — neither the UI nor the provider needs
+                        // these.
+                    } else {
+                        // Use shallow conversion: top-level keys only,
+                        // nested JSONObject/JSONArray values stay as-is
+                        // and the provider casts them when it needs to.
+                        // Avoids walking the full event twice (once
+                        // here, once in the provider).
+                        emit(WebSocketEvent.VoiceProviderEvent(jsonObjectToShallowMap(inner)))
+                    }
                 }
+                "voice_audio_out" -> {
+                    // Speaker chunk for WebSocket voice providers.
+                    val audio = json.optString("audio", "")
+                    if (audio.isNotEmpty()) {
+                        emit(WebSocketEvent.VoiceAudioOut(audio))
+                    }
+                }
+                "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 
                 // Compact
-                "compact_complete" -> {
-                    val summary = json.optString("summary", "")
-                    _events.tryEmit(WebSocketEvent.CompactComplete(summary))
-                }
+                "compact_complete" -> emit(WebSocketEvent.CompactComplete(json.optString("summary", "")))
 
                 // Error
                 "error" -> {
                     val errorMsg = json.optString("error", "Unknown error")
                     val detail = json.optString("detail", null)
-                    _events.tryEmit(WebSocketEvent.Error(errorMsg, detail))
+                    emit(WebSocketEvent.Error(errorMsg, detail))
                 }
 
                 // Legacy compatibility - map old events to new ones
                 "content_block_delta" -> {
                     val delta = json.optString("delta", json.optString("text", ""))
-                    _events.tryEmit(WebSocketEvent.TextDelta(delta))
+                    emit(WebSocketEvent.TextDelta(delta))
                 }
                 "message_start" -> {
                     val messageId = json.optString("message_id", System.currentTimeMillis().toString())
-                    _events.tryEmit(WebSocketEvent.MessageStart(messageId))
+                    emit(WebSocketEvent.MessageStart(messageId))
                 }
-                "message_end", "message_stop" -> {
-                    _events.tryEmit(WebSocketEvent.MessageEnd)
-                }
+                "message_end", "message_stop" -> emit(WebSocketEvent.MessageEnd)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing message: ${e.message}", e)
@@ -360,6 +416,25 @@ class WebSocketManager {
                 JSONObject.NULL -> null
                 else -> value
             }
+        }
+        return map
+    }
+
+    /**
+     * Top-level-only conversion — nested JSONObject / JSONArray values
+     * are kept as-is.  Used for high-frequency events (voice provider
+     * events) where the consumer reads only flat scalars and casts the
+     * occasional nested object on demand.  ~3-5x faster than the
+     * recursive variant for typical voice events.
+     */
+    private fun jsonObjectToShallowMap(json: JSONObject?): Map<String, Any?> {
+        if (json == null) return emptyMap()
+        val map = mutableMapOf<String, Any?>()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = json.opt(key)
+            map[key] = if (value === JSONObject.NULL) null else value
         }
         return map
     }

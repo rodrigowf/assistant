@@ -42,6 +42,11 @@ def _mock_session_manager(session_id="test-123", events=None):
 
     sm.command = _command
 
+    # Used by chat.py to forward typed-text-as-permission-deny.  Default to
+    # "no pending permissions" so the typical send path doesn't try to
+    # resolve anything.
+    sm.pending_permission_ids = MagicMock(return_value=[])
+
     return sm
 
 
@@ -49,20 +54,22 @@ def _make_pool(mock_sm, session_id="test-123"):
     """Create a mock SessionPool that wraps a mock SessionManager.
 
     The mock pool broadcasts serialized events to all subscribers (like the
-    real pool), so the test WS receives events via broadcast.
+    real pool).  start_turn spawns a session-owned task; cancel_turn awaits
+    it.  This mirrors the real pool's behavior and lets tests exercise the
+    "WS becomes a pure observer" contract.
     """
+    import asyncio
     from api.serializers import serialize_event
 
     pool = MagicMock()
     subscribers: dict[str, set] = {}
+    turn_tasks: dict[str, asyncio.Task] = {}
 
-    # has() returns False initially (no pre-existing session)
     pool.has = MagicMock(return_value=False)
-    # create() returns the local_id
     pool.create = AsyncMock(return_value=session_id)
-    # get() returns the SM after create
     pool.get = MagicMock(return_value=mock_sm)
     pool.interrupt = AsyncMock()
+    pool.resolve_session_permission = AsyncMock(return_value=True)
 
     def _subscribe(sid, ws):
         subscribers.setdefault(sid, set()).add(ws)
@@ -73,15 +80,45 @@ def _make_pool(mock_sm, session_id="test-123"):
             subscribers[sid].discard(ws)
     pool.unsubscribe = MagicMock(side_effect=_unsubscribe)
 
-    # send() delegates to sm.send(), broadcasts to subscribers, and yields events
-    async def _pool_send(sid, text, *, source_ws=None):
+    async def _broadcast(sid, payload):
+        # Snapshot to tolerate concurrent sub/unsub during iteration.
+        for ws in tuple(subscribers.get(sid, set())):
+            try:
+                await ws.send_bytes(orjson.dumps(payload))
+            except Exception:
+                pass
+
+    async def _drive(sid, text, source_ws):
         async for event in mock_sm.send(text):
             payload = serialize_event(event)
-            for ws in subscribers.get(sid, set()):
-                await ws.send_bytes(orjson.dumps(payload))
-            yield event
+            for ws in tuple(subscribers.get(sid, set())):
+                if ws is source_ws and payload.get("type") == "user_message":
+                    continue
+                try:
+                    await ws.send_bytes(orjson.dumps(payload))
+                except Exception:
+                    pass
 
-    pool.send = _pool_send
+    async def _cancel_turn(sid):
+        task = turn_tasks.get(sid)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return True
+    pool.cancel_turn = AsyncMock(side_effect=_cancel_turn)
+
+    async def _start_turn(sid, text, *, source_ws=None):
+        await _cancel_turn(sid)
+        turn_tasks[sid] = asyncio.create_task(_drive(sid, text, source_ws))
+    pool.start_turn = AsyncMock(side_effect=_start_turn)
+
+    pool.has_active_turn = MagicMock(
+        side_effect=lambda sid: sid in turn_tasks and not turn_tasks[sid].done()
+    )
 
     return pool
 
@@ -161,7 +198,9 @@ class TestWebSocketChat:
             resp = orjson.loads(ws.receive_bytes())
             assert resp["type"] == "status"
             assert resp["status"] == "interrupted"
-            pool.interrupt.assert_awaited_once_with("test-123")
+            # Interrupt now goes through cancel_turn (which internally
+            # sends the SDK interrupt and awaits the in-flight task).
+            pool.cancel_turn.assert_awaited_with("test-123")
 
     def test_command(self, pool_client):
         client, pool, _ = pool_client
@@ -205,6 +244,62 @@ class TestWebSocketChat:
             resp = orjson.loads(ws.receive_bytes())
             assert resp["type"] == "error"
             assert resp["error"] == "start_failed"
+
+    def test_disconnect_does_not_cancel_turn(self, pool_client):
+        """Page reload (WS disconnect) must NOT cancel the in-flight turn.
+
+        This is the central invariant the session-owned turn refactor was
+        meant to deliver: the turn lifetime belongs to the pool, not to
+        the WebSocket that initiated it.  We verify by:
+          1. Starting a turn whose iterator yields slowly.
+          2. Disconnecting the WS *before* the turn finishes.
+          3. Asserting the pool's start_turn task is still alive.
+        """
+        import asyncio
+        import time
+        from manager.types import TextDelta, TextComplete, TurnComplete
+
+        # Slow event stream — 50ms gap so we can disconnect mid-turn.
+        slow_events = [
+            TextDelta(text="part1"),
+            TextDelta(text="part2"),
+            TextDelta(text="part3"),
+            TextComplete(text="part1part2part3"),
+            TurnComplete(cost=0.01, num_turns=1, session_id="sdk-test-123"),
+        ]
+
+        async def _slow_send(text):
+            for ev in slow_events:
+                await asyncio.sleep(0.05)
+                yield ev
+
+        client, pool, mock_sm = pool_client
+        mock_sm.send = _slow_send
+
+        with client.websocket_connect("/api/sessions/chat") as ws:
+            ws.send_text(orjson.dumps({"type": "start", "local_id": "sticky-1"}).decode())
+            ws.receive_bytes()  # connecting
+            ws.receive_bytes()  # session_started
+            ws.send_text(orjson.dumps({"type": "send", "text": "go"}).decode())
+            # Receive only the first delta then bail — disconnect mid-turn.
+            first = orjson.loads(ws.receive_bytes())
+            assert first["type"] == "text_delta"
+            assert first["text"] == "part1"
+            # WS context manager exit will close the connection (= page reload).
+
+        # Turn task must still be running after the WS closes.  We give the
+        # pool's mock a brief moment to register the next polling tick.
+        time.sleep(0.05)
+        # has_active_turn returns True iff the spawned task hasn't finished.
+        assert pool.has_active_turn("test-123") is True
+
+        # Drain the turn so pytest doesn't leave a dangling task.  Wait
+        # synchronously until the slow generator finishes.
+        deadline = time.monotonic() + 2.0
+        while pool.has_active_turn("test-123") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pool.has_active_turn("test-123") is False, \
+            "turn should complete within 2s of slow-event budget"
 
     def test_resume_session(self, pool_client):
         client, pool, _ = pool_client

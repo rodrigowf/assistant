@@ -2,7 +2,8 @@
 # install.sh — Install context-sync as a systemd user service.
 #
 # Run this on EACH machine that should participate in the sync.
-# Before running: edit config.env with the correct paths and SSH key.
+# Before running: copy install/sync.env to sync/config.env (or
+# sync/config.jetson.env) and fill in the paths and SSH key.
 #
 # Usage: bash sync/install.sh
 
@@ -25,7 +26,7 @@ done
 # Check config exists
 if [[ ! -f "${SCRIPT_DIR}/config.env" ]]; then
   echo "ERROR: ${SCRIPT_DIR}/config.env not found."
-  echo "Copy config.env.example to config.env and fill in your values."
+  echo "Copy install/sync.env to sync/config.env and fill in your values."
   exit 1
 fi
 

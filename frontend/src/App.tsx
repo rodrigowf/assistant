@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState, lazy, Suspense } from "react";
 import "./App.css";
 import { AuthGate } from "./components/AuthGate";
+import { BusyOverlay } from "./components/BusyOverlay";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { ChatPanelContainer } from "./components/ChatPanelContainer";
 import { OrchestratorModal } from "./components/OrchestratorModal";
+import { ConfirmModal } from "./components/ConfirmModal";
 
 const ConfigPage = lazy(() => import("./components/ConfigPage").then(m => ({ default: m.ConfigPage })));
 import { TabsProvider, useTabsContext } from "./context/TabsContext";
@@ -13,8 +15,12 @@ import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
 import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
-  const { sessions, refresh, deleteSession, renameSession } = useSessions();
+  const { sessions, deleting, duplicating, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
   useReconnectPoolSessions();
+  // Mutation in flight from ChatPanelContainer (rewind / fork). Shown as a
+  // whole-app spinner overlay so the user can't queue a second mutation
+  // while the first is still talking to the backend + reopening tabs.
+  const [chatMutationBusy, setChatMutationBusy] = useState<string | null>(null);
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
   // Pending orchestrator action: either open new or resume existing
@@ -27,13 +33,24 @@ function AppContent() {
     openTab(localId, "New session");
   }, [openTab]);
 
-  const handleDeleteSession = useCallback(
-    async (id: string) => {
-      await deleteSession(id);
-      closeTab(id);
+  // Pending delete: id awaiting user confirmation
+  const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
+
+  const requestDeleteSession = useCallback(
+    (id: string) => {
+      const session = sessions.find((s) => s.session_id === id);
+      setPendingDelete({ id, title: session?.title || "this conversation" });
     },
-    [deleteSession, closeTab]
+    [sessions]
   );
+
+  const confirmDeleteSession = useCallback(async () => {
+    if (!pendingDelete) return;
+    const { id } = pendingDelete;
+    setPendingDelete(null);
+    await deleteSession(id);
+    closeTab(id);
+  }, [pendingDelete, deleteSession, closeTab]);
 
   const closeOrchestratorTabs = useCallback(() => {
     for (const tab of tabs) {
@@ -91,6 +108,11 @@ function AppContent() {
   // Config page visibility — toggled without unmounting chat instances
   const [showConfig, setShowConfig] = useState(false);
 
+  // Debug: expose setShowConfig on window for testing
+  useEffect(() => {
+    (window as unknown as { __setShowConfig?: (v: boolean) => void }).__setShowConfig = setShowConfig;
+  }, []);
+
   // Mobile sidebar
   const [sidebarOpen, setSidebarOpen] = useState(false);
   useEffect(() => {
@@ -102,8 +124,10 @@ function AppContent() {
     <>
       <Sidebar
         sessions={sessions}
-        onDelete={handleDeleteSession}
+        deleting={deleting}
+        onDelete={requestDeleteSession}
         onRename={renameSession}
+        onDuplicate={(id) => { duplicateSession(id).catch((e) => { console.error("Duplicate failed:", e); }); }}
         onNew={handleNewSession}
         onNewOrchestrator={handleNewOrchestrator}
         onSelectOrchestrator={handleSelectOrchestrator}
@@ -118,9 +142,9 @@ function AppContent() {
               <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
             </svg>
           </button>
-          <TabBar />
+          <TabBar sessions={sessions} onRename={renameSession} />
         </div>
-        <ChatPanelContainer onSessionChange={refresh} />
+        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onMutationBusy={setChatMutationBusy} />
         {/* Config floats over everything — chat instances stay mounted */}
         <Suspense fallback={null}>
           <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
@@ -132,6 +156,26 @@ function AppContent() {
           onCancel={handleOrchestratorCancel}
         />
       )}
+      {pendingDelete && (
+        <ConfirmModal
+          title="Delete conversation?"
+          body={
+            <>
+              <strong>{pendingDelete.title}</strong> will be moved to trash and hidden from
+              the assistant. The file is kept on disk and can be recovered manually from
+              <code> context/trash/</code>.
+            </>
+          }
+          confirmLabel="Delete"
+          destructive
+          onConfirm={confirmDeleteSession}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
+      <BusyOverlay
+        show={duplicating || chatMutationBusy !== null}
+        label={chatMutationBusy ?? "Duplicating…"}
+      />
     </>
   );
 }

@@ -8,7 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -43,6 +43,11 @@ async def lifespan(app: FastAPI):
 
     app.state.connections = ConnectionManager()
     app.state.pool = SessionPool()
+    # Background orphan reaper — last-line defense against leaked
+    # bundled-claude subprocesses (per-session SIGKILL inside
+    # SessionManager is the primary defense).  Cheap when nothing is
+    # leaked: a few os.kill(0) liveness checks every 30s.
+    await app.state.pool.start_orphan_reaper()
 
     project_path = Path(config.project_dir)
 
@@ -67,9 +72,33 @@ async def lifespan(app: FastAPI):
     prewarm_task = asyncio.create_task(_prewarm_sessions())
     app.state.prewarm_task = prewarm_task
 
+    # Pre-warm the search server so the embedding model is already loaded
+    # when the first search_memory/search_history call arrives (~100s on Jetson).
+    async def _prewarm_search_server() -> None:
+        try:
+            from orchestrator.tools.search import _ensure_server
+            proc = await _ensure_server()
+            if proc is not None:
+                logger.info("Search server pre-warmed (PID %d)", proc.pid)
+            else:
+                logger.warning("Search server pre-warm failed (will retry on first query)")
+        except Exception:
+            logger.exception("Search server pre-warm failed")
+
+    search_prewarm_task = asyncio.create_task(_prewarm_search_server())
+    app.state.search_prewarm_task = search_prewarm_task
+
     try:
         yield
     finally:
+        # Stop the reaper before close_all so it doesn't race against the
+        # final shutdown drain (kill_claude_subprocess on a pid that
+        # close_all is also handling would just be a redundant SIGTERM).
+        try:
+            await app.state.pool.stop_orphan_reaper()
+        except Exception:
+            logger.exception("Error stopping orphan reaper on shutdown")
+
         # Drain the session pool first so remote SSH + claude children get
         # clean SIGTERMs instead of being orphaned by the backend exiting.
         try:
@@ -77,12 +106,20 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Error draining session pool on shutdown")
 
+        # Shut down the warm search server subprocess
+        try:
+            from orchestrator.tools.search import shutdown_server
+            await shutdown_server()
+        except Exception:
+            logger.exception("Error shutting down search server")
+
         memory_watcher.stop()
         history_indexer.stop()
         memory_task.cancel()
         history_task.cancel()
         prewarm_task.cancel()
-        for task in [memory_task, history_task, prewarm_task]:
+        search_prewarm_task.cancel()
+        for task in [memory_task, history_task, prewarm_task, search_prewarm_task]:
             try:
                 await task
             except asyncio.CancelledError:
@@ -133,6 +170,27 @@ def create_app() -> FastAPI:
     project_root = Path(__file__).resolve().parent.parent
     context_public = project_root / "context" / "public"
     context_public_resolved = context_public.resolve() if context_public.exists() else None
+
+    # Projects directory (projects/ at repo root). Exposed at /projects/* so
+    # build artifacts (rendered videos, generated assets, etc.) are reachable
+    # from peripherals on the network without copying them into context/public/.
+    projects_dir = project_root / "projects"
+    projects_dir_resolved = projects_dir.resolve() if projects_dir.exists() else None
+
+    # Projects directory mount: /projects/<path> → projects/<path>.
+    # Registered before the SPA catch-all so /projects never falls through.
+    if projects_dir_resolved is not None:
+        @app.get("/projects/{full_path:path}")
+        async def serve_projects(full_path: str):
+            if not full_path:
+                raise HTTPException(status_code=404)
+            candidate = (projects_dir / full_path).resolve()
+            if (
+                candidate.is_relative_to(projects_dir_resolved)
+                and candidate.is_file()
+            ):
+                return FileResponse(candidate)
+            raise HTTPException(status_code=404)
 
     # Serve the production frontend build if it exists
     frontend_dist = project_root / "frontend" / "dist"

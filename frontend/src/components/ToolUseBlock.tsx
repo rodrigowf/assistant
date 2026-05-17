@@ -47,6 +47,52 @@ interface Props {
 type ToolInput = Record<string, unknown>;
 
 // ---------------------------------------------------------------------------
+// Provider tool-name normalization
+// ---------------------------------------------------------------------------
+// Qwen Code uses snake_case names for its built-in tools, while Claude Code
+// uses PascalCase. We normalize to Claude's names so the rest of this module
+// (icons, summaries, specialized renderers) only handles one canonical set.
+//
+// Source: packages/core/src/tools/tool-names.ts in @qwen-code/qwen-code.
+
+const QWEN_TO_CLAUDE_TOOL: Record<string, string> = {
+  read_file: "Read",
+  write_file: "Write",
+  edit: "Edit",
+  run_shell_command: "Bash",
+  grep_search: "Grep",
+  glob: "Glob",
+  web_fetch: "WebFetch",
+  todo_write: "TodoWrite",
+  agent: "Task",
+  ask_user_question: "AskUserQuestion",
+  exit_plan_mode: "ExitPlanMode",
+  save_memory: "SaveMemory",
+  tool_search: "ToolSearch",
+  list_directory: "ListFiles",
+  read_many_files: "ReadManyFiles",
+};
+
+function normalizeToolName(toolName: string): string {
+  return QWEN_TO_CLAUDE_TOOL[toolName] || toolName;
+}
+
+// Some Qwen tools use different arg keys than Claude's equivalents. Normalize
+// at the entry point so downstream renderers see Claude's keys.
+function normalizeToolInput(originalName: string, input: ToolInput): ToolInput {
+  if (originalName === "grep_search") {
+    // grep_search has the same keys as Grep (pattern/path), no remap needed.
+    return input;
+  }
+  if (originalName === "web_fetch") {
+    // web_fetch carries an extra "prompt" field; WebFetch's summary only uses
+    // url, so passing through is fine. The generic JSON view still shows both.
+    return input;
+  }
+  return input;
+}
+
+// ---------------------------------------------------------------------------
 // Tool Categories (semantic, action-based coloring)
 // ---------------------------------------------------------------------------
 
@@ -1097,8 +1143,11 @@ function SendToAgentBlock({ toolInput, result, isError, complete }: Props) {
 // Component
 // ---------------------------------------------------------------------------
 
-export function ToolUseBlock({ toolName, toolInput, result, isError, complete }: Props) {
+export function ToolUseBlock({ toolName: rawToolName, toolInput: rawToolInput, result, isError, complete }: Props) {
   const [expanded, setExpanded] = useState(false);
+
+  const toolName = normalizeToolName(rawToolName);
+  const toolInput = normalizeToolInput(rawToolName, rawToolInput);
 
   // Task tool is always expanded (non-collapsible)
   if (toolName === "Task") {

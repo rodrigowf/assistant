@@ -206,6 +206,62 @@ def test_history_loader_invalid_json():
         jsonl_path.unlink()
 
 
+def test_history_loader_recovers_concatenated_objects():
+    """Lines like ``}{`` produced by a pre-fix bug (process killed before
+    flushing the trailing ``\\n``) should still load — both objects get
+    recovered via raw_decode."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        # First line: clean.
+        f.write(json.dumps({"type": "user", "message": {"role": "user", "content": "Hi"}}) + "\n")
+        # Second line: two complete JSON objects concatenated (the bug).
+        a = json.dumps({"type": "voice_interrupted", "timestamp": "2026-05-01T00:00:00Z"})
+        b = json.dumps({"type": "voice_interrupted", "timestamp": "2026-05-02T00:00:00Z"})
+        f.write(a + b + "\n")
+        # Third line: clean.
+        f.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "Hey"}}) + "\n")
+        jsonl_path = Path(f.name)
+
+    try:
+        loader = HistoryLoader(jsonl_path)
+        # Reach into _read_jsonl directly so we can verify the recovery
+        # without depending on _reconstruct_history's voice_interrupted
+        # filtering behavior.
+        entries = loader._read_jsonl()
+        assert len(entries) == 4
+        assert entries[0]["type"] == "user"
+        assert entries[1]["type"] == "voice_interrupted"
+        assert entries[1]["timestamp"] == "2026-05-01T00:00:00Z"
+        assert entries[2]["type"] == "voice_interrupted"
+        assert entries[2]["timestamp"] == "2026-05-02T00:00:00Z"
+        assert entries[3]["type"] == "assistant"
+    finally:
+        jsonl_path.unlink()
+
+
+def test_history_writer_atomic_appends():
+    """Each ``append`` call must result in a complete line (json + \\n)
+    landing on disk in a single syscall — partial writes that lose the
+    trailing newline are what produced the ``}{`` corruption."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        jsonl_path = Path(f.name)
+
+    try:
+        writer = HistoryWriter(jsonl_path)
+        for i in range(5):
+            writer.append({"type": "user", "i": i})
+
+        with open(jsonl_path, "rb") as f:
+            raw = f.read()
+
+        assert raw.endswith(b"\n")
+        # No ``}{`` sequence — every object terminated cleanly.
+        assert b"}{" not in raw
+        # Exactly 5 lines.
+        assert raw.count(b"\n") == 5
+    finally:
+        jsonl_path.unlink()
+
+
 def test_history_loader_multiple_tool_calls():
     """Test loading conversation with multiple sequential tool calls."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:

@@ -18,6 +18,8 @@ interface Props {
   isActive?: boolean;
   hasMoreMessages?: boolean;
   onLoadMore?: () => Promise<void>;
+  onRewindMessage?: (dropLastN: number) => void;
+  onForkMessage?: (dropLastN: number) => void;
 }
 
 const NEAR_BOTTOM_THRESHOLD = 150;
@@ -43,7 +45,14 @@ function hideForFrame(el: HTMLElement) {
   });
 }
 
-export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }: Props) {
+export function MessageList({
+  messages,
+  isActive,
+  hasMoreMessages,
+  onLoadMore,
+  onRewindMessage,
+  onForkMessage,
+}: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const prevCountRef = useRef(0);
   const isNearBottomRef = useRef(true);
@@ -193,9 +202,21 @@ export function MessageList({ messages, isActive, hasMoreMessages, onLoadMore }:
           </div>
         )}
         <div className="message-list-inner">
-          {displayedMessages.map((msg) => (
-            <Message key={msg.id} message={msg} />
-          ))}
+          {displayedMessages.map((msg, i) => {
+            const dropLastN = displayedMessages.length - 1 - i;
+            return (
+              <Message
+                key={msg.id}
+                message={msg}
+                onRewind={
+                  onRewindMessage ? () => onRewindMessage(dropLastN) : undefined
+                }
+                onFork={
+                  onForkMessage ? () => onForkMessage(dropLastN) : undefined
+                }
+              />
+            );
+          })}
         </div>
       </div>
       {showScrollButton && (

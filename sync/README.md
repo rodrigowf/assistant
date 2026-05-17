@@ -34,7 +34,7 @@ ssh-copy-id -i ~/.ssh/id_ed25519 rodrigo@192.168.0.28    # Jetson → Desktop
 ### Desktop (pushes to Jetson)
 
 ```bash
-cd ~/Projects/assistant/sync
+cd ~/assistant/sync
 # config.env is already configured for the Desktop → Jetson direction
 bash install.sh
 ```
@@ -43,7 +43,7 @@ bash install.sh
 
 ```bash
 # Copy sync/ folder to Jetson
-scp -r ~/Projects/assistant/sync rodrigo@192.168.0.200:assistant/sync
+scp -r ~/assistant/sync rodrigo@192.168.0.200:assistant/sync
 
 # SSH into Jetson
 ssh rodrigo@192.168.0.200
@@ -60,13 +60,15 @@ bash install.sh
 sync/
 ├── context-sync.sh          # Main sync script (same on both machines)
 ├── config.env               # Local machine config (gitignored)
-├── config.env.example       # Template — copy and edit
 ├── config.jetson.env        # Jetson config (copy to Jetson as config.env)
 ├── context-sync.service     # systemd unit for Desktop
 ├── context-sync.jetson.service  # systemd unit for Jetson
 ├── install.sh               # Installer script
 └── README.md                # This file
 ```
+
+The template for `config.env` lives at the repo root as `install/sync.env` —
+copy it into `sync/config.env` and fill it in.
 
 ## Managing the Service
 

@@ -28,6 +28,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from api.pool import SessionPool
 from api.serializers import serialize_orchestrator_event
 from orchestrator.config import OrchestratorConfig, get_available_models
+from orchestrator.providers.discovery import list_orchestrator_models
 from orchestrator.session import OrchestratorSession
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,42 @@ async def orchestrator_ws(ws: WebSocket):
                     continue
                 await _handle_voice_event(pool, session, msg.get("event", {}))
 
+            elif msg_type == "voice_audio_in":
+                # WS-provider mic chunk from the browser → forward upstream.
+                if session is None or not session.is_voice:
+                    await ws.send_bytes(orjson.dumps({
+                        "type": "error", "error": "not_voice_session",
+                        "detail": "No active voice session",
+                    }))
+                    continue
+                audio_b64 = msg.get("audio", "")
+                if audio_b64:
+                    try:
+                        await session.send_voice_audio_in(audio_b64)
+                    except Exception as e:
+                        logger.exception("Voice audio relay failed")
+                        await pool.broadcast_orchestrator({
+                            "type": "error", "error": "voice_audio_failed", "detail": str(e),
+                        })
+
+            elif msg_type == "voice_recording_chunk":
+                # WebRTC recording chunk from browser — write to recorder.
+                if session is None or not session.is_voice:
+                    continue  # Silently drop if no session
+                recorder = session.audio_recorder
+                if recorder is not None and recorder.is_recording:
+                    channel = msg.get("channel", "user")
+                    audio_b64 = msg.get("audio", "")
+                    if audio_b64:
+                        if channel == "user":
+                            recorder.write_user_audio(audio_b64)
+                        elif channel == "assistant":
+                            recorder.write_assistant_audio(audio_b64)
+
+            elif msg_type == "voice_recording_end":
+                # WebRTC recording ended — handled by session.stop()
+                pass  # No action needed; the session stop handles cleanup
+
             elif msg_type == "compact":
                 if session is None:
                     await ws.send_bytes(orjson.dumps({
@@ -145,10 +182,20 @@ async def orchestrator_ws(ws: WebSocket):
                     "detail": f"Unknown message type: {msg_type!r}",
                 }))
 
-    except WebSocketDisconnect:
-        logger.info("Orchestrator WS disconnected (client closed)")
+    except WebSocketDisconnect as e:
+        # Note what state we were in — a voice-mode disconnect with no
+        # `stop` command tends to indicate a frontend reconnect, which
+        # has consequences (the session.update fires fresh next time).
+        was_voice = bool(session is not None and session.is_voice)
+        logger.info(
+            "Orchestrator WS disconnected (client closed) code=%s reason=%r voice_active=%s",
+            getattr(e, "code", None),
+            getattr(e, "reason", None),
+            was_voice,
+        )
     except Exception:
-        logger.exception("Orchestrator WS error")
+        was_voice = bool(session is not None and getattr(session, "is_voice", False))
+        logger.exception("Orchestrator WS error voice_active=%s", was_voice)
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
@@ -176,6 +223,19 @@ async def _handle_start(
     """
     local_id: str | None = msg.get("local_id")
     resume_id: str | None = msg.get("resume_sdk_id") or msg.get("session_id")
+    voice_provider_req: str | None = msg.get("voice_provider") if voice else None
+    voice_model_req: str | None = msg.get("voice_model") if voice else None
+    voice_name_req: str | None = msg.get("voice_name") if voice else None
+    voice_lang_req: str | None = (
+        msg.get("voice_transcription_language") if voice else None
+    )
+    voice_endpoint_req: str | None = msg.get("voice_endpoint") if voice else None
+
+    if voice:
+        logger.info(
+            "voice_session start_requested local_id=%s resume_id=%s provider=%s model=%s voice=%s lang=%s endpoint=%s",
+            local_id, resume_id, voice_provider_req, voice_model_req, voice_name_req, voice_lang_req, voice_endpoint_req,
+        )
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
@@ -195,9 +255,7 @@ async def _handle_start(
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
             }
-            session_update = await session.get_session_update()
-            if session_update:
-                reconnect_payload["voice_session_update"] = session_update
+            await _attach_voice_payload(reconnect_payload, session)
             await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
         else:
@@ -210,9 +268,7 @@ async def _handle_start(
                 "model_info": session.get_model_info(),
             }
             if current_voice:
-                session_update = await session.get_session_update()
-                if session_update:
-                    reconnect_payload["voice_session_update"] = session_update
+                await _attach_voice_payload(reconnect_payload, session)
             await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
 
@@ -228,9 +284,44 @@ async def _handle_start(
     config = OrchestratorConfig.load()
     project_dir = config.project_dir
 
+    # If voice mode and any of provider/model/voice/language/endpoint missing
+    # from the start message, fall back to what's saved in
+    # assistant_config.json. Endpoint must be included in the gate, otherwise
+    # clients that pass provider/model/voice/lang but omit endpoint (e.g. the
+    # Android peripheral before the voice_endpoint field was added) get
+    # endpoint=None → Vertex default, even when the user has configured AI
+    # Studio. That breaks AI-Studio-only models like
+    # ``gemini-3.1-flash-live-preview`` with a Vertex policy error.
+    if voice and (
+        voice_provider_req is None
+        or voice_model_req is None
+        or voice_name_req is None
+        or voice_lang_req is None
+        or voice_endpoint_req is None
+    ):
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            app_cfg = _load_app_config()
+            voice_provider_req = voice_provider_req or app_cfg.get("default_voice_provider")
+            voice_model_req = voice_model_req or app_cfg.get("default_voice_model")
+            voice_name_req = voice_name_req or app_cfg.get("default_voice_name")
+            if voice_lang_req is None:
+                voice_lang_req = app_cfg.get("default_voice_transcription_language")
+            if voice_endpoint_req is None:
+                voice_endpoint_req = app_cfg.get("default_voice_endpoint")
+        except Exception:
+            logger.exception("Failed to load voice defaults from assistant_config.json")
+
+    # Note: we deliberately do NOT inject ``ws.app.state.config`` here.
+    # That snapshot is built once at app startup and never refreshed, so
+    # tools that used it (notably ``open_agent_session`` historically)
+    # ignored later edits to ``assistant_config.json`` / ``.manager.json``
+    # — the orchestrator would spawn local sessions even after the user
+    # pointed the UI at an SSH host.  Tools that need a ``ManagerConfig``
+    # now call ``api.session_factory.build_session_config()`` which
+    # re-reads the live files on every call.
     context: dict = {
         "store": ws.app.state.store,
-        "manager_config": ws.app.state.config,
         "pool": pool,
         "project_dir": project_dir,
         "index_dir": str(Path(project_dir) / "index" / "chroma"),
@@ -242,6 +333,11 @@ async def _handle_start(
         session_id=resume_id,
         local_id=local_id,
         voice=voice,
+        voice_provider=voice_provider_req,
+        voice_model=voice_model_req,
+        voice_name=voice_name_req,
+        voice_transcription_language=voice_lang_req,
+        voice_endpoint=voice_endpoint_req,
     )
 
     await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
@@ -257,6 +353,32 @@ async def _handle_start(
     pool.set_orchestrator(session_id, session)
     pool.subscribe_orchestrator(session_id, ws)
 
+    # Install the wake callback for background-agent notifications.  When a
+    # fire-and-forget agent turn finishes while the orchestrator is idle, the
+    # callback fires a synthetic empty-prompt turn so the LLM gets a chance
+    # to react asynchronously.  Voice mode is skipped (notifications still
+    # queue and drain on the next text/audio turn) — wiring them through the
+    # OpenAI Realtime data channel is a future enhancement.
+    if not voice:
+        def _make_wake(_pool: SessionPool, _session: OrchestratorSession):
+            async def _wake() -> None:
+                if _session.is_busy:
+                    return
+                if not _session.notifications.has_pending():
+                    return
+                # Schedule, don't await — we must not block the runner's
+                # _drive task that pushed the notification.  The synthetic
+                # turn is a normal _handle_send with an empty prompt; the
+                # session.send() body short-circuits if the queue is also
+                # empty by the time it acquires the busy lock.
+                asyncio.create_task(
+                    _handle_send(_pool, _session, ""),
+                    name="orchestrator-wake",
+                )
+            return _wake
+
+        session.notifications.set_wake_callback(_make_wake(pool, session))
+
     started_payload: dict = {
         "type": "session_started",
         "session_id": session_id,
@@ -264,12 +386,149 @@ async def _handle_start(
         "model_info": session.get_model_info(),
     }
     if voice:
-        session_update = await session.get_session_update()
-        if session_update:
-            started_payload["voice_session_update"] = session_update
+        await _attach_voice_payload(started_payload, session)
 
     await ws.send_bytes(orjson.dumps(started_payload))
     return session, True
+
+
+async def _attach_voice_payload(
+    payload: dict,
+    session: OrchestratorSession,
+) -> None:
+    """Mutate ``payload`` to include voice provider metadata and the
+    provider-specific session.update + connection info, and start the
+    backend relay for WebSocket providers if it isn't already running.
+
+    Errors fetching the ephemeral token or starting the relay are
+    swallowed and reported back as ``voice_connection_error`` so the
+    frontend can surface them; the session itself stays alive.
+    """
+    payload["voice_provider"] = session.voice_provider_id
+    payload["voice_model"] = session.voice_model_id
+    payload["voice_name"] = session.voice_name_id
+    payload["voice_transcription_language"] = session.voice_transcription_language
+    # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
+    payload["voice_recording_enabled"] = session.audio_recorder is not None
+
+    session_update = await session.get_session_update()
+    if session_update:
+        payload["voice_session_update"] = session_update
+
+    provider_obj = getattr(session, "_voice_provider", None)
+    if provider_obj is not None:
+        try:
+            payload["voice_connection_info"] = await provider_obj.get_connection_info()
+        except Exception as e:
+            logger.warning("Voice connection info fetch failed: %s", e)
+            payload["voice_connection_error"] = str(e)
+
+    # Start the backend relay for WS providers (Qwen / Gemini / locals).
+    # Idempotent for healthy relays; rebuilds if the previous drain crashed
+    # (relay object lingers but its drain task is done) so a reconnecting
+    # client recovers automatically.
+    existing_relay = getattr(session, "_voice_relay", None)
+    if existing_relay is not None and not getattr(existing_relay, "is_running", False):
+        logger.warning(
+            "Voice relay for session %s is dead; tearing down and rebuilding",
+            getattr(session, "local_id", "?"),
+        )
+        try:
+            await session.stop_voice_relay()
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_voice_relay during reconnect cleanup failed")
+        existing_relay = None
+
+    if session.needs_voice_relay and existing_relay is None:
+        pool = session._context.get("pool")
+        if pool is not None:
+            async def _on_audio_out(b64: str) -> None:
+                # Record assistant audio if recorder is active
+                session.record_assistant_audio(b64)
+                await pool.broadcast_orchestrator({
+                    "type": "voice_audio_out",
+                    "audio": b64,
+                })
+
+            # Provider events fired by audio that listen_recording injected
+            # into the WS must not reach the frontend: the UI's barge-in
+            # handler would respond to a speech_started by sending
+            # response.cancel, killing the agent's reply mid-stream — the
+            # feedback loop we're guarding against.  Backend still
+            # processes them (for the writer gates in process_voice_event).
+            _INJECTION_SUPPRESSED_TYPES = frozenset({
+                "input_audio_buffer.speech_started",
+                "input_audio_buffer.speech_stopped",
+                "input_audio_buffer.committed",
+                "conversation.item.input_audio_transcription.completed",
+            })
+
+            async def _on_event_for_frontend(event: dict) -> None:
+                # Mirror provider events to the frontend so the UI can
+                # reflect transcripts, status, etc.
+                if not (
+                    session.is_injecting
+                    and event.get("type") in _INJECTION_SUPPRESSED_TYPES
+                ):
+                    await pool.broadcast_orchestrator({
+                        "type": "voice_event",
+                        "event": event,
+                    })
+                # Tool calls go through _handle_voice_tool_call so the
+                # tool_use / tool_result broadcasts fire and execution
+                # happens off the relay-drain task.
+                if event.get("type") == "response.function_call_arguments.done":
+                    asyncio.create_task(
+                        _handle_voice_tool_call(pool, session, event, inject=False),
+                        name="voice-tool-call",
+                    )
+                    return
+                # Gemini Live tool calls — same idea but the wire shape is
+                # ``toolCall.functionCalls[]`` at the top level, no
+                # ``type`` field.  Route through a dedicated dispatcher so
+                # tool_use / tool_result broadcasts reach the chat UI.
+                if not event.get("type") and event.get("toolCall"):
+                    asyncio.create_task(
+                        _handle_gemini_voice_tool_call(pool, session, event),
+                        name="voice-tool-call-gemini",
+                    )
+                    return
+                # All other events: run orchestrator-side processing
+                # (persists transcripts, etc.).  inject=False because
+                # the relay already pushed the event into the provider
+                # queue before invoking this callback.
+                try:
+                    commands = await session.process_voice_event(event, inject=False)
+                    await _dispatch_voice_commands(pool, session, commands)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Voice event processing failed in relay drain")
+
+            # Kick off the relay startup in the background so we can return
+            # `session_started` to the frontend before the upstream WS
+            # handshake completes.  On the Jetson the upstream connect plus
+            # `session.created` round-trip can run several seconds; doing it
+            # inline blew the frontend's 10s start timeout (the visible
+            # symptom: "Voice session did not start (no connection_info
+            # from server)").  We pass the precomputed `session_update` so
+            # the relay does NOT re-summarize history — that's the second
+            # major cost on the Jetson.  Relay readiness is announced via
+            # the provider's own `session.created`/`session.updated`
+            # events, mirrored through `_on_event_for_frontend`.
+            async def _bg_start_relay() -> None:
+                try:
+                    await session.start_voice_relay(
+                        _on_audio_out,
+                        _on_event_for_frontend,
+                        session_update=session_update,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("Failed to start voice relay (bg)")
+                    await pool.broadcast_orchestrator({
+                        "type": "voice_connection_error",
+                        "detail": str(e),
+                    })
+
+            asyncio.create_task(_bg_start_relay(), name="voice-relay-start")
 
 
 async def _handle_send(
@@ -359,8 +618,12 @@ async def _handle_get_model(ws: WebSocket, session: OrchestratorSession) -> None
 
 
 async def _handle_get_models(ws: WebSocket) -> None:
-    """Get list of all available models."""
-    models = get_available_models()
+    """Get list of all available models (live, with static fallback)."""
+    try:
+        models = await list_orchestrator_models()
+    except Exception:
+        logger.exception("Live model discovery failed; falling back to static")
+        models = get_available_models()
     await ws.send_bytes(orjson.dumps({
         "type": "models_list",
         "models": [m.to_dict() for m in models],
@@ -391,14 +654,39 @@ async def _handle_compact(
 async def _handle_voice_event(
     pool: SessionPool, session: OrchestratorSession, event: dict,
 ) -> None:
-    """Process a mirrored OpenAI Realtime event and send back any voice commands.
+    """Process a mirrored realtime event and send back any voice commands.
 
-    Tool calls (response.function_call_arguments.done) are spawned as background
-    tasks so the WebSocket handler can continue processing other voice events
-    (transcripts, interruptions, etc.) without blocking.
+    For WebRTC providers (OpenAI), the events arrive mirrored from the
+    browser's data channel; commands generated by the backend are
+    broadcast as ``voice_command`` so the frontend forwards them.
+
+    For WebSocket providers (Qwen, Gemini, future locals), this also
+    accepts client-originated events to forward upstream — but inbound
+    provider events arrive through the backend relay rather than the
+    frontend, so this path is mostly for tool-result payloads injected by
+    the orchestrator itself.
+
+    Tool calls (response.function_call_arguments.done) are spawned as a
+    background task so the WS handler can continue processing other
+    voice events (transcripts, interruptions, etc.) without blocking.
     """
     try:
         event_type = event.get("type", "")
+
+        # Log all client-originated voice events except the high-frequency
+        # transcript deltas (those would flood).  This gives us a clean
+        # client→backend flow timeline for crash post-mortem.
+        if event_type not in (
+            "response.output_audio_transcript.delta",
+            "response.audio_transcript.delta",
+            "response.text.delta",
+            "input_audio_buffer.append",
+        ):
+            logger.info(
+                "voice_event_in session=%s type=%s",
+                session.local_id,
+                event_type,
+            )
 
         # Tool calls are long-running — spawn as background task to avoid
         # blocking the WebSocket handler loop.
@@ -409,19 +697,77 @@ async def _handle_voice_event(
             )
             return
 
-        commands = await session.process_voice_event(event)
+        # For WS providers (Qwen / Gemini / locals), client-originated
+        # control events need to be forwarded upstream.  WebRTC providers
+        # (OpenAI) skip this path — the frontend talks to the provider
+        # directly via the data channel and only mirrors events here for
+        # backend persistence.
+        if session.needs_voice_relay:
+            try:
+                await session.send_voice_event_upstream(event)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to forward client voice event upstream")
 
-        for cmd in commands:
-            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+        commands = await session.process_voice_event(event)
+        await _dispatch_voice_commands(pool, session, commands)
     except Exception as e:
         logger.exception("Voice event processing failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
 
 
+async def _dispatch_voice_commands(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    commands: list,
+) -> None:
+    """Send provider commands upstream (WS providers) or to frontend (WebRTC).
+
+    For WebRTC providers, the frontend owns the data channel to the
+    provider, so commands need to round-trip through the orchestrator WS
+    as ``voice_command`` payloads. For WS providers, the backend relay
+    holds the upstream connection and sends them directly.
+    """
+    if session.needs_voice_relay:
+        for cmd in commands:
+            try:
+                await session.send_voice_event_upstream(cmd)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to forward voice command upstream")
+    else:
+        for cmd in commands:
+            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+
+
+def _tool_result_is_error(output: str) -> bool:
+    """True when a tool's stringified JSON output carries an ``error`` field.
+
+    Orchestrator tools (``open_agent_session``, ``send_to_agent_session``, …)
+    signal failure by returning ``json.dumps({"error": "..."})`` rather than
+    raising — historically the route layer always stamped ``is_error: False``
+    on the broadcast, so the chat UI rendered the bubble as if the call had
+    succeeded even when it hadn't. This helper flips that around so the
+    user sees a red error bubble that matches Gemini's spoken (often
+    misleadingly confident) follow-up.
+    """
+    if not output:
+        return False
+    try:
+        parsed = orjson.loads(output)
+    except (orjson.JSONDecodeError, ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
+
+
 async def _handle_voice_tool_call(
     pool: SessionPool, session: OrchestratorSession, event: dict,
+    *,
+    inject: bool = True,
 ) -> None:
-    """Execute a voice tool call in the background without blocking the WS handler."""
+    """Execute a voice tool call in the background without blocking the WS handler.
+
+    ``inject=False`` when the relay drain already pushed the event into the
+    provider queue (avoids double-injection for WS providers).
+    """
     try:
         import json as _json
         call_id = event.get("call_id", "")
@@ -451,22 +797,73 @@ async def _handle_voice_tool_call(
             })
 
         # Execute the tool (this is the potentially long-running part)
-        commands = await session.process_voice_event(event)
+        commands = await session.process_voice_event(event, inject=inject)
 
         # Broadcast tool_result after execution completes
         for cmd in commands:
             if cmd.get("type") == "conversation.item.create":
                 item = cmd.get("item", {})
                 if item.get("type") == "function_call_output":
+                    output = item.get("output", "")
                     await pool.broadcast_orchestrator({
                         "type": "tool_result",
                         "tool_use_id": item.get("call_id", ""),
-                        "output": item.get("output", ""),
-                        "is_error": False,
+                        "output": output,
+                        "is_error": _tool_result_is_error(output),
                     })
 
-        for cmd in commands:
-            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+        await _dispatch_voice_commands(pool, session, commands)
     except Exception as e:
         logger.exception("Voice tool call execution failed")
+        await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
+
+
+async def _handle_gemini_voice_tool_call(
+    pool: SessionPool, session: OrchestratorSession, event: dict,
+) -> None:
+    """Execute a Gemini Live tool call off the relay-drain task.
+
+    Gemini's wire shape is ``toolCall.functionCalls: [{id, name, args}]``
+    with no top-level ``type`` field.  We broadcast ``tool_use`` per call
+    before execution, run them via ``process_voice_event`` (which writes
+    JSONL + dispatches the ``toolResponse`` back upstream), then
+    broadcast ``tool_result`` per call so the chat UI renders the
+    output the assistant is about to talk over.
+    """
+    try:
+        calls = (event.get("toolCall") or {}).get("functionCalls", []) or []
+
+        for call in calls:
+            call_id = call.get("id", "")
+            name = call.get("name", "")
+            args = call.get("args", {}) or {}
+            if call_id and name:
+                await pool.broadcast_orchestrator({
+                    "type": "tool_use",
+                    "tool_use_id": call_id,
+                    "tool_name": name,
+                    "tool_input": args,
+                })
+
+        commands = await session.process_voice_event(event, inject=False)
+
+        # Gemini's tool result commands look like
+        # ``{"toolResponse": {"functionResponses": [{id, name, response}]}}``.
+        # Surface each as a tool_result broadcast.
+        for cmd in commands:
+            tr = cmd.get("toolResponse") if isinstance(cmd, dict) else None
+            if not tr:
+                continue
+            for fr in tr.get("functionResponses", []) or []:
+                output = fr.get("response", {}).get("output", "")
+                await pool.broadcast_orchestrator({
+                    "type": "tool_result",
+                    "tool_use_id": fr.get("id", ""),
+                    "output": output,
+                    "is_error": _tool_result_is_error(output),
+                })
+
+        await _dispatch_voice_commands(pool, session, commands)
+    except Exception as e:
+        logger.exception("Gemini voice tool call execution failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})

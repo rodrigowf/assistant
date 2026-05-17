@@ -74,15 +74,17 @@ class TestSerializeEvent:
             is_error=False,
             result="done",
         ))
-        assert result == {
-            "type": "turn_complete",
-            "cost": 0.05,
-            "usage": {"input_tokens": 100},
-            "num_turns": 1,
-            "session_id": "s1",
-            "is_error": False,
-            "result": "done",
-        }
+        # Subset-match: the serializer may add helper fields like
+        # ``input_tokens``/``output_tokens`` (flattened from ``usage``) that
+        # this test doesn't need to pin down.  Check the load-bearing
+        # fields explicitly instead of comparing the whole dict.
+        assert result["type"] == "turn_complete"
+        assert result["cost"] == 0.05
+        assert result["usage"] == {"input_tokens": 100}
+        assert result["num_turns"] == 1
+        assert result["session_id"] == "s1"
+        assert result["is_error"] is False
+        assert result["result"] == "done"
 
     def test_turn_complete_defaults(self):
         result = serialize_event(TurnComplete())
@@ -92,7 +94,11 @@ class TestSerializeEvent:
 
     def test_compact_complete(self):
         result = serialize_event(CompactComplete(trigger="auto"))
-        assert result == {"type": "compact_complete", "trigger": "auto"}
+        # The serializer also exposes the ``summary`` field (empty by
+        # default) for the divider rendering in the UI; pin only the
+        # fields callers depend on.
+        assert result["type"] == "compact_complete"
+        assert result["trigger"] == "auto"
 
     def test_compact_complete_default(self):
         result = serialize_event(CompactComplete())

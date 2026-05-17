@@ -11,13 +11,27 @@ from utils.paths import get_context_dir
 
 logger = logging.getLogger(__name__)
 
-# Keys that are valid in a session config (subset of global config)
-_ALLOWED_KEYS = {"working_directory", "enabled_mcps", "chrome_extension"}
+# Keys that are valid in a session config (subset of global config).
+# ``provider`` is special-cased: once a session has a JSONL written by a
+# particular CLI, switching providers mid-resume would corrupt that file's
+# adapter shape — so we persist provider per session and the resume path
+# treats it as authoritative, never the global default.
+_ALLOWED_KEYS = {
+    "working_directory",
+    "enabled_mcps",
+    "chrome_extension",
+    "provider",         # registered harness id — pinned per session
+    "harness_model",    # provider-appropriate model id, "" = CLI default
+}
 
 _DEFAULTS: dict[str, Any] = {
     "working_directory": None,     # None = inherit active from global config
     "enabled_mcps": None,          # None = inherit from global config
     "chrome_extension": None,      # None = inherit from global config
+    "provider": None,              # None = inherit from global config (new sessions)
+                                   # — but see chat.py: persisted on first start
+                                   #   so resume is deterministic afterwards.
+    "harness_model": None,         # None = inherit from global harness_model[provider]
 }
 
 

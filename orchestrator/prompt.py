@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import OrchestratorConfig
+from utils.mcp_config import load_available_mcps
 
 # Limits for content injection
 MAX_MEMORY_CHARS = 12000
@@ -20,36 +21,6 @@ MEMORY_INDEX_FILENAME = "MEMORY.md"
 # ---------------------------------------------------------------------------
 # MCP Configuration Loading
 # ---------------------------------------------------------------------------
-
-def _load_available_mcps() -> dict[str, dict[str, Any]]:
-    """Load available MCP servers from .claude.json config.
-
-    Returns a dict mapping MCP name to its full configuration.
-    """
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    if config_dir:
-        config_path = Path(config_dir) / ".claude.json"
-    else:
-        project_root = Path(__file__).resolve().parent.parent
-        config_path = project_root / ".claude_config" / ".claude.json"
-
-    if not config_path.is_file():
-        return {}
-
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
-
-    # Get project-specific MCP servers
-    project_root = Path(__file__).resolve().parent.parent
-    project_dir = str(project_root)
-    projects = config.get("projects", {})
-    project_config = projects.get(project_dir, {})
-
-    return project_config.get("mcpServers", {})
-
 
 def _load_mcp_descriptions() -> dict[str, str]:
     """Load MCP descriptions from the descriptions config file."""
@@ -165,15 +136,38 @@ The user interacts with you through a multi-tab web interface. Each agent sessio
 
 
 def _active_sessions_section(context: dict[str, Any]) -> str:
-    """Build the active sessions status section from the live pool."""
+    """Build the active sessions status section from the live pool.
+
+    Includes per-session title (from JSONL store), in-flight background
+    turns dispatched via send_to_agent_session, and pending permissions
+    awaiting an answer.  Lets the orchestrator's LLM see at a glance
+    which agents are busy and whether any need its attention.
+    """
     pool = context.get("pool")
     if pool is None:
         return "## Active Agent Sessions\nNo agent sessions are currently active."
 
     sessions = pool.list_sessions()
+    runner = context.get("runner")
+    notifications = context.get("notifications")
+
     if not sessions:
+        if notifications and notifications.has_pending():
+            n = notifications.pending_count()
+            return (
+                "## Active Agent Sessions\nNo agent sessions are currently active.\n"
+                f"\n_({n} background event{'s' if n != 1 else ''} pending — drained at "
+                "the start of your next turn.)_"
+            )
         return "## Active Agent Sessions\nNo agent sessions are currently active."
 
+    # Group in-flight runner handles by session_id for quick lookup.
+    in_flight: dict[str, list[Any]] = {}
+    if runner is not None:
+        for h in runner.list_in_flight():
+            in_flight.setdefault(h.session_id, []).append(h)
+
+    store = context.get("store")
     lines = ["## Active Agent Sessions"]
     for s in sessions:
         sid = s["session_id"]
@@ -181,17 +175,67 @@ def _active_sessions_section(context: dict[str, Any]) -> str:
         turns = s.get("turns", 0)
         cost = s.get("cost", 0.0)
         sdk_id = s.get("sdk_session_id", "")
+
+        # Title lookup (best-effort) — agents that just opened may not have a
+        # JSONL entry yet, in which case we just omit it.
+        title: str | None = None
+        if store is not None and sdk_id:
+            try:
+                info = store.get_session_info(sdk_id)
+                if info is not None:
+                    title = info.title
+            except Exception:  # noqa: BLE001
+                pass
+
+        title_part = f' ("{title}")' if title else ""
         sdk_note = f", sdk_id={sdk_id}" if sdk_id else ""
-        lines.append(f"- `{sid}`: status={status}, turns={turns}, cost=${cost:.4f}{sdk_note}")
+        lines.append(
+            f"- `{sid}`{title_part}: status={status}, turns={turns}, "
+            f"cost=${cost:.4f}{sdk_note}"
+        )
+
+        # Per-session detail: in-flight fire-and-forget turns + pending perms
+        for h in in_flight.get(sid, []):
+            elapsed = f"{h.elapsed_seconds:.1f}s"
+            lines.append(
+                f"    in-flight: turn {h.turn_id[:8]} "
+                f"running for {elapsed} (status={h.status})"
+            )
+            if h.pending_permission_ids:
+                rids = ", ".join(rid[:8] for rid in h.pending_permission_ids)
+                lines.append(f"        pending permission(s): {rids}")
+        # Pending permissions on the SessionManager itself (independent of
+        # an in-flight runner turn — could be triggered from the user's tab).
+        sm = pool.get(sid)
+        if sm is not None and hasattr(sm, "pending_permission_ids"):
+            try:
+                rids = list(sm.pending_permission_ids())
+            except Exception:  # noqa: BLE001
+                rids = []
+            if rids and not in_flight.get(sid):
+                lines.append(
+                    "    pending permission(s) (not from a runner turn): "
+                    + ", ".join(rid[:8] for rid in rids)
+                )
+
+    if notifications and notifications.has_pending():
+        n = notifications.pending_count()
+        lines.append(
+            f"\n_({n} background event{'s' if n != 1 else ''} pending — drained at "
+            "the start of your next turn.)_"
+        )
     return "\n".join(lines)
 
 
 def _mcp_section() -> str:
-    """Build the MCP orchestration section with dynamically loaded server info."""
-    available_mcps = _load_available_mcps()
+    """Build the MCP orchestration section with dynamically loaded server info.
 
-    if not available_mcps:
-        return ""
+    Renders the live list of MCP servers available in this project. When the
+    list is empty, the section still appears (so the model knows MCP support
+    *exists* but there's nothing to load) — without this, the open_agent_session
+    tool's hardcoded examples used to lead the model to invent server names.
+    """
+    available_mcps = load_available_mcps()
 
     lines = [
         "## MCP Orchestration",
@@ -203,19 +247,27 @@ def _mcp_section() -> str:
         "",
     ]
 
-    for name in sorted(available_mcps.keys()):
-        description = _get_mcp_description(name, available_mcps[name])
-        lines.append(f"- **{name}**: {description}")
+    if available_mcps:
+        for name in sorted(available_mcps.keys()):
+            description = _get_mcp_description(name, available_mcps[name])
+            lines.append(f"- **{name}**: {description}")
+        usage_examples = [
+            f"- `mcp_servers=['{name}']` — load only `{name}`"
+            for name in sorted(available_mcps.keys())[:2]
+        ]
+    else:
+        lines.append("- _(none configured for this project)_")
+        usage_examples = []
 
     lines.extend([
         "",
         "### Usage",
         "",
         "When calling `open_agent_session`, pass the `mcp_servers` parameter with a list of MCP names:",
-        "- `mcp_servers=['obs']` — OBS integration only",
-        "- `mcp_servers=['chrome-devtools', 'ubuntu-desktop-control']` — Browser + desktop automation",
+        *usage_examples,
         "- Omit parameter or pass `[]` — Default Claude Code tools only",
         "",
+        "**Only pass names from the list above.** Inventing names will fail the call.",
         "Load only the MCPs needed for each task to minimize resource usage.",
     ])
 
@@ -311,13 +363,29 @@ def _guidelines_section() -> str:
 
 ### Delegating to Agents
 - **Be specific**: Give clear, actionable instructions with enough context for independent work
-- **One thing at a time**: Wait for an agent's response before sending the next message
+- **Fire-and-forget**: `send_to_agent_session` returns IMMEDIATELY with a turn_id; the agent runs in the background. Do NOT loop calling it waiting for a response — results arrive as background events on your next turn.
+- **In parallel**: While a turn is in flight you can spawn other agents, peek at intermediate output (`peek_agent_session`), read persisted history (`read_agent_session`), respond to permission requests (`respond_to_agent_permission`), or talk to the user.
 - **Match MCPs to tasks**: Load only the MCPs an agent needs
+
+### Background Events
+- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — for actual content call `read_agent_session(session_id)` (persisted) or `peek_agent_session(session_id, turn_id)` (live, while still running).
+- Permission events also arrive as structured lines: `[SESSION xxx event: <user|orchestrator> <approved|denied> <ToolName> — "<message>"]`. Typically the user answered in their tab; only call `respond_to_agent_permission` when they're unavailable, the agent has explicitly asked you to decide, or you have a specific reason to overrule.
+- Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `peek_agent_session` output, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
 
 ### Session Management
 - **Open sessions only when needed**: Don't open sessions speculatively
 - **Close sessions when done**: Free resources after tasks complete
 - **Report progress**: Keep the user informed of status and results
+- **Use the returned session_id immediately**: When `open_agent_session` returns `{"session_id": "<id>", "status": "started"}`, the very next `send_to_agent_session` call for that work MUST pass that exact `<id>`. Do not reuse an older session_id from earlier in the conversation — that silently delivers the work to the wrong agent and the user sees the original task respond, not the new one.
+- **Check tool results**: When a tool returns `{"error": "..."}`, treat it as a failure even if the error sounds recoverable. Do not narrate "I've opened a new session" if `open_agent_session` errored — tell the user what failed and pick a valid input (e.g. an MCP from the Available MCPs list) before retrying.
+
+### Session Configuration
+Sessions inherit their settings from `assistant_config.json` — the same file the Config page in the UI edits. Every `open_agent_session` call resolves working directory (local path or SSH target), session harness (`claude` / `qwen`), harness model, chrome flag, and enabled MCPs from that file at the moment of the call. The orchestrator does NOT carry a separate config: editing the file via the UI or the tools below changes what the next spawned session sees, immediately.
+
+- **Before spawning with non-default settings**: call `get_assistant_config` to inspect the current values. Each `open_agent_session` response also echoes the `resolved_config` it actually used, so you can verify after the fact.
+- **To change settings**: call `update_assistant_config` with only the fields you want to change. Same validation as the Config page (working-directory ids must exist in `working_directory_history`, harness must be registered, etc.). Changes take effect on the next `open_agent_session`.
+- **For one-off MCP overrides**: pass `mcp_servers` to `open_agent_session` directly — that replaces the inherited list for that session only, without touching the global config.
+- **Confirm with the user first** before changing global config in ways that persist across sessions (switching working directory, switching provider, enabling chrome). The user owns the Config page; surprise edits will confuse them.
 
 ### Memory Maintenance
 - **Update the shared index** when you or agents modify skills or create memory files

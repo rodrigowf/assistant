@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(head *)",
+      "Bash(readlink *)",
+      "Bash(python3 *)",
+      "Bash(cat *)",
+      "WebFetch(github.com)",
+      "WebFetch(docs.qwen.ai)",
+      "WebFetch(raw.githubusercontent.com)",
+      "Bash(find *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(rm *)",
+      "Bash(ln *)",
+      "Bash(realpath *)",
+      "Bash(.venv/bin/python3 *)"
+    ]
+  },
+  "$version": 4
+}

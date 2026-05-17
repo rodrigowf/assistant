@@ -1,0 +1,6 @@
+{
+  "model": "claude-sonnet-4-20250514",
+  "permission_mode": "default",
+  "max_budget_usd": null,
+  "max_turns": null
+}

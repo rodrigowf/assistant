@@ -2,7 +2,16 @@ import { MessageList } from "./MessageList";
 import { ChatInput } from "./ChatInput";
 import { StatusBar } from "./StatusBar";
 import { VoiceControls } from "./VoiceControls";
+import { PermissionBar } from "./PermissionBar";
 import type { ChatMessage, SessionStatus, ConnectionState, VoiceStatus } from "../types";
+import type { StallInfo, PendingPermission } from "../hooks/useChatInstance";
+
+function formatStallElapsed(s: number): string {
+  if (s < 90) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s - m * 60);
+  return rem > 0 ? `${m}m${rem}s` : `${m}m`;
+}
 
 interface Props {
   messages: ChatMessage[];
@@ -11,6 +20,11 @@ interface Props {
   cost: number;
   turns: number;
   error: string | null;
+  /** Set when the backend reports the SDK is stuck on a tool. */
+  stall?: StallInfo | null;
+  /** Set when the SDK is waiting for a permission decision (popup). */
+  pendingPermission?: PendingPermission | null;
+  onRespondToPermission?: (decision: "allow" | "deny", message?: string) => void;
   onSend: (text: string) => void;
   onSendAudio?: (audioBase64: string, format: string) => void;
   onInterrupt: () => void;
@@ -19,6 +33,8 @@ interface Props {
   isActive?: boolean;
   hasMoreMessages?: boolean;
   onLoadMore?: () => Promise<void>;
+  onRewindMessage?: (dropLastN: number) => void;
+  onForkMessage?: (dropLastN: number) => void;
   // Voice mode props (orchestrator only)
   isOrchestrator?: boolean;
   voiceStatus?: VoiceStatus;
@@ -45,6 +61,9 @@ export function ChatPanel({
   cost,
   turns,
   error,
+  stall,
+  pendingPermission,
+  onRespondToPermission,
   onSend,
   onSendAudio,
   onInterrupt,
@@ -53,6 +72,8 @@ export function ChatPanel({
   isActive,
   hasMoreMessages,
   onLoadMore,
+  onRewindMessage,
+  onForkMessage,
   isOrchestrator,
   voiceStatus,
   onVoiceStart,
@@ -72,9 +93,38 @@ export function ChatPanel({
 
   return (
     <main className="chat-panel">
-      <MessageList messages={messages} isActive={isActive} hasMoreMessages={hasMoreMessages} onLoadMore={onLoadMore} />
+      <MessageList
+        messages={messages}
+        isActive={isActive}
+        hasMoreMessages={hasMoreMessages}
+        onLoadMore={onLoadMore}
+        onRewindMessage={onRewindMessage}
+        onForkMessage={onForkMessage}
+      />
       {error && (
         <div className="error-banner">{error}</div>
+      )}
+      {stall && isStreaming && (
+        <div className="stall-banner">
+          <span className="stall-banner-text">
+            {stall.toolName
+              ? `${stall.toolName} has been running for ${formatStallElapsed(stall.elapsedSeconds)} with no response.`
+              : `No response from Claude for ${formatStallElapsed(stall.elapsedSeconds)}.`}
+          </span>
+          <button
+            type="button"
+            className="stall-banner-button"
+            onClick={onInterrupt}
+          >
+            Interrupt
+          </button>
+        </div>
+      )}
+      {pendingPermission && onRespondToPermission && (
+        <PermissionBar
+          pending={pendingPermission}
+          onRespond={onRespondToPermission}
+        />
       )}
       <div className="status-bar-container">
         <StatusBar

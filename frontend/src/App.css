@@ -98,6 +98,20 @@
   font-weight: 500;
 }
 
+.tab-title-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  font-weight: 500;
+  background: var(--bg-input);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  color: var(--text-bright);
+  padding: 1px 6px;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
 .tab-close {
   width: 18px;
   height: 18px;
@@ -205,10 +219,61 @@
   color: var(--text-bright);
 }
 
+/* Anchor for the busy overlay: a positioned, flex-grown parent that does
+   NOT scroll itself.  The scroller is .session-list inside; the overlay
+   covers .session-list-wrap so it stays pinned to the visible area no
+   matter how far the user has scrolled. */
+.session-list-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
 .session-list {
   flex: 1;
   overflow-y: auto;
   padding: 8px;
+}
+
+.session-list--busy {
+  /* Block pointer events on rows under the overlay so a second click can't
+     fire another delete while one is in flight. */
+  pointer-events: none;
+}
+
+.session-list-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  z-index: 5;
+}
+
+.session-list-spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: var(--text-bright, #e5e5e5);
+  border-radius: 50%;
+  animation: session-list-spin 0.85s linear infinite;
+}
+
+.session-list-overlay-label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+
+@keyframes session-list-spin {
+  to { transform: rotate(360deg); }
 }
 
 .sidebar-empty {
@@ -286,7 +351,41 @@
   padding: 2px 6px;
 }
 
+/* Provider badge — a single-letter dot in the session meta row.
+   Intentionally minimal: monospace letter, low contrast, no border —
+   glanceable but not visually noisy. Brightens on hover/active. */
+.session-provider-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  font-size: 0.6rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1;
+  opacity: 0.55;
+}
+.session-provider-dot.session-provider-claude {
+  color: #c79972;
+  background: rgba(199, 153, 114, 0.12);
+}
+.session-provider-dot.session-provider-qwen {
+  color: #7aa9d6;
+  background: rgba(122, 169, 214, 0.12);
+}
+.session-provider-dot.session-provider-gemini {
+  color: #d68a8a;
+  background: rgba(214, 138, 138, 0.12);
+}
+.session-item.active .session-provider-dot,
+.session-item:hover .session-provider-dot {
+  opacity: 0.85;
+}
+
 .session-rename,
+.session-duplicate,
 .session-delete {
   position: absolute;
   top: 50%;
@@ -304,12 +403,15 @@
 }
 
 .session-delete { right: 9px; }
-.session-rename { right: 38px; }
+.session-duplicate { right: 38px; }
+.session-rename { right: 67px; }
 
 .session-item:hover .session-rename,
+.session-item:hover .session-duplicate,
 .session-item:hover .session-delete { opacity: 1; }
 
-.session-rename:hover {
+.session-rename:hover,
+.session-duplicate:hover {
   background: var(--bg-hover);
   color: var(--text-bright);
 }
@@ -329,6 +431,168 @@
   padding: 2px 6px;
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+/* When the rename input is active, drop the title's text-overflow clipping so
+   the focused input (and its focus ring) renders in full instead of being
+   ellipsized like the static label. */
+.session-title:has(.session-rename-input) {
+  overflow: visible;
+  white-space: normal;
+  text-overflow: clip;
+}
+
+/* Kebab menu — hidden on desktop, shown on mobile */
+.session-menu {
+  display: none;
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+}
+
+.session-menu-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.session-menu-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.session-menu-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 160px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Lift the hosting session-item above its siblings while the menu is open
+   so the dropdown isn't covered by later rows. */
+.session-item:has(.session-menu-dropdown) {
+  z-index: 100;
+}
+
+.session-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-menu-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+.session-menu-item-danger {
+  color: var(--error);
+}
+
+.session-menu-item-danger:hover {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+/* Per-message action menu (⋮) — top-right corner of each message bubble */
+.message {
+  position: relative;
+}
+
+.message-actions {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  z-index: 20;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.message:hover .message-actions,
+.message-actions:focus-within {
+  opacity: 1;
+}
+
+.message-actions-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.message-actions-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+/* Dropdown is portalled to <body> and positioned via inline `position: fixed`
+   set on open — that's how it escapes the scrolling message list's clipping
+   box, which would otherwise truncate it for short messages. */
+.message-actions-dropdown {
+  min-width: 230px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+}
+
+.message-actions-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.message-actions-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+/* Touch devices: always show the menu button (no hover state). */
+@media (hover: none) {
+  .message-actions { opacity: 1; }
 }
 
 /* ============================================================
@@ -579,7 +843,7 @@
   margin: 8px 0;
   border-left: 2px solid var(--thinking-border);
   border-radius: 0 var(--radius) var(--radius) 0;
-  background: rgba(201, 150, 58, 0.04);
+  background: var(--thinking-bg);
   overflow: hidden;
 }
 
@@ -590,12 +854,12 @@
   gap: 8px;
   padding: 9px 14px;
   font-size: 0.82rem;
-  color: var(--thinking-border);
+  color: var(--text-muted);
   text-align: left;
   transition: background var(--transition);
 }
 
-.thinking-toggle:hover { background: rgba(201, 150, 58, 0.05); }
+.thinking-toggle:hover { background: var(--thinking-bg-hover); }
 
 .thinking-label { flex: 1; font-weight: 600; letter-spacing: 0.01em; }
 
@@ -1330,7 +1594,7 @@ pre.field-value {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 28px;
+  padding: 12px 32px 14px; /* Same as chat-input */
   max-width: 900px;
   width: 100%;
   margin: 0 auto;
@@ -1667,7 +1931,7 @@ pre.field-value {
 
 .status-dot.idle         { background: var(--success); }
 .status-dot.streaming    { background: var(--accent);   animation: pulse 1s infinite; }
-.status-dot.thinking     { background: var(--thinking-border); animation: pulse 1.5s infinite; }
+.status-dot.thinking     { background: var(--status-pending); animation: pulse 1.5s infinite; }
 .status-dot.tool_use     { background: var(--tool-border); }
 .status-dot.interrupted  { background: var(--error); }
 .status-dot.disconnected { background: var(--text-dim); }
@@ -1683,7 +1947,7 @@ pre.field-value {
 }
 
 .conn-state.connected  { color: var(--success); }
-.conn-state.connecting { color: var(--thinking-border); }
+.conn-state.connecting { color: var(--status-pending); }
 .conn-state.error      { color: var(--error); }
 
 .stat-sep {
@@ -1702,6 +1966,38 @@ pre.field-value {
   color: var(--error);
   font-size: 0.82rem;
   border-top: 1px solid rgba(224, 92, 92, 0.18);
+}
+
+.stall-banner {
+  padding: 8px 16px;
+  background: rgba(214, 158, 46, 0.14);
+  color: #d69e2e;
+  font-size: 0.82rem;
+  border-top: 1px solid rgba(214, 158, 46, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stall-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.stall-banner-button {
+  padding: 4px 12px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.stall-banner-button:hover {
+  background: rgba(214, 158, 46, 0.18);
 }
 
 /* ============================================================
@@ -1920,6 +2216,40 @@ pre.field-value {
   z-index: 100;
 }
 
+/* App-wide busy overlay shown during longer mutations (duplicate / rewind /
+   fork). Sits *above* the modal layer so the confirm dialog can close while
+   the work is still in flight and the spinner takes over. */
+.busy-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  z-index: 500;
+  /* Block interactions with everything underneath until the work finishes. */
+  pointer-events: all;
+}
+
+.busy-overlay-spinner {
+  width: 38px;
+  height: 38px;
+  border: 3px solid rgba(255, 255, 255, 0.16);
+  border-top-color: var(--text-bright, #e5e5e5);
+  border-radius: 50%;
+  animation: session-list-spin 0.85s linear infinite;
+}
+
+.busy-overlay-label {
+  font-size: 0.92rem;
+  color: var(--text-bright, #e5e5e5);
+  letter-spacing: 0.02em;
+}
+
 .modal-card {
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -1979,6 +2309,93 @@ pre.field-value {
 .modal-btn-primary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.modal-btn-danger {
+  background: var(--error);
+  color: white;
+}
+
+.modal-btn-danger:hover {
+  background: var(--error);
+  box-shadow: 0 0 12px var(--error-bg);
+  filter: brightness(1.1);
+}
+
+/* ============================================================
+   Permission Bar — inline approve/reject above the chat input.
+   Sits between the messages list and the status/input bars so the
+   chat content (e.g. an ExitPlanMode plan) stays readable.  Typing
+   in the chat input while this is visible auto-rejects with the
+   typed text as the rejection reason (handled in chat.py).
+   ============================================================ */
+
+.permission-bar {
+  flex-shrink: 0;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+}
+
+.permission-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 10px 32px;
+  box-sizing: border-box;
+}
+
+.permission-bar-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.permission-bar-label {
+  font-size: 0.88rem;
+  color: var(--text-bright);
+  font-weight: 500;
+}
+
+.permission-bar-hint {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.permission-bar-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.permission-bar-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  font-size: 0.82rem;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  transition: background var(--transition), border-color var(--transition);
+}
+
+.permission-bar-btn:hover {
+  background: var(--bg-surface);
+}
+
+.permission-bar-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.permission-bar-btn-primary:hover {
+  background: var(--accent-hover);
+  box-shadow: 0 0 12px var(--accent-glow);
 }
 
 /* ============================================================
@@ -2123,6 +2540,20 @@ pre.field-value {
 
   /* ---- Hamburger visible ---- */
   .sidebar-toggle-btn { display: flex; }
+
+  /* ---- Tablet/mobile session row: kebab replaces hover-revealed icons ---- */
+  .session-rename,
+  .session-delete {
+    display: none;
+  }
+
+  .session-menu {
+    display: block;
+  }
+
+  .session-title {
+    padding-right: 40px;
+  }
 
   /* ---- Tab bar ---- */
   .tab { max-width: 140px; min-width: 56px; }
@@ -2336,6 +2767,35 @@ pre.field-value {
   color: var(--text-muted);
   margin-bottom: 14px;
   line-height: 1.55;
+}
+
+.config-subsection {
+  padding: 14px 0 0;
+  margin-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.config-subsection:first-of-type {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.config-subsection-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 4px;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+.config-subsection-desc {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+  line-height: 1.5;
 }
 
 /* Working directory list */
@@ -2739,6 +3199,7 @@ pre.field-value {
 /* Model selector */
 .model-dropdowns {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
 }
 
@@ -2746,7 +3207,14 @@ pre.field-value {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  flex: 1;
+  flex: 1 1 calc(50% - 6px);  /* Two per row when there are 4 fields */
+  min-width: 0;
+}
+
+/* When there are exactly 2 or 3 fields, fit them on one row instead. */
+.model-dropdowns:has(> .model-dropdown-field:nth-child(3):last-child) > .model-dropdown-field,
+.model-dropdowns:has(> .model-dropdown-field:nth-child(2):last-child) > .model-dropdown-field {
+  flex: 1 1 0;
 }
 
 .model-dropdown-label {
@@ -2893,11 +3361,6 @@ pre.field-value {
     font-size: 0.9rem;
   }
 
-  /* Always show rename/delete on mobile (no hover state) */
-  .session-rename,
-  .session-delete {
-    opacity: 1;
-  }
 }
 
 /* ── Sidebar overlay (hidden on desktop) ── */

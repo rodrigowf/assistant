@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import type { SessionInfo } from "../types";
+import { SessionMenu } from "./SessionMenu";
 
 interface Props {
   session: SessionInfo;
@@ -9,9 +10,10 @@ interface Props {
   onClick: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
+  onDuplicate: () => void;
 }
 
-export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDelete, onRename }: Props) {
+export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDelete, onRename, onDuplicate }: Props) {
   const timeAgo = formatRelative(session.last_activity);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -25,8 +27,8 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
     }
   }, [editing, session.title]);
 
-  function startEdit(e: React.MouseEvent) {
-    e.stopPropagation();
+  function startEdit(e?: React.MouseEvent) {
+    e?.stopPropagation();
     setEditing(true);
   }
 
@@ -71,7 +73,20 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
       </div>
       <div className="session-meta">
         {session.is_orchestrator && (
-          <span className="session-type-label">orchestrator</span>
+          <span className="session-type-label">orch</span>
+        )}
+        {/* Provider badge hidden for orchestrator sessions: those don't go
+            through the Claude/Qwen/Gemini CLI — they're a standalone agent
+            loop that talks to Anthropic/OpenAI APIs directly. The "orch"
+            label above already conveys the session kind. */}
+        {session.provider && !session.is_orchestrator && (
+          <span
+            className={`session-provider-dot session-provider-${session.provider}`}
+            title={providerTitle(session.provider)}
+            aria-label={`Provider: ${session.provider}`}
+          >
+            {providerLetter(session.provider)}
+          </span>
         )}
         <span className="session-time">{timeAgo}</span>
         <span className="session-count">{session.message_count} msgs</span>
@@ -89,6 +104,19 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
             </svg>
           </button>
           <button
+            className="session-duplicate"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDuplicate();
+            }}
+            title="Duplicate conversation"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+            </svg>
+          </button>
+          <button
             className="session-delete"
             onClick={(e) => {
               e.stopPropagation();
@@ -98,10 +126,29 @@ export function SessionItem({ session, active, tabOpen, tabStatus, onClick, onDe
           >
             ×
           </button>
+          <SessionMenu onRename={() => startEdit()} onDuplicate={onDuplicate} onDelete={onDelete} />
         </>
       )}
     </div>
   );
+}
+
+function providerLetter(provider: string): string {
+  switch (provider) {
+    case "qwen": return "Q";
+    case "gemini": return "G";
+    case "claude": return "C";
+    default: return provider.charAt(0).toUpperCase();
+  }
+}
+
+function providerTitle(provider: string): string {
+  switch (provider) {
+    case "qwen": return "Qwen Code";
+    case "gemini": return "Gemini CLI";
+    case "claude": return "Claude Code";
+    default: return provider;
+  }
 }
 
 function formatRelative(iso: string): string {

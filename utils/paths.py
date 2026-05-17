@@ -44,8 +44,18 @@ def get_public_dir() -> Path:
 
 
 def get_sessions_dir() -> Path:
-    """Get the sessions directory (JSONL files live at context/ root)."""
+    """Get the sessions directory (Claude JSONL files live at context/ root)."""
     return get_context_dir()
+
+
+def get_chats_dir() -> Path:
+    """Get the Qwen chats directory (Qwen JSONL files live in context/chats/)."""
+    return get_context_dir() / "chats"
+
+
+def get_trash_dir() -> Path:
+    """Soft-deleted sessions land here. Not scanned by the store or the SDK."""
+    return get_context_dir() / "trash"
 
 
 def get_index_dir() -> Path:

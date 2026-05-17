@@ -15,7 +15,7 @@ CONFIG_FILE="${1:-${SCRIPT_DIR}/config.env}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "ERROR: Config file not found: $CONFIG_FILE" >&2
-  echo "Copy sync/config.env.example to sync/config.env and fill in your values." >&2
+  echo "Copy install/sync.env to sync/config.env and fill in your values." >&2
   exit 1
 fi
 

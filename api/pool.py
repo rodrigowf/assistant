@@ -1,17 +1,20 @@
-"""SessionPool — shared pool of Claude Code sessions with event broadcast.
+"""SessionPool — shared pool of agent sessions with event broadcast.
 
-The pool manages both regular agent sessions (SessionManager) and the single
-orchestrator session (OrchestratorSession). All session state lives here;
-there is no separate OrchestratorConnectionManager.
+The pool manages both regular agent sessions (provider-specific
+BaseSessionManager implementations) and the single orchestrator session
+(OrchestratorSession). All session state lives here; there is no
+separate OrchestratorConnectionManager.
 
 Key design:
 - Sessions are keyed by a stable **local_id** (UUID from the frontend) that
   never changes across reconnects or backend restarts.
-- Regular sessions (SessionManager) support multiple concurrent WebSocket
-  subscribers via subscribe/unsubscribe.
+- Regular sessions support multiple concurrent WebSocket subscribers via
+  subscribe/unsubscribe.
 - The orchestrator session is stored separately but uses the same subscriber
   infrastructure. At most one orchestrator can be active at a time.
 - Watchers receive notifications when agent sessions are opened or closed.
+- The provider (Claude vs Qwen) is selected per session based on
+  ``ManagerConfig.provider``; pool internals stay provider-agnostic.
 """
 
 from __future__ import annotations
@@ -27,9 +30,60 @@ import orjson
 from starlette.websockets import WebSocket, WebSocketState
 
 from api.serializers import serialize_event
+from manager._proc import process_alive as _process_alive, looks_like
+from manager.base_session import BaseSessionManager
 from manager.config import ManagerConfig
-from manager.session import SessionManager
 from manager.types import Event
+
+
+def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
+    """Factory: build the right session manager for the configured provider.
+
+    Resolution goes through :mod:`manager.registry` so the pool itself
+    knows nothing about which harnesses exist — adding a fourth is a
+    spec registration plus a new ``manager.<x>_adapter`` module.  The
+    spec's ``session_class_loader`` is lazy, so importing the pool
+    doesn't drag in claude-agent-sdk on a Qwen-only host (or vice-versa).
+    """
+    from manager.registry import ensure_all_registered, get_registry
+    ensure_all_registered()
+    registry = get_registry()
+    provider = (config.provider or "").lower()
+    if not provider:
+        # No provider pinned on the config (legacy default).  Fall back to
+        # the first registered harness so the pool stays deterministic.
+        # Registration order in :mod:`manager.registry._ADAPTER_MODULES`
+        # is the source of truth.
+        names = registry.names()
+        if not names:
+            raise RuntimeError("No session harnesses registered")
+        provider = names[0]
+    spec = registry.require(provider)
+    session_class = spec.session_class_loader()
+    return session_class(config=config, **kwargs)
+
+
+def _kill_tracked_pid(pid: int) -> bool:
+    """Force-kill a tracked subprocess PID, dispatching via the harness
+    registry.
+
+    Used by the orphan reaper.  Every registered harness contributes a
+    ``comm_prefix`` and a ``kill_helper_loader``; we look up the helper by
+    the live ``/proc/<pid>/comm`` prefix.  Unknown comm prefixes are left
+    alone — the reaper only acts on PIDs that still look like ones we
+    spawned.
+
+    Iteration order is registration order, so if two specs share a comm
+    prefix (e.g. multiple Node-based harnesses) the first registered
+    wins.  That's fine for the orphan-reaper case: any kill helper that
+    survived the per-spec comm check is safe to call.
+    """
+    from manager.registry import ensure_all_registered, get_registry
+    ensure_all_registered()
+    for spec in get_registry().all().values():
+        if looks_like(pid, spec.comm_prefix):
+            return spec.kill_helper_loader()(pid)
+    return False
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +93,7 @@ class SessionPool:
 
     def __init__(self) -> None:
         # Regular agent sessions
-        self._sessions: dict[str, SessionManager] = {}
+        self._sessions: dict[str, BaseSessionManager] = {}
         self._subscribers: dict[str, set[WebSocket]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -58,6 +112,28 @@ class SessionPool:
 
         # Watchers: receive agent_session_opened / agent_session_closed events
         self._watchers: set[WebSocket] = set()
+
+        # Belt-and-braces: PIDs of every bundled-claude subprocess we ever
+        # spawned, mapped to a (session_id, first_seen_at) tuple.  The
+        # reaper task scans this periodically and SIGKILLs any pid whose
+        # owning session has been gone from the pool for more than the
+        # grace period — covers the case where the per-session SIGKILL
+        # path inside _lifecycle() was itself bypassed (lifecycle task
+        # cancelled hard, SDK transport refactored so we couldn't grab
+        # the pid, etc.).  See manager.claude.session.kill_claude_subprocess.
+        self._tracked_pids: dict[int, tuple[str, float]] = {}
+        # Sessions that have been removed from _sessions but whose pid we
+        # still want to keep an eye on for ``orphan_grace_seconds``.
+        self._closed_session_pids: dict[str, tuple[int, float]] = {}
+        self._reaper_task: asyncio.Task[None] | None = None
+
+        # Session-owned in-flight turn task.  Decouples turn lifetime from
+        # the WebSocket that initiated it: a page reload (or any momentary
+        # disconnect) merely unsubscribes from broadcasts; the task keeps
+        # running and the new WS picks up the stream when it subscribes.
+        # Keyed by session_id; absent / done means "no turn running".
+        # See start_turn() / cancel_turn() for the public API.
+        self._turn_tasks: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
     # Agent session lifecycle
@@ -140,11 +216,11 @@ class SessionPool:
             from dataclasses import replace
             config = replace(config, mcp_servers=mcp_servers)
 
-        sm = SessionManager(
+        sm = _session_manager_for(
+            config,
             session_id=resume_sdk_id,
             local_id=lid,
             fork=fork,
-            config=config,
         )
         try:
             await sm.start()
@@ -162,15 +238,15 @@ class SessionPool:
                 # get hammered.  One retry only; if that also fails, surface
                 # the error to the caller instead of looping.
                 logger.warning(
-                    "Resume SDK ID %s not found in Claude state; starting fresh session",
+                    "Resume SDK ID %s not found; starting fresh session",
                     resume_sdk_id,
                 )
                 await asyncio.sleep(0.5 + random.random() * 0.5)
-                sm = SessionManager(
+                sm = _session_manager_for(
+                    config,
                     session_id=None,
                     local_id=lid,
                     fork=False,
-                    config=config,
                 )
                 await sm.start()
             else:
@@ -179,6 +255,31 @@ class SessionPool:
         self._sessions[lid] = sm
         self._subscribers[lid] = set()
         self._locks[lid] = asyncio.Lock()
+        # Track the session subprocess pid for the orphan reaper.
+        #
+        # Two paths converge here:
+        #
+        #   Claude: ``sm.subprocess_pid`` returns the bundled-claude PID
+        #   that was captured at SDK connect time.  Stable for the life
+        #   of the session, so a single insert here is enough.
+        #
+        #   Qwen: spawns a fresh subprocess per turn, so ``subprocess_pid``
+        #   only returns a value while a turn is mid-flight (typically
+        #   ``None`` at this point).  Instead, install spawn/exit
+        #   callbacks the QwenSessionManager invokes around each turn —
+        #   keeps tracking in sync with the actual subprocess lifetime.
+        import time as _time
+        pid = sm.subprocess_pid
+        if pid is not None:
+            self._tracked_pids[pid] = (lid, _time.monotonic())
+
+        def _on_pid_spawn(spawned_pid: int, _lid: str = lid) -> None:
+            self._tracked_pids[spawned_pid] = (_lid, _time.monotonic())
+
+        def _on_pid_exit(exited_pid: int) -> None:
+            self._tracked_pids.pop(exited_pid, None)
+
+        sm.set_pid_callbacks(_on_pid_spawn, _on_pid_exit)
 
         await self._notify_watchers({
             "type": "agent_session_opened",
@@ -201,12 +302,49 @@ class SessionPool:
         if sm is None:
             return
 
+        # Cancel any in-flight session-owned turn before tearing down the SDK
+        # client — otherwise the driver task continues iterating sm.send()
+        # against a half-disconnected session and emits scary tracebacks.
+        turn_task = self._turn_tasks.pop(session_id, None)
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
+            try:
+                await turn_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         # Notify while subscribers/watchers are still registered
         await self._broadcast_session(session_id, {"type": "session_stopped"})
         await self._notify_watchers({"type": "agent_session_closed", "session_id": session_id})
 
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
+
+        # Hand the pid(s) off to the closed-session shadow map so the
+        # reaper has a grace window to verify the subprocess actually
+        # exits.  If sm.stop() (which calls our SIGKILL fallback)
+        # succeeds, the pid will be gone by the time the reaper looks
+        # at it — no-op.  Otherwise the reaper escalates after
+        # orphan_grace_seconds.
+        #
+        # Detach the spawn callback first so a Qwen session can't push
+        # more PIDs after we've started tearing down.  The exit callback
+        # stays attached briefly so any PID exit during stop() still
+        # cleans up the tracking entry.
+        sm.set_pid_callbacks(None, None)
+        import time as _time
+        now = _time.monotonic()
+        pid = sm.subprocess_pid
+        if pid is not None:
+            self._closed_session_pids[session_id] = (pid, now)
+            self._tracked_pids.pop(pid, None)
+        # Sweep any other tracked PIDs that still belong to this session
+        # (Qwen turns leave the spawn callback's entries behind even if
+        # the per-turn cleanup ran — defensive cleanup, no signals sent).
+        for tracked_pid, (owner_lid, _seen) in list(self._tracked_pids.items()):
+            if owner_lid == session_id:
+                self._closed_session_pids.setdefault(session_id, (tracked_pid, now))
+                self._tracked_pids.pop(tracked_pid, None)
 
         try:
             # Bound the wait so a misbehaving SDK transport (e.g. a remote
@@ -225,11 +363,35 @@ class SessionPool:
         if sm is not None:
             await sm.interrupt()
 
+    async def resolve_session_permission(
+        self,
+        session_id: str,
+        request_id: str,
+        decision: str,
+        *,
+        message: str | None = None,
+        responder: str = "user",
+    ) -> bool:
+        """Resolve a pending permission request for a session.
+
+        Returns True if this call won the race (and the SDK was unblocked),
+        False if the request was already answered or doesn't exist.  When the
+        orchestrator answers first the UI's later call is a no-op — the
+        ``permission_resolved`` event the manager emits already tells the UI
+        to close its modal.
+        """
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            return False
+        return sm.resolve_permission(
+            request_id, decision, message=message, responder=responder,
+        )
+
     # ------------------------------------------------------------------
     # Agent session access
     # ------------------------------------------------------------------
 
-    def get(self, session_id: str) -> SessionManager | None:
+    def get(self, session_id: str) -> BaseSessionManager | None:
         return self._sessions.get(session_id)
 
     def has(self, session_id: str) -> bool:
@@ -243,6 +405,7 @@ class SessionPool:
                 "status": sm.status.value,
                 "cost": sm.cost,
                 "turns": sm.turns,
+                "provider": sm.provider_name,
             }
             for lid, sm in self._sessions.items()
         ]
@@ -300,12 +463,17 @@ class SessionPool:
         self._orchestrator_subs.discard(ws)
 
     async def broadcast_orchestrator(self, payload: dict) -> None:
-        """Broadcast a payload to all orchestrator subscribers."""
+        """Broadcast a payload to all orchestrator subscribers.
+
+        Iterates over a snapshot because ``await ws.send_bytes`` yields and
+        concurrent (un)subscribers would otherwise mutate the set mid-iteration
+        ("Set changed size during iteration"), tearing down the voice relay.
+        """
         if not self._orchestrator_subs:
             return
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        for ws in self._orchestrator_subs:
+        for ws in tuple(self._orchestrator_subs):
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_bytes(data)
@@ -339,6 +507,112 @@ class SessionPool:
             await self.stop_orchestrator()
         except Exception:
             logger.exception("Error stopping orchestrator during shutdown")
+
+    # ------------------------------------------------------------------
+    # Orphan reaper — last-line defense for leaked claude subprocesses
+    # ------------------------------------------------------------------
+
+    async def start_orphan_reaper(
+        self,
+        *,
+        interval_seconds: float = 30.0,
+        orphan_grace_seconds: float = 30.0,
+    ) -> None:
+        """Spawn the background task that nukes orphaned `claude` subprocesses.
+
+        Runs every *interval_seconds* and force-kills any tracked pid whose
+        owning session has been gone from the pool for *orphan_grace_seconds*.
+        Idempotent — safe to call multiple times; the second call no-ops.
+
+        The grace period gives the per-session SIGKILL path inside
+        SessionManager._lifecycle a chance to do the cleanup itself.  The
+        reaper only acts when that path failed (lifecycle task cancelled,
+        SDK refactored, etc.) — in steady state it observes that every
+        previously-tracked pid is already gone and just trims bookkeeping.
+        """
+        if self._reaper_task is not None and not self._reaper_task.done():
+            return
+        self._reaper_task = asyncio.create_task(
+            self._reaper_loop(interval_seconds, orphan_grace_seconds),
+            name="pool-orphan-reaper",
+        )
+
+    async def stop_orphan_reaper(self) -> None:
+        if self._reaper_task is None:
+            return
+        self._reaper_task.cancel()
+        try:
+            await self._reaper_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._reaper_task = None
+
+    async def _reaper_loop(
+        self, interval_seconds: float, orphan_grace_seconds: float
+    ) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, self._reap_orphans_once, orphan_grace_seconds
+                    )
+                except Exception:
+                    logger.exception("orphan reaper iteration failed")
+        except asyncio.CancelledError:
+            raise
+
+    def _reap_orphans_once(self, orphan_grace_seconds: float) -> None:
+        """One pass of the orphan reaper.  Synchronous so it can run in a
+        thread executor — the underlying kill helpers do sleep() polls.
+
+        Provider-agnostic: ``_kill_tracked_pid`` dispatches by /proc comm
+        prefix, so the same reaper works for both Claude and Qwen
+        subprocesses.  Unrecognized comm prefixes are left alone (we never
+        signal a PID that doesn't look like one of ours).
+        """
+        import time as _time
+        now = _time.monotonic()
+
+        # Pass 1: prune tracked pids that are already dead (process exited
+        # normally — bookkeeping cleanup, no signals sent).
+        dead_pids = [pid for pid in self._tracked_pids if not _process_alive(pid)]
+        for pid in dead_pids:
+            self._tracked_pids.pop(pid, None)
+
+        # Pass 2: closed sessions whose grace period expired.
+        expired = [
+            sid
+            for sid, (_pid, closed_at) in self._closed_session_pids.items()
+            if (now - closed_at) >= orphan_grace_seconds
+        ]
+        for sid in expired:
+            pid, _closed_at = self._closed_session_pids.pop(sid)
+            if not _process_alive(pid):
+                continue
+            if _kill_tracked_pid(pid):
+                logger.warning(
+                    "Orphan reaper: killed leaked subprocess pid=%d "
+                    "(session %s closed %.0fs ago)",
+                    pid, sid, now - _closed_at,
+                )
+
+        # Pass 3 (paranoid): a session is *still* in the pool but its
+        # claimed pid no longer matches a live process — likely the
+        # subprocess crashed and we never noticed.  Mark the session as
+        # dead so the next operation triggers a fresh start.
+        for pid, (sid, _seen_at) in list(self._tracked_pids.items()):
+            if sid not in self._sessions:
+                # Session vanished without going through close() — should
+                # be rare but possible if a test or code path popped it
+                # directly.  Treat the pid as orphaned.
+                self._tracked_pids.pop(pid, None)
+                if _process_alive(pid) and _kill_tracked_pid(pid):
+                    logger.warning(
+                        "Orphan reaper: killed pid=%d for vanished "
+                        "session %s (no close() recorded)",
+                        pid, sid,
+                    )
 
     @property
     def orchestrator_subscriber_count(self) -> int:
@@ -381,6 +655,17 @@ class SessionPool:
             async for event in sm.send(text):
                 payload = serialize_event(event)
                 await self._broadcast_session(session_id, payload)
+                if payload.get("type") in ("permission_request", "permission_resolved"):
+                    # Mirror to the orchestrator so its UI can show a matching
+                    # banner and (for permission_request) so the orchestrator
+                    # agent can respond programmatically.  Same envelope as
+                    # nested_session_event so existing dispatch logic fits.
+                    await self.broadcast_orchestrator({
+                        "type": "nested_session_event",
+                        "session_id": session_id,
+                        "event_type": payload["type"],
+                        "event_data": payload,
+                    })
                 yield event
 
     async def compact(self, session_id: str) -> AsyncIterator[Event]:
@@ -398,6 +683,167 @@ class SessionPool:
                 yield event
 
     # ------------------------------------------------------------------
+    # Session-owned turn API (chat.py uses this; orchestrator runner
+    # has its own task management on top of pool.send()).
+    # ------------------------------------------------------------------
+
+    def has_active_turn(self, session_id: str) -> bool:
+        """True if a session-owned turn task is currently running."""
+        task = self._turn_tasks.get(session_id)
+        return task is not None and not task.done()
+
+    async def start_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        source_ws: WebSocket | None = None,
+    ) -> None:
+        """Spawn a session-owned task that drives the turn to completion.
+
+        The task is owned by the pool, NOT by the caller's task.  This is
+        the key invariant: the turn outlives the WebSocket that sent the
+        prompt, so a page reload (or any transient disconnect) doesn't
+        kill the in-flight work.  Subscribers (current and future) receive
+        events via ``_broadcast_session`` as they're produced.
+
+        If a turn is already in flight on this session, it is cancelled
+        first ("interrupt + new" semantics — the bundled CLI doesn't
+        accept overlapping queries, so the new prompt always supersedes
+        the old).  This makes start_turn safe to call without a
+        prior cancel_turn, and atomic against the rare race where two
+        WSes send prompts to the same session simultaneously.
+
+        Returns once the task is created.  Errors during the turn are
+        logged and broadcast to subscribers; they do NOT propagate to
+        the caller.
+        """
+        if session_id not in self._sessions:
+            raise ValueError(f"No session with ID {session_id}")
+
+        # Atomic interrupt + spawn.  If another caller is mid-cancel_turn,
+        # the second cancel_turn here is a no-op (task already done) so
+        # this remains correct under concurrent calls.
+        await self.cancel_turn(session_id)
+
+        task = asyncio.create_task(
+            self._drive_turn(session_id, text, source_ws),
+            name=f"turn-{session_id[:8]}",
+        )
+        self._turn_tasks[session_id] = task
+
+    async def _drive_turn(
+        self,
+        session_id: str,
+        text: str,
+        source_ws: WebSocket | None,
+    ) -> None:
+        """Body of the session-owned turn task.
+
+        Iterates ``self.send()`` (the existing async-gen API that handles
+        per-session locking, broadcasting, and orchestrator mirroring) and
+        catches everything so a stray exception doesn't show up as
+        ``Task exception was never retrieved`` in the logs.  Subscribers
+        already see the events via the broadcast inside ``send()``; this
+        loop just consumes the iterator to completion.
+
+        Owns the TurnAbandoned retry: if the upstream request never
+        produced any messages (TCP path silently wedged), interrupt the
+        wedged turn and retry once.  This logic used to live in
+        ``api.routes.chat._handle_send`` — moved here because the WS task
+        no longer owns the iteration and so couldn't observe the exception.
+
+        ``TurnAbandoned`` is the provider-agnostic base for both Claude's
+        ``SessionAbandoned`` and Qwen's ``QwenAbandoned``, so a single
+        except clause covers both providers without forcing either SDK
+        to be installed at module load time.
+
+        The reason we don't surface exceptions to a caller is that THERE
+        IS NO CALLER once the turn starts — the WebSocket that initiated
+        it is just one of N possible subscribers, and may already be gone
+        by the time the turn finishes.  Broadcast and logs are the right
+        channels for telling everyone what happened.
+        """
+        from manager.base_session import TurnAbandoned
+
+        async def _stream_once() -> None:
+            async for _event in self.send(session_id, text, source_ws=source_ws):
+                pass
+
+        try:
+            try:
+                await _stream_once()
+            except TurnAbandoned as exc:
+                logger.warning(
+                    "Turn abandoned for session %s after %.0fs; retrying once",
+                    session_id, exc.elapsed_seconds,
+                )
+                await self._broadcast_session(session_id, {
+                    "type": "status", "status": "retrying",
+                    "detail": f"upstream silent for {exc.elapsed_seconds:.0f}s, retrying",
+                })
+                try:
+                    await self.interrupt(session_id)
+                except Exception:
+                    logger.exception("Failed to interrupt abandoned turn for %s", session_id)
+                await asyncio.sleep(1.0)
+                await _stream_once()
+        except asyncio.CancelledError:
+            raise
+        except TurnAbandoned as exc:
+            await self._broadcast_session(session_id, {
+                "type": "error", "error": "upstream_wedged",
+                "detail": (
+                    f"Upstream did not respond after retry "
+                    f"({exc.elapsed_seconds:.0f}s). Try again in a moment."
+                ),
+            })
+        except Exception as exc:
+            logger.exception(
+                "Session-owned turn for %s raised; broadcasting error",
+                session_id,
+            )
+            try:
+                await self._broadcast_session(session_id, {
+                    "type": "error", "error": "send_failed",
+                    "detail": str(exc),
+                })
+            except Exception:
+                logger.exception("Failed to broadcast send_failed for %s", session_id)
+
+    async def cancel_turn(self, session_id: str) -> bool:
+        """Stop the in-flight turn for *session_id*.
+
+        Sends an SDK interrupt (so the bundled ``claude`` subprocess
+        actually halts the current request — cancelling the asyncio task
+        alone wouldn't reach across the process boundary), then awaits
+        the task so the caller knows the turn has fully unwound (lock
+        released, drain task torn down, finally blocks run) before they
+        proceed.  Returns True if a turn was actually cancelled, False
+        if no turn was running.
+        """
+        task = self._turn_tasks.get(session_id)
+        if task is None or task.done():
+            return False
+
+        # Issue the SDK interrupt FIRST.  That's the proper way to stop
+        # the bundled-claude turn; cancelling our reader task alone leaves
+        # the subprocess still working and emitting messages into a
+        # buffer no one is reading.
+        try:
+            await self.interrupt(session_id)
+        except Exception:
+            logger.exception("interrupt() failed during cancel_turn for %s", session_id)
+
+        # Now cancel the driver task and wait for it to unwind.
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        return True
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -413,7 +859,7 @@ class SessionPool:
             return
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        for ws in subs:
+        for ws in tuple(subs):
             if ws is exclude:
                 continue
             try:
@@ -427,7 +873,7 @@ class SessionPool:
     async def _notify_watchers(self, payload: dict[str, Any]) -> None:
         data = orjson.dumps(payload)
         dead: list[WebSocket] = []
-        for ws in self._watchers:
+        for ws in tuple(self._watchers):
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_bytes(data)

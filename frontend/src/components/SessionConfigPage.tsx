@@ -5,9 +5,14 @@ import {
   getSessionConfig,
   updateSessionConfig,
   listMcpServers,
+  listQwenHarnessModels,
+  listSessionProviders,
   type AssistantConfig,
+  type AssistantProvider,
   type SessionConfig,
   type McpServerConfig,
+  type QwenModelInfo,
+  type SessionProviderSpec,
 } from "../api/rest";
 import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
 
@@ -26,6 +31,8 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
   const [globalConfig, setGlobalConfig] = useState<AssistantConfig | null>(null);
   const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(null);
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
+  const [qwenHarnessModels, setQwenHarnessModels] = useState<QwenModelInfo[]>([]);
+  const [sessionProviders, setSessionProviders] = useState<SessionProviderSpec[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,14 +48,22 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
     setLoading(true);
     setError(null);
     try {
-      const [globalCfg, sessionCfg, mcpRes] = await Promise.all([
+      const [globalCfg, sessionCfg, mcpRes, qwenHarnessRes, providersRes] = await Promise.all([
         getConfig(),
         getSessionConfig(sessionId),
         listMcpServers(),
+        // Fail-safe: a failed harness-models fetch shouldn't blank the panel.
+        listQwenHarnessModels().catch(e => {
+          console.warn("listQwenHarnessModels failed:", e);
+          return { models: [] };
+        }),
+        listSessionProviders(),
       ]);
       setGlobalConfig(globalCfg);
       setSessionConfig(sessionCfg);
       setMcpServers(mcpRes.servers);
+      setQwenHarnessModels(qwenHarnessRes.models);
+      setSessionProviders(providersRes.providers);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -92,6 +107,14 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
   const effectiveWdId = sessionConfig?.working_directory ?? globalConfig?.working_directory ?? null;
   const effectiveMcps = sessionConfig?.enabled_mcps ?? globalConfig?.enabled_mcps ?? [];
   const effectiveChrome = sessionConfig?.chrome_extension ?? globalConfig?.chrome_extension ?? false;
+  const effectiveProvider: AssistantProvider =
+    (sessionConfig?.provider ?? globalConfig?.provider ?? "claude") as AssistantProvider;
+  // Empty string is a meaningful per-session value ("CLI default for this
+  // session"), distinct from null ("inherit"), so we don't collapse them.
+  const effectiveHarnessModel =
+    sessionConfig?.harness_model ??
+    globalConfig?.harness_model?.[effectiveProvider] ??
+    "";
 
   const isInherited = (field: keyof SessionConfig) =>
     sessionConfig?.[field] === null || sessionConfig?.[field] === undefined;
@@ -170,6 +193,95 @@ export function SessionConfigPage({ isOpen, onClose, sessionId, canRestart, onSa
                 inherited={isInherited("working_directory")}
                 onReset={() => resetToGlobal("working_directory")}
               />
+
+              {/* ── Session provider + harness model ─────────────────── */}
+              <section className="config-section">
+                <div className="config-section-header">
+                  <h3 className="config-section-title">
+                    Session provider
+                    {isInherited("provider") && (
+                      <span className="config-inherited-tag"> · inherited</span>
+                    )}
+                  </h3>
+                  {!isInherited("provider") && (
+                    <button
+                      className="config-reset-btn"
+                      onClick={() => resetToGlobal("provider")}
+                      disabled={saving}
+                      title="Reset to global default"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+                <p className="config-section-desc">
+                  Pinning the provider is mostly useful for resumed sessions —
+                  the resume path treats it as authoritative since switching
+                  CLIs behind an existing JSONL would corrupt its shape.
+                </p>
+                <div className="model-dropdowns">
+                  <div className="model-dropdown-field">
+                    <label className="model-dropdown-label">Provider</label>
+                    <select
+                      className="model-dropdown-select"
+                      value={effectiveProvider}
+                      disabled={saving}
+                      onChange={(e) =>
+                        save({ provider: e.target.value as AssistantProvider })
+                      }
+                    >
+                      {sessionProviders.map(p => (
+                        <option key={p.id} value={p.id}>{p.label}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Qwen-only harness model picker, sourced from
+                      ~/.qwen/settings.json on the backend. */}
+                  {effectiveProvider === "qwen" && (
+                    <div className="model-dropdown-field">
+                      <label className="model-dropdown-label">
+                        Model
+                        {sessionConfig?.harness_model === null && (
+                          <span className="config-inherited-tag"> · inherited</span>
+                        )}
+                      </label>
+                      <select
+                        className="model-dropdown-select"
+                        value={effectiveHarnessModel}
+                        disabled={saving || qwenHarnessModels.length === 0}
+                        onChange={(e) => save({ harness_model: e.target.value })}
+                      >
+                        <option value="">CLI default</option>
+                        {qwenHarnessModels.map(m => {
+                          const badges = [
+                            m.context_window ? `${Math.round(m.context_window / 1000)}K ctx` : null,
+                            m.supports_thinking ? "thinking" : null,
+                            m.supports_vision ? "vision" : null,
+                            m.supports_video ? "video" : null,
+                          ].filter(Boolean).join(" · ");
+                          return (
+                            <option key={m.id} value={m.id}>
+                              {m.display_name}{badges ? ` — ${badges}` : ""}
+                            </option>
+                          );
+                        })}
+                      </select>
+                      {sessionConfig?.harness_model !== null && (
+                        <button
+                          className="config-reset-btn"
+                          onClick={() => resetToGlobal("harness_model")}
+                          disabled={saving}
+                          title="Reset to global default"
+                          style={{ marginTop: 4 }}
+                        >
+                          Reset model
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </section>
 
               <SessionFlagsSection
                 chromeEnabled={effectiveChrome}

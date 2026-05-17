@@ -12,7 +12,11 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -183,6 +187,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val discoveredServers by viewModel.discoveredServers.collectAsState()
     val isScanning by viewModel.isScanning.collectAsState()
     val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
+    val systemConfig by viewModel.systemConfig.collectAsState()
 
     // Wire wake word detection: start turn-based recording and navigate to chat
     val coroutineScope = rememberCoroutineScope()
@@ -283,6 +288,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     // Chat input state lives at app scope so it persists across tab switches.
     var chatInputText by remember { mutableStateOf("") }
 
+    // Pending rewind / fork confirmation. We capture the UI index at click time
+    // and resolve it to a JSONL-absolute index inside the ViewModel.
+    var pendingMessageAction by remember {
+        mutableStateOf<Pair<String, Int>?>(null) // (kind, uiIndex)
+    }
+
     Scaffold { innerPadding ->
     Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
         // Page content
@@ -296,7 +307,9 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         messages = messages,
                         hasMoreMessages = hasMoreMessages,
                         isLoadingMoreMessages = isLoadingMoreMessages,
-                        onLoadMoreMessages = viewModel::loadMoreMessages
+                        onLoadMoreMessages = viewModel::loadMoreMessages,
+                        onRewindMessage = { idx -> pendingMessageAction = "rewind" to idx },
+                        onForkMessage = { idx -> pendingMessageAction = "fork" to idx }
                     )
                 }
 
@@ -306,8 +319,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         currentSessionId = currentSessionId,
                         liveSessionIds = liveSessionIds,
                         isLoading = sessionsLoading,
-                        onSessionClick = { sessionId, isOrchestrator ->
-                            viewModel.loadSession(sessionId, isOrchestrator)
+                        onSessionClick = { sessionId, isOrchestrator, liveLocalId ->
+                            viewModel.loadSession(sessionId, isOrchestrator, liveLocalId)
                             navController.navigate(Screen.Chat.route)
                         },
                         onNewSession = {
@@ -316,6 +329,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         },
                         onRenameSession = viewModel::renameSession,
                         onDeleteSession = viewModel::deleteSession,
+                        onDuplicateSession = viewModel::duplicateSession,
                         onCloseSession = viewModel::closeSession,
                         onRefresh = viewModel::refreshSessions
                     )
@@ -327,6 +341,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         connectionState = connectionState,
                         discoveredServers = discoveredServers,
                         isScanning = isScanning,
+                        systemConfig = systemConfig,
                         onUpdateServerUrl = viewModel::updateServerUrl,
                         onUpdateThemeMode = viewModel::updateThemeMode,
                         onUpdateAutoConnect = viewModel::updateAutoConnect,
@@ -350,7 +365,10 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         onConnectToServer = viewModel::connectToDiscoveredServer,
                         onAddSavedServer = viewModel::addSavedServer,
                         onRemoveSavedServer = viewModel::removeSavedServer,
-                        onSelectSavedServer = viewModel::selectSavedServer
+                        onSelectSavedServer = viewModel::selectSavedServer,
+                        onLoadSystemConfig = viewModel::loadSystemConfig,
+                        onUpdateSystemConfig = viewModel::updateSystemConfig,
+                        onToggleMcp = viewModel::toggleMcp,
                     )
                 }
             }
@@ -397,26 +415,86 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             )
         }
 
-        NavigationBar {
-            val currentDestination = navBackStackEntry?.destination
+        Surface(
+            color = NavigationBarDefaults.containerColor,
+            tonalElevation = NavigationBarDefaults.Elevation,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(NavigationBarDefaults.windowInsets)
+                    .height(80.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                val currentDestination = navBackStackEntry?.destination
+                val selectedBg = MaterialTheme.colorScheme.secondaryContainer
+                val selectedFg = MaterialTheme.colorScheme.onSecondaryContainer
+                val unselectedFg = MaterialTheme.colorScheme.onSurfaceVariant
 
-            screens.forEach { screen ->
-                NavigationBarItem(
-                    icon = { Icon(screen.icon, contentDescription = screen.title) },
-                    label = { Text(screen.title) },
-                    selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true,
-                    onClick = {
-                        navController.navigate(screen.route) {
-                            popUpTo(navController.graph.findStartDestination().id) {
-                                saveState = true
-                            }
-                            launchSingleTop = true
-                            restoreState = true
-                        }
+                screens.forEach { screen ->
+                    val selected = currentDestination?.hierarchy?.any { it.route == screen.route } == true
+                    Box(
+                        modifier = Modifier
+                            .size(width = 64.dp, height = 48.dp)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(24.dp))
+                            .background(if (selected) selectedBg else androidx.compose.ui.graphics.Color.Transparent)
+                            .clickable {
+                                navController.navigate(screen.route) {
+                                    popUpTo(navController.graph.findStartDestination().id) {
+                                        saveState = true
+                                    }
+                                    launchSingleTop = true
+                                    restoreState = true
+                                }
+                            },
+                        contentAlignment = androidx.compose.ui.Alignment.Center
+                    ) {
+                        Icon(
+                            screen.icon,
+                            contentDescription = screen.title,
+                            tint = if (selected) selectedFg else unselectedFg
+                        )
                     }
-                )
+                }
             }
         }
     }
+    }
+
+    // Rewind / fork confirmation dialog. Rendered outside the Scaffold's
+    // content so it overlays the whole screen.
+    pendingMessageAction?.let { (kind, uiIndex) ->
+        AlertDialog(
+            onDismissRequest = { pendingMessageAction = null },
+            title = {
+                Text(
+                    if (kind == "rewind") "Rewind conversation?" else "Fork conversation?"
+                )
+            },
+            text = {
+                Text(
+                    if (kind == "rewind")
+                        "All messages after the selected one will be removed from this conversation. The session will be closed; reopen it from History to continue from the rewound point."
+                    else
+                        "A copy of this conversation will be created, truncated to the selected message. The original is unchanged."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (kind == "rewind") viewModel.rewindCurrentSessionAt(uiIndex)
+                    else viewModel.forkCurrentSessionAt(uiIndex)
+                    pendingMessageAction = null
+                }) {
+                    Text(if (kind == "rewind") "Rewind" else "Fork")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingMessageAction = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }

@@ -5,8 +5,11 @@ import { generateUUID } from "../utils/uuid";
 
 interface Props {
   sessions: SessionInfo[];
+  /** True while a delete is in flight — dims the list and shows a spinner. */
+  deleting?: boolean;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => void;
+  onDuplicate: (id: string) => void;
   onNew: () => void;
   onNewOrchestrator: () => void;
   onSelectOrchestrator: (id: string, title: string) => void;
@@ -15,7 +18,7 @@ interface Props {
   onClose?: () => void;
 }
 
-export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
+export function Sidebar({ sessions, deleting, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
   const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
 
   const handleSelect = (sdkId: string, localId?: string) => {
@@ -108,27 +111,36 @@ export function Sidebar({ sessions, onDelete, onRename, onNew, onNewOrchestrator
         </svg>
         Configuration
       </button>
-      <div className="session-list">
-        {sessions.map((s) => {
-          // A session item is active if the current tab matches by resumeSdkId or by local_id
-          const isActive =
-            activeTab?.resumeSdkId === s.session_id ||
-            (!!s.local_id && activeTab?.sessionId === s.local_id);
-          return (
-            <SessionItem
-              key={s.session_id}
-              session={s}
-              active={isActive}
-              tabOpen={sdkTabOpenSet.has(s.session_id)}
-              tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
-              onClick={() => handleSelect(s.session_id, s.local_id)}
-              onDelete={() => onDelete(s.session_id)}
-              onRename={(title) => onRename(s.session_id, title)}
-            />
-          );
-        })}
-        {sessions.length === 0 && (
-          <div className="sidebar-empty">No sessions yet</div>
+      <div className="session-list-wrap">
+        <div className={`session-list${deleting ? " session-list--busy" : ""}`}>
+          {sessions.map((s) => {
+            // A session item is active if the current tab matches by resumeSdkId or by local_id
+            const isActive =
+              activeTab?.resumeSdkId === s.session_id ||
+              (!!s.local_id && activeTab?.sessionId === s.local_id);
+            return (
+              <SessionItem
+                key={s.session_id}
+                session={s}
+                active={isActive}
+                tabOpen={sdkTabOpenSet.has(s.session_id)}
+                tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
+                onClick={() => handleSelect(s.session_id, s.local_id)}
+                onDelete={() => onDelete(s.session_id)}
+                onRename={(title) => onRename(s.session_id, title)}
+                onDuplicate={() => onDuplicate(s.session_id)}
+              />
+            );
+          })}
+          {sessions.length === 0 && (
+            <div className="sidebar-empty">No sessions yet</div>
+          )}
+        </div>
+        {deleting && (
+          <div className="session-list-overlay" aria-busy="true" aria-live="polite">
+            <div className="session-list-spinner" aria-hidden="true" />
+            <span className="session-list-overlay-label">Deleting…</span>
+          </div>
         )}
       </div>
     </aside>

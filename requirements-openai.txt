@@ -1,0 +1,10 @@
+# OpenAI-family orchestrator backends — install this if you want any of:
+#   - OpenAI text mode (gpt-5, gpt-4o, ...)
+#   - OpenAI Realtime voice (gpt-realtime)
+#   - Qwen orchestrator (uses OpenAI-compatible endpoint via DashScope)
+#   - Google Gemini orchestrator (also OpenAI-compatible)
+#
+# Loaded lazily by orchestrator.providers; without this package these
+# providers don't register and their models are hidden from the picker.
+
+openai>=1.0.0

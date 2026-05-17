@@ -25,4 +25,11 @@ if [ ! -f "$VENV_PYTHON" ]; then
     exit 1
 fi
 
+# On aarch64 (Jetson Nano), preload libgomp to avoid "cannot allocate memory
+# in static TLS block" errors when importing sklearn via sentence_transformers.
+# Loading libgomp early ensures it gets space in the fixed-size TLS block.
+if [ "$(uname -m)" = "aarch64" ] && [ -f /usr/lib/aarch64-linux-gnu/libgomp.so.1 ]; then
+    export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}/usr/lib/aarch64-linux-gnu/libgomp.so.1"
+fi
+
 exec "$VENV_PYTHON" "$@"

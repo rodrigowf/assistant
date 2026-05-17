@@ -1,7 +1,14 @@
-# Core dependencies
-claude-agent-sdk>=0.1.0
-anthropic>=0.40.0
-openai>=1.0.0
+# Core dependencies — required for the backend regardless of which session
+# harness or orchestrator backend you use.
+#
+# Provider-specific SDKs live in the per-extra files alongside this one:
+#   requirements-claude.txt   — claude-agent-sdk (Claude Code harness)
+#   requirements-anthropic.txt — anthropic SDK (Anthropic API orchestrator)
+#   requirements-openai.txt   — openai SDK (OpenAI / Qwen / Gemini-via-OpenAI orchestrator + voice)
+#
+# install.sh picks which extras to install based on the harness and
+# orchestrator-backend prompts.  Pip-install any combination of them
+# directly if you'd rather skip the interactive installer.
 
 # API server
 fastapi>=0.115.0

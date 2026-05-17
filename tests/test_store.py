@@ -344,8 +344,26 @@ class TestSessionStoreDeleteSession:
         with patch("utils.paths.PROJECT_ROOT", tmp_path):
             store = SessionStore(tmp_path)
 
-        assert store.delete_session("del") is True
-        assert not (context_dir / "del.jsonl").exists()
+            assert store.delete_session("del") is True
+            assert not (context_dir / "del.jsonl").exists()
+            assert (context_dir / "trash" / "del.jsonl").is_file()
+
+    def test_delete_collision_keeps_both(self, tmp_path):
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        trash_dir = context_dir / "trash"
+        trash_dir.mkdir()
+        (trash_dir / "dup.jsonl").write_text("old")
+        (context_dir / "dup.jsonl").write_text("new")
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            assert store.delete_session("dup") is True
+
+        assert (trash_dir / "dup.jsonl").read_text() == "old"
+        moved = [p for p in trash_dir.iterdir() if p.name != "dup.jsonl"]
+        assert len(moved) == 1
+        assert moved[0].read_text() == "new"
 
     def test_delete_nonexistent(self, tmp_path):
         context_dir = tmp_path / "context"
@@ -381,3 +399,364 @@ class TestSessionStoreDeleteSession:
             mock_remove.assert_called_once_with(
                 "indexed-session", collection_name="history"
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests for duplicate_session / truncate_session / fork_session
+# ---------------------------------------------------------------------------
+
+
+def _tool_result_user_line(tool_use_id, output, timestamp, uuid="tr1"):
+    """Claude-style user message that contains only a tool_result block."""
+    return {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": output}],
+        },
+        "timestamp": timestamp,
+        "uuid": uuid,
+    }
+
+
+def _assistant_tool_use_line(name, tool_id, timestamp, uuid="au1"):
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": {}}],
+        },
+        "timestamp": timestamp,
+        "uuid": uuid,
+    }
+
+
+class TestDuplicateSession:
+    def test_copies_file_and_title(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "src.jsonl", "src",
+            [
+                _user_msg("Hello", "2026-02-05T10:00:00Z", uuid="u1"),
+                _assistant_msg("Hi!", "2026-02-05T10:00:01Z", uuid="a1"),
+            ],
+        )
+        (context_dir / ".titles.json").write_text(json.dumps({"src": "My chat"}))
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            new_id = store.duplicate_session("src")
+
+        assert new_id is not None
+        assert new_id != "src"
+        # The copy file exists with same content
+        src_text = (context_dir / "src.jsonl").read_text()
+        new_text = (context_dir / f"{new_id}.jsonl").read_text()
+        assert src_text == new_text
+        # Title was copied with " (copy)" suffix
+        titles = json.loads((context_dir / ".titles.json").read_text())
+        assert titles["src"] == "My chat"
+        assert titles[new_id] == "My chat (copy)"
+
+    def test_no_title_entry_when_source_unnamed(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "src.jsonl", "src",
+            [_user_msg("Hello", "2026-02-05T10:00:00Z")],
+        )
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            new_id = store.duplicate_session("src")
+
+        assert new_id is not None
+        # No titles entry should be created if source had none
+        titles_path = context_dir / ".titles.json"
+        if titles_path.exists():
+            titles = json.loads(titles_path.read_text())
+            assert new_id not in titles
+
+    def test_returns_none_for_missing(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            assert store.duplicate_session("does-not-exist") is None
+
+
+class TestTruncateSession:
+    def test_drops_last_n_visible_messages(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "s.jsonl", "s",
+            [
+                _user_msg("first", "2026-02-05T10:00:00Z", uuid="u1"),
+                _assistant_msg("reply 1", "2026-02-05T10:00:01Z", uuid="a1"),
+                _user_msg("second", "2026-02-05T10:00:02Z", uuid="u2"),
+                _assistant_msg("reply 2", "2026-02-05T10:00:03Z", uuid="a2"),
+            ],
+        )
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            # Drop the last two visible messages — leaves u1 + a1.
+            assert store.truncate_session("s", 2) is True
+
+        lines = [json.loads(line) for line in (context_dir / "s.jsonl").read_text().strip().split("\n")]
+        assert [l["uuid"] for l in lines] == ["u1", "a1"]
+
+    def test_drops_trailing_tool_result_lines(self, tmp_path):
+        """Claude-style: a 'user' line containing only tool_result is internal,
+        not a visible message — and trailing internal lines after the last
+        kept visible message should be dropped too (they'd be dangling)."""
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+
+        _write_session_jsonl(
+            context_dir / "s.jsonl", "s",
+            [
+                _user_msg("ask", "2026-02-05T10:00:00Z", uuid="u1"),
+                _assistant_tool_use_line("read", "tool-1", "2026-02-05T10:00:01Z", uuid="a1"),
+                _tool_result_user_line("tool-1", "result", "2026-02-05T10:00:02Z", uuid="tr1"),
+                _assistant_msg("done", "2026-02-05T10:00:03Z", uuid="a2"),
+                _user_msg("next", "2026-02-05T10:00:04Z", uuid="u3"),
+            ],
+        )
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            # Visible turns: u1, a1, a2, u3 (4 total — tr1 is not visible).
+            # drop_last_n=1 → drop u3 → keep u1, a1, tr1, a2.
+            assert store.truncate_session("s", 1) is True
+
+        lines = [json.loads(line) for line in (context_dir / "s.jsonl").read_text().strip().split("\n")]
+        assert [l["uuid"] for l in lines] == ["u1", "a1", "tr1", "a2"]
+
+    def test_qwen_parts_format_counted_as_visible(self, tmp_path):
+        """Qwen JSONL uses ``message.parts`` (not ``content``) and ``role: model``.
+        Those user/assistant turns must still count as visible."""
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+
+        qwen_lines = [
+            {"type": "user", "message": {"role": "user", "parts": [{"text": "hi"}]},
+             "timestamp": "2026-02-05T10:00:00Z", "uuid": "u1"},
+            {"type": "system", "subtype": "ui_telemetry", "timestamp": "2026-02-05T10:00:00.5Z"},
+            {"type": "assistant", "message": {"role": "model", "parts": [{"text": "yo"}]},
+             "timestamp": "2026-02-05T10:00:01Z", "uuid": "a1"},
+            {"type": "user", "message": {"role": "user", "parts": [{"text": "more?"}]},
+             "timestamp": "2026-02-05T10:00:02Z", "uuid": "u2"},
+        ]
+        (context_dir / "chats").mkdir(parents=True)
+        (context_dir / "chats" / "qs.jsonl").write_text(
+            "\n".join(json.dumps(l) for l in qwen_lines) + "\n"
+        )
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            # 3 visible turns (u1, a1, u2). drop_last_n=1 → keep u1 + telemetry + a1.
+            assert store.truncate_session("qs", 1) is True
+
+        out = [json.loads(l) for l in (context_dir / "chats" / "qs.jsonl").read_text().strip().split("\n")]
+        assert [l.get("uuid", l["type"]) for l in out] == ["u1", "system", "a1"]
+
+    def test_gemini_flat_content_counted_as_visible(self, tmp_path):
+        """Gemini JSONL uses ``{type, content}`` flat (no ``message`` wrapper)
+        and ``type: "gemini"`` for the assistant role.  The truncate path
+        must delegate to the Gemini adapter so those turns count as visible —
+        before the fix, every line was classified internal and any non-zero
+        ``drop_last_n`` failed with 'out of range'."""
+        from unittest.mock import patch
+        from manager.config import ManagerConfig
+
+        context_dir = tmp_path / "context"
+        chats_dir = context_dir / "chats"
+        chats_dir.mkdir(parents=True)
+
+        # session id whose 8-char prefix matches the file name (mimics the
+        # real Gemini layout: session-<iso>-<uuid-prefix>.jsonl).
+        sid = "6e38da2a-e9ea-4032-bd18-04040f878227"
+        gemini_lines = [
+            {"sessionId": sid, "projectHash": "abc", "startTime": "2026-05-16T14:48:11Z",
+             "lastUpdated": "2026-05-16T14:48:11Z", "kind": "main"},
+            {"id": "m1", "timestamp": "2026-05-16T14:48:12Z",
+             "type": "user", "content": [{"text": "Hello!"}]},
+            {"$set": {"lastUpdated": "2026-05-16T14:48:12Z"}},
+            {"id": "m2", "timestamp": "2026-05-16T14:48:13Z",
+             "type": "gemini", "content": "Hi there!"},
+            {"id": "m3", "timestamp": "2026-05-16T14:48:14Z",
+             "type": "user", "content": [{"text": "Bye"}]},
+        ]
+        jsonl_path = chats_dir / f"session-2026-05-16T14-48-{sid[:8]}.jsonl"
+        jsonl_path.write_text("\n".join(json.dumps(l) for l in gemini_lines) + "\n")
+
+        # Point ManagerConfig.load() at this tmp project so the Gemini
+        # jsonl_path_resolver finds the right chats/ directory.
+        cfg = ManagerConfig(project_dir=str(tmp_path))
+        with patch("utils.paths.PROJECT_ROOT", tmp_path), \
+             patch("manager.config.ManagerConfig.load", return_value=cfg):
+            store = SessionStore(tmp_path)
+            # 3 visible turns (m1, m2, m3). drop_last_n=1 → keep m1, $set, m2.
+            assert store.truncate_session(sid, 1) is True
+
+        out = [json.loads(l) for l in jsonl_path.read_text().strip().split("\n")]
+        # Header + m1 + $set + m2; m3 dropped.
+        assert out[0].get("sessionId") == sid
+        ids_or_keys = [l.get("id") or ("$set" if "$set" in l else None) for l in out[1:]]
+        assert ids_or_keys == ["m1", "$set", "m2"]
+
+    def test_gemini_empty_content_with_thoughts_is_visible(self, tmp_path):
+        """Most Gemini assistant lines carry an empty ``content`` string and
+        store the real payload in ``thoughts`` / ``toolCalls``.  Those must
+        still count as visible turns — early returns on ``content == ""``
+        previously made them all invisible and forks failed instantly."""
+        from unittest.mock import patch
+        from manager.config import ManagerConfig
+
+        context_dir = tmp_path / "context"
+        chats_dir = context_dir / "chats"
+        chats_dir.mkdir(parents=True)
+
+        sid = "abc12345-0000-0000-0000-000000000000"
+        gemini_lines = [
+            {"sessionId": sid, "projectHash": "x", "startTime": "2026-05-16T14:48:11Z",
+             "lastUpdated": "2026-05-16T14:48:11Z", "kind": "main"},
+            {"id": "u1", "timestamp": "2026-05-16T14:48:12Z",
+             "type": "user", "content": [{"text": "go"}]},
+            {"id": "g1", "timestamp": "2026-05-16T14:48:13Z",
+             "type": "gemini", "content": "",
+             "thoughts": [{"subject": "Plan", "description": "..."}]},
+            {"id": "g2", "timestamp": "2026-05-16T14:48:14Z",
+             "type": "gemini", "content": "",
+             "toolCalls": [{"id": "t1", "name": "x", "args": {}, "status": "ok"}]},
+            {"id": "u2", "timestamp": "2026-05-16T14:48:15Z",
+             "type": "user", "content": [{"text": "next"}]},
+        ]
+        jsonl_path = chats_dir / f"session-2026-05-16T14-48-{sid[:8]}.jsonl"
+        jsonl_path.write_text("\n".join(json.dumps(l) for l in gemini_lines) + "\n")
+
+        cfg = ManagerConfig(project_dir=str(tmp_path))
+        with patch("utils.paths.PROJECT_ROOT", tmp_path), \
+             patch("manager.config.ManagerConfig.load", return_value=cfg):
+            store = SessionStore(tmp_path)
+            # 4 visible turns: u1, g1 (thoughts), g2 (toolCalls), u2.
+            # drop_last_n=3 → keep just u1.
+            assert store.truncate_session(sid, 3) is True
+
+        out = [json.loads(l) for l in jsonl_path.read_text().strip().split("\n")]
+        ids = [l.get("id") for l in out[1:] if l.get("id")]
+        assert ids == ["u1"]
+
+    def test_keeps_orchestrator_internal_lines(self, tmp_path):
+        """Orchestrator JSONL has tool_use / tool_result as their own line types;
+        they should be preserved when they precede the cutoff visible message."""
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+
+        lines_in = [
+            {"type": "orchestrator_meta", "orchestrator": True, "session_id": "s"},
+            {"type": "user", "message": {"role": "user", "content": "ask"}, "timestamp": "2026-02-05T10:00:00Z"},
+            {"type": "tool_use", "tool_call_id": "t1", "tool_name": "x", "tool_input": {}},
+            {"type": "tool_result", "tool_call_id": "t1", "output": "r"},
+            {"type": "assistant", "message": {"role": "assistant", "content": "done"}, "timestamp": "2026-02-05T10:00:01Z"},
+            {"type": "user", "message": {"role": "user", "content": "next"}, "timestamp": "2026-02-05T10:00:02Z"},
+        ]
+        (context_dir / "s.jsonl").write_text("\n".join(json.dumps(l) for l in lines_in) + "\n")
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            # Visible: user (0), assistant (1), user (2). Drop last 1 → drop "next".
+            assert store.truncate_session("s", 1) is True
+
+        out_lines = [json.loads(l) for l in (context_dir / "s.jsonl").read_text().strip().split("\n")]
+        types = [l["type"] for l in out_lines]
+        assert types == ["orchestrator_meta", "user", "tool_use", "tool_result", "assistant"]
+
+    def test_drop_last_n_out_of_range_returns_false(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "s.jsonl", "s",
+            [_user_msg("only", "2026-02-05T10:00:00Z", uuid="u1")],
+        )
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            assert store.truncate_session("s", 5) is False
+            # File untouched
+            assert (context_dir / "s.jsonl").read_text().strip() != ""
+
+    def test_drop_last_n_zero_is_noop(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "s.jsonl", "s",
+            [
+                _user_msg("one", "2026-02-05T10:00:00Z", uuid="u1"),
+                _assistant_msg("two", "2026-02-05T10:00:01Z", uuid="a1"),
+            ],
+        )
+        original = (context_dir / "s.jsonl").read_text()
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            assert store.truncate_session("s", 0) is True
+        assert (context_dir / "s.jsonl").read_text() == original
+
+
+class TestForkSession:
+    def test_duplicates_then_drops_last_n(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "src.jsonl", "src",
+            [
+                _user_msg("first", "2026-02-05T10:00:00Z", uuid="u1"),
+                _assistant_msg("reply 1", "2026-02-05T10:00:01Z", uuid="a1"),
+                _user_msg("second", "2026-02-05T10:00:02Z", uuid="u2"),
+                _assistant_msg("reply 2", "2026-02-05T10:00:03Z", uuid="a2"),
+            ],
+        )
+        (context_dir / ".titles.json").write_text(json.dumps({"src": "Chat"}))
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            new_id = store.fork_session("src", 2)
+
+        assert new_id is not None
+        # Original untouched
+        src_lines = [json.loads(line) for line in (context_dir / "src.jsonl").read_text().strip().split("\n")]
+        assert len(src_lines) == 4
+        # Fork has only the first two messages (dropped last 2 visible)
+        new_lines = [json.loads(line) for line in (context_dir / f"{new_id}.jsonl").read_text().strip().split("\n")]
+        assert [l["uuid"] for l in new_lines] == ["u1", "a1"]
+        # Title was copied
+        titles = json.loads((context_dir / ".titles.json").read_text())
+        assert titles[new_id] == "Chat (copy)"
+
+    def test_rolls_back_on_bad_drop_count(self, tmp_path):
+        from unittest.mock import patch
+        context_dir = tmp_path / "context"
+        context_dir.mkdir(parents=True)
+        _write_session_jsonl(
+            context_dir / "src.jsonl", "src",
+            [_user_msg("only", "2026-02-05T10:00:00Z", uuid="u1")],
+        )
+        with patch("utils.paths.PROJECT_ROOT", tmp_path):
+            store = SessionStore(tmp_path)
+            with patch("manager.store.remove_session_from_index", return_value=True):
+                # We patch index removal because fork_session→delete_session calls it
+                new_id = store.fork_session("src", 10)
+
+        assert new_id is None
+        # No orphan files left behind
+        jsonls = sorted(p.name for p in context_dir.glob("*.jsonl"))
+        assert jsonls == ["src.jsonl"]

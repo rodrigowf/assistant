@@ -1,0 +1,71 @@
+# Gemini CLI file-tool ignore list.
+#
+# We disable respectGitIgnore in .gemini/settings.json so Gemini can read
+# context/ and projects/ (which are gitignored at the repo root). This file
+# re-blocks everything else from .gitignore that Gemini shouldn't be poking at:
+# build artifacts, caches, secrets, virtualenvs, runtime state.
+
+# Vector search index (regenerable)
+index/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv
+
+# Environment
+.env
+
+# Manager local config (runtime copies)
+/.manager.json
+/assistant_config.json
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+
+# Local logs
+logs/
+remote_console.log
+
+# Claude Code SDK config (symlink into context/)
+.claude_config/
+
+# Qwen Code per-user runtime state
+.qwen/
+
+# Claude Code runtime artifacts
+.claude.json
+.claude.json.backup.*
+debug/
+todos/
+plugins/
+
+# Secrets, credentials, and certificates
+secrets/
+certs/
+
+# Temporary files
+.index-temp/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/
+
+# Android build artifacts
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/**/*.apk
+android/**/*.aab
+
+# Android Device companion app build artifacts
+android-device/.gradle/
+android-device/app/build/
+android-device/build/
+android-device/local.properties
+android-device/**/*.apk
+android-device/**/*.aab
+sync/config.env

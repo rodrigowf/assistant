@@ -4,11 +4,24 @@ import {
   updateConfig,
   listMcpServers,
   listModels,
+  listVoiceModels,
+  listGoogleVoiceModels,
+  listQwenHarnessModels,
+  listSessionProviders,
   type AssistantConfig,
   type McpServerConfig,
   type ModelInfo,
+  type VoiceModelEntry,
+  type QwenModelInfo,
+  type SessionProviderSpec,
 } from "../api/rest";
 import { WorkingDirectorySection, SessionFlagsSection, McpServersSection } from "./AgentSettings";
+
+const VOICE_PROVIDER_LABELS: Record<string, string> = {
+  openai: "OpenAI",
+  qwen: "Qwen (Alibaba)",
+  google: "Google Gemini",
+};
 
 interface Props {
   isOpen: boolean;
@@ -19,6 +32,12 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [config, setConfig] = useState<AssistantConfig | null>(null);
   const [mcpServers, setMcpServers] = useState<Record<string, McpServerConfig>>({});
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [qwenHarnessModels, setQwenHarnessModels] = useState<QwenModelInfo[]>([]);
+  const [voiceProviders, setVoiceProviders] = useState<Record<string, VoiceModelEntry[]>>({});
+  // Session-harness specs loaded from /api/config/providers — the picker
+  // and the "Provider description" text both read from this so adding a
+  // new harness server-side surfaces here automatically.
+  const [sessionProviders, setSessionProviders] = useState<SessionProviderSpec[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,14 +52,45 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [cfg, mcpRes, modelsRes] = await Promise.all([
-        getConfig(),
+      // First fetch config so we know which Google backend to query.
+      const cfg = await getConfig();
+      const [mcpRes, modelsRes, voiceRes, googleVoiceRes, qwenHarnessRes, providersRes] = await Promise.all([
         listMcpServers(),
         listModels(),
+        listVoiceModels(),
+        // Dynamic Gemini Live list — backend queries the catalog for
+        // the requested endpoint (vertex / aistudio) and caches for
+        // 60s.  Tolerate failure: if ADC isn't set up or the upstream
+        // is broken, the route returns {models: []} and we fall back
+        // to the static VOICE_MODELS["google"] from listVoiceModels()
+        // below.
+        listGoogleVoiceModels(cfg.default_voice_endpoint).catch(e => {
+          console.warn("listGoogleVoiceModels failed:", e);
+          return { models: [] };
+        }),
+        // Tolerate failure here: if the user hasn't installed the Qwen CLI,
+        // the route still works (returns []) but a fetch error would still
+        // blank the whole config page.  Swallow + log so the rest renders.
+        listQwenHarnessModels().catch(e => {
+          console.warn("listQwenHarnessModels failed:", e);
+          return { models: [] };
+        }),
+        listSessionProviders(),
       ]);
       setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setModels(modelsRes.models);
+      // Merge the dynamic Gemini Live list into voiceProviders, replacing
+      // the static "google" entries when the dynamic list is non-empty.
+      // Empty list → keep the static fallback so the UI still works
+      // even when the API key isn't configured.
+      const mergedVoiceProviders = { ...voiceRes.providers };
+      if (googleVoiceRes.models.length > 0) {
+        mergedVoiceProviders.google = googleVoiceRes.models;
+      }
+      setVoiceProviders(mergedVoiceProviders);
+      setQwenHarnessModels(qwenHarnessRes.models);
+      setSessionProviders(providersRes.providers);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -59,6 +109,28 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, [isOpen, onClose]);
+
+  // Refetch the Google voice catalog when the user flips the endpoint
+  // selector mid-session — the two backends (AI Studio / Vertex) have
+  // different model lists.  Skipped on first render: ``load`` already
+  // fetched the right catalog from the initial config.
+  const endpointRef = useRef<string | null>(null);
+  useEffect(() => {
+    const ep = config?.default_voice_endpoint;
+    if (!ep) return;
+    if (endpointRef.current === null) {
+      endpointRef.current = ep;
+      return;
+    }
+    if (endpointRef.current === ep) return;
+    endpointRef.current = ep;
+    listGoogleVoiceModels(ep)
+      .then(res => {
+        if (res.models.length === 0) return;
+        setVoiceProviders(prev => ({ ...prev, google: res.models }));
+      })
+      .catch(e => console.warn("listGoogleVoiceModels refetch failed:", e));
+  }, [config?.default_voice_endpoint]);
 
   const showSaved = () => {
     setSavedMsg(true);
@@ -96,6 +168,21 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const selectedProvider = selectedModel?.provider ?? providers[0] ?? "";
   const providerModels = models.filter(m => m.provider === selectedProvider);
 
+  // Derived voice-provider/model/voice/language state for dropdowns
+  const voiceProviderIds = Object.keys(voiceProviders);
+  const selectedVoiceProvider = config?.default_voice_provider ?? voiceProviderIds[0] ?? "";
+  // Endpoint sub-selector — applies only when provider === "google".
+  const selectedVoiceEndpoint = config?.default_voice_endpoint ?? "vertex";
+  const voiceModels: VoiceModelEntry[] = voiceProviders[selectedVoiceProvider] ?? [];
+  const selectedVoiceModel: VoiceModelEntry | undefined =
+    voiceModels.find(m => m.id === config?.default_voice_model) ?? voiceModels[0];
+  const voiceVoices = selectedVoiceModel?.voices ?? [];
+  const selectedVoiceName = config?.default_voice_name ?? selectedVoiceModel?.voice ?? "";
+  const voiceLanguages = selectedVoiceModel?.transcription_languages ?? [];
+  const selectedVoiceLanguage =
+    config?.default_voice_transcription_language ??
+    selectedVoiceModel?.default_transcription_language ?? "";
+
   if (!isOpen) return null;
 
   return (
@@ -129,53 +216,268 @@ export function ConfigPage({ isOpen, onClose }: Props) {
 
           {!loading && config && (
             <>
-              {/* ── Orchestrator Model ─────────────────────────── */}
+              {/* ── Orchestrator ──────────────────────────────── */}
               <section className="config-section">
-                <h3 className="config-section-title">Orchestrator Model</h3>
+                <h3 className="config-section-title">Orchestrator</h3>
                 <p className="config-section-desc">
-                  Default model for new orchestrator sessions. Can be changed mid-conversation.
+                  Defaults the orchestrator uses for new sessions. Text mode also drives
+                  history summarization.
                 </p>
-                {models.length === 0 ? (
-                  <div className="config-empty">No models available</div>
-                ) : (
-                  <div className="model-dropdowns">
-                    <div className="model-dropdown-field">
-                      <label className="model-dropdown-label">Provider</label>
-                      <select
-                        className="model-dropdown-select"
-                        value={selectedProvider}
-                        disabled={saving}
-                        onChange={(e) => {
-                          // When provider changes, auto-select first model of that provider
-                          const first = models.find(m => m.provider === e.target.value);
-                          if (first) save({ default_model: first.model_id }).catch(err => setError(String(err)));
-                        }}
-                      >
-                        {providers.map(p => (
-                          <option key={p} value={p}>
-                            {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
-                          </option>
-                        ))}
-                      </select>
+
+                {/* Text mode */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Text mode</h4>
+                  <p className="config-subsection-desc">
+                    Used for typed conversations. Can be changed mid-conversation.
+                  </p>
+                  {models.length === 0 ? (
+                    <div className="config-empty">No models available</div>
+                  ) : (
+                    <div className="model-dropdowns">
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Provider</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedProvider}
+                          disabled={saving}
+                          onChange={(e) => {
+                            // When provider changes, auto-select first model of that provider
+                            const first = models.find(m => m.provider === e.target.value);
+                            if (first) save({ default_model: first.model_id }).catch(err => setError(String(err)));
+                          }}
+                        >
+                          {providers.map(p => (
+                            <option key={p} value={p}>
+                              {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Model</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={config.default_model}
+                          disabled={saving}
+                          onChange={(e) => save({ default_model: e.target.value }).catch(err => setError(String(err)))}
+                        >
+                          {providerModels.map(m => (
+                            <option key={m.model_id} value={m.model_id}>
+                              {m.display_name}
+                              {m.supports_audio ? " 🎤" : ""}
+                              {m.supports_vision ? " 👁" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
+                  )}
+                </div>
+
+                {/* Voice mode */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Voice mode</h4>
+                  <p className="config-subsection-desc">
+                    Used for realtime voice sessions. Cannot be changed mid-session.
+                  </p>
+                  {voiceProviderIds.length === 0 ? (
+                    <div className="config-empty">No voice providers available</div>
+                  ) : (
+                    <div className="model-dropdowns">
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Provider</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceProvider}
+                          disabled={saving}
+                          onChange={(e) =>
+                            save({ default_voice_provider: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                        >
+                          {voiceProviderIds.map(p => (
+                            <option key={p} value={p}>
+                              {VOICE_PROVIDER_LABELS[p] ?? p}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {selectedVoiceProvider === "google" && (
+                        <div className="model-dropdown-field">
+                          <label className="model-dropdown-label">Endpoint</label>
+                          <select
+                            className="model-dropdown-select"
+                            value={selectedVoiceEndpoint}
+                            disabled={saving}
+                            onChange={(e) =>
+                              save({ default_voice_endpoint: e.target.value })
+                                .catch(err => setError(String(err)))
+                            }
+                            title="Which Google backend serves Gemini Live. Vertex AI is the stable default; AI Studio (generativelanguage.googleapis.com) is the legacy path and may return 1008 denials for preview models."
+                          >
+                            <option value="vertex">Vertex AI (recommended)</option>
+                            <option value="aistudio">AI Studio (legacy)</option>
+                          </select>
+                        </div>
+                      )}
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Model</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceModel?.id ?? ""}
+                          disabled={saving || voiceModels.length === 0}
+                          onChange={(e) =>
+                            save({ default_voice_model: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                        >
+                          {voiceModels.map(m => (
+                            <option key={m.id} value={m.id}>{m.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Voice</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedVoiceName}
+                          disabled={saving || voiceVoices.length === 0}
+                          onChange={(e) =>
+                            save({ default_voice_name: e.target.value })
+                              .catch(err => setError(String(err)))
+                          }
+                        >
+                          {voiceVoices.map(v => (
+                            <option key={v.id} value={v.id} title={v.description}>
+                              {v.label}
+                              {v.description ? ` — ${v.description}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {voiceLanguages.length > 0 && (
+                        <div className="model-dropdown-field">
+                          <label className="model-dropdown-label">
+                            Transcription language
+                          </label>
+                          <select
+                            className="model-dropdown-select"
+                            value={selectedVoiceLanguage}
+                            disabled={saving}
+                            onChange={(e) =>
+                              save({ default_voice_transcription_language: e.target.value })
+                                .catch(err => setError(String(err)))
+                            }
+                            title="Language hint for transcribing your voice into the conversation history. Auto-detect lets the ASR identify per turn — best for multilingual speakers, but more error-prone on short fragments."
+                          >
+                            {voiceLanguages.map(l => (
+                              <option key={l.id || "auto"} value={l.id} title={l.description}>
+                                {l.label}
+                                {l.description ? ` — ${l.description}` : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Voice recording */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Voice recording</h4>
+                  <p className="config-subsection-desc">
+                    Save raw audio from voice sessions for later playback and analysis.
+                    Recordings are stored in context/recordings/ and can be used by the
+                    orchestrator to analyze emotional states, tone, and pacing.
+                  </p>
+                  <div className="config-item-list">
+                    <label className={`config-item${config.voice_recording_enabled ? " enabled" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={config.voice_recording_enabled}
+                        onChange={() => save({ voice_recording_enabled: !config.voice_recording_enabled }).catch(e => setError(String(e)))}
+                        disabled={saving}
+                      />
+                      <div className="config-item-info">
+                        <span className="config-item-name">Enable voice recording</span>
+                        <span className="config-item-detail">
+                          Record both user and assistant audio streams during voice sessions
+                        </span>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              {/* ── Session Provider ──────────────────────────── */}
+              <section className="config-section">
+                <h3 className="config-section-title">Session provider</h3>
+                <p className="config-section-desc">
+                  Which agent backs new chat sessions. Existing sessions keep their original
+                  provider; this only affects newly-created tabs.
+                </p>
+                <div className="model-dropdowns">
+                  <div className="model-dropdown-field">
+                    <label className="model-dropdown-label">Provider</label>
+                    <select
+                      className="model-dropdown-select"
+                      value={config.provider ?? "claude"}
+                      disabled={saving}
+                      onChange={(e) =>
+                        save({ provider: e.target.value })
+                          .catch(err => setError(String(err)))
+                      }
+                    >
+                      {sessionProviders.map(p => (
+                        <option key={p.id} value={p.id}>{p.label}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Qwen harness model — sourced from ~/.qwen/settings.json so anything
+                      the user has wired up there (Qwen, DeepSeek, GLM, a local provider,
+                      …) shows up automatically.  An empty value means "let the CLI pick
+                      its own default" — we surface that as the first option so users on a
+                      fresh install don't have to touch this. */}
+                  {(config.provider ?? "claude") === "qwen" && (
                     <div className="model-dropdown-field">
                       <label className="model-dropdown-label">Model</label>
                       <select
                         className="model-dropdown-select"
-                        value={config.default_model}
-                        disabled={saving}
-                        onChange={(e) => save({ default_model: e.target.value }).catch(err => setError(String(err)))}
+                        value={config.harness_model?.qwen ?? ""}
+                        disabled={saving || qwenHarnessModels.length === 0}
+                        onChange={(e) =>
+                          save({ harness_model: { qwen: e.target.value } })
+                            .catch(err => setError(String(err)))
+                        }
                       >
-                        {providerModels.map(m => (
-                          <option key={m.model_id} value={m.model_id}>
-                            {m.display_name}
-                            {m.supports_audio ? " 🎤" : ""}
-                            {m.supports_vision ? " 👁" : ""}
-                          </option>
-                        ))}
+                        <option value="">CLI default</option>
+                        {qwenHarnessModels.map(m => {
+                          const badges = [
+                            m.context_window ? `${Math.round(m.context_window / 1000)}K ctx` : null,
+                            m.supports_thinking ? "thinking" : null,
+                            m.supports_vision ? "vision" : null,
+                            m.supports_video ? "video" : null,
+                          ].filter(Boolean).join(" · ");
+                          return (
+                            <option key={m.id} value={m.id}>
+                              {m.display_name}{badges ? ` — ${badges}` : ""}
+                            </option>
+                          );
+                        })}
                       </select>
                     </div>
-                  </div>
+                  )}
+                </div>
+                <p className="config-section-desc" style={{ marginTop: 8 }}>
+                  {sessionProviders.find(p => p.id === (config.provider ?? "claude"))?.description ?? ""}
+                </p>
+                {(config.provider ?? "claude") === "qwen" && qwenHarnessModels.length === 0 && (
+                  <p className="config-section-desc" style={{ marginTop: 4, opacity: 0.7 }}>
+                    No models found in <code>~/.qwen/settings.json</code> — run <code>qwen</code> once to
+                    initialize the catalog, or add custom providers there.
+                  </p>
                 )}
               </section>
 

@@ -34,9 +34,9 @@ object MdColors {
     val codeHeaderBg = Color(0xFF1E1E22)    // = bgElevated
     val codeText = Color(0xFFABB2BF)        // oneDark default foreground
 
-    // Thinking block
-    val thinkingBorder = Color(0xFFC4923A)  // --thinking-border
-    val thinkingBg = Color(0x0AC4923A)      // rgba(201,150,58, 0.04)
+    // Thinking block — soft gray, distinct from amber shell tool color
+    val thinkingBorder = Color(0xFF7A7A85)  // --thinking-border
+    val thinkingBg = Color(0x0D8C8C9B)      // rgba(140,140,155, 0.05)
 
     // Syntax highlighting (oneDark palette)
     val synKeyword = Color(0xFFC678DD)      // purple

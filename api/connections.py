@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from starlette.websockets import WebSocket
 
-from manager.session import SessionManager
+from manager.base_session import BaseSessionManager
+
+if TYPE_CHECKING:
+    # Imported only for type-checkers; runtime code uses the base class so
+    # this module can load without the Claude SDK installed.
+    pass
 
 
 class ConnectionManager:
-    """Track active WebSocket connections and their SessionManager instances.
+    """Track active WebSocket connections and their session-manager instances.
 
-    Used by the auth route to look up sessions by WebSocket.
+    Used by the auth route to look up sessions by WebSocket.  Typed against
+    ``BaseSessionManager`` so the module stays provider-agnostic — Claude
+    and Qwen sessions are stored uniformly.
     """
 
     def __init__(self) -> None:
-        self._active: dict[str, tuple[WebSocket, SessionManager]] = {}
+        self._active: dict[str, tuple[WebSocket, BaseSessionManager]] = {}
 
-    def connect(self, session_id: str, ws: WebSocket, sm: SessionManager) -> None:
+    def connect(self, session_id: str, ws: WebSocket, sm: BaseSessionManager) -> None:
         self._active[session_id] = (ws, sm)
 
     async def disconnect(self, session_id: str) -> None:
@@ -28,7 +37,7 @@ class ConnectionManager:
             except Exception:
                 pass
 
-    def get(self, session_id: str) -> tuple[WebSocket, SessionManager] | None:
+    def get(self, session_id: str) -> tuple[WebSocket, BaseSessionManager] | None:
         return self._active.get(session_id)
 
     def is_active(self, session_id: str) -> bool:
