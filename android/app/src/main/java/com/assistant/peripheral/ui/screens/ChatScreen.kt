@@ -255,16 +255,20 @@ private fun MessageItem(
         return
     }
 
-    Column(
+    val hasMenu = onRewind != null || onFork != null
+
+    // Lay out the bubble and its overflow menu in a single row so the
+    // ⋮ button sits beside the bubble (in the open margin) instead of
+    // floating on its own line above it. User bubbles align right with
+    // the menu on the left side; assistant prose aligns left with the
+    // menu on the right.
+    Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
-        if (onRewind != null || onFork != null) {
-            MessageActionsMenu(
-                onRewind = onRewind ?: {},
-                onFork = onFork ?: {},
-                modifier = Modifier.align(if (isUser) Alignment.End else Alignment.Start)
-            )
+        if (hasMenu && isUser) {
+            MessageActionsMenu(onRewind = onRewind ?: {}, onFork = onFork ?: {})
         }
         if (isUser || isSystem) {
             // USER / SYSTEM: Keep bubble with rounded corners
@@ -313,10 +317,11 @@ private fun MessageItem(
                 }
             }
         } else {
-            // ASSISTANT: Full-width prose, no bubble (matches web message-assistant)
+            // ASSISTANT: Full-width prose, no bubble (matches web message-assistant).
+            // Take remaining width via weight so the inline menu stays at the row's end.
             Column(
                 modifier = Modifier
-                    .fillMaxWidth()
+                    .weight(1f)
                     .padding(horizontal = 4.dp)
                     .animateContentSize()
             ) {
@@ -341,6 +346,9 @@ private fun MessageItem(
                     )
                 }
             }
+        }
+        if (hasMenu && !isUser) {
+            MessageActionsMenu(onRewind = onRewind ?: {}, onFork = onFork ?: {})
         }
     }
 }

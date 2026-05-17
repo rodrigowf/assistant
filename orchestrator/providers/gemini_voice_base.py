@@ -129,6 +129,25 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         self._pending_call_names: dict[str, str] = {}
         # Running transcript for interruption events.
         self._current_transcript: str = ""
+        # Session resumption — Gemini Live closes the upstream WS after
+        # ~10–15 minutes per session. Opting in via ``sessionResumption``
+        # in the setup payload makes the server emit periodic
+        # ``sessionResumptionUpdate`` frames carrying a ``newHandle``; on
+        # disconnect we can reopen with that handle and pick up the
+        # in-memory context. We hold the most recent resumable handle
+        # here so :meth:`format_session_config` includes it whenever the
+        # relay rebuilds setup (first session: handle is None →
+        # opt-in-only). See https://ai.google.dev/api/live#session-resumption.
+        self._resumption_handle: str | None = None
+        # Sticky flag: set when the upstream emits ``goAway`` (typically
+        # ~30–60s before the server force-closes with WS 1008 / "session
+        # duration"). The relay's drain task catches that close and asks
+        # the provider via :meth:`is_recoverable_error` whether to try a
+        # transparent reconnect — we only return True when this flag is
+        # set, because a 1008 from any other cause (e.g. AI Studio's
+        # "project denied access") is genuinely fatal and reconnecting
+        # would just loop. Cleared on ``setupComplete`` after reconnect.
+        self._goaway_received: bool = False
 
     # --- identity ---------------------------------------------------------
 
@@ -424,6 +443,15 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
                     "silenceDurationMs": 1500,
                 },
             },
+            # Opt into session resumption. First setup sends an empty
+            # object (no handle) to ask the server to start emitting
+            # ``sessionResumptionUpdate`` frames; on a relay-initiated
+            # reconnect we send the most recent ``newHandle`` and Gemini
+            # restores the upstream session's in-memory state.
+            "sessionResumption": (
+                {"handle": self._resumption_handle}
+                if self._resumption_handle else {}
+            ),
         }
         if system:
             setup["systemInstruction"] = {"parts": [{"text": system}]}
@@ -476,13 +504,78 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
     # No keepalive needed empirically — Gemini Live doesn't have Qwen's
     # ASR-timeout pathology. If a similar problem surfaces, override
     # build_keepalive_chunk() to return a short silent PCM chunk.
-    #
-    # is_recoverable_error / should_gate_event / on_inbound_event all
-    # default to the base-class no-op behaviour. Gemini Live doesn't
-    # reject concurrent client messages the way Qwen does, and we
-    # haven't (yet) seen any close codes that benefit from automatic
-    # reconnect. Add overrides here if either pattern emerges in
-    # production.
+
+    def on_inbound_event(self, event: dict[str, Any]) -> None:
+        """Track session-resumption handles and the goAway signal.
+
+        Gemini Live exposes two pieces of state we need to react to:
+
+        - ``sessionResumptionUpdate.newHandle`` — opaque string that, on
+          a future reconnect, restores this session's in-memory context.
+          We keep the most recent one (the server replaces older
+          handles); :meth:`format_session_config` reads it on rebuild.
+        - ``goAway.timeLeft`` — warning emitted ~30–60s before the
+          server force-closes the WS with code 1008 because the
+          per-session duration limit is up. We don't close eagerly: we
+          let Gemini drop the connection and the relay's drain task
+          catches the close; :meth:`is_recoverable_error` then returns
+          True so the existing reconnect machinery reopens with the
+          saved handle.
+        - ``setupComplete`` — fires after every successful (re)open.
+          Clears the goAway flag so a *new* genuine 1008 (e.g. quota)
+          won't loop reconnects.
+        """
+        if "setupComplete" in event:
+            self._goaway_received = False
+        update = event.get("sessionResumptionUpdate")
+        if isinstance(update, dict):
+            handle = update.get("newHandle")
+            if isinstance(handle, str) and handle:
+                self._resumption_handle = handle
+                logger.info(
+                    "gemini session_resumption handle captured (resumable=%s)",
+                    update.get("resumable"),
+                )
+        go_away = event.get("goAway")
+        if isinstance(go_away, dict):
+            self._goaway_received = True
+            logger.info(
+                "gemini goAway received timeLeft=%s (will reconnect on close)",
+                go_away.get("timeLeft"),
+            )
+
+    def should_close_after_event(self, event: dict[str, Any]) -> bool:
+        """Close the upstream WS immediately after a ``goAway``.
+
+        Per Google's Live API spec, the client is expected to close the
+        connection on receiving ``goAway`` — failing to do so triggers
+        the punitive ``1008`` close with the misleading "policy
+        violation" reason. We close cleanly (1000), which routes the
+        drain loop into :meth:`is_recoverable_error` (which returns True
+        because we just set ``_goaway_received``) and lets the relay
+        reconnect with the saved session-resumption handle.
+        """
+        return isinstance(event.get("goAway"), dict)
+
+    def is_recoverable_error(self, exc: BaseException) -> bool:
+        """Reconnect when the upstream closed *after* a goAway.
+
+        Any other 1008 is treated as fatal: AI Studio's "project denied
+        access" close shares the same code but isn't recoverable —
+        retrying would just loop. We also require a captured resumption
+        handle so the rebuilt setup can actually restore state instead
+        of silently starting a fresh session.
+        """
+        if not self._goaway_received:
+            return False
+        if not self._resumption_handle:
+            return False
+        # We don't inspect ``exc`` further — once goAway has fired, the
+        # next close (whatever code) is the duration kill we're prepared
+        # for. Returning True hands control to the relay's reconnect
+        # machinery, which calls ``rebuild_session_update`` (→ our
+        # ``format_session_config`` reads ``_resumption_handle``).
+        return True
 
     # --- connection metadata ---------------------------------------------
 

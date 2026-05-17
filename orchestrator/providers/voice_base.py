@@ -215,6 +215,26 @@ class BaseVoiceProvider(ABC):
         """
         return True
 
+    def should_close_after_event(self, event: dict[str, Any]) -> bool:
+        """Decide whether the relay should proactively close the upstream WS.
+
+        Default: ``False``. Providers can return ``True`` for inbound
+        signals that *require* the client to close the connection per
+        protocol — Gemini Live's ``goAway`` is the motivating case:
+        Google's docs say the client must close after receiving the
+        signal, and a passively-dropped connection produces a misleading
+        ``1008 policy violation`` close that the user sees as a red
+        error banner.
+
+        Called by the relay right after :meth:`on_inbound_event`. When
+        True, the relay closes the upstream WS with a clean 1000; the
+        drain loop then enters the recoverable-error path and, if
+        :meth:`is_recoverable_error` agrees, the existing reconnect
+        machinery reopens with a fresh ``session.update`` (which lets
+        Gemini's session-resumption handle restore in-memory context).
+        """
+        return False
+
     def build_keepalive_chunk(self) -> str | None:
         """Return a base64-PCM silent chunk to keep the upstream warm, or None.
 

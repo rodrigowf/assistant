@@ -649,6 +649,25 @@ class VoiceRelay:
                 # Control events → orchestrator pipeline + frontend mirror.
                 await self._provider.inject_event(event)
                 await self._on_event_for_frontend(event)
+
+                # Some inbound signals require the client to close the
+                # upstream WS per protocol — Gemini Live's ``goAway`` is
+                # the motivating case. Closing here (clean 1000) makes
+                # the drain loop catch ConnectionClosedOK and route into
+                # the recoverable-error path, instead of waiting for
+                # Gemini's punitive 1008 "policy violation" force-close.
+                if self._provider.should_close_after_event(event) and self._ws is not None:
+                    self._slog("provider requested upstream close; closing 1000 to trigger reconnect")
+                    logger.info(
+                        "voice_relay provider-requested close session_id=%s",
+                        self._session_id,
+                    )
+                    try:
+                        await self._ws.close(code=1000, reason="provider-requested close")
+                    except Exception:  # noqa: BLE001
+                        logger.exception("voice_relay close failed after provider request")
+                    # Drain loop will exit on the next iteration; the
+                    # exception handler below picks up reconnect.
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

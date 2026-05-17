@@ -106,6 +106,16 @@ class QwenVoiceProvider(
     private var inSampleRate: Int = 24000
     private var outSampleRate: Int = 24000
 
+    // --- Gemini assistant transcript accumulator --------------------------
+    // Gemini Live streams the assistant's transcript as deltas under
+    // ``serverContent.outputTranscription.text`` and signals completion
+    // with ``serverContent.turnComplete``. There's no final consolidated
+    // ``done`` event like OpenAI / Qwen, so we accumulate deltas here and
+    // emit a single ``TextComplete`` on turnComplete so the chat bubble
+    // renders. Mirrors ``orchestrator/session.py``'s
+    // ``_pending_assistant_transcript``.
+    private val geminiAssistantStaged = StringBuilder()
+
     // --- Bridge to the backend WS (set in connect) ------------------------
     private var sendMicChunk: ((String) -> Unit)? = null
 
@@ -186,7 +196,15 @@ class QwenVoiceProvider(
      *     gain is applied directly to PCM in the capture loop.
      */
     override fun handleProviderEvent(event: Map<String, Any?>) {
-        val eventType = event["type"] as? String ?: return
+        val eventType = event["type"] as? String
+        if (eventType == null) {
+            // Gemini Live event shape — top-level camelCase keys
+            // (``serverContent``, ``toolCall``, ``setupComplete``), no
+            // ``type`` field. Mirrors the web frontend's branch in
+            // ``frontend/src/hooks/useVoiceOrchestrator.ts``.
+            handleGeminiEvent(event)
+            return
+        }
         when (eventType) {
             "error" -> {
                 // The WS layer hands us shallow maps for voice events,
@@ -250,6 +268,96 @@ class QwenVoiceProvider(
             // session.created / session.updated / response.audio.* etc.
             // are noise from the client's perspective — backend persists
             // them; we don't need to react.
+        }
+    }
+
+    /**
+     * Gemini Live event dispatcher. The wire shape differs from OpenAI /
+     * Qwen in two ways: no ``type`` field, and the meaningful payload
+     * lives under camelCase keys (``serverContent`` for transcripts /
+     * turn signals, ``toolCall`` for function calls). The WS layer hands
+     * us partially-walked maps, so nested objects may arrive as either
+     * Map or JSONObject — read both via [readNestedAny].
+     */
+    private fun handleGeminiEvent(event: Map<String, Any?>) {
+        val sc = event["serverContent"]
+        if (sc != null) {
+            val inputText = readNestedString(readNestedAny(sc, "inputTranscription"), "text")
+            if (!inputText.isNullOrEmpty()) {
+                _events.tryEmit(VoiceEvent.UserTranscript(inputText))
+            }
+            val outputText = readNestedString(readNestedAny(sc, "outputTranscription"), "text")
+            if (!outputText.isNullOrEmpty()) {
+                geminiAssistantStaged.append(outputText)
+                _events.tryEmit(VoiceEvent.TextDelta(outputText))
+            }
+            // Half-cascade Live preview streams text via modelTurn.parts[].text.
+            val modelTurn = readNestedAny(sc, "modelTurn")
+            val parts = readNestedAny(modelTurn, "parts")
+            if (parts is List<*>) {
+                for (p in parts) {
+                    val t = readNestedString(p, "text")
+                    if (!t.isNullOrEmpty()) {
+                        geminiAssistantStaged.append(t)
+                        _events.tryEmit(VoiceEvent.TextDelta(t))
+                    }
+                }
+            }
+            if (readNestedBoolean(sc, "interrupted") == true) {
+                flushSpeakerOutput()
+                _state.value = VoiceState.Active
+                // Drop the partial transcript — barge-in cuts the turn.
+                geminiAssistantStaged.setLength(0)
+            }
+            if (readNestedBoolean(sc, "turnComplete") == true) {
+                _state.value = VoiceState.Active
+                val staged = geminiAssistantStaged.toString()
+                geminiAssistantStaged.setLength(0)
+                _events.tryEmit(VoiceEvent.TextComplete(staged))
+                _events.tryEmit(VoiceEvent.TurnComplete)
+            }
+        }
+        val toolCall = event["toolCall"]
+        if (toolCall != null) {
+            _state.value = VoiceState.ToolUse
+            val calls = readNestedAny(toolCall, "functionCalls")
+            if (calls is List<*>) {
+                for (c in calls) {
+                    val callId = readNestedString(c, "id") ?: ""
+                    val name = readNestedString(c, "name") ?: ""
+                    val argsAny = readNestedAny(c, "args")
+                    val args: Map<String, Any?> = when (argsAny) {
+                        is Map<*, *> -> {
+                            @Suppress("UNCHECKED_CAST")
+                            argsAny as Map<String, Any?>
+                        }
+                        is org.json.JSONObject -> jsonObjectToMap(argsAny)
+                        else -> emptyMap()
+                    }
+                    if (callId.isNotEmpty() && name.isNotEmpty()) {
+                        _events.tryEmit(VoiceEvent.ToolUse(callId, name, args))
+                    }
+                }
+            }
+        }
+    }
+
+    /** Read a nested value by key from a Map or JSONObject. */
+    private fun readNestedAny(value: Any?, key: String): Any? {
+        return when (value) {
+            is Map<*, *> -> value[key]
+            is org.json.JSONObject -> value.opt(key)
+            else -> null
+        }
+    }
+
+    /** Read a boolean field from a Map or JSONObject (null if absent). */
+    private fun readNestedBoolean(value: Any?, key: String): Boolean? {
+        return when (value) {
+            is Map<*, *> -> value[key] as? Boolean
+            is org.json.JSONObject ->
+                if (value.has(key)) value.optBoolean(key, false) else null
+            else -> null
         }
     }
 
