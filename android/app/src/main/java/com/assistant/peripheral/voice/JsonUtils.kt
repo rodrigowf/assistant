@@ -37,3 +37,30 @@ internal fun jsonArrayToList(array: JSONArray): List<Any?> {
     }
     return list
 }
+
+// The WS layer hands voice providers shallow maps where nested values
+// may arrive either as fully-walked Map/List or as raw JSONObject /
+// JSONArray (depending on which conversion path took them). These
+// helpers read either shape transparently so parsers don't have to
+// branch at every access.
+
+/** Read a nested value by key from a Map or JSONObject. */
+internal fun readNestedAny(value: Any?, key: String): Any? = when (value) {
+    is Map<*, *> -> value[key]
+    is JSONObject -> value.opt(key)
+    else -> null
+}
+
+/** Read a string field from a Map or JSONObject (null if absent or empty). */
+internal fun readNestedString(value: Any?, key: String): String? = when (value) {
+    is JSONObject -> value.optString(key, "").ifEmpty { null }
+    is Map<*, *> -> value[key] as? String
+    else -> null
+}
+
+/** Read a boolean field from a Map or JSONObject (null if absent). */
+internal fun readNestedBoolean(value: Any?, key: String): Boolean? = when (value) {
+    is Map<*, *> -> value[key] as? Boolean
+    is JSONObject -> if (value.has(key)) value.optBoolean(key, false) else null
+    else -> null
+}

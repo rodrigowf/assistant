@@ -20,11 +20,17 @@ import kotlinx.coroutines.flow.*
  * routing, Bluetooth detection) and delegates all transport-specific
  * work to a [VoiceProvider] implementation.
  *
- * Two providers ship today:
+ * Three providers ship today:
  *   - [OpenAIVoiceProvider]   — WebRTC, owns the peer connection
- *   - [QwenVoiceProvider]     — WebSocket, audio relayed via the
- *                               orchestrator WS (see [setMicChunkCallback]
- *                               and [pushSpeakerChunk])
+ *   - [QwenVoiceProvider]     — WebSocket (OpenAI-Realtime event shape),
+ *                               audio relayed via the orchestrator WS
+ *                               (see [setMicChunkCallback] and
+ *                               [pushSpeakerChunk])
+ *   - [GeminiVoiceProvider]   — WebSocket (Gemini Live event shape),
+ *                               same transport as Qwen
+ *
+ * The two WebSocket providers share their audio plumbing via
+ * [WebSocketPcmProvider]; only their upstream-event parsers differ.
  *
  * The provider is selected on every [start] call based on the
  * [VoiceConfig] fetched from the backend.  Switching providers requires
@@ -285,12 +291,16 @@ class VoiceManager(
         return when (providerId) {
             "openai" -> OpenAIVoiceProvider(context, apiClient)
             "qwen" -> QwenVoiceProvider(context)
+            "google" -> GeminiVoiceProvider(context)
             else -> {
-                // Unknown provider — fall back based on the connection type.
+                // Unknown provider — fall back based on the connection
+                // type. WebSocket fallback uses the Qwen parser since
+                // OpenAI-Realtime event shape is the de-facto standard
+                // among third-party realtime APIs.
                 Log.w(TAG, "Unknown provider '$providerId'; falling back by connection type")
                 when (connectionType) {
                     VoiceConnectionType.WEBRTC -> OpenAIVoiceProvider(context, apiClient)
-                    VoiceConnectionType.WEBSOCKET -> QwenVoiceProvider(context)
+                    VoiceConnectionType.WEBSOCKET -> QwenVoiceProvider(context, providerId = providerId)
                 }
             }
         }
