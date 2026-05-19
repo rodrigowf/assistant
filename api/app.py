@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 
 from manager.auth import AuthManager
 from manager.config import ManagerConfig
+from manager.loop_watchdog import start_loop_watchdog
 from manager.store import SessionStore
 
 from .connections import ConnectionManager
@@ -30,6 +31,12 @@ async def lifespan(app: FastAPI):
     # Ensure CLAUDE_CONFIG_DIR is always set, even if not launched via run.sh.
     project_root = Path(__file__).resolve().parent.parent
     os.environ.setdefault("CLAUDE_CONFIG_DIR", str(project_root / ".claude_config"))
+
+    # Event-loop liveness watchdog: forces a process restart if the loop ever
+    # stops servicing callbacks for >30s.  Defense against claude-agent-sdk#378 /
+    # anyio#695 (busy-loop in _deliver_cancellation pinning the loop forever).
+    # systemd restarts the service; sessions resume from their JSONL.
+    start_loop_watchdog(asyncio.get_running_loop())
 
     config = ManagerConfig.load()
     app.state.config = config
