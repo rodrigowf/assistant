@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive icon background: 135deg gradient from deep purple to indigo,
+  matching the design sheet's `.app-icon.gradient` treatment.
+  Replaces the previous flat @color/primary.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M0,0 L108,0 L108,108 L0,108 Z">
+        <aapt:attr xmlns:aapt="http://schemas.android.com/aapt" name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108">
+                <item android:offset="0.0" android:color="#FF4B0856"/>
+                <item android:offset="1.0" android:color="#FF6366F1"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

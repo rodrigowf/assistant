@@ -2,9 +2,9 @@
 <!--
   Adaptive icon foreground for Assistant.
   Source: context/public/design/logo-icon.svg
-  Original SVG viewBox: 9.55 7.62 97.34 89.37, content drawn under translate(-33.48,-22.49).
-  We re-anchor that content to (0,0) and scale to fit the 72x72 safe zone of the 108x108 foreground.
-  Scale: 72 / max(97.34, 89.37) ~= 0.7397.  Center offsets keep the glyph in the safe zone.
+  Glyph fills 41% of the 108x108 canvas (stays inside the 72x72 safe zone
+  with a small margin). Counter dot drawn in gradient-start color so it
+  punches through onto the background gradient.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -12,25 +12,29 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
     <group
-        android:translateX="18"
-        android:translateY="20.8"
-        android:scaleX="0.7397"
-        android:scaleY="0.7397">
+        android:translateX="31.5360"
+        android:translateY="36.1800"
+        android:scaleX="0.4616"
+        android:scaleY="0.4616">
         <group
-            android:translateX="-43.026177"
-            android:translateY="-30.111808">
-            <!-- Main bubble body -->
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M 98.480703,32.661887 C 67.754367,33.259103 46.458161,54.860273 46.208209,73.168671 46.012937,87.471796 51.161111,93.572555 61.633729,102.17629 L 67.766099,117.99267 103.88787,61.465252 C 103.88787,61.465252 105.90103,57.370514 111.44445,58.668375 L 117.00199,95.956096 C 130.73463,86.140753 137.41091,74.628442 137.09133,64.102633 137.09126,46.849641 125.5835,32.1351 98.480703,32.661887 Z"/>
-            <!-- Right leg -->
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M 99.616178,84.759027 88.88798,104.69593 C 95.037865,104.84419 101.24552,103.25254 107.2637,100.75395 L 107.2617,84.864696 C 107.26167,84.624842 107.10218,84.500581 106.94034,84.501639 L 99.957051,84.547309 C 99.823301,84.548184 99.616178,84.62545 99.616178,84.759027 Z"/>
-            <!-- Counter dot punched out via background color -->
-            <path
-                android:fillColor="#FF4B0856"
-                android:pathData="M 105.31412,74.805437 C 104.92348,74.984446 102.76734,76.477216 102.83109,77.958725 102.84869,78.388588 102.92509,78.541781 103.10257,78.767454 103.71195,79.542422 105.77525,79.800739 106.91871,79.319183 107.19726,79.201881 107.40365,79.052424 107.4663,78.601143 107.64077,77.344068 107.28431,75.425605 106.29971,74.82533 105.92723,74.62122 105.59205,74.678075 105.31412,74.805437 Z"/>
+            android:translateX="-9.55"
+            android:translateY="-7.62">
+            <group
+                android:translateX="-33.476177"
+                android:translateY="-22.491808">
+                <!-- Main bubble body -->
+                <path
+                    android:fillColor="#FFFFFFFF"
+                    android:pathData="M 98.480703,32.661887 C 67.754367,33.259103 46.458161,54.860273 46.208209,73.168671 46.012937,87.471796 51.161111,93.572555 61.633729,102.17629 L 67.766099,117.99267 103.88787,61.465252 C 103.88787,61.465252 105.90103,57.370514 111.44445,58.668375 L 117.00199,95.956096 C 130.73463,86.140753 137.41091,74.628442 137.09133,64.102633 137.09126,46.849641 125.5835,32.1351 98.480703,32.661887 Z"/>
+                <!-- Right leg -->
+                <path
+                    android:fillColor="#FFFFFFFF"
+                    android:pathData="M 99.616178,84.759027 88.88798,104.69593 C 95.037865,104.84419 101.24552,103.25254 107.2637,100.75395 L 107.2617,84.864696 C 107.26167,84.624842 107.10218,84.500581 106.94034,84.501639 L 99.957051,84.547309 C 99.823301,84.548184 99.616178,84.62545 99.616178,84.759027 Z"/>
+                <!-- Counter dot in gradient-start color -->
+                <path
+                    android:fillColor="#FF4B0856"
+                    android:pathData="M 105.31412,74.805437 C 104.92348,74.984446 102.76734,76.477216 102.83109,77.958725 102.84869,78.388588 102.92509,78.541781 103.10257,78.767454 103.71195,79.542422 105.77525,79.800739 106.91871,79.319183 107.19726,79.201881 107.40365,79.052424 107.4663,78.601143 107.64077,77.344068 107.28431,75.425605 106.29971,74.82533 105.92723,74.62122 105.59205,74.678075 105.31412,74.805437 Z"/>
+            </group>
         </group>
     </group>
 </vector>
