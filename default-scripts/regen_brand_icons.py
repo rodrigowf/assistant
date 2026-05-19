@@ -50,8 +50,15 @@ DENSITIES = {
 # For our purposes (launcher tile fill on Xiaomi/HyperOS), 0.86 looks right;
 # we accept that on a strict-Material-3 launcher the bubble's leg might
 # touch the mask edge.
-GLYPH_FRACTION_LEGACY = 0.474   # +5% from 0.451
-GLYPH_FRACTION_ADAPTIVE = 0.416  # +5% from 0.396
+GLYPH_FRACTION_LEGACY = 0.474   # +5% from 0.451 — used by PWA install PNGs (plate)
+GLYPH_FRACTION_ADAPTIVE = 0.416  # +5% from 0.396 — adaptive icon foreground
+
+# Free-standing bubble icon (no plate, no shape mask). Used for Android
+# legacy launcher PNGs (API <= 25), where the launcher composites the
+# PNG directly onto the wallpaper — matches the OS pattern used by
+# stock Android 5.x system icons (Gallery, My Files, etc.). The bubble
+# fills most of the canvas since there's no surrounding plate.
+GLYPH_FRACTION_FREE = 0.92
 # Push glyph DOWN by 4.3% of icon size so the bubble's visual center sits
 # slightly below the tile center. Without this, centering the bounding box
 # (bubble + leg) puts the bubble's optical center above the tile center.
@@ -148,6 +155,77 @@ def composite_icon(size: int, glyph_fraction: float, shape: str) -> Image.Image:
     out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     out.paste(bg, mask=mask)
     return out
+
+
+# Flat-fill gradient bubble SVG for legacy launcher PNGs (API <= 25).
+# Renders the bubble shape on a transparent background — NO plate, NO
+# shape mask. Matches the iOS / Android-pre-Oreo pattern where the icon
+# IS the visible shape, sitting directly on the launcher wallpaper.
+# We bake the brand gradient into the path fills here since Inkscape's
+# snap build doesn't reliably render <linearGradient> from SVG.
+FREE_BUBBLE_SVG_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="9.55 7.62 97.34 89.37">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4B0856"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(-33.476177,-22.491808)">
+    <!-- Bubble body -->
+    <path fill="url(#g)" d="m 98.480703,32.661887 c -30.726336,0.597216 -52.022542,22.198386 -52.272494,40.506784 -0.195272,14.303125 4.952902,20.403884 15.42552,29.007619 l 6.13237,15.81638 36.121771,-56.527418 c 0,0 2.01316,-4.094738 7.55658,-2.796877 l 5.55754,37.287721 C 130.73463,86.140753 137.41091,74.628442 137.09133,64.102633 137.09126,46.849641 125.5835,32.1351 98.480703,32.661887 Z"/>
+    <!-- Right leg -->
+    <path fill="url(#g)" d="M 99.616178,84.759027 88.88798,104.69593 c 6.149885,0.14826 12.35754,-1.44339 18.37572,-3.94198 l -0.002,-15.889254 c -3e-5,-0.239854 -0.15952,-0.364115 -0.32136,-0.363057 l -6.983289,0.04567 c -0.13375,8.75e-4 -0.340873,0.07796 -0.340873,0.211716 z"/>
+    <!-- Counter dot (slightly darker than bubble center to read as a hole) -->
+    <path fill="#3a0644" d="m 105.31412,74.805437 c -0.39064,0.179009 -2.54678,1.671779 -2.48303,3.153288 0.0176,0.429863 0.094,0.583056 0.27148,0.808729 0.60938,0.774968 2.67268,1.033285 3.81614,0.551729 0.27855,-0.117302 0.48494,-0.266759 0.54759,-0.71804 0.17447,-1.257075 -0.18199,-3.175538 -1.16659,-3.775813 -0.37248,-0.20411 -0.70766,-0.147255 -0.98559,-0.01989 z"/>
+  </g>
+</svg>
+"""
+
+
+def render_free_bubble(canvas_size: int, glyph_fraction: float) -> Image.Image:
+    """Render the gradient bubble onto a transparent canvas at `canvas_size`,
+    sized to `glyph_fraction` of the canvas, with the same Y-offset rule
+    used for the gradient-plate variant so the bubble's visual center
+    sits slightly below the canvas center."""
+    TMP.mkdir(exist_ok=True)
+    src = TMP / "free_bubble.svg"
+    src.write_text(FREE_BUBBLE_SVG_TEMPLATE)
+    target_long_side = int(canvas_size * glyph_fraction)
+    raw = TMP / f"free_bubble_{target_long_side}.png"
+    subprocess.run(
+        [
+            "inkscape",
+            "--export-type=png",
+            f"--export-filename={raw}",
+            f"--export-width={target_long_side * 2}",
+            f"--export-height={target_long_side * 2}",
+            str(src),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    bubble = Image.open(raw).convert("RGBA")
+    bbox = bubble.getbbox()
+    if bbox:
+        bubble = bubble.crop(bbox)
+    # Resize so the longest side equals target_long_side.
+    if bubble.width >= bubble.height:
+        bubble = bubble.resize(
+            (target_long_side, target_long_side * bubble.height // bubble.width),
+            Image.LANCZOS,
+        )
+    else:
+        bubble = bubble.resize(
+            (target_long_side * bubble.width // bubble.height, target_long_side),
+            Image.LANCZOS,
+        )
+
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    bx = (canvas_size - bubble.width) // 2
+    by = (canvas_size - bubble.height) // 2 + int(canvas_size * GLYPH_Y_OFFSET_FRACTION)
+    canvas.alpha_composite(bubble, dest=(bx, by))
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -249,18 +327,18 @@ def main() -> None:
         img.save(out, "PNG")
         print(f"wrote {out}")
 
-    # 2. Android legacy launcher PNGs — gradient + larger glyph + shape mask.
+    # 2. Android legacy launcher PNGs — free-standing gradient bubble on
+    #    transparent background. No plate, no shape mask: the bubble's
+    #    own outline IS the visible icon, matching the OS pattern for
+    #    stock Android 5.x icons. Same image for both ic_launcher and
+    #    ic_launcher_round since neither needs a shape mask.
     for density, size in DENSITIES.items():
         d = RES / f"mipmap-{density}"
         d.mkdir(parents=True, exist_ok=True)
-
-        sq = composite_icon(size, GLYPH_FRACTION_LEGACY, shape="square")
-        sq.save(d / "ic_launcher.png", "PNG")
-
-        rd = composite_icon(size, GLYPH_FRACTION_LEGACY, shape="circle")
-        rd.save(d / "ic_launcher_round.png", "PNG")
-
-        print(f"{density}: {size}x{size} -> {d}/ic_launcher{{,_round}}.png")
+        img = render_free_bubble(size, GLYPH_FRACTION_FREE)
+        img.save(d / "ic_launcher.png", "PNG")
+        img.save(d / "ic_launcher_round.png", "PNG")
+        print(f"{density}: {size}x{size} -> {d}/ic_launcher{{,_round}}.png (free bubble)")
 
     # 3. Android adaptive-icon vector drawables.
     (RES / "drawable/ic_launcher_background.xml").write_text(ADAPTIVE_BG_VECTOR)
