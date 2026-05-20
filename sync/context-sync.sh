@@ -185,6 +185,18 @@ while IFS= read -r line; do
 
   if [[ $PENDING -eq 1 ]]; then
     PENDING=0
+    # Confirm deletions against the live filesystem. A MOVED_FROM during an
+    # atomic-rename (e.g. recorder rotating tempfiles) looks identical to a
+    # delete but the path reappears under the same name once the rename
+    # completes; replicating that as a remote rm races with the rsync push
+    # and can wipe the just-renamed file on the remote. Only keep paths that
+    # are genuinely gone locally after the debounce window closes.
+    CONFIRMED_DELETES=()
+    for rel in "${DELETED_PATHS[@]}"; do
+      if [[ ! -e "${LOCAL_DIR%/}/$rel" ]]; then
+        CONFIRMED_DELETES+=("$rel")
+      fi
+    done
     if remote_reachable; then
       # 1) Push content first (no --delete). A file the remote already has
       #    but we just modified gets updated; new files get created.
@@ -193,11 +205,11 @@ while IFS= read -r line; do
         continue
       fi
       # 2) Then apply the per-path deletions we actually observed locally.
-      if [[ ${#DELETED_PATHS[@]} -gt 0 ]]; then
-        if remote_delete_paths "${DELETED_PATHS[@]}" 2>/dev/null; then
-          log "Synced after change (rm ${#DELETED_PATHS[@]} path(s) on remote)."
+      if [[ ${#CONFIRMED_DELETES[@]} -gt 0 ]]; then
+        if remote_delete_paths "${CONFIRMED_DELETES[@]}" 2>/dev/null; then
+          log "Synced after change (rm ${#CONFIRMED_DELETES[@]} path(s) on remote)."
         else
-          err "Sync content ok but remote deletion failed for ${#DELETED_PATHS[@]} path(s)."
+          err "Sync content ok but remote deletion failed for ${#CONFIRMED_DELETES[@]} path(s)."
         fi
       else
         log "Synced after change (no deletions)."
