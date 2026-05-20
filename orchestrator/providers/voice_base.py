@@ -153,6 +153,16 @@ class BaseVoiceProvider(ABC):
             f"override format_audio_in()"
         )
 
+    @property
+    def audio_in_sample_rate(self) -> int | None:
+        """Sample rate (Hz) of PCM the frontend ships in.
+
+        Optional — only websocket providers that want client-side VAD
+        (orchestrator/voice_vad.py) need to declare this. Returns None on
+        the base; providers that know their rate override.
+        """
+        return None
+
     @classmethod
     def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
         """Return the base64-PCM audio payload from a provider event, or None.
