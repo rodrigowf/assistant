@@ -278,5 +278,13 @@ class VoiceVAD:
 
 
 def is_enabled() -> bool:
-    """True if QWEN_MANUAL_VAD=1 in the environment."""
-    return os.environ.get("QWEN_MANUAL_VAD") == "1"
+    """True unless QWEN_MANUAL_VAD=0 is set explicitly.
+
+    Default-on as of 2026-05-20: DashScope's server VAD reliably
+    force-commits long utterances mid-speech, splitting one user turn
+    into two conversation.item entries with a phantom response.create
+    between them. Manual VAD avoids that. Opt back into server VAD by
+    exporting ``QWEN_MANUAL_VAD=0`` (useful if Alibaba ever fixes the
+    upstream).
+    """
+    return os.environ.get("QWEN_MANUAL_VAD", "1") != "0"

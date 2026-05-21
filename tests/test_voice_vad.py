@@ -147,9 +147,11 @@ def test_min_silence_duration_threshold_changes_event_count():
 
 
 def test_is_enabled_env_var(monkeypatch: pytest.MonkeyPatch):
+    # Default-on: unset env → enabled.
     monkeypatch.delenv("QWEN_MANUAL_VAD", raising=False)
-    assert is_enabled() is False
+    assert is_enabled() is True
     monkeypatch.setenv("QWEN_MANUAL_VAD", "1")
     assert is_enabled() is True
+    # Only explicit "0" opts back into server VAD.
     monkeypatch.setenv("QWEN_MANUAL_VAD", "0")
     assert is_enabled() is False

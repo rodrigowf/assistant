@@ -454,12 +454,14 @@ class QwenVoiceProvider(BaseVoiceProvider):
         # for any single offending field; if Alibaba ever publishes a
         # ``nullable``-equivalent flag we'll wire it in here.
         sanitized_tools = [_sanitize_tool_for_qwen(t) for t in tools or []]
-        # When QWEN_MANUAL_VAD=1, we disable DashScope's server VAD and
-        # run our own endpoint detection in voice_relay (see voice_vad.py).
-        # DashScope's server VAD force-commits long utterances mid-speech,
-        # splitting one user turn into two conversation.item entries with
-        # a phantom response.create between them; manual mode avoids that
-        # entirely. The caller's explicit `vad` argument always wins so
+        # Manual VAD is on by default (voice_vad.is_enabled()); we disable
+        # DashScope's server VAD here and run our own endpoint detection in
+        # voice_relay (see voice_vad.py). DashScope's server VAD reliably
+        # force-commits long utterances mid-speech, splitting one user
+        # turn into two conversation.item entries with a phantom
+        # response.create between them. Opt back into server VAD by
+        # exporting QWEN_MANUAL_VAD=0 (useful if Alibaba ever fixes the
+        # upstream). The caller's explicit `vad` argument always wins so
         # listen_recording's disable/restore plumbing still works.
         from orchestrator.voice_vad import is_enabled as _manual_vad_enabled
         if vad is not None:

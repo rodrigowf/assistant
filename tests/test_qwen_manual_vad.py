@@ -38,25 +38,25 @@ def _load_speech_pcm() -> bytes:
 # --- Qwen provider config -----------------------------------------------------
 
 
-def test_qwen_emits_server_vad_by_default(monkeypatch):
-    """Without QWEN_MANUAL_VAD=1, format_session_config keeps DEFAULT_VAD."""
+def test_qwen_disables_server_vad_by_default(monkeypatch):
+    """Default: turn_detection goes to None (manual VAD on)."""
     monkeypatch.delenv("QWEN_MANUAL_VAD", raising=False)
-    provider = QwenVoiceProvider(model="qwen3.5-omni-plus-realtime")
-    payload = provider.format_session_config(system="hi", tools=[])
-    assert payload["session"]["turn_detection"] == DEFAULT_VAD
-
-
-def test_qwen_disables_server_vad_when_manual_mode_on(monkeypatch):
-    """With QWEN_MANUAL_VAD=1, turn_detection goes to None."""
-    monkeypatch.setenv("QWEN_MANUAL_VAD", "1")
     provider = QwenVoiceProvider(model="qwen3.5-omni-plus-realtime")
     payload = provider.format_session_config(system="hi", tools=[])
     assert payload["session"]["turn_detection"] is None
 
 
+def test_qwen_uses_server_vad_when_opt_out(monkeypatch):
+    """QWEN_MANUAL_VAD=0 re-enables DashScope's server VAD."""
+    monkeypatch.setenv("QWEN_MANUAL_VAD", "0")
+    provider = QwenVoiceProvider(model="qwen3.5-omni-plus-realtime")
+    payload = provider.format_session_config(system="hi", tools=[])
+    assert payload["session"]["turn_detection"] == DEFAULT_VAD
+
+
 def test_qwen_explicit_vad_overrides_manual_mode(monkeypatch):
     """A caller-provided vad= argument always wins (listen_recording path)."""
-    monkeypatch.setenv("QWEN_MANUAL_VAD", "1")
+    monkeypatch.delenv("QWEN_MANUAL_VAD", raising=False)
     provider = QwenVoiceProvider(model="qwen3.5-omni-plus-realtime")
     explicit = {"type": "server_vad", "threshold": 0.5}
     payload = provider.format_session_config(system="hi", tools=[], vad=explicit)
@@ -79,7 +79,7 @@ async def test_relay_manual_vad_emits_frontend_events_and_commits(monkeypatch):
     - frontend gets synthetic speech_started + speech_stopped events
     - upstream gets input_audio_buffer.commit + response.create
     """
-    monkeypatch.setenv("QWEN_MANUAL_VAD", "1")
+    monkeypatch.delenv("QWEN_MANUAL_VAD", raising=False)
 
     from orchestrator.voice_relay import VoiceRelay
 
@@ -132,9 +132,9 @@ async def test_relay_manual_vad_emits_frontend_events_and_commits(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_relay_skips_manual_vad_when_env_off(monkeypatch):
-    """Without QWEN_MANUAL_VAD=1, the relay never instantiates VoiceVAD."""
-    monkeypatch.delenv("QWEN_MANUAL_VAD", raising=False)
+async def test_relay_skips_manual_vad_when_opt_out(monkeypatch):
+    """With QWEN_MANUAL_VAD=0, the relay never instantiates VoiceVAD."""
+    monkeypatch.setenv("QWEN_MANUAL_VAD", "0")
     from orchestrator.voice_relay import VoiceRelay
 
     provider = QwenVoiceProvider(model="qwen3.5-omni-plus-realtime")
