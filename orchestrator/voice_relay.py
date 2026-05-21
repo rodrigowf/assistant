@@ -509,25 +509,25 @@ class VoiceRelay:
 
         # Safety commit: DashScope manual mode caps continuous audio at
         # 60s before requiring a commit. If our VAD is still saying
-        # "speech" after _MANUAL_VAD_SAFETY_COMMIT_S, force one so the
-        # user's monologue keeps flowing in 50s segments rather than
-        # tripping the cap.
+        # "speech" after _MANUAL_VAD_SAFETY_COMMIT_S, force a commit
+        # WITHOUT response.create — the model must not speak while the
+        # user is still mid-monologue. The next user segment opens a
+        # new conversation.item; when the user finally pauses, the
+        # natural speech_stopped path commits the tail and asks for a
+        # response that Qwen evaluates against all accumulated items.
         started_at = self._manual_vad_speech_started_at
         if (
             started_at is not None
             and (time.monotonic() - started_at) >= _MANUAL_VAD_SAFETY_COMMIT_S
         ):
             self._slog(
-                f"manual_vad: SAFETY commit at t+{self._now_rel():.2f}s "
+                f"manual_vad: SAFETY commit (NO response) at t+{self._now_rel():.2f}s "
                 f"(speech ran {time.monotonic() - started_at:.1f}s)"
             )
-            # Pretend we stopped, send commit + new response, and
-            # immediately re-mark speech as active so subsequent chunks
-            # belong to the next manual segment. The VAD state is
-            # untouched — it's still in "is_speech=True" so it won't
-            # double-fire a stop until the user actually pauses.
+            # Reset the timer so subsequent 50s windows trigger again
+            # without flipping VAD state — the user is still speaking.
             self._manual_vad_speech_started_at = time.monotonic()
-            await self._send_manual_commit()
+            await self.send_event({"type": "input_audio_buffer.commit"})
 
     async def _send_manual_commit(self) -> None:
         """Send ``input_audio_buffer.commit`` + ``response.create`` upstream.
