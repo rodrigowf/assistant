@@ -8,3 +8,11 @@
 # providers don't register and their models are hidden from the picker.
 
 openai>=1.0.0
+
+# Client-side VAD for Qwen voice manual mode (QWEN_MANUAL_VAD=1).
+# DashScope's server VAD force-commits long utterances mid-speech; we
+# disable it and run Silero locally. We load the ONNX model file
+# directly (vendored in vendor/silero_vad_v5.onnx) — the pypi
+# silero-vad package transitively requires torch+torchaudio (~600MB)
+# which is way more than we need. onnxruntime is already pulled in
+# transitively by sentence-transformers.

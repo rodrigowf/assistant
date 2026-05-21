@@ -203,6 +203,11 @@ class QwenVoiceProvider(BaseVoiceProvider):
         return "websocket"
 
     @property
+    def audio_in_sample_rate(self) -> int | None:
+        """Sample rate of frontend mic audio — used by manual-VAD path."""
+        return _audio_formats_for(self._model)["in_sample_rate"]
+
+    @property
     def model(self) -> str:
         return self._model
 
@@ -449,6 +454,22 @@ class QwenVoiceProvider(BaseVoiceProvider):
         # for any single offending field; if Alibaba ever publishes a
         # ``nullable``-equivalent flag we'll wire it in here.
         sanitized_tools = [_sanitize_tool_for_qwen(t) for t in tools or []]
+        # Manual VAD is on by default (voice_vad.is_enabled()); we disable
+        # DashScope's server VAD here and run our own endpoint detection in
+        # voice_relay (see voice_vad.py). DashScope's server VAD reliably
+        # force-commits long utterances mid-speech, splitting one user
+        # turn into two conversation.item entries with a phantom
+        # response.create between them. Opt back into server VAD by
+        # exporting QWEN_MANUAL_VAD=0 (useful if Alibaba ever fixes the
+        # upstream). The caller's explicit `vad` argument always wins so
+        # listen_recording's disable/restore plumbing still works.
+        from orchestrator.voice_vad import is_enabled as _manual_vad_enabled
+        if vad is not None:
+            turn_detection: dict[str, Any] | None = vad
+        elif _manual_vad_enabled():
+            turn_detection = None
+        else:
+            turn_detection = DEFAULT_VAD
         return {
             "type": "session.update",
             "session": {
@@ -463,7 +484,7 @@ class QwenVoiceProvider(BaseVoiceProvider):
                 "tool_choice": "auto",
                 "input_audio_format": fmt["input_audio_format"],
                 "output_audio_format": fmt["output_audio_format"],
-                "turn_detection": vad or DEFAULT_VAD,
+                "turn_detection": turn_detection,
                 # Transcription is what gets persisted to JSONL — quality
                 # matters for cross-session memory.  `gummy-realtime-v1` is
                 # the only documented value but it's English-weak (drifts
