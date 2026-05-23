@@ -64,6 +64,17 @@ class VoiceManager(
     // --- Active provider --------------------------------------------------
     private var currentProvider: VoiceProvider? = null
     private var providerJob: Job? = null   // collects state + events into our flows
+    private var routeReapplyJob: Job? = null  // re-applies routing after provider audio stack init
+
+    // Synchronous reentrancy gate.  `_state.value` only flips to non-Off
+    // after the HTTP roundtrip in step 1, so concurrent callers (e.g.
+    // two viewModelScope.launch blocks if a stale collector ever fires
+    // start twice) would both slip past the `_state == Off` guard and
+    // each spin up an independent provider + WebRTC peer connection.
+    // Symptom: two SDP exchanges with different ufrag values, two
+    // SESSION START log lines a few hundred ms apart, audio doubled,
+    // and only one of the sessions gets stopped on disconnect.
+    @Volatile private var starting: Boolean = false
 
     // --- Pre-provider command queue --------------------------------------
     // The backend replies to ``voice_start`` with a ``session_started``
@@ -163,7 +174,19 @@ class VoiceManager(
             Log.w(TAG, "start: already active state=${_state.value}")
             return
         }
+        // Synchronous gate — prevents a second start() from sneaking past
+        // while the first is awaiting the HTTP roundtrip below.  Cleared
+        // once we've wired the provider's state flow, after which the
+        // _state guard above takes over (provider flips to Connecting).
+        synchronized(this) {
+            if (starting) {
+                Log.w(TAG, "start: already in progress (starting=true), ignoring duplicate call")
+                return
+            }
+            starting = true
+        }
 
+        try {
         // 1. Fetch the connection metadata for this provider/model/voice.
         val info = apiClient.startVoiceSession(
             provider = cfg.provider,
@@ -214,6 +237,28 @@ class VoiceManager(
 
         // 5. Acquire OS-level audio resources (focus, routing) and connect.
         requestAudioFocus()
+
+        // 5b. Schedule post-connect routing re-apply.  WebRTC's
+        // JavaAudioDeviceModule (and Samsung Lollipop's HAL more broadly)
+        // can pin the audio route to the call earpiece during native
+        // audio-module init — well after we set isSpeakerphoneOn(true).
+        // The fix is to re-assert routing at 1s and 5s after connect()
+        // returns, *and* re-log the live mode/speaker/sco state so we
+        // can see whether something downstream is flipping it back.
+        routeReapplyJob?.cancel()
+        routeReapplyJob = scope.launch {
+            for (delayMs in longArrayOf(1000L, 3000L, 5000L)) {
+                delay(delayMs)
+                if (!isActive) return@launch
+                val am = audioManager ?: continue
+                @Suppress("DEPRECATION")
+                Log.d(TAG, "[ROUTE] post-connect re-apply at +${delayMs}ms — " +
+                    "before: target=$audioOutput speakerOn=${am.isSpeakerphoneOn} " +
+                    "scoOn=${am.isBluetoothScoOn} mode=${am.mode}")
+                applySpeakerRouting()
+            }
+        }
+
         provider.connect(
             info = info,
             mirrorEventToBackend = { event ->
@@ -223,6 +268,12 @@ class VoiceManager(
                 micChunkCallback?.invoke(b64)
             },
         )
+        } finally {
+            // Clear the gate.  By here either provider.connect has
+            // returned (success — _state guard now blocks reentry) or we
+            // bailed early (error — caller should be able to retry).
+            starting = false
+        }
     }
 
     /**
@@ -235,6 +286,8 @@ class VoiceManager(
     }
 
     private suspend fun stopInternal() {
+        routeReapplyJob?.cancel()
+        routeReapplyJob = null
         currentProvider?.disconnect()
         currentProvider = null
         providerJob?.cancel()
@@ -414,6 +467,7 @@ class VoiceManager(
 
     private fun applySpeakerRouting() {
         val am = audioManager ?: return
+        dumpAudioDevices(am)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             applyRoutingModern(am)
         } else {
@@ -421,6 +475,42 @@ class VoiceManager(
         }
         @Suppress("DEPRECATION")
         Log.d(TAG, "[ROUTE] after applySpeakerRouting: target=$audioOutput speakerOn=${am.isSpeakerphoneOn} scoOn=${am.isBluetoothScoOn} mode=${am.mode}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val cd = am.communicationDevice
+            Log.d(TAG, "[ROUTE] active communicationDevice type=${cd?.type} productName=${cd?.productName}")
+        }
+    }
+
+    private fun dumpAudioDevices(am: AudioManager) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            Log.d(TAG, "[ROUTE] device dump unsupported on API ${Build.VERSION.SDK_INT}")
+            return
+        }
+        try {
+            val outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).joinToString(", ") {
+                "type=${it.type}/${audioDeviceTypeName(it.type)} name=${it.productName}"
+            }
+            Log.d(TAG, "[ROUTE] GET_DEVICES_OUTPUTS: [$outs]")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val comms = am.availableCommunicationDevices.joinToString(", ") {
+                    "type=${it.type}/${audioDeviceTypeName(it.type)} name=${it.productName}"
+                }
+                Log.d(TAG, "[ROUTE] availableCommunicationDevices: [$comms]")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[ROUTE] device dump failed: ${e.message}")
+        }
+    }
+
+    private fun audioDeviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "BUILTIN_EARPIECE"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "BUILTIN_SPEAKER"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "BLUETOOTH_A2DP"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BLUETOOTH_SCO"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "WIRED_HEADSET"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "WIRED_HEADPHONES"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB_HEADSET"
+        else -> "type_$type"
     }
 
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.S)

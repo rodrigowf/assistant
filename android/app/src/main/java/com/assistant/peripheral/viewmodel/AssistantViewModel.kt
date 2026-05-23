@@ -284,15 +284,29 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
                     .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
                 // Update API client when server URL changes
-                apiClient = ApiClient(_settings.value.serverUrl)
-                // Update VoiceManager with new API client
-                voiceManager?.release()
-                voiceManager = VoiceManager(getApplication(), apiClient!!).also {
-                    it.setMicGain(_settings.value.micGainLevel)
-                    it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                    it.setAudioOutput(_settings.value.audioOutput)
+                val needNewVoiceManager = voiceManager == null || serverUrlChanged
+                if (needNewVoiceManager) {
+                    apiClient = ApiClient(_settings.value.serverUrl)
+                    voiceManager?.release()
+                    voiceManager = VoiceManager(getApplication(), apiClient!!).also {
+                        it.setMicGain(_settings.value.micGainLevel)
+                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
+                        it.setAudioOutput(_settings.value.audioOutput)
+                    }
+                    setupVoiceManagerCallbacks()
+                } else {
+                    // Same server — just refresh tunables on the existing manager.
+                    // Rebuilding here on every DataStore emission was creating
+                    // overlapping VoiceManager instances + stale flow collectors,
+                    // which produced phantom duplicate sessions when the wake
+                    // word fired (two .start() calls slipping past the off-state
+                    // guard during the HTTP await).
+                    voiceManager?.let {
+                        it.setMicGain(_settings.value.micGainLevel)
+                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
+                        it.setAudioOutput(_settings.value.audioOutput)
+                    }
                 }
-                setupVoiceManagerCallbacks()
 
                 // Clear all session state when switching servers
                 if (serverUrlChanged) {
