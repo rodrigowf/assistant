@@ -114,6 +114,12 @@ export function useVoiceOrchestrator(
   // — misleading boilerplate for any malformed/unexpected request) and
   // closes the upstream WS, killing the voice session.
   const responseInFlightRef = useRef(false);
+  // Gemini Live ``serverContent.inputTranscription`` arrives as
+  // token-level deltas. Accumulate them and emit a single
+  // ``onUserTranscript`` per turn (flushed on first output delta or
+  // turnComplete). Without this, each fragment became its own user
+  // bubble — one bubble per word.
+  const pendingUserTranscriptRef = useRef("");
 
   // Mute state
   const [isMuted, setIsMuted] = useState(false);
@@ -208,17 +214,29 @@ export function useVoiceOrchestrator(
       if (sc) {
         const inputT = sc.inputTranscription as Record<string, unknown> | undefined;
         if (inputT) {
+          // Accumulate — Gemini Live sends one event per word/fragment.
+          // Flushed on the first output delta of this turn (model
+          // started replying) or on turnComplete.
           const text = (inputT.text as string) || "";
-          if (text) optsRef.current.onUserTranscript?.(text);
+          if (text) pendingUserTranscriptRef.current += text;
         }
+        const flushPendingUser = () => {
+          const staged = pendingUserTranscriptRef.current;
+          if (staged) {
+            pendingUserTranscriptRef.current = "";
+            optsRef.current.onUserTranscript?.(staged);
+          }
+        };
         const outputT = sc.outputTranscription as Record<string, unknown> | undefined;
         if (outputT) {
+          flushPendingUser();
           const text = (outputT.text as string) || "";
           if (text) optsRef.current.onAssistantDelta?.(text);
         }
         // Streaming text via modelTurn.parts[].text (half-cascade Live preview)
         const modelTurn = sc.modelTurn as Record<string, unknown> | undefined;
         if (modelTurn) {
+          flushPendingUser();
           const parts = (modelTurn.parts as Array<Record<string, unknown>>) || [];
           for (const p of parts) {
             const t = p.text as string | undefined;
@@ -237,6 +255,9 @@ export function useVoiceOrchestrator(
           updateStatus("active");
         }
         if (sc.turnComplete) {
+          // Failsafe: covers audio-only turns where neither
+          // outputTranscription nor modelTurn fired.
+          flushPendingUser();
           responseInFlightRef.current = false;
           updateStatus("active");
           optsRef.current.onAssistantComplete?.("");

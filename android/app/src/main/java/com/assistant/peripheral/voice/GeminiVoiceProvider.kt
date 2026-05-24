@@ -30,6 +30,11 @@ class GeminiVoiceProvider(
 ) : WebSocketPcmProvider(context, providerId) {
 
     private val assistantStaged = StringBuilder()
+    // Gemini Live streams ``inputTranscription.text`` as token-level
+    // deltas. Buffer and emit one [VoiceEvent.UserTranscript] per turn —
+    // flushed when the model starts replying (first output delta) or on
+    // turnComplete. Without this, the UI got one user bubble per word.
+    private val userStaged = StringBuilder()
 
     override fun parseProviderEvent(event: Map<String, Any?>) {
         val sc = event["serverContent"]
@@ -42,13 +47,22 @@ class GeminiVoiceProvider(
         }
     }
 
+    private fun flushUserStaged() {
+        if (userStaged.isEmpty()) return
+        val text = userStaged.toString()
+        userStaged.setLength(0)
+        emit(VoiceEvent.UserTranscript(text))
+    }
+
     private fun handleServerContent(sc: Any?) {
         val inputText = readNestedString(readNestedAny(sc, "inputTranscription"), "text")
         if (!inputText.isNullOrEmpty()) {
-            emit(VoiceEvent.UserTranscript(inputText))
+            userStaged.append(inputText)
         }
         val outputText = readNestedString(readNestedAny(sc, "outputTranscription"), "text")
         if (!outputText.isNullOrEmpty()) {
+            // Model started replying → user's turn ended.
+            flushUserStaged()
             assistantStaged.append(outputText)
             emit(VoiceEvent.TextDelta(outputText))
         }
@@ -56,6 +70,7 @@ class GeminiVoiceProvider(
         val modelTurn = readNestedAny(sc, "modelTurn")
         val parts = readNestedAny(modelTurn, "parts")
         if (parts is List<*>) {
+            flushUserStaged()
             for (p in parts) {
                 val t = readNestedString(p, "text")
                 if (!t.isNullOrEmpty()) {
@@ -72,6 +87,9 @@ class GeminiVoiceProvider(
         }
         if (readNestedBoolean(sc, "turnComplete") == true) {
             setState(VoiceState.Active)
+            // Failsafe: covers audio-only turns where neither output
+            // path fired.
+            flushUserStaged()
             val staged = assistantStaged.toString()
             assistantStaged.setLength(0)
             emit(VoiceEvent.TextComplete(staged))

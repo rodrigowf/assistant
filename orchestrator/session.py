@@ -657,6 +657,34 @@ class OrchestratorSession:
         if self._audio_recorder is not None and self._audio_recorder.is_recording:
             self._audio_recorder.write_assistant_audio(pcm_b64)
 
+    def _flush_pending_user_transcript(self, transcript: str) -> None:
+        """Write the buffered user transcript as a single JSONL entry.
+
+        Used by the Gemini Live event path where ``inputTranscription``
+        arrives as token-level deltas across many events. The buffer is
+        cleared after writing.
+        """
+        segment = None
+        if self._audio_recorder is not None and self._audio_recorder.is_recording:
+            segment = self._audio_recorder.mark_user_turn_end(transcript)
+        if segment:
+            content = (
+                f"[voice, recording: {self._local_id} "
+                f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+            )
+        else:
+            content = f"[voice] {transcript}"
+        entry: dict[str, Any] = {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "source": "voice_transcription",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if segment:
+            entry["audio_segment"] = segment
+        self._writer.append(entry)
+        self._pending_user_transcript = None
+
     @property
     def audio_recorder(self) -> AudioRecorder | None:
         """The audio recorder instance, if recording is active."""
@@ -711,39 +739,41 @@ class OrchestratorSession:
             output_t = sc.get("outputTranscription") if isinstance(sc, dict) else None
             tool_call = event.get("toolCall")
 
-            # User speech transcript — persist a [voice] JSONL entry.
+            # User speech transcript — Gemini Live streams inputTranscription
+            # as token-level deltas (one event per word/fragment). Buffer and
+            # persist a single JSONL entry on turn boundary, mirroring the
+            # assistant-side accumulation below. Without this every fragment
+            # became its own "[voice] my" / "[voice] friend" user turn,
+            # corrupting both UI and history.
             if isinstance(input_t, dict) and not self.is_injecting:
-                transcript = input_t.get("text", "")
-                if transcript:
-                    segment = None
-                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
-                        segment = self._audio_recorder.mark_user_turn_end(transcript)
-                    if segment:
-                        content = (
-                            f"[voice, recording: {self._local_id} "
-                            f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
-                        )
-                    else:
-                        content = f"[voice] {transcript}"
-                    entry: dict[str, Any] = {
-                        "type": "user",
-                        "message": {"role": "user", "content": content},
-                        "source": "voice_transcription",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                    if segment:
-                        entry["audio_segment"] = segment
-                    self._writer.append(entry)
+                delta = input_t.get("text", "")
+                if delta:
+                    staged = getattr(self, "_pending_user_transcript", None) or ""
+                    self._pending_user_transcript = staged + delta
 
             # Assistant transcript delta — accumulate; persist on turnComplete.
+            # Flushing the *user* transcript here too: when the model starts
+            # replying, the user's turn is by definition over, so the buffered
+            # user fragments form one coherent utterance.
             if isinstance(output_t, dict):
+                # Flush staged user transcript on the first output delta of
+                # this turn (model started speaking → user turn ended).
+                staged_user = getattr(self, "_pending_user_transcript", None)
+                if staged_user and not self.is_injecting:
+                    self._flush_pending_user_transcript(staged_user)
                 delta = output_t.get("text", "")
                 if delta:
                     staged = getattr(self, "_pending_assistant_transcript", None) or ""
                     self._pending_assistant_transcript = staged + delta
 
-            # Turn complete — persist staged assistant transcript.
+            # Turn complete — persist staged transcripts.
             if isinstance(sc, dict) and sc.get("turnComplete"):
+                # Failsafe flush of user transcript: covers turns where the
+                # model produced no text output (audio-only modality) so the
+                # outputTranscription branch above never fired.
+                staged_user = getattr(self, "_pending_user_transcript", None)
+                if staged_user and not self.is_injecting:
+                    self._flush_pending_user_transcript(staged_user)
                 staged = getattr(self, "_pending_assistant_transcript", None)
                 if staged:
                     segment = None
