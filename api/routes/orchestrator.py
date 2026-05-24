@@ -290,8 +290,8 @@ async def _handle_start(
     # clients that pass provider/model/voice/lang but omit endpoint (e.g. the
     # Android peripheral before the voice_endpoint field was added) get
     # endpoint=None → Vertex default, even when the user has configured AI
-    # Studio. That breaks AI-Studio-only models like
-    # ``gemini-3.1-flash-live-preview`` with a Vertex policy error.
+    # Studio. That breaks AI-Studio-named ids like
+    # ``gemini-2.5-flash-native-audio-latest`` with a Vertex policy error.
     if voice and (
         voice_provider_req is None
         or voice_model_req is None

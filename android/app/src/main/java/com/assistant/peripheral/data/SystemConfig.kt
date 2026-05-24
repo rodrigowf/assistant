@@ -105,6 +105,18 @@ data class SystemConfigState(
     val saving: Boolean = false,
     val error: String? = null,
     val savedFlash: Boolean = false,
+    /**
+     * Set when the previously-saved Gemini Live model id is no longer
+     * in the discovered catalog (Google deprecates Live ids
+     * periodically). The ViewModel silently writes through to the new
+     * default; this field drives a dismissable banner in the Config UI.
+     */
+    val voiceModelAutoCorrected: VoiceModelAutoCorrection? = null,
+)
+
+data class VoiceModelAutoCorrection(
+    val from: String,
+    val to: String,
 )
 
 /**

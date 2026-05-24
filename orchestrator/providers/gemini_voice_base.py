@@ -27,8 +27,9 @@ Please contact support."* — for preview Live models on previously
 working keys. Google maintainers' documented workaround is to switch to
 Vertex AI, which uses GCP IAM instead of AI Studio's allowlist. We keep
 both backends available because Vertex doesn't yet mirror every preview
-model AI Studio carries (e.g. ``gemini-3.1-flash-live-preview`` is AI
-Studio-only at the time of writing).
+model AI Studio carries (e.g. ``gemini-2.5-flash-native-audio-latest``
+is AI Studio's canonical id; Vertex still serves it as
+``gemini-live-2.5-flash-native-audio``).
 
 References:
 - https://ai.google.dev/api/live (AI Studio Live API)

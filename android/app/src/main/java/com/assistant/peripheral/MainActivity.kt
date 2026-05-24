@@ -369,6 +369,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         onLoadSystemConfig = viewModel::loadSystemConfig,
                         onUpdateSystemConfig = viewModel::updateSystemConfig,
                         onToggleMcp = viewModel::toggleMcp,
+                        onDismissVoiceModelAutoCorrected = viewModel::dismissVoiceModelAutoCorrected,
                     )
                 }
             }

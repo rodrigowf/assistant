@@ -58,6 +58,7 @@ fun SettingsScreen(
     onLoadSystemConfig: () -> Unit,
     onUpdateSystemConfig: (ConfigPatch) -> Unit,
     onToggleMcp: (String) -> Unit,
+    onDismissVoiceModelAutoCorrected: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(SettingsTab.APP) }
@@ -121,6 +122,7 @@ fun SettingsScreen(
                 onReload = onLoadSystemConfig,
                 onUpdate = onUpdateSystemConfig,
                 onToggleMcp = onToggleMcp,
+                onDismissVoiceModelAutoCorrected = onDismissVoiceModelAutoCorrected,
                 modifier = modifier.padding(padding)
             )
         }
