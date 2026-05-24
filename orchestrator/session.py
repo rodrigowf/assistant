@@ -31,6 +31,7 @@ from orchestrator.config import (
     get_model_info,
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
+from orchestrator.providers.voice_base import BaseVoiceProvider
 from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 # Provider classes are imported lazily inside the methods that need them so
 # this module remains importable on machines where the corresponding SDK
@@ -209,6 +210,17 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def voice_provider(self) -> BaseVoiceProvider | None:
+        """The active voice provider instance, or None outside a voice session.
+
+        Exposed so callers (notably the WebSocket route's voice-event
+        filter) can consult provider-specific hooks like
+        ``accepts_upstream_event`` without reaching through the private
+        attribute.
+        """
+        return self._voice_provider
 
     @property
     def voice_provider_id(self) -> str | None:

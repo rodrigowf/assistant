@@ -1,7 +1,5 @@
 package com.assistant.peripheral.voice
 
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
@@ -56,6 +54,20 @@ class VoiceManager(
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
     private var audioOutput: AudioOutput = AudioOutput.LOUDSPEAKER
+
+    /**
+     * Owns the routing decision tree (HFP-vs-A2DP, call-audio vs
+     * media-audio) plus all the AudioManager mode/communicationDevice
+     * mutations.  Lifecycle is the same as VoiceManager — created in
+     * [requestAudioFocus] and released in [releaseAudioFocus].
+     */
+    private val audioRouter: AudioRouter = AudioRouter(context)
+
+    /**
+     * Tracks devices changing during a session so the router can
+     * re-evaluate.  Stays null when no session is active.
+     */
+    private var deviceCallback: android.media.AudioDeviceCallback? = null
 
     // --- Persisted-across-sessions settings (apply to whichever provider) -
     private var pendingMicGain: Float = 1.0f
@@ -239,22 +251,18 @@ class VoiceManager(
         requestAudioFocus()
 
         // 5b. Schedule post-connect routing re-apply.  WebRTC's
-        // JavaAudioDeviceModule (and Samsung Lollipop's HAL more broadly)
-        // can pin the audio route to the call earpiece during native
-        // audio-module init — well after we set isSpeakerphoneOn(true).
-        // The fix is to re-assert routing at 1s and 5s after connect()
-        // returns, *and* re-log the live mode/speaker/sco state so we
-        // can see whether something downstream is flipping it back.
+        // JavaAudioDeviceModule (and Samsung Lollipop's HAL more
+        // broadly) can pin the audio route to the call earpiece
+        // during native audio-module init — well after our initial
+        // applySpeakerRouting fires.  Re-assert at +1s/+3s/+5s.
+        // Dynamic device-connect events are handled separately via
+        // [registerDeviceCallback].
         routeReapplyJob?.cancel()
         routeReapplyJob = scope.launch {
             for (delayMs in longArrayOf(1000L, 3000L, 5000L)) {
                 delay(delayMs)
                 if (!isActive) return@launch
-                val am = audioManager ?: continue
-                @Suppress("DEPRECATION")
-                Log.d(TAG, "[ROUTE] post-connect re-apply at +${delayMs}ms — " +
-                    "before: target=$audioOutput speakerOn=${am.isSpeakerphoneOn} " +
-                    "scoOn=${am.isBluetoothScoOn} mode=${am.mode}")
+                Log.d(TAG, "[ROUTE] post-connect re-apply at +${delayMs}ms")
                 applySpeakerRouting()
             }
         }
@@ -383,25 +391,25 @@ class VoiceManager(
             )
         }
 
-        // MODE_IN_COMMUNICATION matters for both transports — WebRTC
-        // forces it internally; AudioRecord on the WS path also works
-        // best in this mode on Lollipop devices.
-        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
         applySpeakerRouting()
+        ensureCallStreamAudible()
+        registerDeviceCallback()
+    }
 
-        // Ensure STREAM_VOICE_CALL is audible — voice output routes through
-        // this stream; if at 0 the user hears nothing.
-        val am = audioManager
-        if (am != null) {
-            val maxVoice = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-            val curVoice = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-            if (curVoice == 0) {
-                val target = (maxVoice * 0.75).toInt().coerceAtLeast(1)
-                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, target, 0)
-                Log.d(TAG, "STREAM_VOICE_CALL was 0, raised to $target/$maxVoice")
-            }
+    /**
+     * STREAM_VOICE_CALL ships muted on some devices — bring it up to a
+     * reasonable level so the user actually hears the agent.  Only
+     * needed for routes on the communication-audio plane.
+     */
+    private fun ensureCallStreamAudible() {
+        val am = audioManager ?: return
+        val maxVoice = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        val curVoice = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        if (curVoice == 0) {
+            val target = (maxVoice * 0.75).toInt().coerceAtLeast(1)
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, target, 0)
+            Log.d(TAG, "STREAM_VOICE_CALL was 0, raised to $target/$maxVoice")
         }
-        Log.d(TAG, "Audio routed to ${audioOutput.name.lowercase()}")
     }
 
     private fun releaseAudioFocus() {
@@ -411,18 +419,8 @@ class VoiceManager(
             @Suppress("DEPRECATION")
             audioManager?.abandonAudioFocus(null)
         }
-        audioManager?.mode = AudioManager.MODE_NORMAL
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager?.clearCommunicationDevice()
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.let {
-                if (it.isBluetoothScoOn) {
-                    it.stopBluetoothSco()
-                    it.isBluetoothScoOn = false
-                }
-            }
-        }
+        audioRouter.release()
+        unregisterDeviceCallback()
         audioFocusRequest = null
     }
 
@@ -437,135 +435,86 @@ class VoiceManager(
         if (audioManager != null) applySpeakerRouting()
     }
 
-    fun isBluetoothAudioAvailable(): Boolean {
-        val am = audioManager ?: (context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
-            ?.also { audioManager = it }
-            ?: return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            return devices.any { isBluetoothDevice(it.type) }
-        }
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
-        if (!adapter.isEnabled) return false
-        @Suppress("DEPRECATION")
-        val headsetState = adapter.getProfileConnectionState(BluetoothProfile.HEADSET)
-        @Suppress("DEPRECATION")
-        val a2dpState = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
-        return headsetState == BluetoothProfile.STATE_CONNECTED ||
-               a2dpState == BluetoothProfile.STATE_CONNECTED
-    }
+    fun isBluetoothAudioAvailable(): Boolean = audioRouter.isBluetoothAudioAvailable()
 
-    private fun isBluetoothDevice(type: Int): Boolean = when (type) {
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> true
-        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-            type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
-            type == AudioDeviceInfo.TYPE_BLE_BROADCAST
-        else false
-    }
-
+    /**
+     * Pick a [AudioRouter.Route] for the current audioOutput + active
+     * provider, apply it to the system, and forward the resulting
+     * [AudioRouter.SpeakerMode] to the provider's AudioTrack so the
+     * media-vs-call decision propagates end-to-end.
+     *
+     * Also emits [VoiceEvent.RoutingFallback] when the router had to
+     * downgrade (e.g. user picked BT but only an A2DP-only sink is
+     * available on a WebRTC provider) — the ViewModel surfaces this
+     * as a toast.
+     */
     private fun applySpeakerRouting() {
-        val am = audioManager ?: return
-        dumpAudioDevices(am)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            applyRoutingModern(am)
-        } else {
-            applyRoutingLegacy(am)
+        audioManager ?: return
+        val provider = currentProvider
+        val providerKind = when (provider?.connectionType) {
+            VoiceConnectionType.WEBSOCKET -> AudioRouter.ProviderKind.WEBSOCKET
+            VoiceConnectionType.WEBRTC -> AudioRouter.ProviderKind.WEBRTC
+            null -> AudioRouter.ProviderKind.WEBRTC  // conservative default
         }
-        @Suppress("DEPRECATION")
-        Log.d(TAG, "[ROUTE] after applySpeakerRouting: target=$audioOutput speakerOn=${am.isSpeakerphoneOn} scoOn=${am.isBluetoothScoOn} mode=${am.mode}")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val cd = am.communicationDevice
-            Log.d(TAG, "[ROUTE] active communicationDevice type=${cd?.type} productName=${cd?.productName}")
+        val route = audioRouter.pickRoute(audioOutput, providerKind)
+        val mode = audioRouter.apply(route)
+
+        // Forward the speaker mode + preferred device to the provider so
+        // its AudioTrack picks the right audio plane (WS providers
+        // only; WebRTC ignores).
+        val preferredDevice = when (route) {
+            is AudioRouter.Route.BluetoothMedia -> route.device
+            is AudioRouter.Route.BluetoothCallAudio -> route.device
+            else -> null
+        }
+        provider?.setSpeakerMode(mode, preferredDevice)
+
+        if (route is AudioRouter.Route.BluetoothUnsupported) {
+            val msg = when (route.reason) {
+                AudioRouter.FallbackReason.BT_NOT_AVAILABLE ->
+                    "Bluetooth not available — using loudspeaker"
+                AudioRouter.FallbackReason.BT_A2DP_REQUIRES_WS_PROVIDER ->
+                    "OpenAI Realtime can't route to Bluetooth speakers " +
+                        "(no mic on this device). Switch to Qwen or Gemini, " +
+                        "or use a BT headset. Using loudspeaker for now."
+            }
+            _events.tryEmit(VoiceEvent.RoutingFallback(msg))
         }
     }
 
-    private fun dumpAudioDevices(am: AudioManager) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            Log.d(TAG, "[ROUTE] device dump unsupported on API ${Build.VERSION.SDK_INT}")
-            return
+    // --- Device-change observer -----------------------------------------
+
+    /**
+     * Watch for BT devices connecting/disconnecting mid-session and
+     * re-run the routing decision.  Without this, plugging in the JBL
+     * mid-conversation leaves audio on the loudspeaker until the next
+     * full session start.
+     */
+    private fun registerDeviceCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        if (deviceCallback != null) return
+        val cb = object : android.media.AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                Log.d(TAG, "[ROUTE] device added — re-applying routing")
+                applySpeakerRouting()
+            }
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                Log.d(TAG, "[ROUTE] device removed — re-applying routing")
+                applySpeakerRouting()
+            }
         }
+        deviceCallback = cb
+        audioManager?.registerAudioDeviceCallback(cb, null)
+    }
+
+    private fun unregisterDeviceCallback() {
+        val cb = deviceCallback ?: return
         try {
-            val outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).joinToString(", ") {
-                "type=${it.type}/${audioDeviceTypeName(it.type)} name=${it.productName}"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager?.unregisterAudioDeviceCallback(cb)
             }
-            Log.d(TAG, "[ROUTE] GET_DEVICES_OUTPUTS: [$outs]")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val comms = am.availableCommunicationDevices.joinToString(", ") {
-                    "type=${it.type}/${audioDeviceTypeName(it.type)} name=${it.productName}"
-                }
-                Log.d(TAG, "[ROUTE] availableCommunicationDevices: [$comms]")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "[ROUTE] device dump failed: ${e.message}")
-        }
-    }
-
-    private fun audioDeviceTypeName(type: Int): String = when (type) {
-        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "BUILTIN_EARPIECE"
-        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "BUILTIN_SPEAKER"
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "BLUETOOTH_A2DP"
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "BLUETOOTH_SCO"
-        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "WIRED_HEADSET"
-        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "WIRED_HEADPHONES"
-        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB_HEADSET"
-        else -> "type_$type"
-    }
-
-    @androidx.annotation.RequiresApi(Build.VERSION_CODES.S)
-    private fun applyRoutingModern(am: AudioManager) {
-        val devices = am.availableCommunicationDevices
-        val target: AudioDeviceInfo? = when (audioOutput) {
-            AudioOutput.EARPIECE ->
-                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
-            AudioOutput.LOUDSPEAKER ->
-                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-            AudioOutput.BLUETOOTH ->
-                devices.firstOrNull { isBluetoothDevice(it.type) }
-        }
-        if (target != null) {
-            val ok = am.setCommunicationDevice(target)
-            Log.d(TAG, "setCommunicationDevice(${audioOutput.name}, type=${target.type}) → $ok")
-            if (!ok && audioOutput == AudioOutput.BLUETOOTH) {
-                Log.w(TAG, "Bluetooth setCommunicationDevice failed; falling back to loudspeaker")
-                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                    ?.let { am.setCommunicationDevice(it) }
-            }
-        } else {
-            Log.w(TAG, "No communication device for $audioOutput in $devices — clearing + falling back to speaker")
-            am.clearCommunicationDevice()
-            @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = true
-        }
-    }
-
-    private fun applyRoutingLegacy(am: AudioManager) {
-        @Suppress("DEPRECATION")
-        when (audioOutput) {
-            AudioOutput.EARPIECE -> {
-                am.stopBluetoothSco()
-                am.isBluetoothScoOn = false
-                am.isSpeakerphoneOn = false
-            }
-            AudioOutput.LOUDSPEAKER -> {
-                am.stopBluetoothSco()
-                am.isBluetoothScoOn = false
-                am.isSpeakerphoneOn = true
-            }
-            AudioOutput.BLUETOOTH -> {
-                if (isBluetoothAudioAvailable()) {
-                    am.isSpeakerphoneOn = false
-                    am.startBluetoothSco()
-                    am.isBluetoothScoOn = true
-                } else {
-                    Log.w(TAG, "BLUETOOTH requested but no BT device available; falling back to loudspeaker")
-                    am.stopBluetoothSco()
-                    am.isBluetoothScoOn = false
-                    am.isSpeakerphoneOn = true
-                }
-            }
-        }
+        } catch (_: Exception) {}
+        deviceCallback = null
     }
 }
 
@@ -604,4 +553,12 @@ sealed class VoiceEvent {
 
     /** Error occurred. */
     data class Error(val message: String) : VoiceEvent()
+
+    /**
+     * The router downgraded the user's requested audio output (e.g. user
+     * selected Bluetooth but only an A2DP-only speaker is connected on
+     * a WebRTC provider).  Surfaced as a toast so silent route fallbacks
+     * don't confuse the user.
+     */
+    data class RoutingFallback(val message: String) : VoiceEvent()
 }

@@ -185,6 +185,27 @@ class BaseVoiceProvider(ABC):
         """
         return False
 
+    def accepts_upstream_event(self, event: dict[str, Any]) -> bool:
+        """Whether a client-mirrored event is safe to forward upstream.
+
+        The orchestrator's WebSocket route relays frontend ``voice_event``
+        messages to the active provider's upstream WS. Each provider
+        uses a different wire schema (OpenAI Realtime uses ``type=...``
+        envelopes; Gemini Live uses camelCase top-level keys), so an
+        event leaking in from another provider's session — which can
+        happen when the user resumes a session whose voice mode was on
+        a different provider, before the old client-side provider tore
+        down — will be rejected by the upstream WS with a fatal close
+        (Gemini WS 1007 "Invalid JSON payload received. Unknown name
+        'type': Cannot find field").
+
+        Default: accept everything. Each concrete provider overrides
+        to declare which event shapes it actually expects, and the
+        relay drops mismatches with a log line instead of crashing the
+        session.
+        """
+        return True
+
     def should_gate_event(self, event: dict[str, Any]) -> bool:
         """Decide whether an outbound control event must be deferred.
 

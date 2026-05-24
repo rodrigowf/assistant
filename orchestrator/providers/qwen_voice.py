@@ -603,6 +603,29 @@ class QwenVoiceProvider(BaseVoiceProvider):
         err_text = str(exc)
         return any(s in err_text for s in self._RECONNECTABLE_ERR_SUBSTRINGS)
 
+    # Client-mirrored events on the OpenAI-Realtime wire schema that
+    # Qwen's DashScope endpoint actually understands.  Any other
+    # ``type`` (in particular OpenAI-only diagnostics like
+    # ``session.created`` / ``error``) is dropped at the relay edge
+    # rather than forwarded — those leak in when the user resumes a
+    # session whose previous voice mode was OpenAI and the Android
+    # client hasn't yet torn down its WebRTC provider.
+    _ACCEPTED_UPSTREAM_TYPES = frozenset({
+        "input_audio_buffer.append",
+        "input_audio_buffer.commit",
+        "input_audio_buffer.clear",
+        "conversation.item.create",
+        "conversation.item.delete",
+        "conversation.item.truncate",
+        "response.create",
+        "response.cancel",
+        "session.update",
+    })
+
+    def accepts_upstream_event(self, event: dict[str, Any]) -> bool:
+        evt_type = event.get("type")
+        return isinstance(evt_type, str) and evt_type in self._ACCEPTED_UPSTREAM_TYPES
+
     def should_gate_event(self, event: dict[str, Any]) -> bool:
         """Defer ``response.create`` while another response is in flight.
 

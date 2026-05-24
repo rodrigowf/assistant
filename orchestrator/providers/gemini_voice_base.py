@@ -558,6 +558,31 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """
         return isinstance(event.get("goAway"), dict)
 
+    # Client-mirrored events on Gemini Live's wire schema that we
+    # actually forward upstream.  Gemini doesn't use OpenAI's ``type=...``
+    # envelopes; its top-level keys are camelCase ``clientContent``,
+    # ``realtimeInput``, ``toolResponse``, ``setup``.  Anything else
+    # (most importantly: stray OpenAI-shape events that leak in when
+    # the user resumes a session whose previous voice mode was OpenAI)
+    # is dropped at the relay edge to avoid WS 1007 "Invalid JSON
+    # payload: Unknown name 'type'" close.
+    _ACCEPTED_UPSTREAM_KEYS = frozenset({
+        "clientContent",
+        "realtimeInput",
+        "toolResponse",
+        "setup",
+        # ``sessionResumptionUpdate`` is sent by us during reconnect
+        # but always passes through ``send_event`` from the relay's own
+        # rebuild path, so it's also accepted here for completeness.
+        "sessionResumptionUpdate",
+    })
+
+    def accepts_upstream_event(self, event: dict[str, Any]) -> bool:
+        if "type" in event:
+            # OpenAI-Realtime envelope.  Definitely not for us.
+            return False
+        return any(k in event for k in self._ACCEPTED_UPSTREAM_KEYS)
+
     def is_recoverable_error(self, exc: BaseException) -> bool:
         """Reconnect when the upstream closed *after* a goAway.
 

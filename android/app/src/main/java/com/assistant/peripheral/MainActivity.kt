@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.core.content.ContextCompat
@@ -188,6 +189,19 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isScanning by viewModel.isScanning.collectAsState()
     val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
     val systemConfig by viewModel.systemConfig.collectAsState()
+    val toastMessage by viewModel.toastMessage.collectAsState()
+
+    // Surface one-shot router messages (e.g. "BT speaker unsupported on
+    // OpenAI") as a system Toast.  Compose-side LaunchedEffect drains the
+    // state flow so each new message fires once.
+    val toastContext = LocalContext.current
+    LaunchedEffect(toastMessage) {
+        val msg = toastMessage
+        if (msg != null) {
+            android.widget.Toast.makeText(toastContext, msg, android.widget.Toast.LENGTH_LONG).show()
+            viewModel.clearToast()
+        }
+    }
 
     // Wire wake word detection: start turn-based recording and navigate to chat
     val coroutineScope = rememberCoroutineScope()

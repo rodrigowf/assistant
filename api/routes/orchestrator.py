@@ -702,11 +702,29 @@ async def _handle_voice_event(
         # (OpenAI) skip this path — the frontend talks to the provider
         # directly via the data channel and only mirrors events here for
         # backend persistence.
+        #
+        # Filter through the provider's ``accepts_upstream_event`` first:
+        # if the client is still mirroring events shaped for a previously
+        # active provider (e.g. OpenAI ``session.created`` / ``error``
+        # leaking onto a Gemini session during a provider crossover), we
+        # drop them here instead of letting the upstream WS close with a
+        # fatal 1007/1008 schema-mismatch error.  Without this filter,
+        # resuming any session with a different voice provider was a
+        # silent kill.
         if session.needs_voice_relay:
-            try:
-                await session.send_voice_event_upstream(event)
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to forward client voice event upstream")
+            provider = session.voice_provider  # type: ignore[union-attr]
+            if provider is not None and not provider.accepts_upstream_event(event):
+                logger.info(
+                    "voice_event_drop session=%s type=%s reason=provider_schema_mismatch provider=%s",
+                    session.local_id,
+                    event_type or "?",
+                    provider.provider_name,
+                )
+            else:
+                try:
+                    await session.send_voice_event_upstream(event)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to forward client voice event upstream")
 
         commands = await session.process_voice_event(event)
         await _dispatch_voice_commands(pool, session, commands)

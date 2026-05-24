@@ -178,6 +178,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _voiceState = MutableStateFlow<VoiceState>(VoiceState.Off)
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
 
+    /**
+     * One-shot transient message for the UI to display as a toast/snackbar.
+     * Set to a non-null string when something noteworthy happens (e.g. the
+     * audio router downgrades the user's requested output).  The UI consumes
+     * it and calls [clearToast] when it's done showing.
+     */
+    private val _toastMessage = MutableStateFlow<String?>(null)
+    val toastMessage: StateFlow<String?> = _toastMessage.asStateFlow()
+
+    fun clearToast() {
+        _toastMessage.value = null
+    }
+
     // Muted state for voice
     private val _isMuted = MutableStateFlow(false)
     val isMuted: StateFlow<Boolean> = _isMuted.asStateFlow()
@@ -433,6 +446,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     content = "Voice error: ${event.message}"
                 )
                 b.messages.update { it + errorMessage }
+            }
+            is VoiceEvent.RoutingFallback -> {
+                // Surface as a toast so the user knows the requested
+                // audio output was downgraded (e.g. JBL on OpenAI).
+                Log.w(TAG, "Routing fallback: ${event.message}")
+                _toastMessage.value = event.message
             }
             is VoiceEvent.SessionEnded -> {
                 _voiceState.value = VoiceState.Off

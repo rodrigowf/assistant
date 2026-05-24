@@ -73,6 +73,26 @@ abstract class WebSocketPcmProvider(
     private val running = AtomicBoolean(false)
 
     /**
+     * Current speaker-side audio plane.  Read by [startSpeaker] when
+     * building the [AudioTrack]; updated mid-session via
+     * [setSpeakerMode] when [VoiceManager]'s routing changes (e.g.
+     * user plugs in / picks a BT speaker mid-call).
+     *
+     * Defaults to [AudioRouter.SpeakerMode.CALL] — the same as the
+     * legacy behaviour, so anything that doesn't call [setSpeakerMode]
+     * gets the old code path.
+     */
+    @Volatile private var speakerMode: AudioRouter.SpeakerMode =
+        AudioRouter.SpeakerMode.CALL
+
+    /**
+     * Optional output endpoint to pin the [AudioTrack] to via
+     * [AudioTrack.setPreferredDevice].  When set, makes the route
+     * deterministic — critical when multiple A2DP devices are paired.
+     */
+    @Volatile private var preferredOutputDevice: android.media.AudioDeviceInfo? = null
+
+    /**
      * Queue of decoded PCM speaker chunks waiting to be written to
      * [AudioTrack].  Decoupling the WS receive thread from the
      * AudioTrack.write() blocking call is critical: writing on the
@@ -265,12 +285,123 @@ abstract class WebSocketPcmProvider(
         Log.d(tag, "Echo ducking gain set to: $echoDuckingGain")
     }
 
+    /**
+     * Switch the speaker's [AudioTrack] between communication-audio
+     * and media-audio planes.  Rebuilds the AudioTrack iff the mode
+     * actually changes — silent no-op otherwise so the router can
+     * fire this freely on every re-apply tick.
+     *
+     * Safe to call before / after [connect].  Before connect it just
+     * stages the mode; the actual AudioTrack is built in
+     * [startSpeaker].
+     */
+    final override fun setSpeakerMode(
+        mode: AudioRouter.SpeakerMode,
+        preferredDevice: android.media.AudioDeviceInfo?,
+    ) {
+        val deviceChanged = preferredOutputDevice?.id != preferredDevice?.id
+        val modeChanged = speakerMode != mode
+        speakerMode = mode
+        preferredOutputDevice = preferredDevice
+        if (!modeChanged && !deviceChanged) return
+        // If we're not yet playing, the staged values will take effect
+        // when startSpeaker() runs.
+        if (audioTrack == null) return
+        // Mid-session rebuild: tear down the current track and start
+        // fresh.  The playback queue is preserved — the playback
+        // coroutine will pick up the next chunk against the new
+        // AudioTrack on its next loop iteration.
+        Log.i(tag, "setSpeakerMode → $mode (rebuilding AudioTrack)")
+        stopSpeakerOnly()
+        try {
+            startSpeaker()
+        } catch (e: Exception) {
+            Log.e(tag, "AudioTrack rebuild failed: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Tear down the current speaker [AudioTrack] without touching
+     * the playback queue or coroutine.  The next [startSpeaker] call
+     * brings up a new track and the playback loop seamlessly resumes.
+     */
+    private fun stopSpeakerOnly() {
+        val t = audioTrack ?: return
+        audioTrack = null
+        try {
+            if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.stop()
+            t.release()
+        } catch (e: Exception) {
+            Log.w(tag, "stopSpeakerOnly failed: ${e.message}")
+        }
+    }
+
     fun release() {
         runBlocking { disconnect() }
         scope.cancel()
     }
 
     // --- AudioTrack (speaker) ---------------------------------------------
+
+    /**
+     * Build an [AudioTrack] for the current [speakerMode].
+     *
+     *  - CALL  → ``USAGE_VOICE_COMMUNICATION`` / ``CONTENT_TYPE_SPEECH``
+     *            (legacy: ``STREAM_VOICE_CALL``).  Routes through the
+     *            communication-audio plane; cooperates with AEC.
+     *  - MEDIA → ``USAGE_MEDIA`` / ``CONTENT_TYPE_MUSIC`` (legacy:
+     *            ``STREAM_MUSIC``).  Routes through the media-audio
+     *            plane — reaches A2DP sinks that the call plane can't.
+     */
+    private fun buildAudioTrack(
+        bufSize: Int,
+        mode: AudioRouter.SpeakerMode,
+    ): AudioTrack {
+        val track = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val attrs = when (mode) {
+                AudioRouter.SpeakerMode.CALL -> AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                AudioRouter.SpeakerMode.MEDIA -> AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            }
+            AudioTrack.Builder()
+                .setAudioAttributes(attrs)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(outSampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            val legacyStream = when (mode) {
+                AudioRouter.SpeakerMode.CALL -> AudioManager.STREAM_VOICE_CALL
+                AudioRouter.SpeakerMode.MEDIA -> AudioManager.STREAM_MUSIC
+            }
+            @Suppress("DEPRECATION")
+            AudioTrack(
+                legacyStream,
+                outSampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufSize,
+                AudioTrack.MODE_STREAM,
+            )
+        }
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            track.release()
+            throw IllegalStateException("AudioTrack failed to initialize (state=${track.state})")
+        }
+        return track
+    }
 
     private fun startSpeaker() {
         val minBuf = AudioTrack.getMinBufferSize(
@@ -285,42 +416,23 @@ abstract class WebSocketPcmProvider(
         val bytesPerSecond = outSampleRate * 2  // mono PCM16
         val bufSize = max(minBuf * 4, (bytesPerSecond * 1.5).toInt())
 
-        val track = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setSampleRate(outSampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .build()
-                )
-                .setBufferSizeInBytes(bufSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-        } else {
-            @Suppress("DEPRECATION")
-            AudioTrack(
-                AudioManager.STREAM_VOICE_CALL,
-                outSampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufSize,
-                AudioTrack.MODE_STREAM,
-            )
-        }
-        if (track.state != AudioTrack.STATE_INITIALIZED) {
-            track.release()
-            throw IllegalStateException("AudioTrack failed to initialize (state=${track.state})")
+        val track = buildAudioTrack(bufSize, speakerMode)
+        // Pin the output endpoint when the router gave us a specific
+        // device (e.g. the JBL).  Without this Android's default
+        // routing may snap the stream to the wrong sink the moment a
+        // new device connects.  ``setPreferredDevice`` is API 23+.
+        val pinned = preferredOutputDevice
+        if (pinned != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                val ok = track.setPreferredDevice(pinned)
+                Log.d(tag, "AudioTrack pinned to ${pinned.productName} (type=${pinned.type}) → $ok")
+            } catch (e: Exception) {
+                Log.w(tag, "AudioTrack.setPreferredDevice failed: ${e.message}")
+            }
         }
         track.play()
         audioTrack = track
-        Log.d(tag, "Speaker started: rate=${outSampleRate}Hz bufSize=$bufSize")
+        Log.d(tag, "Speaker started: rate=${outSampleRate}Hz bufSize=$bufSize mode=$speakerMode")
 
         // Drain the speaker queue on a dedicated IO coroutine.  This
         // is the only thread that calls AudioTrack.write() — keeping

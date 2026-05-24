@@ -200,6 +200,24 @@ interface VoiceProvider {
      */
     fun setEchoDuckingGain(gain: Float)
 
+    /**
+     * Switch the provider's speaker [AudioTrack] between the
+     * communication-audio plane (``CALL``) and the media-audio plane
+     * (``MEDIA``).  Only WebSocket providers honour this — WebRTC
+     * providers own their AudioTrack via JavaAudioDeviceModule and
+     * cannot rebuild it without tearing down the peer connection.
+     *
+     * The optional [preferredDevice] pins the AudioTrack to a specific
+     * output endpoint (used to make A2DP routing deterministic in
+     * MEDIA mode).
+     */
+    fun setSpeakerMode(
+        mode: AudioRouter.SpeakerMode,
+        preferredDevice: android.media.AudioDeviceInfo? = null,
+    ) {
+        // Default no-op — only WebSocket providers override.
+    }
+
     /** Tear down the upstream connection and release resources. */
     suspend fun disconnect()
 }
