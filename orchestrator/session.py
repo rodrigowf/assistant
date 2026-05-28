@@ -488,6 +488,7 @@ class OrchestratorSession:
             self._context,
             recent_messages=recent_messages,
             history_summary=history_summary,
+            voice_provider_id=self._voice_provider.provider_name,
         )
         tools = registry.get_openai_definitions()
         return self._voice_provider.get_session_update_payload(system, tools)
