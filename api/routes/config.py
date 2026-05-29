@@ -388,19 +388,32 @@ async def _fetch_aistudio_gemini_models() -> list[dict[str, Any]]:
     if not api_key:
         return []
 
+    # AI Studio's default page size is 50, which excludes the Live models
+    # (they sit past the cutoff). Request a large page and walk
+    # ``nextPageToken`` defensively so we don't silently drop them again.
+    all_models: list[dict[str, Any]] = []
+    page_token: str | None = None
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                "https://generativelanguage.googleapis.com/v1beta/models",
-                params={"key": api_key},
-            )
-        if resp.status_code != 200:
-            logger.warning(
-                "AI Studio models.list returned %s; falling back to static registry",
-                resp.status_code,
-            )
-            return []
-        data = resp.json()
+            for _ in range(10):
+                params: dict[str, str] = {"key": api_key, "pageSize": "1000"}
+                if page_token:
+                    params["pageToken"] = page_token
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params=params,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "AI Studio models.list returned %s; falling back to static registry",
+                        resp.status_code,
+                    )
+                    return []
+                data = resp.json()
+                all_models.extend(data.get("models", []))
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
     except Exception:  # noqa: BLE001
         logger.exception(
             "AI Studio models.list failed; falling back to static registry",
@@ -409,7 +422,7 @@ async def _fetch_aistudio_gemini_models() -> list[dict[str, Any]]:
 
     voices_list = [{"id": v, "label": v, "description": ""} for v in GEMINI_LIVE_VOICES]
     out: list[dict[str, Any]] = []
-    for m in data.get("models", []):
+    for m in all_models:
         methods = m.get("supportedGenerationMethods", [])
         if "bidiGenerateContent" not in methods:
             continue

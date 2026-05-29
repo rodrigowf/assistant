@@ -334,25 +334,33 @@ VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
     # either backend's canonical model id.
     #
     # Live-capable Gemini ids diverge by backend:
-    # - AI Studio: ``gemini-2.5-flash-native-audio-latest`` (the only
-    #   stable Live id at /v1beta as of 2026-05-23 — Google dropped the
-    #   ``-live-`` prefix). 3.x models exist on AI Studio but none
-    #   support ``bidiGenerateContent`` yet.
-    # - Vertex AI: ``gemini-live-2.5-flash-native-audio`` (Vertex kept
-    #   the ``-live-`` prefix when AI Studio renamed).
+    # - AI Studio: ``gemini-3.1-flash-live-preview`` (current preview) and
+    #   ``gemini-2.5-flash-native-audio-latest`` (stable). Both are returned
+    #   by /v1beta/models when the request is paginated past the default
+    #   50-model cutoff.
+    # - Vertex AI: ``gemini-live-2.5-flash-native-audio`` (Vertex kept the
+    #   ``-live-`` prefix when AI Studio renamed; no 3.1 Live variant in
+    #   the Vertex publisher catalog as of 2026-05-28).
     #
     # AI Studio entry is default because most users start there (no GCP
     # project required). When the user picks Vertex via
     # ``default_voice_endpoint``, the discovery endpoint provides the
     # Vertex catalog and the saved model id is honoured.
     "google": [
+        {"id": "gemini-3.1-flash-live-preview",
+         "label": "Gemini 3.1 Flash Live Preview (AI Studio)",
+         "voice": "Puck",
+         "voices": _GEMINI_LIVE_VOICES,
+         "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
+         "default_transcription_language": "",
+         "default": True},
         {"id": "gemini-2.5-flash-native-audio-latest",
          "label": "Gemini 2.5 Flash Native Audio (AI Studio)",
          "voice": "Puck",
          "voices": _GEMINI_LIVE_VOICES,
          "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
          "default_transcription_language": "",
-         "default": True},
+         "default": False},
         {"id": "gemini-live-2.5-flash-native-audio",
          "label": "Gemini Live 2.5 Flash Native Audio (Vertex)",
          "voice": "Puck",
