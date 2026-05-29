@@ -151,6 +151,17 @@ class VoiceRelay:
         # would.
         self._pending_reconnect: bool = False
 
+        # Handshake gate. ``send_audio`` and ``send_event`` await this
+        # before forwarding upstream so we never send mic/control frames
+        # before the server has acknowledged ``setup`` — Gemini Live
+        # enforces this strictly and force-closes with WS 1008
+        # "BidiGenerateContent session expired" when violated. For
+        # ``server_first`` providers (OpenAI / Qwen) the post-
+        # ``session.created`` send in ``_open_and_handshake`` sets this
+        # immediately; for ``client_first`` providers (Gemini Live) the
+        # drain loop sets it when ``setupComplete`` arrives.
+        self._handshake_complete: asyncio.Event = asyncio.Event()
+
         # --- observability state ---
         self._started_at: float = 0.0  # set in start()
         self._first_audio_in_at: float | None = None
@@ -256,8 +267,27 @@ class VoiceRelay:
             getattr(self._provider, "voice", "?"),
         )
 
+        # Let the frontend show a "preparing" indicator while the
+        # upstream handshake completes. For server_first providers the
+        # gate opens inside _open_and_handshake (synchronous from the
+        # caller's POV); for client_first (Gemini) it opens when the
+        # drain task receives setupComplete.
+        await self._on_event_for_frontend({
+            "type": "voice_status",
+            "status": "preparing",
+        })
+
         await self._open_and_handshake(session_config)
         self._drain_task = asyncio.create_task(self._drain(), name=f"voice-relay-{self._provider.provider_name}")
+
+        # server_first providers complete the handshake synchronously
+        # inside _open_and_handshake; announce ready here so the UI gets
+        # the same signal it would for client_first via the drain loop.
+        if self._handshake_complete.is_set():
+            await self._on_event_for_frontend({
+                "type": "voice_status",
+                "status": "ready",
+            })
 
         # Initialise client-side VAD if QWEN_MANUAL_VAD=1 and the
         # provider tells us its mic sample rate. The model load is
@@ -388,6 +418,13 @@ class VoiceRelay:
             await self._ws.send(json.dumps(session_config))
         self._last_send_at = time.monotonic()
 
+        # server_first providers (OpenAI / Qwen) were already greeted with
+        # session.created above and ack the session.update they just got;
+        # the gate opens immediately. client_first (Gemini Live) waits for
+        # setupComplete in the drain loop before opening the gate.
+        if direction == "server_first":
+            self._handshake_complete.set()
+
     def _record_sent(self, event: dict[str, Any]) -> None:
         """Stash a sent control frame for post-mortem on upstream close.
 
@@ -421,6 +458,16 @@ class VoiceRelay:
         if self._ws is None or self._closed.is_set():
             return  # Drop silently — caller already saw an error event.
 
+        # Wait for the upstream handshake to ack before forwarding
+        # anything (see ``_handshake_complete`` for details). Bound the
+        # wait so a botched handshake doesn't pin frontend frames forever.
+        if not self._handshake_complete.is_set():
+            try:
+                await asyncio.wait_for(self._handshake_complete.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                self._slog(f"WARN handshake gate timeout dropping event type={event.get('type')}")
+                return
+
         if self._provider.should_gate_event(event):
             self._slog(f"defer event type={event.get('type')} (provider gate active)")
             self._deferred_events.append(event)
@@ -444,6 +491,16 @@ class VoiceRelay:
         """
         if self._ws is None or self._closed.is_set():
             return  # Drop silently after upstream close — frontend already notified.
+        # Wait for the upstream handshake to ack. Gemini Live force-closes
+        # with WS 1008 "BidiGenerateContent session expired" when audio
+        # arrives before ``setupComplete``; dropping pre-handshake mic
+        # frames is safer than triggering that close.
+        if not self._handshake_complete.is_set():
+            try:
+                await asyncio.wait_for(self._handshake_complete.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                self._slog("WARN handshake gate timeout dropping audio_in chunk")
+                return
         try:
             async with self._send_lock:
                 await self._ws.send(json.dumps(self._provider.format_audio_in(pcm_b64)))
@@ -728,6 +785,17 @@ class VoiceRelay:
                 self._record_recv(event)
                 size = len(raw) if isinstance(raw, str) else len(raw or "")
                 self._slog(f"recv  type={evt_type} size={size}B")
+
+                # Gemini Live (client_first) acks the setup with
+                # ``setupComplete``; open the handshake gate so deferred
+                # send_audio / send_event calls can proceed.
+                if not self._handshake_complete.is_set() and "setupComplete" in event:
+                    self._handshake_complete.set()
+                    self._slog("handshake gate opened (setupComplete)")
+                    await self._on_event_for_frontend({
+                        "type": "voice_status",
+                        "status": "ready",
+                    })
                 # Gemini Live debug: log full body of control events so we
                 # can see whether outputTranscription / turnComplete are
                 # actually arriving. Opt-in via VOICE_DEBUG_GEMINI_BODIES=1.
@@ -942,6 +1010,18 @@ class VoiceRelay:
         # gating state resets itself naturally as the new session
         # delivers fresh events through :meth:`on_inbound_event`.
         self._deferred_events.clear()
+        # Re-close the handshake gate so the new upstream gets a fresh
+        # setup → setupComplete round trip before audio/events resume.
+        self._handshake_complete.clear()
+        # Mirror "preparing" to the frontend on reconnect too so the UI
+        # accurately reflects the upstream WS state during recovery.
+        try:
+            await self._on_event_for_frontend({
+                "type": "voice_status",
+                "status": "preparing",
+            })
+        except Exception:  # noqa: BLE001
+            pass
 
         try:
             session_config = await self._rebuild_session_update()

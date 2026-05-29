@@ -243,6 +243,16 @@ abstract class WebSocketPcmProvider(
     }
 
     final override fun handleProviderEvent(event: Map<String, Any?>) {
+        // Backend-synthesised handshake status — sent before the upstream
+        // provider's own greeting. "preparing" keeps the spinner; "ready"
+        // flips to Active so the user knows they can talk.
+        if (event["type"] == "voice_status") {
+            when (event["status"] as? String) {
+                "preparing" -> setState(VoiceState.Connecting)
+                "ready" -> setState(VoiceState.Active)
+            }
+            return
+        }
         parseProviderEvent(event)
     }
 

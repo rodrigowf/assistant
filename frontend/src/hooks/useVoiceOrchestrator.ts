@@ -204,6 +204,21 @@ export function useVoiceOrchestrator(
   const handleProviderEvent = useCallback((event: RealtimeEvent) => {
     const eventType = event.type;
 
+    // Backend-synthesised status for the upstream handshake (sent before
+    // the WS provider's own greeting). "preparing" keeps the connecting
+    // spinner up; "ready" flips to active so the user knows they can
+    // start talking. Other voice_status payloads are reserved for future
+    // states and ignored here.
+    if (eventType === "voice_status") {
+      const status = (event as { status?: string }).status;
+      if (status === "preparing") {
+        updateStatus("connecting");
+      } else if (status === "ready") {
+        updateStatus("active");
+      }
+      return;
+    }
+
     // Gemini Live event shape: no top-level ``type`` field. Top-level
     // keys are camelCase (``setupComplete``, ``serverContent``,
     // ``toolCall``). Map to the same callbacks the OpenAI/Qwen branches
