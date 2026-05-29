@@ -259,18 +259,60 @@ async def _handle_start(
             await ws.send_bytes(orjson.dumps(reconnect_payload))
             return session, True
         else:
-            # Same mode — just reconnect
-            pool.subscribe_orchestrator(local_id, ws)
-            reconnect_payload = {
-                "type": "session_started",
-                "session_id": local_id,
-                "voice": current_voice,
-                "model_info": session.get_model_info(),
-            }
-            if current_voice:
-                await _attach_voice_payload(reconnect_payload, session)
-            await ws.send_bytes(orjson.dumps(reconnect_payload))
-            return session, True
+            # Same mode — check if the client is asking for a different
+            # voice provider/model/voice/endpoint than the live session.
+            # If so, we need to rebuild the relay; the existing relay's
+            # provider object is bound to the original config and won't
+            # honour mid-session changes. Block the swap while a turn is
+            # in flight so we don't tear down upstream audio mid-reply.
+            if voice and current_voice:
+                drift = _voice_config_drift(
+                    session,
+                    voice_provider_req,
+                    voice_model_req,
+                    voice_name_req,
+                    voice_lang_req,
+                    voice_endpoint_req,
+                )
+                if drift:
+                    if session.is_busy:
+                        await ws.send_bytes(orjson.dumps({
+                            "type": "error",
+                            "error": "voice_config_busy",
+                            "detail": (
+                                "Cannot switch voice provider/model mid-turn"
+                                f" ({drift}). Wait for the current response"
+                                " to finish, then try again."
+                            ),
+                        }))
+                        return None, False
+                    logger.info(
+                        "voice config drift on reconnect (%s) — tearing down to rebuild",
+                        drift,
+                    )
+                    await pool.stop_orchestrator()
+                    # Fall through to the new-session creation path below.
+                else:
+                    pool.subscribe_orchestrator(local_id, ws)
+                    reconnect_payload = {
+                        "type": "session_started",
+                        "session_id": local_id,
+                        "voice": current_voice,
+                        "model_info": session.get_model_info(),
+                    }
+                    await _attach_voice_payload(reconnect_payload, session)
+                    await ws.send_bytes(orjson.dumps(reconnect_payload))
+                    return session, True
+            else:
+                pool.subscribe_orchestrator(local_id, ws)
+                reconnect_payload = {
+                    "type": "session_started",
+                    "session_id": local_id,
+                    "voice": current_voice,
+                    "model_info": session.get_model_info(),
+                }
+                await ws.send_bytes(orjson.dumps(reconnect_payload))
+                return session, True
 
     # --- A different orchestrator is already active ---
     if pool.has_orchestrator():
@@ -390,6 +432,45 @@ async def _handle_start(
 
     await ws.send_bytes(orjson.dumps(started_payload))
     return session, True
+
+
+def _voice_config_drift(
+    session: OrchestratorSession,
+    provider: str | None,
+    model: str | None,
+    voice_name: str | None,
+    language: str | None,
+    endpoint: str | None,
+) -> str | None:
+    """Return a short description of which voice fields the client asked
+    to change vs. the live session, or ``None`` if they match.
+
+    Fields the client didn't send (``None``) are skipped — same-mode
+    reconnect WS messages frequently omit settings the client doesn't
+    care about. Endpoint comparison uses the live provider's classname
+    via ``endpoint_id`` for Gemini, falling back to ``_voice_endpoint``.
+    """
+    changed: list[str] = []
+    if provider is not None and provider != session.voice_provider_id:
+        changed.append(f"provider {session.voice_provider_id!r}→{provider!r}")
+    if model is not None and model != session.voice_model_id:
+        changed.append(f"model {session.voice_model_id!r}→{model!r}")
+    if voice_name is not None and voice_name != session.voice_name_id:
+        changed.append(f"voice {session.voice_name_id!r}→{voice_name!r}")
+    if language is not None and language != session.voice_transcription_language:
+        changed.append(
+            f"language {session.voice_transcription_language!r}→{language!r}"
+        )
+    if endpoint is not None:
+        live_endpoint: str | None = None
+        provider_obj = getattr(session, "_voice_provider", None)
+        if provider_obj is not None:
+            live_endpoint = getattr(provider_obj, "endpoint_id", None)
+        if live_endpoint is None:
+            live_endpoint = getattr(session, "_voice_endpoint", None)
+        if endpoint != live_endpoint:
+            changed.append(f"endpoint {live_endpoint!r}→{endpoint!r}")
+    return ", ".join(changed) if changed else None
 
 
 async def _attach_voice_payload(
