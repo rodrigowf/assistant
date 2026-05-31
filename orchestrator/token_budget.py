@@ -12,15 +12,23 @@ from typing import Any
 # gpt-realtime context window
 MODEL_CONTEXT_TOKENS = 32_000
 
-# Total budget for the voice system prompt — leaves ~14k for live turns + output.
-MAX_VOICE_PROMPT_TOKENS = 18_000
+# Soft target for the voice system prompt size.  Not enforced anywhere — the
+# summarizer is never truncated; this is just a design reference.
+MAX_VOICE_PROMPT_TOKENS = 24_000
 
-# Within the prompt, the history section (summary + recent verbatim) gets ~12k.
-HISTORY_SECTION_TOKENS = 12_000
+# Within the prompt, the history section (summary + recent verbatim) gets ~18k.
+HISTORY_SECTION_TOKENS = 18_000
 
-# Of that, ~8k is kept verbatim (newest messages), ~4k is the summary budget.
+# Of that, 8k is kept verbatim (newest messages).  The summary side is
+# uncapped at the API level — the model decides how long it needs to be — but
+# we steer it toward ~10k tokens (~7500 words) for the very largest digests
+# via a "Target length" hint in the system prompt.  See
+# ``summary_target_word_range`` below and ``_summarize_history`` in
+# ``orchestrator/session.py``.
 RECENT_VERBATIM_TOKENS = 8_000
-SUMMARY_MAX_TOKENS = 4_000
+# Soft ceiling on summary length, used only to compute the upper bound of the
+# steering range we suggest to the summarizer model.  Not a hard cap.
+SUMMARY_SOFT_TARGET_TOKENS = 10_000
 
 # Tool results in the verbatim history are clipped to this many chars plus a
 # short "re-read to get full content" hint, so huge tool outputs don't eat the
@@ -148,14 +156,30 @@ def split_by_token_budget(
     return messages[:cutoff], messages[cutoff:]
 
 
-def scale_summary_max_tokens(prefix_message_count: int, prefix_tokens: int) -> int:
-    """Pick a max_tokens for the summarizer based on how much we're compressing.
+def summary_target_word_range(
+    prefix_message_count: int, prefix_tokens: int
+) -> tuple[int, int]:
+    """Steering range (min_words, max_words) the summarizer system prompt asks for.
 
-    Shorter prefixes → shorter summaries. Longer prefixes → longer summaries,
-    bounded by SUMMARY_MAX_TOKENS.
+    Pure prompt-level steering — the API call itself is *uncapped* so the
+    model can always finish, even if it goes over the suggested range.
+
+    Shorter prefixes → shorter targets. Longer prefixes → longer targets,
+    capped at the word-equivalent of ``SUMMARY_SOFT_TARGET_TOKENS`` (~7,500
+    words ≈ 10,000 tokens at the standard 0.75 words/token ratio).
     """
     if prefix_message_count == 0:
-        return 0
-    # ~1 summary token per 10 prefix tokens, floor 256, ceil SUMMARY_MAX_TOKENS
-    scaled = max(256, prefix_tokens // 10)
-    return min(scaled, SUMMARY_MAX_TOKENS)
+        return (0, 0)
+
+    # 0.75 words per token, rounded for readability.
+    soft_max_words = int(SUMMARY_SOFT_TARGET_TOKENS * 0.75)
+
+    # The richer digest format keeps a short version of every user message
+    # plus a narrative arc + topics + decisions + entities, so the summary
+    # legitimately needs to scale ~30% of the input on long conversations.
+    scaled_max = int(prefix_tokens * 0.30)
+    max_words = min(soft_max_words, max(400, scaled_max))
+    # Lower bound keeps the model from being overly terse — roughly a third
+    # of the max, with a small floor for tiny prefixes.
+    min_words = max(100, max_words // 3)
+    return (min_words, max_words)

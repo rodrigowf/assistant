@@ -223,6 +223,13 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const selectedProvider = selectedModel?.provider ?? providers[0] ?? "";
   const providerModels = models.filter(m => m.provider === selectedProvider);
 
+  // Summarizer model — uses the same provider/model catalog as Text mode.
+  // Empty saved value falls back to the backend's DEFAULT_SUMMARIZER_MODEL.
+  const summarizerModelId = (config?.summarizer_model ?? "").trim();
+  const selectedSummarizerModel = models.find(m => m.model_id === summarizerModelId);
+  const selectedSummarizerProvider = selectedSummarizerModel?.provider ?? providers[0] ?? "";
+  const summarizerProviderModels = models.filter(m => m.provider === selectedSummarizerProvider);
+
   // Derived voice-provider/model/voice/language state for dropdowns
   const voiceProviderIds = Object.keys(voiceProviders);
   const selectedVoiceProvider = config?.default_voice_provider ?? voiceProviderIds[0] ?? "";
@@ -336,6 +343,57 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                             <option key={m.model_id} value={m.model_id}>
                               {m.display_name}
                               {m.supports_audio ? " 🎤" : ""}
+                              {m.supports_vision ? " 👁" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* History summarizer */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">History summarizer</h4>
+                  <p className="config-subsection-desc">
+                    Compresses older conversation history into the digest the
+                    voice agent reads at session start. Picked separately
+                    because realtime/audio models aren't reliable summarizers
+                    — use a frontier reasoning model here.
+                  </p>
+                  {models.length === 0 ? (
+                    <div className="config-empty">No models available</div>
+                  ) : (
+                    <div className="model-dropdowns">
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Provider</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedSummarizerProvider}
+                          disabled={saving}
+                          onChange={(e) => {
+                            const first = models.find(m => m.provider === e.target.value);
+                            if (first) save({ summarizer_model: first.model_id }).catch(err => setError(String(err)));
+                          }}
+                        >
+                          {providers.map(p => (
+                            <option key={p} value={p}>
+                              {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Model</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={summarizerModelId}
+                          disabled={saving}
+                          onChange={(e) => save({ summarizer_model: e.target.value }).catch(err => setError(String(err)))}
+                        >
+                          {summarizerProviderModels.map(m => (
+                            <option key={m.model_id} value={m.model_id}>
+                              {m.display_name}
                               {m.supports_vision ? " 👁" : ""}
                             </option>
                           ))}

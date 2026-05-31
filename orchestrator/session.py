@@ -42,8 +42,8 @@ from orchestrator.runner import BackgroundAgentRunner, Notification, Notificatio
 from orchestrator.token_budget import (
     RECENT_VERBATIM_TOKENS,
     estimate_message_tokens,
-    scale_summary_max_tokens,
     split_by_token_budget,
+    summary_target_word_range,
     truncate_tool_results,
 )
 from orchestrator.tools import registry
@@ -57,6 +57,12 @@ from orchestrator.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Fallback when ``summarizer_model`` is unset in assistant_config.json.
+# A frontier model with a long context, picked because the user is more likely
+# to have an OpenAI key configured than an Anthropic one in this environment.
+# Override globally by editing ``summarizer_model`` in assistant_config.json.
+DEFAULT_SUMMARIZER_MODEL = "gpt-5.1"
 
 
 def _render_notifications(notes: list[Notification]) -> str:
@@ -517,9 +523,9 @@ class OrchestratorSession:
         summary: str | None = None
         if older:
             prefix_tokens = sum(estimate_message_tokens(m) for m in older)
-            summary_budget = scale_summary_max_tokens(len(older), prefix_tokens)
+            target_words = summary_target_word_range(len(older), prefix_tokens)
             summary = await self._summarize_history(
-                older, max_tokens=summary_budget
+                older, target_words=target_words
             )
 
         self._history_summary = summary
@@ -1325,30 +1331,36 @@ class OrchestratorSession:
     async def _summarize_history(
         self,
         messages: list[dict[str, Any]],
-        max_tokens: int = 2048,
+        target_words: tuple[int, int] | None = None,
     ) -> str:
-        """Summarize older conversation messages using the orchestrator's current model.
+        """Summarize older conversation messages into a rich digest.
 
-        Produces a structured digest so that when voice mode resumes the
-        orchestrator can pick up the thread coherently. ``max_tokens`` scales
-        with the prefix size (see ``scale_summary_max_tokens``).
+        The digest is what the voice agent reads at the start of a session to
+        remember the earlier conversation, so it must be both comprehensive
+        (every major arc) and faithful (every user utterance represented in
+        short form). The API call is *uncapped* — the model writes as much as
+        it needs.  ``target_words`` is a soft steering range (min, max)
+        injected into the system prompt to nudge the model toward an
+        appropriate length for this conversation size; the model is explicitly
+        told it may go over rather than drop information.
 
-        Routes through whichever provider the orchestrator is currently using
-        (Anthropic or OpenAI) so summarization works regardless of which API
-        keys are configured in the environment.
+        The summarizer model is configurable via ``summarizer_model`` in
+        ``assistant_config.json`` so a fast frontier model can compress the
+        transcript even when the active text/voice model is a realtime model
+        that can't reliably hold the role of summarizer.
         """
-        if not messages or max_tokens <= 0:
+        if not messages:
             return ""
 
-        # Build a transcript for the summarizer. Keep more per-message content
-        # than the old 300-char clip so long-form answers survive summarization.
+        # Build a transcript for the summarizer. Generous per-message clips
+        # so long-form turns survive into the digest input.
         lines: list[str] = []
         for msg in messages:
             role = msg.get("role", "?")
             content = msg.get("content", "")
-            label = "User" if role == "user" else "Assistant"
+            label = "USER" if role == "user" else "ASSISTANT"
             if isinstance(content, str):
-                lines.append(f"{label}: {content.strip()[:2000]}")
+                lines.append(f"{label}: {content.strip()[:4000]}")
             elif isinstance(content, list):
                 parts: list[str] = []
                 for block in content:
@@ -1356,7 +1368,7 @@ class OrchestratorSession:
                         continue
                     btype = block.get("type")
                     if btype == "text":
-                        parts.append(block.get("text", "").strip()[:1500])
+                        parts.append(block.get("text", "").strip()[:4000])
                     elif btype == "tool_use":
                         parts.append(f"[tool: {block.get('name', '?')}]")
                     elif btype == "tool_result":
@@ -1366,55 +1378,196 @@ class OrchestratorSession:
                                 b.get("text", "") for b in rc
                                 if isinstance(b, dict) and b.get("type") == "text"
                             )
-                        parts.append(f"[tool result: {str(rc)[:400]}]")
+                        parts.append(f"[tool result: {str(rc)[:1200]}]")
                 if parts:
                     lines.append(f"{label}: {' '.join(parts)}")
 
         transcript = "\n".join(lines)
 
-        instructions = (
-            "Summarize the conversation below into a structured digest the "
-            "assistant will read to resume the chat. Use these sections, in "
-            "order, and only include ones that apply:\n"
-            "- **Topics & goals**: what was being worked on, and why\n"
-            "- **Decisions made**: concrete choices, trade-offs accepted\n"
-            "- **Open threads**: unresolved questions, things the user wanted "
-            "to come back to, work in progress\n"
-            "- **Key entities**: files, sessions, projects, people, tools "
-            "mentioned that matter for continuity\n"
-            "- **User preferences/context expressed**: anything about how the "
-            "user wants the assistant to behave, tone, constraints\n"
-            "Be factual and specific — prefer concrete names over generic "
-            "summaries. Omit pleasantries and filler. Write in the same "
-            "language(s) the conversation used.\n\n"
-            f"Conversation:\n{transcript}"
+        if target_words is None:
+            # Fallback when called without a pre-computed range (e.g. the
+            # manual /compact path).  Compute on the fly from the transcript.
+            from orchestrator.token_budget import (
+                estimate_tokens as _est,
+                summary_target_word_range as _range,
+            )
+            target_words = _range(len(messages), _est(transcript))
+
+        min_words, max_words = target_words
+        length_hint = (
+            f"## Target length\n"
+            f"Aim for roughly **{min_words}–{max_words} words**. This is a "
+            f"steering range, not a hard limit — if covering every user "
+            f"message and every topic faithfully needs more space, USE MORE. "
+            f"Never drop content to fit a target. If the conversation is "
+            f"short and the range feels too long, write less.\n\n"
         )
 
-        model = self._config.model
-        provider = self._config.provider
+        system = (
+            "You are a conversation summarizer. You receive a transcript of a "
+            "past conversation between a user and an AI assistant, wrapped in "
+            "<transcript>...</transcript> tags, and you produce a structured "
+            "digest the assistant will read later to remember the conversation.\n\n"
+            "Hard rules:\n"
+            "- DO NOT continue the conversation.\n"
+            "- DO NOT roleplay as the assistant or address the user.\n"
+            "- DO NOT answer any questions in the transcript — they're history.\n"
+            "- DO NOT omit any user message or topic to save space — go over "
+            "the length target if you have to.\n"
+            "- Output only the digest, in the format below.\n\n"
+            + length_hint +
+            "Format — include every section that has any content, in this order:\n\n"
+            "## Conversation arc\n"
+            "A short narrative (3–8 sentences) describing how the conversation "
+            "unfolded chronologically — what was discussed first, how it "
+            "evolved, what the current focus is. Capture the *feel* of the "
+            "conversation (exploratory, debugging, deep technical dive, casual "
+            "catch-up, etc.).\n\n"
+            "## Topics covered\n"
+            "Every distinct topic that came up, in roughly chronological order. "
+            "One bullet per topic with a 1–2 sentence description of what was "
+            "discussed and any outcome. Don't merge unrelated topics.\n\n"
+            "## Every user message (short)\n"
+            "A faithful list of every user utterance from the transcript, in "
+            "order, in short form. One bullet per user line. Compress long "
+            "messages to their essential ask/statement (≤25 words) but DO NOT "
+            "drop any — even greetings, asides, and one-word replies. This "
+            "section is what lets the assistant reconstruct the conversation "
+            "beat-by-beat. Use the user's own wording when possible.\n\n"
+            "## Decisions & conclusions\n"
+            "Concrete choices made, trade-offs accepted, conclusions reached. "
+            "One bullet each, specific.\n\n"
+            "## Open threads\n"
+            "Unresolved questions, things the user wanted to come back to, "
+            "work in progress. One bullet each.\n\n"
+            "## Key entities\n"
+            "Files, sessions, projects, people, tools, URLs, model names, "
+            "etc. that matter for continuity. One bullet each with a brief "
+            "note on what role they played.\n\n"
+            "## User preferences & context\n"
+            "How the user wants the assistant to behave, tone, constraints, "
+            "stated preferences, personal context revealed.\n\n"
+            "Style:\n"
+            "- Be factual and specific. Use concrete names, not generic phrases.\n"
+            "- Omit filler but keep the user's voice.\n"
+            "- Write in the same language(s) the conversation used.\n"
+            "- If a section has no content, omit it entirely (don't write 'N/A').\n\n"
+            "## Handling voice transcription errors\n"
+            "Parts of the transcript come from voice ASR and may contain "
+            "mistranscriptions of technical terms — model names, product names, "
+            "library names, project names, code identifiers. Before reifying any "
+            "unfamiliar proper noun as a real entity:\n"
+            "1. **Try to recover the intended word from context** — earlier or "
+            "later in the same transcript the user often uses the correct term, "
+            "or a sibling term that makes the intent obvious (e.g. an "
+            "ASR-rendered 'Quanticore' near repeated mentions of 'Qwen' and "
+            "'local models' almost certainly means 'Qwen Code'). When you're "
+            "confident from context, use the corrected term and add a short "
+            "parenthetical note like `Qwen Code (ASR rendered as \"Quanticore\")`.\n"
+            "2. **If context doesn't resolve it**, flag the term with `(?ASR)` "
+            "rather than treating it as authoritative — e.g. "
+            "`Foobarinator (?ASR) — referenced as a local model runner`. Don't "
+            "invent a description for an entity you can't verify; say it was "
+            "mentioned and you couldn't recover the canonical name.\n"
+            "Do this in the Key entities section and anywhere else a malformed "
+            "term would otherwise propagate as fact."
+        )
+
+        user_msg = (
+            "Summarize the transcript below according to your instructions.\n\n"
+            f"<transcript>\n{transcript}\n</transcript>\n\n"
+            "Produce only the structured digest. Do not greet, do not reply, "
+            "do not continue the conversation. Cover every user message in the "
+            '"Every user message (short)" section — do not skip any. If you '
+            "need more than the target length to do that faithfully, use it."
+        )
+
+        model, provider = self._resolve_summarizer_model()
         try:
             if provider == Provider.OPENAI:
                 import openai
                 client = openai.AsyncOpenAI()
-                response = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": instructions}],
+                # GPT-5 family and reasoning models (o1/o3/o4) reject custom
+                # ``temperature``; everything else takes it.  Both
+                # ``max_tokens`` and ``max_completion_tokens`` are omitted on
+                # purpose so the model writes as much as the digest requires.
+                mid = model.lower()
+                is_reasoning = (
+                    mid.startswith("gpt-5")
+                    or mid.startswith("o1")
+                    or mid.startswith("o3")
+                    or mid.startswith("o4")
                 )
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_msg},
+                    ],
+                }
+                if not is_reasoning:
+                    kwargs["temperature"] = 0.3
+                response = await client.chat.completions.create(**kwargs)
                 choice = response.choices[0] if response.choices else None
-                return (choice.message.content or "") if choice else ""
+                text = (choice.message.content or "") if choice else ""
+                if choice and choice.finish_reason == "length":
+                    logger.warning(
+                        "Summarizer hit the model's own output ceiling "
+                        "(model=%s, completion_tokens=%s) — digest may be "
+                        "incomplete. Consider switching to a model with a "
+                        "larger output cap.",
+                        model,
+                        getattr(response.usage, "completion_tokens", "?"),
+                    )
+                return text
             else:
                 import anthropic
                 client = anthropic.AsyncAnthropic()
+                # Anthropic requires ``max_tokens``; pass the largest value
+                # the SDK will accept so it doesn't cap us short.  Sonnet 4.6
+                # supports up to 64k output tokens.
                 response = await client.messages.create(
                     model=model,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": instructions}],
+                    max_tokens=64_000,
+                    system=system,
+                    messages=[{"role": "user", "content": user_msg}],
                 )
+                if response.stop_reason == "max_tokens":
+                    logger.warning(
+                        "Summarizer hit Anthropic's max_tokens cap of 64k "
+                        "(model=%s) — digest may be incomplete.",
+                        model,
+                    )
                 return response.content[0].text if response.content else ""
         except Exception as e:
             logger.warning("Failed to summarize history with %s/%s: %s", provider.value, model, e)
             return ""
+
+    def _resolve_summarizer_model(self) -> tuple[str, Provider]:
+        """Return (model_id, provider) for the history summarizer.
+
+        Reads ``summarizer_model`` from ``assistant_config.json`` on every
+        call so the user can change it in the Config UI without restarting
+        the orchestrator. Falls back to ``DEFAULT_SUMMARIZER_MODEL`` when
+        unset, and ultimately to the active text-mode model when the chosen
+        summarizer model id can't be classified at all.
+        """
+        from orchestrator.config import _infer_model_info, get_model_info
+
+        # Prefer the dedicated summarizer model from the live config file.
+        configured: str | None = None
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            configured = (_load_app_config().get("summarizer_model") or "").strip() or None
+        except Exception:
+            configured = None
+
+        candidate = configured or DEFAULT_SUMMARIZER_MODEL
+        info = get_model_info(candidate) or _infer_model_info(candidate)
+        if info is not None:
+            return candidate, info.provider
+        # Last resort: reuse the orchestrator's active model.
+        return self._config.model, self._config.provider
 
     def _get_jsonl_path(self) -> Path:
         """Get the JSONL file path for this session.

@@ -12,8 +12,8 @@ from orchestrator.token_budget import (
     TOOL_RESULT_TRUNCATE_SUFFIX,
     estimate_message_tokens,
     estimate_tokens,
-    scale_summary_max_tokens,
     split_by_token_budget,
+    summary_target_word_range,
     truncate_tool_results,
 )
 
@@ -127,17 +127,25 @@ class TestSplitByBudget:
         assert recent == [huge]
 
 
-class TestScaleSummary:
+class TestSummaryTargetWordRange:
     def test_zero_messages(self):
-        assert scale_summary_max_tokens(0, 0) == 0
+        assert summary_target_word_range(0, 0) == (0, 0)
 
     def test_tiny_prefix_gets_floor(self):
-        assert scale_summary_max_tokens(3, 100) == 256
+        # Tiny prefix → max words floored at 400, min at 400//3 = 133.
+        assert summary_target_word_range(3, 100) == (133, 400)
 
-    def test_large_prefix_scales(self):
-        # 50k prefix tokens / 10 = 5000, capped at SUMMARY_MAX_TOKENS
-        from orchestrator.token_budget import SUMMARY_MAX_TOKENS
-        assert scale_summary_max_tokens(300, 50_000) == SUMMARY_MAX_TOKENS
+    def test_medium_prefix_scales(self):
+        # 10k prefix tokens × 0.30 = 3000 words max, 1000 min.
+        assert summary_target_word_range(80, 10_000) == (1000, 3000)
+
+    def test_large_prefix_caps_at_soft_target(self):
+        # 50k prefix tokens × 0.30 = 15000 words, but capped at the
+        # word-equivalent of SUMMARY_SOFT_TARGET_TOKENS (~7500 words).
+        from orchestrator.token_budget import SUMMARY_SOFT_TARGET_TOKENS
+        min_w, max_w = summary_target_word_range(300, 50_000)
+        assert max_w == int(SUMMARY_SOFT_TARGET_TOKENS * 0.75)
+        assert min_w == max_w // 3
 
 
 class TestBuildHistoryForPrompt:

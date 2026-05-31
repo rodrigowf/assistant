@@ -167,6 +167,7 @@ export interface AssistantConfig {
   chrome_extension: boolean;
   provider: AssistantProvider;                   // session provider for new chats
   default_model: string;
+  summarizer_model: string;                       // "" = use backend default
   harness_model: Partial<Record<AssistantProvider, string>>; // per-provider; "" = CLI default
   default_voice_provider: string;
   default_voice_model: string;
@@ -183,6 +184,7 @@ export interface ConfigUpdate {
   chrome_extension?: boolean;
   provider?: AssistantProvider;
   default_model?: string;
+  summarizer_model?: string;
   harness_model?: Partial<Record<AssistantProvider, string>>; // shallow-merged server-side
   default_voice_provider?: string;
   default_voice_model?: string;

@@ -126,6 +126,14 @@ def _default_config() -> dict[str, Any]:
         "chrome_extension": False,  # launch sessions with --chrome flag
         "provider": "claude",  # session-harness id (registry-driven)
         "default_model": "claude-sonnet-4-5-20250929",  # default model for orchestrator
+        # Model used to summarize older conversation history into the digest the
+        # voice agent reads at session start / reconnect.  Picked separately
+        # from ``default_model`` because the chosen voice/text model is often a
+        # realtime / audio model that can't be trusted to compress a long
+        # transcript into a structured summary.  Empty string falls back to a
+        # code-level default in ``orchestrator/session.py``
+        # (``DEFAULT_SUMMARIZER_MODEL``).
+        "summarizer_model": "",
         # Default *harness* model per provider — what `claude --model <id>`
         # or `qwen --model <id>` runs with on a new session.  Empty string
         # means "let the CLI pick its own default" (which is what the CLI
@@ -231,6 +239,7 @@ class ConfigUpdate(BaseModel):
     chrome_extension: bool | None = None
     provider: str | None = None  # session provider — "claude" | "qwen"
     default_model: str | None = None  # default model for new orchestrator sessions
+    summarizer_model: str | None = None  # model used to summarize older history for the voice prompt
     harness_model: dict[str, str] | None = None  # per-provider harness model ("" = CLI default)
     default_voice_provider: str | None = None  # default provider for voice sessions
     default_voice_model: str | None = None     # default model for voice sessions
@@ -606,6 +615,17 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
             if hint is not None:
                 raise HTTPException(status_code=400, detail=hint)
         config["default_model"] = body.default_model
+
+    if body.summarizer_model is not None:
+        # Empty string is allowed — means "use the code-level default".
+        summ = body.summarizer_model.strip()
+        if summ:
+            provider_id = _orchestrator_provider_for_model(summ)
+            if provider_id is not None:
+                hint = _check_orchestrator_sdk_available(provider_id)
+                if hint is not None:
+                    raise HTTPException(status_code=400, detail=hint)
+        config["summarizer_model"] = summ
 
     if (
         body.default_voice_provider is not None
