@@ -1246,6 +1246,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 _sessions.update { it.filter { s -> s.sessionId != sessionId } }
                 // Also remove from cache
                 sessionCache.remove(sessionId)
+            } else {
+                Log.w(TAG, "deleteSession: backend rejected $sessionId")
+                _toastMessage.value = "Delete failed."
             }
         }
     }
@@ -1273,21 +1276,32 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             if (newId != null) {
                 lastRefreshTime = 0L  // bypass refresh debounce
                 refreshSessions()
+                _toastMessage.value = "Conversation duplicated."
             } else {
                 Log.w(TAG, "duplicateSession: backend rejected $sessionId")
+                _toastMessage.value = "Duplicate failed."
             }
         }
     }
 
     /**
      * Rewind a session: drop the last [dropLastN] visible messages.
-     * The session must be closed first (backend rejects truncate on live sessions).
-     * If the rewound session is the currently-loaded one, closes it first.
+     * The session must be closed first (backend rejects truncate on live
+     * sessions, including the orchestrator). [explicitLocalId] is the live
+     * pool's local_id for [sessionId] when known by the caller — required
+     * for orchestrator rewinds, since `_sdkToLocalId` only reliably tracks
+     * agent sessions.
      */
-    fun truncateSession(sessionId: String, dropLastN: Int) {
+    fun truncateSession(
+        sessionId: String,
+        dropLastN: Int,
+        explicitLocalId: String? = null,
+    ) {
         viewModelScope.launch {
-            // If the session is open, close it first.
-            val localId = _sdkToLocalId.value[sessionId]
+            // Close the live session first if we can identify one. Prefer the
+            // explicit local_id (from the active bucket); fall back to the
+            // SDK→local map for callers that only know the JSONL id.
+            val localId = explicitLocalId ?: _sdkToLocalId.value[sessionId]
             if (localId != null) {
                 apiClient?.closePoolSession(localId)
                 _liveSessionIds.update { it - sessionId }
@@ -1297,6 +1311,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             val ok = apiClient?.truncateSession(sessionId, dropLastN) ?: false
             if (!ok) {
                 Log.w(TAG, "truncateSession: backend rejected $sessionId drop=$dropLastN")
+                _toastMessage.value = "Rewind failed — session may still be open."
                 return@launch
             }
 
@@ -1308,10 +1323,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     b.currentSessionId.value = null
                     b.currentSessionIdForPagination = null
                     b.hasMoreMessages.value = false
+                    b.jsonlSessionId = null
                 }
             }
             sessionCache.remove(sessionId)
 
+            _toastMessage.value = "Conversation rewound."
             lastRefreshTime = 0L
             refreshSessions()
         }
@@ -1327,8 +1344,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             if (newId != null) {
                 lastRefreshTime = 0L
                 refreshSessions()
+                _toastMessage.value = "Conversation forked."
             } else {
                 Log.w(TAG, "forkSession: backend rejected $sessionId drop=$dropLastN")
+                _toastMessage.value = "Fork failed."
             }
         }
     }
@@ -1338,6 +1357,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * position [uiIndex]. Converts to a bottom-relative drop count so the
      * action survives pagination — the frontend may only have the most
      * recent page loaded, so an absolute top-index would be unreliable.
+     *
+     * Passes the bucket's live local_id through to [truncateSession] so the
+     * orchestrator path (which isn't reliably indexed in `_sdkToLocalId`)
+     * can still close the pool session before the truncate call.
      */
     fun rewindCurrentSessionAt(uiIndex: Int) {
         val b = activeBucket()
@@ -1348,7 +1371,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val total = b.messages.value.size
         val dropLastN = (total - 1 - uiIndex).coerceAtLeast(0)
-        truncateSession(sessionId, dropLastN)
+        truncateSession(sessionId, dropLastN, explicitLocalId = b.currentLocalId.value)
     }
 
     /**

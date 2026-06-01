@@ -308,6 +308,13 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         mutableStateOf<Pair<String, Int>?>(null) // (kind, uiIndex)
     }
 
+    // Pending delete confirmation, mirroring the web frontend's ConfirmModal.
+    // We hold (sessionId, title) so the dialog can display the human-readable
+    // title even after the user navigates away from the sessions list.
+    var pendingDeleteSession by remember {
+        mutableStateOf<Pair<String, String>?>(null)
+    }
+
     Scaffold { innerPadding ->
     Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
         // Page content
@@ -342,7 +349,10 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                             navController.navigate(Screen.Chat.route)
                         },
                         onRenameSession = viewModel::renameSession,
-                        onDeleteSession = viewModel::deleteSession,
+                        onDeleteSession = { sid ->
+                            val title = sessions.find { it.sessionId == sid }?.title ?: "this conversation"
+                            pendingDeleteSession = sid to title
+                        },
                         onDuplicateSession = viewModel::duplicateSession,
                         onCloseSession = viewModel::closeSession,
                         onRefresh = viewModel::refreshSessions
@@ -476,6 +486,35 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             }
         }
     }
+    }
+
+    // Delete-conversation confirmation, matching the web ConfirmModal. The
+    // file is moved to context/trash/ on the backend and can be recovered
+    // manually, but the user shouldn't lose a conversation to a stray tap.
+    pendingDeleteSession?.let { (sessionId, title) ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteSession = null },
+            title = { Text("Delete conversation?") },
+            text = {
+                Text(
+                    "\"$title\" will be moved to trash and hidden from the assistant. " +
+                        "The file is kept on disk and can be recovered manually from context/trash/."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.deleteSession(sessionId)
+                    pendingDeleteSession = null
+                }) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteSession = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     // Rewind / fork confirmation dialog. Rendered outside the Scaffold's
