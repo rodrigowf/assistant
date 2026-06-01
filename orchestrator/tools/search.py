@@ -62,6 +62,12 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
             logger.error("Failed to start search server: %s", e)
             return None
 
+        # Forward the server's stderr to our logger so boot-probe /
+        # boot-repair / write-error messages surface in journalctl.
+        # We start this BEFORE waiting on `ready` so any messages
+        # emitted during the model-load window aren't lost.
+        asyncio.create_task(_forward_stderr(proc))
+
         # Wait for the "ready" signal (model loaded)
         try:
             ready_line = await asyncio.wait_for(
@@ -71,7 +77,11 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
             if ready_data.get("status") == "ready":
                 _server_proc = proc
                 _server_ready = True
-                logger.info("Search server ready (PID %d)", proc.pid)
+                socket_path = ready_data.get("socket")
+                if socket_path:
+                    logger.info("Search server ready (PID %d, socket=%s)", proc.pid, socket_path)
+                else:
+                    logger.info("Search server ready (PID %d)", proc.pid)
                 return proc
             else:
                 logger.error("Unexpected ready response: %s", ready_data)
@@ -85,6 +95,49 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
             logger.error("Search server startup error: %s", e)
             proc.kill()
             return None
+
+
+async def _forward_stderr(proc: asyncio.subprocess.Process) -> None:
+    """Pipe the search server's stderr into our logger one line at a time.
+
+    Lines that look like our own `[search-server]` markers (boot-probe,
+    boot-repair, etc.) are logged at WARNING — they're once-per-boot
+    events worth surfacing under the default log config without
+    needing to flip the orchestrator logger to INFO. Lines from chatty
+    libraries we trust (sentence-transformers' "Loading weights:"
+    progress bar, huggingface_hub's auth warning) are dropped.
+    Anything else also goes to WARNING — that's the bucket for genuine
+    surprises like chroma tracebacks."""
+    if proc.stderr is None:
+        return
+    # Patterns we silence outright — high-volume noise that's not
+    # actionable. Anything not matched falls through to WARNING.
+    NOISE_PREFIXES = (
+        "Loading weights",
+        "BertModel LOAD REPORT",
+        "Warning: You are sending unauthenticated requests to the HF Hub",
+        "Notes:",
+        "- UNEXPECTED",
+        "Key",
+        "embeddings.position_ids",
+        "------------------------",
+    )
+    try:
+        while True:
+            raw = await proc.stderr.readline()
+            if not raw:
+                return
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            if line.startswith("[search-server]"):
+                logger.warning("search-server: %s", line[len("[search-server] "):])
+                continue
+            if any(line.startswith(p) for p in NOISE_PREFIXES):
+                continue
+            logger.warning("search-server stderr: %s", line)
+    except Exception as e:
+        logger.warning("search-server stderr reader stopped: %s", e)
 
 
 async def _query_server(
