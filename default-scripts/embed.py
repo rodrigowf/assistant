@@ -21,6 +21,15 @@ Examples:
     context/scripts/embed.py index history/2026-02-05-session.md --collection history
     context/scripts/embed.py stats
     context/scripts/embed.py reset --collection history
+
+Implementation notes
+--------------------
+When a warm search-server is running (its lockfile is held and its
+Unix domain socket is reachable), all chroma access goes through the
+server. Otherwise we open chroma directly. The IndexFacade helper
+enforces this — including a refusal to open chroma directly if a warm
+server's lockfile is present (which would risk concurrent-writer
+corruption).
 """
 import argparse
 import hashlib
@@ -30,14 +39,20 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_DIR))
+sys.path.insert(0, str(SCRIPT_DIR))  # for index_client
+
 INDEX_DIR = PROJECT_DIR / "index" / "chroma"
 
-# Lazy imports to keep startup fast when just checking --help
+# Lazy state for the direct-chroma path (kept so tests that monkey-patch
+# `embed.INDEX_DIR` + clear `_clients` keep working).
 _model = None
 _clients = {}
 
 
 def get_client():
+    """Direct chroma client. Only used when no warm server is reachable.
+    Tests use this directly via fixture."""
     import chromadb
     if "default" not in _clients:
         INDEX_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,7 +64,7 @@ def get_collection(name="memory"):
     client = get_client()
     return client.get_or_create_collection(
         name=name,
-        metadata={"hnsw:space": "cosine"},
+        metadata={"hnsw:space": "cosine", "hnsw:sync_threshold": 200},
     )
 
 
@@ -84,12 +99,10 @@ def chunk_file(filepath, chunk_size=10, overlap=3):
         chunk_lines = lines[i:end]
         chunk_text = "\n".join(chunk_lines).strip()
 
-        if chunk_text:  # Skip empty chunks
-            # Stable ID based on file path + line range
+        if chunk_text:
             chunk_id = hashlib.sha256(
                 f"{filepath}:{i+1}-{end}".encode()
             ).hexdigest()[:16]
-
             chunks.append({
                 "id": chunk_id,
                 "text": chunk_text,
@@ -108,13 +121,24 @@ def chunk_file(filepath, chunk_size=10, overlap=3):
     return chunks
 
 
+def _open_facade():
+    """Return an IndexFacade pointed at INDEX_DIR.
+
+    The facade uses the warm server if reachable, else direct chroma.
+    If our module-level INDEX_DIR has been monkey-patched (tests), we
+    override the facade's path to match so test isolation works."""
+    # Import lazily so the module loads cheaply for --help.
+    import index_client
+    index_client.INDEX_DIR = INDEX_DIR
+    index_client.SOCKET_PATH = INDEX_DIR / ".search-server.sock"
+    index_client.LOCKFILE = INDEX_DIR / ".search-server.lock"
+    return index_client.IndexFacade()
+
+
 def index_path(path, collection_name="memory", chunk_size=10, overlap=3):
     """Index a file or directory."""
     path = Path(path)
-    collection = get_collection(collection_name)
-    model = get_model()
 
-    # Gather files
     if path.is_file():
         files = [path]
     elif path.is_dir():
@@ -132,119 +156,143 @@ def index_path(path, collection_name="memory", chunk_size=10, overlap=3):
         print(f"No indexable files found in {path}")
         return
 
+    facade = _open_facade()
+    print(f"[embed] mode={facade.mode}", file=sys.stderr)
+
     total_chunks = 0
-    for filepath in files:
-        # Remove old chunks for this file before re-indexing
-        _delete_file_chunks(collection, str(filepath))
+    with facade:
+        for filepath in files:
+            # Remove old chunks for this file before re-indexing
+            old_ids = facade.get_by_file(collection_name, str(filepath))
+            if old_ids:
+                facade.delete_ids(collection_name, old_ids)
 
-        chunks = chunk_file(filepath, chunk_size, overlap)
-        if not chunks:
-            continue
+            chunks = chunk_file(filepath, chunk_size, overlap)
+            if not chunks:
+                continue
 
-        # Batch embed and store
-        texts = [c["text"] for c in chunks]
-        embeddings = model.encode(texts, show_progress_bar=False)
+            texts = [c["text"] for c in chunks]
+            embeddings = facade.encode_many(texts)
 
-        collection.add(
-            ids=[c["id"] for c in chunks],
-            embeddings=embeddings.tolist(),
-            documents=texts,
-            metadatas=[c["metadata"] for c in chunks],
-        )
+            payload = [
+                {
+                    "id": c["id"],
+                    "embedding": e,
+                    "document": c["text"],
+                    "metadata": c["metadata"],
+                }
+                for c, e in zip(chunks, embeddings)
+            ]
+            facade.add_chunks(collection_name, payload)
 
-        total_chunks += len(chunks)
-        print(f"  Indexed {filepath} ({len(chunks)} chunks)")
+            total_chunks += len(chunks)
+            print(f"  Indexed {filepath} ({len(chunks)} chunks)")
 
     print(f"\nTotal: {len(files)} files, {total_chunks} chunks in '{collection_name}'")
 
 
 def _delete_file_chunks(collection, file_path):
-    """Remove all chunks belonging to a file path."""
+    """Tests still call this with a direct chroma collection. Kept for
+    test compatibility — production code goes through the facade."""
     try:
         results = collection.get(where={"file_path": file_path})
         if results["ids"]:
             collection.delete(ids=results["ids"])
     except Exception:
-        pass  # Collection might be empty
+        pass
 
 
 def delete_path(path, collection_name="memory"):
-    """Delete all chunks from a file path."""
-    collection = get_collection(collection_name)
     path = Path(path)
-
-    if path.is_dir():
-        # Delete all files under this directory
-        results = collection.get()
-        ids_to_delete = [
-            id_ for id_, meta in zip(results["ids"], results["metadatas"])
-            if meta.get("file_path", "").startswith(str(path))
-        ]
-        if ids_to_delete:
-            collection.delete(ids=ids_to_delete)
-            print(f"Deleted {len(ids_to_delete)} chunks from {path}")
+    facade = _open_facade()
+    with facade:
+        if path.is_dir():
+            # No direct "delete prefix" command; fetch all metadata and filter.
+            # Round-trip is fine for the rare cleanup case.
+            if facade._client:
+                # When using the warm server we can't enumerate by prefix
+                # cheaply; fall back to per-file deletes for each known file.
+                # Caller can also pass an exact file path.
+                print(
+                    f"[embed] delete on directory via warm server is not supported; "
+                    f"pass an exact file path or use 'reset' for a full clear.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            client = get_client()
+            collection = client.get_or_create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine", "hnsw:sync_threshold": 200},
+            )
+            results = collection.get()
+            ids_to_delete = [
+                id_ for id_, meta in zip(results["ids"], results["metadatas"])
+                if meta.get("file_path", "").startswith(str(path))
+            ]
+            if ids_to_delete:
+                collection.delete(ids=ids_to_delete)
+                print(f"Deleted {len(ids_to_delete)} chunks from {path}")
+            else:
+                print(f"No chunks found for {path}")
         else:
-            print(f"No chunks found for {path}")
-    else:
-        _delete_file_chunks(collection, str(path))
-        print(f"Deleted chunks for {path}")
+            ids = facade.get_by_file(collection_name, str(path))
+            facade.delete_ids(collection_name, ids)
+            print(f"Deleted chunks for {path} ({len(ids)} chunks)")
 
 
 def reset_collection(collection_name="memory"):
-    """Clear all data from a collection."""
-    client = get_client()
-    try:
-        client.delete_collection(collection_name)
-        print(f"Collection '{collection_name}' reset")
-    except Exception:
-        print(f"Collection '{collection_name}' doesn't exist or already empty")
+    facade = _open_facade()
+    with facade:
+        try:
+            facade.reset_collection(collection_name)
+            print(f"Collection '{collection_name}' reset")
+        except Exception as e:
+            print(f"Collection '{collection_name}' reset failed: {e}")
 
 
 def show_stats(collection_name="memory"):
-    """Show collection statistics."""
-    collection = get_collection(collection_name)
-    count = collection.count()
-
-    if count == 0:
-        print(f"Collection '{collection_name}': empty")
-        return
-
-    results = collection.get()
-    files = set()
-    for meta in results["metadatas"]:
-        files.add(meta.get("file_path", "unknown"))
-
-    print(f"Collection '{collection_name}':")
-    print(f"  Total chunks: {count}")
-    print(f"  Files indexed: {len(files)}")
-    for f in sorted(files):
-        file_chunks = sum(1 for m in results["metadatas"] if m.get("file_path") == f)
-        print(f"    {f} ({file_chunks} chunks)")
+    facade = _open_facade()
+    with facade:
+        count = facade.count(collection_name)
+        if count == 0:
+            print(f"Collection '{collection_name}': empty")
+            return
+        print(f"Collection '{collection_name}':")
+        print(f"  Total chunks: {count}")
+        # File-level breakdown only available via direct chroma (we'd
+        # need a new server command to enumerate; not critical for now).
+        if not facade._client:
+            client = get_client()
+            collection = client.get_collection(collection_name)
+            results = collection.get()
+            files = set()
+            for meta in results["metadatas"]:
+                files.add(meta.get("file_path", "unknown"))
+            print(f"  Files indexed: {len(files)}")
+            for f in sorted(files):
+                file_chunks = sum(1 for m in results["metadatas"] if m.get("file_path") == f)
+                print(f"    {f} ({file_chunks} chunks)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Embedding pipeline for memory and history")
     sub = parser.add_subparsers(dest="command")
 
-    # index
     p_index = sub.add_parser("index", help="Index a file or directory")
     p_index.add_argument("path", help="File or directory to index")
-    p_index.add_argument("--collection", default="memory", help="Collection name (default: memory)")
-    p_index.add_argument("--chunk-size", type=int, default=10, help="Lines per chunk (default: 10)")
-    p_index.add_argument("--overlap", type=int, default=3, help="Overlap lines between chunks (default: 3)")
+    p_index.add_argument("--collection", default="memory")
+    p_index.add_argument("--chunk-size", type=int, default=10)
+    p_index.add_argument("--overlap", type=int, default=3)
 
-    # delete
     p_delete = sub.add_parser("delete", help="Delete chunks for a file/directory")
-    p_delete.add_argument("path", help="File or directory path")
-    p_delete.add_argument("--collection", default="memory", help="Collection name")
+    p_delete.add_argument("path")
+    p_delete.add_argument("--collection", default="memory")
 
-    # reset
     p_reset = sub.add_parser("reset", help="Clear a collection")
-    p_reset.add_argument("--collection", default="memory", help="Collection name")
+    p_reset.add_argument("--collection", default="memory")
 
-    # stats
     p_stats = sub.add_parser("stats", help="Show collection statistics")
-    p_stats.add_argument("--collection", default="memory", help="Collection name")
+    p_stats.add_argument("--collection", default="memory")
 
     args = parser.parse_args()
 

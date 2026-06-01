@@ -1,4 +1,11 @@
-"""Utilities for managing the vector index alongside session operations."""
+"""Utilities for managing the vector index alongside session operations.
+
+Single-writer discipline: never open chromadb.PersistentClient directly
+from this module. Instead, route every read/write through
+default-scripts/index_client.IndexFacade, which talks to the warm
+search-server when one is running, and falls back to a direct chroma
+open only when the lockfile is unheld (so no other writer can race us).
+"""
 
 from __future__ import annotations
 
@@ -9,85 +16,61 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+PROJECT_DIR = Path(__file__).parent.parent.resolve()
+SCRIPTS_DIR = PROJECT_DIR / "default-scripts"
+
 
 def get_index_dir() -> Path:
-    """Get the ChromaDB index directory."""
-    script_dir = Path(__file__).parent.resolve()
-    project_dir = script_dir.parent
-    return project_dir / "index" / "chroma"
+    """Path to the chroma index directory."""
+    return PROJECT_DIR / "index" / "chroma"
 
 
-def get_chroma_client():
-    """Get a ChromaDB client instance."""
-    try:
-        import chromadb
-        index_dir = get_index_dir()
-        index_dir.mkdir(parents=True, exist_ok=True)
-        return chromadb.PersistentClient(path=str(index_dir))
-    except ImportError:
-        return None
-
-
-def get_collection(name: str = "history"):
-    """Get or create a ChromaDB collection."""
-    client = get_chroma_client()
-    if client is None:
-        return None
-    return client.get_or_create_collection(
-        name=name,
-        metadata={"hnsw:space": "cosine"},
-    )
-
-
-def remove_session_from_index(session_id: str, collection_name: str = "history") -> bool:
+def remove_session_from_index(
+    session_id: str,
+    collection_name: str = "history",
+    timeout: float = 30.0,
+) -> bool:
     """Remove all chunks for a session from the vector index.
 
-    Runs in a subprocess to protect the main server process from segfaults
-    in ChromaDB's native code (e.g. corrupted HNSW index).
-
-    Args:
-        session_id: The session ID to remove
-        collection_name: The collection name (default: "history")
-
-    Returns:
-        True if chunks were deleted, False otherwise
+    Runs in a subprocess so a chroma SIGSEGV is a recoverable exit
+    code, not a crashed backend. Inside the subprocess we use the
+    IndexFacade, which prefers the warm server's socket (single-writer
+    safe). If the warm server has shut down (e.g. backend teardown),
+    the facade refuses to open chroma directly while the lockfile is
+    held — we treat that as a soft skip; the next HistoryIndexer tick
+    will pick up the missing JSONL via its mtime hash and re-index from
+    scratch (which removes the orphan).
     """
-    index_dir = str(get_index_dir())
-
-    # Run in subprocess so a ChromaDB segfault can't crash the server
     script = f"""
 import sys
-import chromadb
+sys.path.insert(0, {str(PROJECT_DIR)!r})
+sys.path.insert(0, {str(SCRIPTS_DIR)!r})
+import index_client
 
-try:
-    client = chromadb.PersistentClient(path={index_dir!r})
-    collection = client.get_collection({collection_name!r})
-except Exception as e:
-    print(f"Collection not available: {{e}}", file=sys.stderr)
-    sys.exit(1)
+session_id = {session_id!r}
+collection_name = {collection_name!r}
 
-try:
-    results = collection.get(where={{"file_path": {{"$contains": "{session_id}.md"}}}})
-except Exception:
-    # Fallback: fetch all and filter (older ChromaDB versions)
-    results = collection.get()
-
-if not results["ids"]:
-    sys.exit(0)
-
-# Filter to matching chunks
-to_delete = []
-for chunk_id, metadata in zip(results["ids"], results["metadatas"]):
-    fp = metadata.get("file_path", "")
-    if "/{session_id}.md" in fp or ".index-temp/{session_id}.md" in fp:
-        to_delete.append(chunk_id)
-
-if to_delete:
-    collection.delete(ids=to_delete)
-    print(f"Deleted {{len(to_delete)}} chunks")
-    sys.exit(0)
-else:
-    sys.exit(0)
+facade = index_client.IndexFacade()
+with facade:
+    try:
+        # Match by file_path containing the session id. Sessions live
+        # in .index-temp/<uuid>.md (the converted JSONL form).
+        # Use delete_where for an exact-path match if known; otherwise
+        # fall back to enumerating IDs by file_path metadata.
+        candidates = [
+            f"/home/rodrigo/assistant/.index-temp/{{session_id}}.md",
+        ]
+        total = 0
+        for path in candidates:
+            ids = facade.get_by_file(collection_name, path)
+            if ids:
+                total += facade.delete_ids(collection_name, ids)
+        print(f"Deleted {{total}} chunks")
+    except RuntimeError as e:
+        # Lockfile-held-but-socket-unreachable case: skip cleanly.
+        # The next indexer tick will re-derive the truth.
+        print(f"SKIP: {{e}}", file=sys.stderr)
+        sys.exit(0)
 """
 
     try:
@@ -95,7 +78,7 @@ else:
             [sys.executable, "-c", script],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
         )
         if result.returncode != 0:
             stderr = result.stderr.strip()

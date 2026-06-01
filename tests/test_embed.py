@@ -162,9 +162,13 @@ class TestResetCollection:
         assert embed.get_collection("test_reset").count() == 0
 
     def test_reset_nonexistent(self, tmp_index, capsys):
+        # reset_collection now creates the collection if missing (since
+        # writes go through IndexFacade which uses get_or_create), so
+        # the end state is always an empty collection — no error path.
         embed.reset_collection("nonexistent_collection")
         captured = capsys.readouterr()
-        assert "doesn't exist" in captured.out or "already empty" in captured.out
+        assert "reset" in captured.out
+        assert embed.get_collection("nonexistent_collection").count() == 0
 
 
 class TestShowStats:

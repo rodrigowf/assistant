@@ -48,8 +48,12 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
 
         logger.info("Starting search server subprocess...")
         try:
+            # `--socket` opens a Unix domain socket transport in addition
+            # to the stdio one used by this client. The socket lets
+            # external writers (embed.py, manager/index_utils.py) reach
+            # the same warm server, keeping chroma single-writer.
             proc = await asyncio.create_subprocess_exec(
-                str(_RUN_SH), str(_SEARCH_SERVER),
+                str(_RUN_SH), str(_SEARCH_SERVER), "--socket",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -86,6 +90,8 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
 async def _query_server(
     proc: asyncio.subprocess.Process,
     request: dict,
+    *,
+    timeout: float = 30.0,
 ) -> dict | None:
     """Send a query to the warm server and read the response."""
     try:
@@ -94,7 +100,7 @@ async def _query_server(
         await proc.stdin.drain()
 
         response_line = await asyncio.wait_for(
-            proc.stdout.readline(), timeout=30,  # Warm queries should be fast
+            proc.stdout.readline(), timeout=timeout,  # Warm queries should be fast
         )
 
         if not response_line:
@@ -337,3 +343,64 @@ async def search_memory(
 ) -> str:
     results = await _do_search(query, "memory", max_results)
     return json.dumps({"query": query, "results": results, "count": len(results)})
+
+
+@registry.register(
+    name="check_index_health",
+    description=(
+        "Probe the vector index for corruption and optionally auto-repair. "
+        "Use this when /recall returns crashes or empty results unexpectedly. "
+        "Validation runs in a subprocess so even a SIGSEGV is recoverable."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "collection": {
+                "type": "string",
+                "description": "Collection name to check (memory or history).",
+            },
+            "repair": {
+                "type": "boolean",
+                "description": "If true and the collection is unhealthy, run auto-repair (WAL-replay first, then full re-embed trigger).",
+            },
+        },
+        "required": ["collection"],
+    },
+)
+async def check_index_health(
+    context: dict[str, Any], collection: str, repair: bool = False
+) -> str:
+    request: dict = {"command": "validate", "collection": collection}
+    async with _query_lock:
+        proc = await _ensure_server()
+        if proc is None:
+            return json.dumps({"error": "warm search-server unavailable"})
+        v = await _query_server(proc, request)
+        if v is None:
+            return json.dumps({"error": "warm server unresponsive during validate"})
+        healthy = bool(v.get("healthy"))
+        details = v.get("details") or v
+        if healthy or not repair:
+            return json.dumps({
+                "collection": collection,
+                "healthy": healthy,
+                "details": details,
+                "repaired": False,
+            })
+        # Trigger repair via a long-timeout query. WAL replay is ~10s
+        # for a small collection, but on the Jetson with a real history
+        # collection (~13k chunks) it can take several minutes if it
+        # has to escalate to a re-create.
+        r = await _query_server(
+            proc, {"command": "repair", "collection": collection, "tier": "auto"},
+            timeout=600.0,
+        )
+        if r is None:
+            return json.dumps({"error": "warm server unresponsive during repair"})
+        return json.dumps({
+            "collection": collection,
+            "healthy": healthy,
+            "details": details,
+            "repaired": True,
+            "repair": r,
+        })

@@ -11,7 +11,7 @@ import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
     "index_memory",
-    Path(__file__).parent.parent / "scripts" / "index-memory.py",
+    Path(__file__).parent.parent / "default-scripts" / "index-memory.py",
 )
 index_memory = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(index_memory)
