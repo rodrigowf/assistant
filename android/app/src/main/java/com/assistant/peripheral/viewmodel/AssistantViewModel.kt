@@ -1634,6 +1634,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun isBluetoothAudioAvailable(): Boolean =
         voiceManager?.isBluetoothAudioAvailable() == true
 
+    /**
+     * Whether a wired 3.5mm headphone/headset is currently plugged in.
+     * UI should call this to decide whether to enable the WIRED segment.
+     */
+    fun isWiredHeadphoneAvailable(): Boolean =
+        voiceManager?.isWiredHeadphoneAvailable() == true
+
     fun updateSpeakerVolumeLevel(level: Float) {
         viewModelScope.launch {
             val clamped = level.coerceIn(0.0f, 1.5f)

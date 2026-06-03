@@ -379,6 +379,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         // TODO: surface this via a StateFlow if we want live updates without
                         // leaving Settings.
                         isBluetoothAvailable = viewModel.isBluetoothAudioAvailable(),
+                        isWiredHeadphoneAvailable = viewModel.isWiredHeadphoneAvailable(),
                         onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
                         onUpdateWakeWord = viewModel::updateWakeWord,
                         onUpdateVoiceWord = viewModel::updateVoiceWord,

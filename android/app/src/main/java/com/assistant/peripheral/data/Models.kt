@@ -243,11 +243,16 @@ data class AppSettings(
  *
  * BLUETOOTH requires a connected Bluetooth audio device — UI should gray this option out
  * when none is available. VoiceManager.isBluetoothAudioAvailable() exposes that state.
+ *
+ * WIRED requires a wired headphone/headset plugged into the 3.5mm jack (or a USB audio
+ * device on devices that support it). VoiceManager.isWiredHeadphoneAvailable() exposes
+ * that state.
  */
 enum class AudioOutput {
     EARPIECE,
     LOUDSPEAKER,
-    BLUETOOTH;
+    BLUETOOTH,
+    WIRED;
 
     companion object {
         /** Safe parse for DataStore — falls back to LOUDSPEAKER on unknown / null. */

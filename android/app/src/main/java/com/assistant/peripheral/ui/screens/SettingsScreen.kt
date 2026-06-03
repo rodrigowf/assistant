@@ -44,6 +44,7 @@ fun SettingsScreen(
     onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateAudioOutput: (AudioOutput) -> Unit,
     isBluetoothAvailable: Boolean,
+    isWiredHeadphoneAvailable: Boolean,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
     onUpdateVoiceWord: (String) -> Unit,
@@ -103,6 +104,7 @@ fun SettingsScreen(
                 onUpdateEchoDuckingGain = onUpdateEchoDuckingGain,
                 onUpdateAudioOutput = onUpdateAudioOutput,
                 isBluetoothAvailable = isBluetoothAvailable,
+                isWiredHeadphoneAvailable = isWiredHeadphoneAvailable,
                 onUpdateEnableWakeWord = onUpdateEnableWakeWord,
                 onUpdateWakeWord = onUpdateWakeWord,
                 onUpdateVoiceWord = onUpdateVoiceWord,
@@ -144,6 +146,7 @@ private fun AppSettingsTabContent(
     onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateAudioOutput: (AudioOutput) -> Unit,
     isBluetoothAvailable: Boolean,
+    isWiredHeadphoneAvailable: Boolean,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
     onUpdateVoiceWord: (String) -> Unit,
@@ -344,7 +347,7 @@ private fun AppSettingsTabContent(
                     Divider()
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Audio output routing — 3 options: Earpiece, Loudspeaker, Bluetooth.
+                    // Audio output routing — 4 options: Earpiece, Loudspeaker, Bluetooth, Wired.
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
@@ -361,6 +364,9 @@ private fun AppSettingsTabContent(
                                     AudioOutput.BLUETOOTH ->
                                         if (isBluetoothAvailable) "Bluetooth"
                                         else "No Bluetooth device connected"
+                                    AudioOutput.WIRED ->
+                                        if (isWiredHeadphoneAvailable) "Wired headphone"
+                                        else "No wired headphone plugged in"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -371,9 +377,14 @@ private fun AppSettingsTabContent(
                                 Triple(AudioOutput.EARPIECE, "Earpiece", Icons.Default.Hearing),
                                 Triple(AudioOutput.LOUDSPEAKER, "Speaker", Icons.Default.VolumeUp),
                                 Triple(AudioOutput.BLUETOOTH, "Bluetooth", Icons.Default.Bluetooth),
+                                Triple(AudioOutput.WIRED, "Wired", Icons.Default.Headphones),
                             )
                             options.forEach { (output, label, icon) ->
-                                val enabled = output != AudioOutput.BLUETOOTH || isBluetoothAvailable
+                                val enabled = when (output) {
+                                    AudioOutput.BLUETOOTH -> isBluetoothAvailable
+                                    AudioOutput.WIRED -> isWiredHeadphoneAvailable
+                                    else -> true
+                                }
                                 FilledIconToggleButton(
                                     checked = settings.audioOutput == output,
                                     onCheckedChange = { if (it) onUpdateAudioOutput(output) },

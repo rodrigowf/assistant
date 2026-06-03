@@ -437,6 +437,8 @@ class VoiceManager(
 
     fun isBluetoothAudioAvailable(): Boolean = audioRouter.isBluetoothAudioAvailable()
 
+    fun isWiredHeadphoneAvailable(): Boolean = audioRouter.isWiredHeadphoneAvailable()
+
     /**
      * Pick a [AudioRouter.Route] for the current audioOutput + active
      * provider, apply it to the system, and forward the resulting
@@ -465,6 +467,7 @@ class VoiceManager(
         val preferredDevice = when (route) {
             is AudioRouter.Route.BluetoothMedia -> route.device
             is AudioRouter.Route.BluetoothCallAudio -> route.device
+            is AudioRouter.Route.WiredHeadphone -> route.device
             else -> null
         }
         provider?.setSpeakerMode(mode, preferredDevice)
