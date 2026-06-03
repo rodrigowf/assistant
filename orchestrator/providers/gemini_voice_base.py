@@ -438,10 +438,14 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
                     "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
                     "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
                     "prefixPaddingMs": 300,
-                    # Wait 1.5s of silence before deciding the user is
+                    # Wait 2.5s of silence before deciding the user is
                     # done; matches our Qwen tuning so users can pause
-                    # mid-sentence without the model cutting in.
-                    "silenceDurationMs": 1500,
+                    # mid-sentence (breathing, hesitation) without the
+                    # model cutting in.  endOfSpeechSensitivity is already
+                    # at LOW (least aggressive); this is the only other
+                    # lever.  Tradeoff is ~1s extra latency at real
+                    # end-of-turn, which is acceptable for natural pacing.
+                    "silenceDurationMs": 2500,
                 },
             },
             # Opt into session resumption. First setup sends an empty
