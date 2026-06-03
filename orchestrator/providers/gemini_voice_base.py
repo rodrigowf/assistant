@@ -149,6 +149,16 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         # "project denied access") is genuinely fatal and reconnecting
         # would just loop. Cleared on ``setupComplete`` after reconnect.
         self._goaway_received: bool = False
+        # Single-shot guard for the "stale handle" recovery path: when
+        # we observe 1008 "BidiGenerateContent session expired" with no
+        # prior goAway, the saved ``_resumption_handle`` is poisoned
+        # (server invalidated it — common when the session was
+        # force-closed previously, or has aged out across an
+        # orchestrator restart). We drop the handle and reconnect once
+        # with a fresh setup. If that fresh attempt ALSO gets 1008, we
+        # treat it as genuinely fatal instead of looping. Reset on the
+        # next ``setupComplete``.
+        self._stale_handle_recovery_used: bool = False
 
     # --- identity ---------------------------------------------------------
 
@@ -532,6 +542,7 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """
         if "setupComplete" in event:
             self._goaway_received = False
+            self._stale_handle_recovery_used = False
         update = event.get("sessionResumptionUpdate")
         if isinstance(update, dict):
             handle = update.get("newHandle")
@@ -588,24 +599,48 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         return any(k in event for k in self._ACCEPTED_UPSTREAM_KEYS)
 
     def is_recoverable_error(self, exc: BaseException) -> bool:
-        """Reconnect when the upstream closed *after* a goAway.
+        """Reconnect when the upstream closed *after* a goAway, OR when
+        the close was a "BidiGenerateContent session expired" 1008
+        triggered by a stale resumption handle (one-shot recovery).
 
-        Any other 1008 is treated as fatal: AI Studio's "project denied
-        access" close shares the same code but isn't recoverable —
-        retrying would just loop. We also require a captured resumption
-        handle so the rebuilt setup can actually restore state instead
-        of silently starting a fresh session.
+        Other 1008 closes are treated as fatal: AI Studio's "project
+        denied access" close shares the same code but isn't recoverable
+        — retrying would just loop.
         """
-        if not self._goaway_received:
-            return False
-        if not self._resumption_handle:
-            return False
-        # We don't inspect ``exc`` further — once goAway has fired, the
-        # next close (whatever code) is the duration kill we're prepared
-        # for. Returning True hands control to the relay's reconnect
-        # machinery, which calls ``rebuild_session_update`` (→ our
-        # ``format_session_config`` reads ``_resumption_handle``).
-        return True
+        if self._goaway_received and self._resumption_handle:
+            # Standard goAway recovery: rebuild with the live handle.
+            return True
+
+        # Stale-handle recovery: we DID have a handle on this attempt
+        # but it was rejected with "session expired" without a prior
+        # goAway. The handle is poisoned (server invalidated it across
+        # a previous force-close, or it aged out). Drop it and let the
+        # relay rebuild with an empty resumption block. One-shot to
+        # prevent infinite loops if the fresh setup also dies.
+        if (
+            self._resumption_handle
+            and not self._stale_handle_recovery_used
+            and self._is_session_expired_close(exc)
+        ):
+            logger.warning(
+                "gemini stale resumption handle rejected; dropping handle and "
+                "reconnecting with fresh setup"
+            )
+            self._resumption_handle = None
+            self._stale_handle_recovery_used = True
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_session_expired_close(exc: BaseException) -> bool:
+        """Detect Gemini's 1008 "BidiGenerateContent session expired"
+        close. The reason string travels in ``str(exc)`` because
+        ``websockets`` formats ``ConnectionClosedError`` as
+        ``received <code> (<short>) <reason>; then sent ...``.
+        """
+        msg = str(exc)
+        return "1008" in msg and "session expired" in msg.lower()
 
     # --- connection metadata ---------------------------------------------
 

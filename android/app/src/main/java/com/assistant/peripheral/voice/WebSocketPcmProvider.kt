@@ -492,6 +492,26 @@ abstract class WebSocketPcmProvider(
             }
             return
         }
+        // Backend-synthesised relay error — the upstream provider WS
+        // died and the relay gave up (e.g. Gemini 1008 "session expired"
+        // after a stale resumption-handle retry, or AI Studio quota
+        // denial). Without explicit handling here, the local mic+
+        // speaker stay live and the UI sits "active" with no audio
+        // flowing — the user sees a silent dead session. Surface it as
+        // an Error state and tear down so the mic icon flips red.
+        if (event["type"] == "error") {
+            @Suppress("UNCHECKED_CAST")
+            val err = event["error"] as? Map<String, Any?>
+            val msg = (err?.get("message") as? String)
+                ?: "Voice relay closed by backend"
+            val code = err?.get("code") as? String
+            Log.w(tag, "Backend relay error code=$code msg=$msg — tearing down voice session")
+            setState(VoiceState.Error(msg))
+            _events.tryEmit(VoiceEvent.Error(msg))
+            cleanup()
+            _events.tryEmit(VoiceEvent.SessionEnded)
+            return
+        }
         parseProviderEvent(event)
     }
 
