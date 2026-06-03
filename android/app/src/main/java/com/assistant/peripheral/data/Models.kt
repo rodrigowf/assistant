@@ -234,29 +234,38 @@ data class AppSettings(
     val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for wake word detection
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
-    val audioOutput: AudioOutput = AudioOutput.LOUDSPEAKER,  // where voice session audio is routed
+    val audioOutput: AudioOutput = AudioOutput.AUTO,  // where voice session audio is routed; AUTO lets the OS pick
     val enableButtonTrigger: Boolean = false   // long-press recents button starts voice session
 )
 
 /**
  * Audio output routing for voice sessions.
  *
- * BLUETOOTH requires a connected Bluetooth audio device — UI should gray this option out
- * when none is available. VoiceManager.isBluetoothAudioAvailable() exposes that state.
+ * AUTO is the default: hand routing to the Android system audio policy and let it pick
+ * whatever output device is appropriate (wired headphone if plugged, BT A2DP if paired
+ * and active, otherwise built-in loudspeaker). The OS automatically reacts to
+ * plug/unplug events without app involvement, so this is the most robust choice for
+ * the dedicated-device use case where the user just wants "use whatever's connected".
  *
- * WIRED requires a wired headphone/headset plugged into the 3.5mm jack (or a USB audio
- * device on devices that support it). VoiceManager.isWiredHeadphoneAvailable() exposes
- * that state.
+ * The other modes are explicit overrides for power users:
+ *   - LOUDSPEAKER: force built-in speaker even if a headphone is plugged.
+ *   - EARPIECE: force the phone earpiece (private listening).
+ *   - BLUETOOTH: force the call-audio plane through a BT HFP headset (gives you the
+ *     BT device's mic too). Requires a connected BT audio device.
+ *   - WIRED: force the 3.5mm jack via the call-audio plane. Mostly obsoleted by AUTO,
+ *     kept for cases where MODE_NORMAL routing isn't what the user wants. Requires a
+ *     wired plug.
  */
 enum class AudioOutput {
-    EARPIECE,
+    AUTO,
     LOUDSPEAKER,
+    EARPIECE,
     BLUETOOTH,
     WIRED;
 
     companion object {
-        /** Safe parse for DataStore — falls back to LOUDSPEAKER on unknown / null. */
+        /** Safe parse for DataStore — falls back to AUTO on unknown / null. */
         fun fromString(value: String?): AudioOutput =
-            values().firstOrNull { it.name == value } ?: LOUDSPEAKER
+            values().firstOrNull { it.name == value } ?: AUTO
     }
 }

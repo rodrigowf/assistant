@@ -87,6 +87,14 @@ class AudioRouter(private val context: Context) {
     }
 
     sealed class Route {
+        // Let the Android system pick: MODE_NORMAL, media-audio plane,
+        // no pinning. The OS routes to whatever output is currently
+        // priority-highest (wired > BT A2DP > built-in speaker) and
+        // automatically follows plug/unplug events without app
+        // involvement. Mic input pairs with the chosen output via the
+        // OS policy too — for wired-headphone-without-mic the OS falls
+        // back to the built-in mic.
+        object SystemDefault : Route()
         object Earpiece : Route()
         object Loudspeaker : Route()
         // device is nullable because pre-Android-6 we can't enumerate
@@ -105,11 +113,15 @@ class AudioRouter(private val context: Context) {
 
         /** Which speaker mode the provider's AudioTrack should use. */
         val speakerMode: SpeakerMode
-            get() = if (this is BluetoothMedia) SpeakerMode.MEDIA else SpeakerMode.CALL
+            get() = when (this) {
+                is BluetoothMedia, is SystemDefault -> SpeakerMode.MEDIA
+                else -> SpeakerMode.CALL
+            }
 
         /** Human-readable label for logs. */
         val label: String
             get() = when (this) {
+                is SystemDefault -> "system-default"
                 is Earpiece -> "earpiece"
                 is Loudspeaker -> "loudspeaker"
                 is BluetoothCallAudio -> "bluetooth-call(${device?.productName ?: "unknown"})"
@@ -132,6 +144,7 @@ class AudioRouter(private val context: Context) {
      */
     fun pickRoute(desired: AudioOutput, providerKind: ProviderKind): Route {
         return when (desired) {
+            AudioOutput.AUTO -> Route.SystemDefault
             AudioOutput.EARPIECE -> Route.Earpiece
             AudioOutput.LOUDSPEAKER -> Route.Loudspeaker
             AudioOutput.BLUETOOTH -> pickBluetoothRoute(providerKind)
@@ -342,8 +355,10 @@ class AudioRouter(private val context: Context) {
         // The communication-audio plane needs MODE_IN_COMMUNICATION.
         // The media-audio plane works in MODE_NORMAL — and forcing
         // IN_COMMUNICATION there would yank STREAM_VOICE_CALL back onto
-        // the earpiece, so we deliberately switch.
-        val targetMode = if (route is Route.BluetoothMedia)
+        // the earpiece, so we deliberately switch.  SystemDefault also
+        // wants MODE_NORMAL: that's what hands routing back to the OS
+        // policy (which knows about plug events, BT priorities, etc.).
+        val targetMode = if (route is Route.BluetoothMedia || route is Route.SystemDefault)
             AudioManager.MODE_NORMAL
         else
             AudioManager.MODE_IN_COMMUNICATION
@@ -357,6 +372,7 @@ class AudioRouter(private val context: Context) {
         }
 
         when (route) {
+            is Route.SystemDefault -> applySystemDefault()
             is Route.Earpiece -> applyCommunicationRoute(
                 AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
                 speakerphone = false,
@@ -379,6 +395,34 @@ class AudioRouter(private val context: Context) {
 
         logFinalState(route)
         return route.speakerMode
+    }
+
+    /**
+     * Hand routing back to the Android system audio policy.
+     *
+     * Combined with `MODE_NORMAL` (set in [apply]), the OS picks the
+     * current priority-highest output device for STREAM_MUSIC and
+     * pairs the mic to whichever input the policy associates with
+     * that output.  It also reacts to plug/unplug events on its own,
+     * so the app doesn't have to listen for them.
+     *
+     * What this method does: undo any pins the previous route may
+     * have applied.  Anything we don't explicitly clear here could
+     * stick and override the OS policy.
+     */
+    private fun applySystemDefault() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try { audioManager.clearCommunicationDevice() } catch (_: Exception) {}
+        }
+        @Suppress("DEPRECATION")
+        try { audioManager.isSpeakerphoneOn = false } catch (_: Exception) {}
+        @Suppress("DEPRECATION")
+        try {
+            if (audioManager.isBluetoothScoOn) {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
+        } catch (_: Exception) {}
     }
 
     /**
