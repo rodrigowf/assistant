@@ -199,7 +199,26 @@ async def orchestrator_ws(ws: WebSocket):
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
-        # Orchestrator session keeps running headlessly until explicitly stopped.
+        # Orchestrator session keeps running headlessly until explicitly
+        # stopped — that's intentional so background work survives a
+        # browser-tab close.  BUT the voice relay must NOT survive: an
+        # open upstream WS to Gemini Live / Qwen burns provider tokens
+        # continuously for as long as it stays connected, even with no
+        # client listening.  Without this teardown, a single client-side
+        # disconnect (network glitch, app crash, user backgrounds the
+        # phone) silently keeps the upstream open until the relay's
+        # natural error or the upstream's session-age limit closes it
+        # — repeated goAway reconnects can hold the session open for
+        # hours, racking up costs nobody is using.
+        if was_voice and session is not None:
+            try:
+                await session.stop_voice_relay()
+                logger.info(
+                    "Voice relay stopped on client disconnect session=%s",
+                    getattr(session, "local_id", "?"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("stop_voice_relay on disconnect failed")
 
 
 async def _handle_start(
