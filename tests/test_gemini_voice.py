@@ -135,6 +135,15 @@ def test_session_config_uses_server_vad_when_manual_off():
     assert aad["silenceDurationMs"] == 2500
 
 
+def test_audio_in_sample_rate_declared_for_manual_vad():
+    """Gemini must declare its mic sample rate so the relay's manual-VAD
+    init gate (which requires non-None ``audio_in_sample_rate``) actually
+    fires. Without this, the relay disables server VAD via setup but
+    never sends ``activityStart`` — and Gemini sits silent on the audio."""
+    p = _make_provider()
+    assert p.audio_in_sample_rate == 16000
+
+
 def test_manual_vad_frames_match_live_api_activity_shape():
     """Manual VAD: start/stop frames must use Live API's
     ``realtimeInput.activityStart`` / ``activityEnd`` envelopes."""

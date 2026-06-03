@@ -182,6 +182,15 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         return "websocket"
 
     @property
+    def audio_in_sample_rate(self) -> int | None:
+        """16 kHz mono PCM16 — declared so the relay can initialise
+        Silero for manual VAD (see ``manual_vad_*`` hooks). Matches the
+        hardcoded ``audio/pcm;rate=16000`` in :meth:`format_audio_in`
+        and what the Android client ships.
+        """
+        return 16000
+
+    @property
     def model(self) -> str:
         return self._model
 
