@@ -154,30 +154,32 @@ abstract class WebSocketPcmProvider(
         // tail that the mic could still pick up as the agent's voice.
         private const val MIC_RESTORE_TAIL_MS = 600L
 
-        // Hard cap on how long [scheduleMicRestore] will wait for the
-        // hardware buffer to drain before giving up and restoring anyway.
-        // Should be larger than the AudioTrack buffer size (1.5s in
-        // [startSpeaker]) plus typical jitter.
-        private const val MIC_RESTORE_DRAIN_TIMEOUT_MS = 4000L
-
         // Poll interval while waiting for the buffer to drain.
+        // The drain loop has no timeout: previous 4s and 20s caps
+        // panic-restored the mic mid-speech on legitimate long agent
+        // turns, leaking the speaker tail into the open mic and
+        // triggering Gemini's server-side VAD into a self-interrupt.
+        // The loop exits naturally on the real "done" conditions
+        // (writes quiet + head caught up, or writes quiet + head
+        // stuck after underrun) — both reliable.
+        //
+        // If we ever observe the drain loop genuinely wedged (e.g.
+        // AudioTrack truly hung): the cleanest next step is to wire
+        // Gemini's `serverContent.turnComplete: true` (and Qwen's
+        // `response.done`) as an explicit "agent's turn ended" signal
+        // into a new onAgentTurnComplete() hook in the providers, then
+        // force-restore on that. Both subclasses already parse those
+        // events for transcript flushing, so the plumbing is half there.
         private const val MIC_RESTORE_DRAIN_POLL_MS = 80L
 
-        // If [AudioTrack.getPlaybackHeadPosition] hasn't moved for this
-        // long, treat the DAC as idle even if `head < totalFramesWritten`.
-        // Why this matters: Lollipop's AudioTrack freezes its head
-        // pointer after underrun.  When an underrun happens right
-        // before the agent goes silent (very common because the agent
-        // pauses → the speaker drains → underrun fires → head freezes),
-        // the strict `head >= totalFramesWritten` check loops until
-        // [MIC_RESTORE_DRAIN_TIMEOUT_MS] expires and then restores in
-        // a hurry — by which point any subsequent residual playback
-        // bleeds into the mic and trips Gemini's VAD.
-        //
-        // 350ms of head-stuck is well past any normal inter-frame gap
-        // (frames advance at 24kHz / 480 frames per ~20ms) so the
-        // false-positive rate is essentially zero.
-        private const val MIC_RESTORE_HEAD_STUCK_MS = 350L
+        // How long [totalFramesWritten] must stay constant before we
+        // believe the playback loop is genuinely done writing.  Anything
+        // shorter risks declaring "done" during a tiny pause between
+        // bursts; the playback loop bursts ~24K frames/sec when active.
+        // 400ms (5 polls) ≈ 9600 frames of expected motion: any real
+        // playback exceeds this dramatically, any genuine quiescence
+        // produces zero motion.
+        private const val MIC_RESTORE_WRITES_QUIET_MS = 400L
     }
 
     // --- Format (set in connect) ------------------------------------------
@@ -274,62 +276,109 @@ abstract class WebSocketPcmProvider(
      *   2. When `head == totalFramesWritten`, the DAC is idle.  Wait
      *      [MIC_RESTORE_TAIL_MS] more (BT transducer latency + room
      *      reverb tail) then restore.
-     *   3. Bail out at [MIC_RESTORE_DRAIN_TIMEOUT_MS] as a safety net.
+     *
+     * No timeout: the loop waits as long as playback takes. Earlier
+     * versions had a 4s and later 20s cap that fired on legitimate
+     * long agent turns and panic-restored the mic mid-speech — the
+     * residual speaker tail would then bleed into the open mic and
+     * trip the upstream VAD into a self-interrupt.
      *
      * If new speaker chunks arrive while we're polling, [pushSpeakerChunk]
      * cancels this job — same as the previous behaviour.
      */
+    /**
+     * Wait for the speaker pipeline to fully quiesce, then restore mic
+     * gain.  "Fully quiesced" means BOTH:
+     *
+     *   (a) `totalFramesWritten` has stopped growing for
+     *       [MIC_RESTORE_WRITES_QUIET_MS] — the playback loop has run
+     *       out of queued chunks AND no new chunks are arriving.
+     *   (b) `audioTrack.playbackHeadPosition` has reached
+     *       `totalFramesWritten` — the DAC has actually played
+     *       everything that was written, OR (fallback) the head has
+     *       gone stuck for the same quiet window (post-underrun case
+     *       where Lollipop's head pointer freezes).
+     *
+     * Why both conditions: the prior implementation only checked (b),
+     * which fired too early because the WS staleness detector schedules
+     * this restore as soon as no NEW chunks have arrived for 800ms,
+     * regardless of whether the local playback queue still has 5+
+     * seconds of buffered audio.  In that case `head` lags `written`
+     * by ~1s (the hardware buffer) and the strict `head >= written`
+     * check hit the 4s timeout while the speaker was still playing,
+     * panic-restored the mic, and the residual audio fed back into the
+     * mic — triggering server-side VAD self-interrupts mid-sentence.
+     *
+     * With (a) enforced first, we only start checking (b) once the
+     * playback loop is actually idle.  If [pushSpeakerChunk] receives
+     * new data at any point, it cancels this job — same as before.
+     */
     private fun scheduleMicRestore(reason: String) {
         if (gainBeforeSpeaking == null) return
         micRestoreJob?.cancel()
-        Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) waiting; written=$totalFramesWritten head=${audioTrack?.playbackHeadPosition?.toLong()?.and(0xFFFFFFFFL)}")
+        val startedHead = (audioTrack?.playbackHeadPosition?.toLong() ?: 0L) and 0xFFFFFFFFL
+        Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) waiting; written=$totalFramesWritten head=$startedHead")
         micRestoreJob = scope.launch {
             val startMs = System.currentTimeMillis()
-            // Seed with the current head so the "head not advancing" check
-            // measures from when we started polling, not from a -1 sentinel
-            // that the first iteration always invalidates.
-            var lastHead: Long = (audioTrack?.playbackHeadPosition?.toLong() ?: 0L) and 0xFFFFFFFFL
-            var lastHeadAtMs: Long = startMs
+            var lastWritten = totalFramesWritten
+            var lastWrittenAtMs = startMs
+            var lastHead = startedHead
+            var lastHeadAtMs = startMs
+            var writesQuietLoggedAt: Long = 0L
             var pollCount = 0
             while (true) {
                 val nowMs = System.currentTimeMillis()
-                if (nowMs - startMs > MIC_RESTORE_DRAIN_TIMEOUT_MS) {
-                    Log.w(tag, "[MIC_STATE] RESTORE_DRAIN($reason) timeout after ${MIC_RESTORE_DRAIN_TIMEOUT_MS}ms; head=$lastHead written=$totalFramesWritten (delta=${totalFramesWritten - lastHead}); restoring anyway")
-                    break
-                }
                 val track = audioTrack
                 if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
                     Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) AudioTrack gone; restoring")
                     break
                 }
-                // playbackHeadPosition returns an Int that wraps at
-                // 2^31 frames (~24h at 24kHz), so cast to Long via
-                // toLong() and mask the sign bit just in case.
+
+                val written = totalFramesWritten
                 val head = (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
                 pollCount++
 
-                // Periodic diagnostic so we can see whether the head is
-                // actually advancing during the drain wait.
-                if (pollCount % 10 == 0) {
-                    Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) poll=$pollCount head=$head written=$totalFramesWritten remaining=${totalFramesWritten - head}")
+                // Update "last changed" timestamps.
+                if (written != lastWritten) {
+                    lastWritten = written
+                    lastWrittenAtMs = nowMs
+                }
+                if (head != lastHead) {
+                    lastHead = head
+                    lastHeadAtMs = nowMs
                 }
 
-                // Caught up to writes — DAC is idle, await tail then restore.
-                if (head >= totalFramesWritten) {
+                if (pollCount % 10 == 0) {
+                    Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) poll=$pollCount head=$head written=$written remaining=${written - head} writesQuiet=${nowMs - lastWrittenAtMs}ms")
+                }
+
+                val writesQuietForMs = nowMs - lastWrittenAtMs
+                val writesAreQuiet = writesQuietForMs >= MIC_RESTORE_WRITES_QUIET_MS
+
+                if (writesAreQuiet && writesQuietLoggedAt == 0L) {
+                    writesQuietLoggedAt = nowMs
+                    Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) writes quiet at written=$written head=$head remaining=${written - head}")
+                }
+
+                // (a) AND (b)-primary: writes have stopped AND head caught up.
+                if (writesAreQuiet && head >= written) {
                     Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) AudioTrack drained at head=$head poll=$pollCount; tail wait ${MIC_RESTORE_TAIL_MS}ms")
                     delay(MIC_RESTORE_TAIL_MS)
                     break
                 }
 
-                // Head is frozen (e.g. AudioTrack stuck after underrun).
-                // If it hasn't advanced for a while, nothing is actually
-                // playing — treat as drained and don't wait for the
-                // timeout-then-panic-restore path.
-                if (head != lastHead) {
-                    lastHead = head
-                    lastHeadAtMs = nowMs
-                } else if (nowMs - lastHeadAtMs > MIC_RESTORE_HEAD_STUCK_MS) {
-                    Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) head stuck at $head (written=$totalFramesWritten) for ${nowMs - lastHeadAtMs}ms; treating as drained; tail wait ${MIC_RESTORE_TAIL_MS}ms")
+                // (a) AND (b)-fallback: writes have stopped AND head has
+                // also been frozen for the same quiet window.  Covers
+                // Samsung Lollipop's post-underrun state where
+                // `playbackHeadPosition` never advances past the
+                // underrun frame, so the strict `head >= written` check
+                // would never be satisfied.  Safe because: if writes
+                // are quiet, the playback loop isn't going to push more
+                // frames, so whatever the DAC has is what it'll play —
+                // the small gap left in the hardware buffer is silence-
+                // equivalent (the underrun already happened, audibly).
+                if (writesAreQuiet && nowMs - lastHeadAtMs >= MIC_RESTORE_WRITES_QUIET_MS) {
+                    Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) head stuck at $head (written=$written) AND writes quiet; treating as drained; tail wait ${MIC_RESTORE_TAIL_MS}ms")
                     delay(MIC_RESTORE_TAIL_MS)
                     break
                 }
