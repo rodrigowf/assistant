@@ -115,6 +115,11 @@ class VoiceRelay:
         self._rebuild_session_update = rebuild_session_update
         self._max_reconnects = max_reconnects
         self._reconnect_count = 0
+        # Separate counter for goAway-driven reconnects, used purely
+        # for unique task names; goAway reconnects are NOT subject to
+        # ``max_reconnects`` since they're protocol-driven by the
+        # upstream provider.
+        self._goaway_reconnect_count = 0
 
         self._ws = None  # type: ignore[assignment]
         self._drain_task: asyncio.Task[None] | None = None
@@ -872,11 +877,11 @@ class VoiceRelay:
                     "voice_relay drain exited cleanly with pending reconnect session_id=%s",
                     self._session_id,
                 )
-                reconnected = await self._try_reconnect(synthetic)
+                reconnected = await self._try_reconnect(synthetic, is_goaway=True)
                 if reconnected:
                     self._drain_task = asyncio.create_task(
                         self._drain(),
-                        name=f"voice-relay-{self._provider.provider_name}-reconnect{self._reconnect_count}",
+                        name=f"voice-relay-{self._provider.provider_name}-goaway{self._goaway_reconnect_count}",
                     )
                     return
                 # Fall through to the close path below: the reconnect
@@ -961,15 +966,29 @@ class VoiceRelay:
                 },
             })
 
-    async def _try_reconnect(self, err: BaseException) -> bool:
+    async def _try_reconnect(
+        self,
+        err: BaseException,
+        *,
+        is_goaway: bool = False,
+    ) -> bool:
         """Attempt to transparently reopen the upstream WS.
 
-        Only fires for errors the provider classifies as recoverable
-        (via :meth:`BaseVoiceProvider.is_recoverable_error`) AND when
-        the relay was constructed with a ``rebuild_session_update``
-        callback AND we haven't exhausted :attr:`_max_reconnects`.  On
-        success the new WS is wired up and ``_ws`` points at it; the
-        caller restarts the drain task.
+        Only fires when the relay was constructed with a
+        ``rebuild_session_update`` callback.  Two reconnect classes:
+
+        * **Provider-requested (``is_goaway=True``)**: Gemini Live (and
+          similar) emit a ``goAway`` lifecycle frame every ~10 minutes
+          and require the client to reopen with a resumption handle.
+          These are protocol-driven, NOT errors — refusing them caps
+          conversations at the upstream's session limit (~30 min for
+          ``max_reconnects=2``).  We do NOT cap these; the user can
+          talk for as long as they want.
+        * **Error-recoverable**: a transient network blip, transport
+          reset, etc., classified by
+          :meth:`BaseVoiceProvider.is_recoverable_error`.  These ARE
+          capped by :attr:`_max_reconnects` to prevent an infinite
+          reconnect storm on a broken upstream.
 
         We deliberately do NOT mirror the upstream error frame to the
         frontend on a successful reconnect — the user shouldn't see a
@@ -978,23 +997,34 @@ class VoiceRelay:
         """
         if self._rebuild_session_update is None:
             return False
-        if self._reconnect_count >= self._max_reconnects:
-            self._slog(
-                f"reconnect skipped: hit max_reconnects={self._max_reconnects}"
-            )
-            return False
-        if not self._provider.is_recoverable_error(err):
-            self._slog(f"reconnect skipped: provider classifies error as fatal")
-            return False
+        if not is_goaway:
+            if self._reconnect_count >= self._max_reconnects:
+                self._slog(
+                    f"reconnect skipped: hit max_reconnects={self._max_reconnects}"
+                )
+                return False
+            if not self._provider.is_recoverable_error(err):
+                self._slog(f"reconnect skipped: provider classifies error as fatal")
+                return False
 
-        self._reconnect_count += 1
-        self._slog(
-            f"reconnect attempt #{self._reconnect_count}/{self._max_reconnects}"
-        )
-        logger.warning(
-            "voice_relay reconnect attempt %d/%d session_id=%s after: %s",
-            self._reconnect_count, self._max_reconnects, self._session_id, err,
-        )
+        if is_goaway:
+            self._goaway_reconnect_count += 1
+            self._slog(
+                f"reconnect attempt #{self._goaway_reconnect_count} (goAway, uncapped)"
+            )
+            logger.info(
+                "voice_relay reconnect (goAway #%d) session_id=%s",
+                self._goaway_reconnect_count, self._session_id,
+            )
+        else:
+            self._reconnect_count += 1
+            self._slog(
+                f"reconnect attempt #{self._reconnect_count}/{self._max_reconnects}"
+            )
+            logger.warning(
+                "voice_relay reconnect attempt %d/%d session_id=%s after: %s",
+                self._reconnect_count, self._max_reconnects, self._session_id, err,
+            )
 
         # Tear down the old WS.  We do NOT cancel keepalive — it shares
         # the relay state and will resume on the new ``self._ws``.
