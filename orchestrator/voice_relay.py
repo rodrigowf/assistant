@@ -294,13 +294,21 @@ class VoiceRelay:
                 "status": "ready",
             })
 
-        # Initialise client-side VAD if QWEN_MANUAL_VAD=1 and the
-        # provider tells us its mic sample rate. The model load is
-        # ~50ms on a Jetson and we only do it once per session.
-        # getattr-default for the rate keeps test mocks that don't
-        # implement the full BaseVoiceProvider surface working.
+        # Initialise client-side VAD when (a) the provider declares
+        # support via ``supports_manual_vad`` (= it overrode the
+        # ``manual_vad_*_frames`` hooks), (b) the per-provider env
+        # toggle hasn't been flipped off, and (c) the provider tells us
+        # its mic sample rate. The model load is ~50ms on a Jetson and
+        # we only do it once per session. getattr-default for the rate
+        # keeps test mocks that don't implement the full
+        # BaseVoiceProvider surface working.
         in_sr = getattr(self._provider, "audio_in_sample_rate", None)
-        if voice_vad.is_enabled() and in_sr is not None:
+        supports_manual = getattr(self._provider, "supports_manual_vad", False)
+        if (
+            supports_manual
+            and voice_vad.is_enabled_for(self._provider.provider_name)
+            and in_sr is not None
+        ):
             try:
                 self._manual_vad = voice_vad.VoiceVAD(input_sample_rate=in_sr)
                 self._slog(f"manual_vad init: in_sr={in_sr}Hz")
@@ -545,12 +553,13 @@ class VoiceRelay:
     async def _run_manual_vad(self, pcm_b64: str) -> None:
         """Feed a mic chunk through the local VAD; emit events on transitions.
 
-        Called for every ``send_audio`` chunk when ``QWEN_MANUAL_VAD=1``
-        and the provider supplied a sample rate. Emits synthetic
+        Called for every ``send_audio`` chunk when manual VAD is active
+        for this provider. Emits synthetic
         ``input_audio_buffer.speech_started/stopped`` events on the
         frontend channel so the UI's "thinking" state still flips, and
-        sends the corresponding ``input_audio_buffer.commit`` +
-        ``response.create`` upstream when the user is done.
+        sends the provider's wire-specific manual-VAD frames upstream
+        (see :meth:`BaseVoiceProvider.manual_vad_start_frames` /
+        ``manual_vad_stop_frames`` / ``manual_vad_safety_commit_frames``).
         """
         assert self._manual_vad is not None
         pcm = base64.b64decode(pcm_b64)
@@ -561,48 +570,42 @@ class VoiceRelay:
                 await self._on_event_for_frontend({
                     "type": "input_audio_buffer.speech_started",
                 })
+                for frame in self._provider.manual_vad_start_frames():
+                    await self.send_event(frame)
             elif event.kind == "speech_stopped":
                 self._manual_vad_speech_started_at = None
                 self._slog(f"manual_vad: speech_stopped at t+{self._now_rel():.2f}s, committing")
                 await self._on_event_for_frontend({
                     "type": "input_audio_buffer.speech_stopped",
                 })
-                await self._send_manual_commit()
+                for frame in self._provider.manual_vad_stop_frames():
+                    await self.send_event(frame)
 
-        # Safety commit: DashScope manual mode caps continuous audio at
-        # 60s before requiring a commit. If our VAD is still saying
-        # "speech" after _MANUAL_VAD_SAFETY_COMMIT_S, force a commit
-        # WITHOUT response.create — the model must not speak while the
-        # user is still mid-monologue. The next user segment opens a
-        # new conversation.item; when the user finally pauses, the
-        # natural speech_stopped path commits the tail and asks for a
-        # response that Qwen evaluates against all accumulated items.
+        # Safety commit: some upstreams cap continuous audio in manual
+        # mode (DashScope: 60s; Gemini: no documented cap but we chunk
+        # defensively anyway to avoid losing the segment if the upstream
+        # silently truncates). When our VAD is still saying "speech"
+        # past _MANUAL_VAD_SAFETY_COMMIT_S, close the current segment
+        # WITHOUT triggering a model response — the user is still
+        # mid-monologue. The provider's ``manual_vad_safety_commit_frames``
+        # owns the exact wire shape; if it returns an empty list (its
+        # default) the safety path is a no-op for that provider.
         started_at = self._manual_vad_speech_started_at
         if (
             started_at is not None
             and (time.monotonic() - started_at) >= _MANUAL_VAD_SAFETY_COMMIT_S
         ):
-            self._slog(
-                f"manual_vad: SAFETY commit (NO response) at t+{self._now_rel():.2f}s "
-                f"(speech ran {time.monotonic() - started_at:.1f}s)"
-            )
-            # Reset the timer so subsequent 50s windows trigger again
-            # without flipping VAD state — the user is still speaking.
-            self._manual_vad_speech_started_at = time.monotonic()
-            await self.send_event({"type": "input_audio_buffer.commit"})
-
-    async def _send_manual_commit(self) -> None:
-        """Send ``input_audio_buffer.commit`` + ``response.create`` upstream.
-
-        Used by the manual-VAD path to mark the end of a user turn. The
-        provider's gate (``should_gate_event``) handles the case where
-        a previous response is still streaming.
-        """
-        for event in (
-            {"type": "input_audio_buffer.commit"},
-            {"type": "response.create"},
-        ):
-            await self.send_event(event)
+            safety_frames = self._provider.manual_vad_safety_commit_frames()
+            if safety_frames:
+                self._slog(
+                    f"manual_vad: SAFETY commit (NO response) at t+{self._now_rel():.2f}s "
+                    f"(speech ran {time.monotonic() - started_at:.1f}s)"
+                )
+                # Reset the timer so subsequent 50s windows trigger again
+                # without flipping VAD state — the user is still speaking.
+                self._manual_vad_speech_started_at = time.monotonic()
+                for frame in safety_frames:
+                    await self.send_event(frame)
 
     async def stop(self) -> None:
         """Cancel the drain task and close the upstream WS."""

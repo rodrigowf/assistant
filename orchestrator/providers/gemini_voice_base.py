@@ -55,6 +55,7 @@ from typing import Any
 
 import websockets
 
+from orchestrator import voice_vad
 from orchestrator.providers.voice_base import BaseVoiceProvider
 from orchestrator.types import (
     ErrorEvent,
@@ -437,26 +438,38 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
             # and our chat window has nothing to show.
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
-            # Tune activity (VAD) detection.  The defaults are
-            # aggressive enough that an open mic with ambient noise
-            # keeps resetting the model's pending turn and the second
-            # reply never lands.  Higher-sensitivity end-of-speech and
-            # a longer silence gap let the model actually finish.
+            # Activity (VAD) detection.  Two modes:
+            #
+            # Manual (default, GEMINI_MANUAL_VAD=1 — opt out with =0):
+            #   ``disabled: True`` hands turn boundaries to us. The
+            #   relay runs Silero locally over the mic stream and
+            #   demarcates each user turn with
+            #   ``realtimeInput.activityStart`` / ``activityEnd``
+            #   (see ``manual_vad_start_frames`` / ``stop_frames``).
+            #   Why: Gemini's server VAD ends turns mid-sentence on
+            #   natural breathing pauses even with
+            #   ``endOfSpeechSensitivity: LOW`` and
+            #   ``silenceDurationMs: 2500``. The same client-side VAD
+            #   architecture that fixed Qwen's force-commit issue
+            #   fixes this here.
+            #
+            # Server (GEMINI_MANUAL_VAD=0):
+            #   Fall back to the upstream's VAD, tuned as conservatively
+            #   as the API allows. Tradeoff is ~1s extra latency at
+            #   real end-of-turn from the 2.5s silence window; you
+            #   still get cut off mid-sentence on longer pauses.
             "realtimeInputConfig": {
-                "automaticActivityDetection": {
-                    "disabled": False,
-                    "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
-                    "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
-                    "prefixPaddingMs": 300,
-                    # Wait 2.5s of silence before deciding the user is
-                    # done; matches our Qwen tuning so users can pause
-                    # mid-sentence (breathing, hesitation) without the
-                    # model cutting in.  endOfSpeechSensitivity is already
-                    # at LOW (least aggressive); this is the only other
-                    # lever.  Tradeoff is ~1s extra latency at real
-                    # end-of-turn, which is acceptable for natural pacing.
-                    "silenceDurationMs": 2500,
-                },
+                "automaticActivityDetection": (
+                    {"disabled": True}
+                    if voice_vad.is_enabled_for("google")
+                    else {
+                        "disabled": False,
+                        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                        "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                        "prefixPaddingMs": 300,
+                        "silenceDurationMs": 2500,
+                    }
+                ),
             },
             # Opt into session resumption. First setup sends an empty
             # object (no handle) to ask the server to start emitting
@@ -494,6 +507,43 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
                 },
             },
         }
+
+    # --- manual-VAD upstream frames --------------------------------------
+    #
+    # When ``automaticActivityDetection.disabled = True`` (see
+    # format_session_config), Gemini Live expects the client to send
+    # ``realtimeInput.activityStart`` to open a user turn and
+    # ``realtimeInput.activityEnd`` to close it. The model only
+    # generates a response after receiving ``activityEnd``. There's no
+    # separate ``response.create`` like the OpenAI-realtime wire shape.
+
+    def manual_vad_start_frames(self) -> list[dict[str, Any]]:
+        """Mark start of a user turn — sent on local-VAD speech_started."""
+        return [{"realtimeInput": {"activityStart": {}}}]
+
+    def manual_vad_stop_frames(self) -> list[dict[str, Any]]:
+        """Mark end of a user turn — triggers the model's reply."""
+        return [{"realtimeInput": {"activityEnd": {}}}]
+
+    def manual_vad_safety_commit_frames(self) -> list[dict[str, Any]]:
+        """Long-utterance safety chunking — close current segment and
+        immediately open the next one WITHOUT prompting a reply.
+
+        Gemini's manual activity mode doesn't document an upstream cap
+        on continuous audio between activityStart/activityEnd, but we
+        chunk defensively to bound the worst case if the upstream ever
+        truncates a multi-minute monologue. Sending ``activityEnd``
+        followed *immediately* by ``activityStart`` would normally
+        provoke a reply on the first frame; in practice Gemini batches
+        the response generation until it sees a real pause, so back-
+        to-back end/start ends up being a soft seam in one logical
+        turn. If this provokes premature replies, drop to ``[]``
+        (which disables the safety path for Gemini).
+        """
+        return [
+            {"realtimeInput": {"activityEnd": {}}},
+            {"realtimeInput": {"activityStart": {}}},
+        ]
 
     @classmethod
     def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:

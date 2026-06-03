@@ -603,6 +603,30 @@ class QwenVoiceProvider(BaseVoiceProvider):
         err_text = str(exc)
         return any(s in err_text for s in self._RECONNECTABLE_ERR_SUBSTRINGS)
 
+    # --- manual-VAD upstream frames --------------------------------------
+
+    def manual_vad_stop_frames(self) -> list[dict[str, Any]]:
+        """End-of-turn: commit the buffered mic audio and ask for a reply.
+
+        Qwen uses the OpenAI-Realtime wire shape, so this is the same
+        sequence the OpenAI realtime API uses.
+        """
+        return [
+            {"type": "input_audio_buffer.commit"},
+            {"type": "response.create"},
+        ]
+
+    def manual_vad_safety_commit_frames(self) -> list[dict[str, Any]]:
+        """Mid-monologue safety commit (no ``response.create``).
+
+        DashScope's manual mode documents a 60s cap on continuous audio
+        before commit becomes mandatory. Past ~50s we commit ONLY so the
+        segment closes on the wire but the model stays silent — the
+        user is still speaking. The accumulated items get evaluated
+        together on the next real ``speech_stopped``.
+        """
+        return [{"type": "input_audio_buffer.commit"}]
+
     # Client-mirrored events on the OpenAI-Realtime wire schema that
     # Qwen's DashScope endpoint actually understands.  Any other
     # ``type`` (in particular OpenAI-only diagnostics like

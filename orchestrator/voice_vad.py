@@ -277,14 +277,40 @@ class VoiceVAD:
         return self._is_speech
 
 
-def is_enabled() -> bool:
-    """True unless QWEN_MANUAL_VAD=0 is set explicitly.
+def is_enabled_for(provider_name: str) -> bool:
+    """Manual-VAD opt-out per provider.
 
-    Default-on as of 2026-05-20: DashScope's server VAD reliably
-    force-commits long utterances mid-speech, splitting one user turn
-    into two conversation.item entries with a phantom response.create
-    between them. Manual VAD avoids that. Opt back into server VAD by
-    exporting ``QWEN_MANUAL_VAD=0`` (useful if Alibaba ever fixes the
-    upstream).
+    Each provider has its own env switch (``QWEN_MANUAL_VAD``,
+    ``GEMINI_MANUAL_VAD``, …). All default to **on** because every
+    realtime voice service we've shipped has shown a force-commit /
+    early-end-of-turn pathology on long utterances:
+
+    - **Qwen / DashScope (2026-05-20)**: server VAD force-commits
+      utterances at ~30–40s of continuous audio, splitting one turn
+      into two ``conversation.item`` entries.
+    - **Gemini Live (2026-06-03)**: server VAD ends turns
+      mid-sentence on natural breathing pauses even with
+      ``endOfSpeechSensitivity: LOW`` and ``silenceDurationMs: 2500``.
+
+    Opt back into server VAD per-provider:
+    ``export QWEN_MANUAL_VAD=0`` or ``export GEMINI_MANUAL_VAD=0``.
+
+    Unknown provider names default to True (opt-in via override only
+    matters for the providers we've actually wired hooks for).
     """
-    return os.environ.get("QWEN_MANUAL_VAD", "1") != "0"
+    env_var = {
+        "qwen": "QWEN_MANUAL_VAD",
+        "google": "GEMINI_MANUAL_VAD",
+    }.get(provider_name)
+    if env_var is None:
+        return True
+    return os.environ.get(env_var, "1") != "0"
+
+
+def is_enabled() -> bool:
+    """Back-compat shim — equivalent to ``is_enabled_for("qwen")``.
+
+    Existing callers (and tests) that don't yet route through the
+    per-provider gate keep the old Qwen-only behaviour.
+    """
+    return is_enabled_for("qwen")

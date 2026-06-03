@@ -266,6 +266,70 @@ class BaseVoiceProvider(ABC):
         """
         return False
 
+    # --- manual-VAD (client-side endpoint detection) hooks ------------------
+    #
+    # When ``voice_vad.is_enabled_for(provider_name)`` is true, the relay
+    # runs Silero locally over the mic stream and drives turn boundaries
+    # itself instead of trusting the upstream's server-side VAD. The
+    # frames a provider needs to emit at each boundary differ by wire
+    # format:
+    #
+    # - Qwen / OpenAI-Realtime: ``input_audio_buffer.commit`` +
+    #   ``response.create`` at speech_stopped; nothing at speech_started.
+    # - Gemini Live (manual activity mode): ``realtimeInput.activityStart``
+    #   at speech_started, ``realtimeInput.activityEnd`` at speech_stopped;
+    #   the model auto-responds when ``activityEnd`` is received.
+    #
+    # Providers that want manual VAD override these hooks AND make sure
+    # their ``format_session_config`` disables the server-side VAD.
+    # Providers that don't support manual VAD leave the defaults (empty
+    # lists), in which case the relay never initialises Silero for them.
+
+    def manual_vad_start_frames(self) -> list[dict[str, Any]]:
+        """Upstream frames to send when local VAD detects speech_started.
+
+        Default: ``[]`` (no-op — matches Qwen, which doesn't need a
+        per-turn-start frame because ``input_audio_buffer.append``
+        implicitly opens a turn).
+        """
+        return []
+
+    def manual_vad_stop_frames(self) -> list[dict[str, Any]]:
+        """Upstream frames to send when local VAD detects speech_stopped.
+
+        Default: ``[]``. Providers MUST override to enable manual VAD —
+        with no stop frames, manual mode would never request a response
+        and the upstream would hang.
+        """
+        return []
+
+    def manual_vad_safety_commit_frames(self) -> list[dict[str, Any]]:
+        """Upstream frames to send when the user has been speaking
+        continuously past the safety-commit window (~50s).
+
+        The intent is to close the current segment on the wire WITHOUT
+        triggering a model response — the user is still mid-monologue.
+        Qwen sends ``input_audio_buffer.commit`` only. Gemini's manual
+        activity mode sends ``activityEnd`` followed by ``activityStart``
+        (chunking the long utterance into two segments without provoking
+        a reply).
+
+        Default: ``[]`` (no safety commit — appropriate if the provider
+        has no documented duration cap in manual mode).
+        """
+        return []
+
+    @property
+    def supports_manual_vad(self) -> bool:
+        """Quick check used by the relay to decide whether to initialise
+        Silero. Returns True iff the provider overrode
+        :meth:`manual_vad_stop_frames` to a non-empty list.
+
+        Subclasses generally don't override this directly — overriding
+        ``manual_vad_stop_frames`` is enough.
+        """
+        return bool(self.manual_vad_stop_frames())
+
     def build_keepalive_chunk(self) -> str | None:
         """Return a base64-PCM silent chunk to keep the upstream warm, or None.
 

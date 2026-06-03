@@ -111,16 +111,52 @@ def test_translate_input_transcription_nested_under_server_content():
     assert out.text == "hello there"
 
 
-def test_session_config_includes_activity_detection():
-    """Tuned VAD prevents an open mic from preempting subsequent replies."""
+def test_session_config_disables_server_vad_when_manual_vad_on():
+    """Default mode (GEMINI_MANUAL_VAD unset) is manual VAD: server
+    VAD must be disabled so the client controls turn boundaries."""
     p = _make_provider()
-    cfg = p.format_session_config(system="x", tools=[])
-    rt = cfg["setup"]["realtimeInputConfig"]
-    aad = rt["automaticActivityDetection"]
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GEMINI_MANUAL_VAD", None)
+        cfg = p.format_session_config(system="x", tools=[])
+    aad = cfg["setup"]["realtimeInputConfig"]["automaticActivityDetection"]
+    assert aad == {"disabled": True}
+
+
+def test_session_config_uses_server_vad_when_manual_off():
+    """GEMINI_MANUAL_VAD=0 falls back to server VAD, tuned as
+    conservatively as the Live API allows."""
+    p = _make_provider()
+    with patch.dict(os.environ, {"GEMINI_MANUAL_VAD": "0"}):
+        cfg = p.format_session_config(system="x", tools=[])
+    aad = cfg["setup"]["realtimeInputConfig"]["automaticActivityDetection"]
     assert aad["disabled"] is False
     assert aad["startOfSpeechSensitivity"] == "START_SENSITIVITY_LOW"
     assert aad["endOfSpeechSensitivity"] == "END_SENSITIVITY_LOW"
     assert aad["silenceDurationMs"] == 2500
+
+
+def test_manual_vad_frames_match_live_api_activity_shape():
+    """Manual VAD: start/stop frames must use Live API's
+    ``realtimeInput.activityStart`` / ``activityEnd`` envelopes."""
+    p = _make_provider()
+    assert p.manual_vad_start_frames() == [
+        {"realtimeInput": {"activityStart": {}}},
+    ]
+    assert p.manual_vad_stop_frames() == [
+        {"realtimeInput": {"activityEnd": {}}},
+    ]
+    assert p.supports_manual_vad is True
+
+
+def test_manual_vad_safety_commit_chunks_long_utterance():
+    """Long-utterance safety: close-then-reopen so a multi-minute
+    monologue doesn't sit in one unbounded segment."""
+    p = _make_provider()
+    frames = p.manual_vad_safety_commit_frames()
+    assert frames == [
+        {"realtimeInput": {"activityEnd": {}}},
+        {"realtimeInput": {"activityStart": {}}},
+    ]
 
 
 def test_session_config_skips_system_when_empty():
