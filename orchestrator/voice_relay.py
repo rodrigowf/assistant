@@ -1232,6 +1232,17 @@ class VoiceRelay:
             self._manual_vad.reset()
             self._slog("manual_vad state reset after reconnect")
 
+        # Also clear the safety-commit watchdog timestamp. Otherwise it
+        # carries an N-seconds-ago timestamp from the pre-reconnect
+        # session and the post-reconnect path computes "speech ran
+        # 79.1s" and fires an immediate safety commit on the fresh
+        # upstream. Even with the safety frames now empty for Gemini,
+        # keeping this clean matters for Qwen and any future provider
+        # that does want the safety path.
+        if self._manual_vad_speech_started_at is not None:
+            self._manual_vad_speech_started_at = None
+            self._slog("manual_vad safety-commit watchdog reset after reconnect")
+
         return True
 
 

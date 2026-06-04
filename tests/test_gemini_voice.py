@@ -157,15 +157,15 @@ def test_manual_vad_frames_match_live_api_activity_shape():
     assert p.supports_manual_vad is True
 
 
-def test_manual_vad_safety_commit_chunks_long_utterance():
-    """Long-utterance safety: close-then-reopen so a multi-minute
-    monologue doesn't sit in one unbounded segment."""
+def test_manual_vad_safety_commit_is_disabled_for_gemini():
+    """Gemini Live's ``activityEnd`` triggers a reply unconditionally —
+    there's no Qwen-style separation of "commit" from "response.create".
+    So the safety-commit path is disabled (empty frames) and the relay's
+    safety watchdog becomes a no-op for Gemini sessions. See the
+    docstring on ``manual_vad_safety_commit_frames`` for the live
+    test that disproved the original assumption."""
     p = _make_provider()
-    frames = p.manual_vad_safety_commit_frames()
-    assert frames == [
-        {"realtimeInput": {"activityEnd": {}}},
-        {"realtimeInput": {"activityStart": {}}},
-    ]
+    assert p.manual_vad_safety_commit_frames() == []
 
 
 def test_session_config_skips_system_when_empty():

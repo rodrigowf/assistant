@@ -535,24 +535,29 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         return [{"realtimeInput": {"activityEnd": {}}}]
 
     def manual_vad_safety_commit_frames(self) -> list[dict[str, Any]]:
-        """Long-utterance safety chunking — close current segment and
-        immediately open the next one WITHOUT prompting a reply.
+        """No safety commit for Gemini — return ``[]`` to disable.
 
-        Gemini's manual activity mode doesn't document an upstream cap
-        on continuous audio between activityStart/activityEnd, but we
-        chunk defensively to bound the worst case if the upstream ever
-        truncates a multi-minute monologue. Sending ``activityEnd``
-        followed *immediately* by ``activityStart`` would normally
-        provoke a reply on the first frame; in practice Gemini batches
-        the response generation until it sees a real pause, so back-
-        to-back end/start ends up being a soft seam in one logical
-        turn. If this provokes premature replies, drop to ``[]``
-        (which disables the safety path for Gemini).
+        History: we initially copied Qwen's safety-commit pattern as
+        ``activityEnd`` + ``activityStart`` on the assumption that
+        Gemini would batch the response generation until a real pause.
+        Live test 2026-06-04 disproved that hypothesis: when the user
+        spoke continuously for 50s, our safety commit fired and
+        Gemini started replying within 290ms of the ``activityEnd``,
+        cutting the user off mid-sentence. The architectural reality:
+        Qwen's wire shape SEPARATES ``input_audio_buffer.commit``
+        (close segment) from ``response.create`` (ask for reply), so
+        a "commit-only" safety chunking works. Gemini Live's
+        ``activityEnd`` collapses those into one — there is no
+        documented or empirical way to chunk a long utterance without
+        provoking a reply.
+
+        Gemini Live also has NO documented per-utterance cap in
+        manual mode (vs. DashScope's documented 60s) and no observed
+        cap in 200+s monologues. So the safety path was guarding
+        against a problem that does not exist; removing it cleanly
+        fixes the only real issue (false interruption).
         """
-        return [
-            {"realtimeInput": {"activityEnd": {}}},
-            {"realtimeInput": {"activityStart": {}}},
-        ]
+        return []
 
     @classmethod
     def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
