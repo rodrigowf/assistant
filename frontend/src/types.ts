@@ -96,6 +96,8 @@ export type ServerEvent =
   | { type: "voice_command"; command: Record<string, unknown> }
   | { type: "voice_event"; event: RealtimeEvent }
   | { type: "voice_audio_out"; audio: string }
+  | { type: "voice_ending"; reason?: string; session_id?: string }
+  | { type: "voice_ended"; reason?: string; session_id?: string }
   | { type: "voice_stopped" };
 
 // OpenAI Realtime API event types (subset used by voice integration)
