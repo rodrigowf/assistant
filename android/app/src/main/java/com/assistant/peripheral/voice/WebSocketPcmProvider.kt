@@ -488,6 +488,7 @@ abstract class WebSocketPcmProvider(
         if (event["type"] == "voice_status") {
             when (event["status"] as? String) {
                 "preparing" -> setState(VoiceState.Connecting)
+                "summarizing" -> setState(VoiceState.Summarizing)
                 "ready" -> setState(VoiceState.Active)
                 "reconnect_warning" -> {
                     // Gemini goAway. timeLeft is a Number (Int|Double|Long)

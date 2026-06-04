@@ -84,6 +84,12 @@ sealed class ConnectionState {
 sealed class VoiceState {
     object Off : VoiceState()
     object Connecting : VoiceState()
+    /** Backend is rebuilding the history summary (the LLM call inside
+     *  get_session_update). Shown as a yellow "Preparing conversation"
+     *  state so the user knows the wake-word landed but the session
+     *  isn't ready yet. Distinct from [Connecting] (network handshake)
+     *  because this can take 15-25s on long sessions. */
+    object Summarizing : VoiceState()
     object Active : VoiceState()
     object Speaking : VoiceState()
     object Listening : VoiceState()

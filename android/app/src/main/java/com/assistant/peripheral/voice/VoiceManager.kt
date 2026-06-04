@@ -159,6 +159,23 @@ class VoiceManager(
      * which receive their events via the data channel directly.
      */
     fun handleProviderEvent(event: Map<String, Any?>) {
+        // Some backend-synthesised voice_status events arrive BEFORE the
+        // provider is created — most notably `summarizing` (emitted
+        // inside _attach_voice_payload, before session_started is sent
+        // to the client, since the LLM summarisation runs in-between).
+        // Surface those on the VoiceManager's own state flow so the UI
+        // can flip to yellow during the slow window. The provider will
+        // pick up subsequent status events normally once it exists.
+        if (event["type"] == "voice_status" && currentProvider == null) {
+            when (event["status"] as? String) {
+                "summarizing" -> _state.value = VoiceState.Summarizing
+                "preparing" -> _state.value = VoiceState.Connecting
+                // "ready" / "reconnect_warning" / "reconnecting" never
+                // arrive before the provider in practice; ignore them
+                // here rather than handle without a provider to clear.
+            }
+            return
+        }
         currentProvider?.handleProviderEvent(event)
     }
 
@@ -182,8 +199,14 @@ class VoiceManager(
      * has the values.
      */
     suspend fun start(cfg: VoiceConfig) {
-        if (_state.value != VoiceState.Off && _state.value !is VoiceState.Error) {
-            Log.w(TAG, "start: already active state=${_state.value}")
+        // Summarizing is a backend-pushed pre-start state (the
+        // history-summary LLM call is running before session_started
+        // lands). Treat it as "not yet started" so the local provider
+        // start can proceed normally — the provider will overwrite the
+        // state to Connecting once it begins its own handshake.
+        val s = _state.value
+        if (s != VoiceState.Off && s !is VoiceState.Error && s != VoiceState.Summarizing) {
+            Log.w(TAG, "start: already active state=$s")
             return
         }
         // Synchronous gate — prevents a second start() from sneaking past
@@ -228,7 +251,20 @@ class VoiceManager(
         providerJob?.cancel()
         providerJob = scope.launch {
             launch {
-                provider.state.collect { _state.value = it }
+                provider.state.collect { ps ->
+                    // Don't let the provider's initial Off emission clobber
+                    // a backend-pushed Summarizing/Connecting state that we
+                    // surfaced before the provider was created. Any later
+                    // state from the provider (including its own Connecting
+                    // a few ms later) wins normally.
+                    if (ps == VoiceState.Off &&
+                        (_state.value == VoiceState.Summarizing ||
+                         _state.value == VoiceState.Connecting)
+                    ) {
+                        return@collect
+                    }
+                    _state.value = ps
+                }
             }
             launch {
                 provider.events.collect { _events.tryEmit(it) }

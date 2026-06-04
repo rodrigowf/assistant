@@ -39,6 +39,7 @@ from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 # Missing SDKs surface as a 400 at config-save time and a friendly runtime
 # error at send time — never as a backend that won't boot.
 from orchestrator.runner import BackgroundAgentRunner, Notification, NotificationQueue
+from orchestrator import summary_cache
 from orchestrator.token_budget import (
     RECENT_VERBATIM_TOKENS,
     estimate_message_tokens,
@@ -505,6 +506,13 @@ class OrchestratorSession:
         """Load history fresh from JSONL, clip tool results, split by token
         budget, and summarize the older prefix.
 
+        The summary of the older prefix is the expensive part — a 15-25s
+        LLM call on long sessions. We consult ``summary_cache`` first
+        (sibling ``.summary.json`` file keyed on JSONL size+mtime). On
+        cache hit we skip the LLM call entirely. On miss we compute
+        synchronously (so the caller still gets a correct prompt) and
+        write the result back so the next call is fast.
+
         Returns (recent_verbatim_messages, summary_or_none).
         """
         if self._jsonl_path is None or not self._jsonl_path.is_file():
@@ -524,12 +532,94 @@ class OrchestratorSession:
         if older:
             prefix_tokens = sum(estimate_message_tokens(m) for m in older)
             target_words = summary_target_word_range(len(older), prefix_tokens)
-            summary = await self._summarize_history(
-                older, target_words=target_words
-            )
+
+            cached = summary_cache.read(self._jsonl_path)
+            if cached is not None:
+                # Hit. The cache key is (jsonl_size, jsonl_mtime_ns) so
+                # any new turn appended to the JSONL invalidates this.
+                # We don't re-verify the input slice — the splitter is
+                # deterministic given file content.
+                logger.info(
+                    "history summary cache HIT for %s (input_messages=%d, "
+                    "summary_chars=%d, generated_at=%s)",
+                    self._jsonl_path.name, cached.input_message_count,
+                    len(cached.summary_text), cached.generated_at,
+                )
+                summary = cached.summary_text
+            else:
+                logger.info(
+                    "history summary cache MISS for %s — recomputing "
+                    "(input_messages=%d, target_words=%s)",
+                    self._jsonl_path.name, len(older), target_words,
+                )
+                summary = await self._summarize_history(
+                    older, target_words=target_words
+                )
+                # Write through. Failures are logged inside summary_cache
+                # and never propagate — at worst the next call recomputes.
+                if summary:
+                    summary_cache.write(
+                        self._jsonl_path,
+                        summary_text=summary,
+                        input_message_count=len(older),
+                        summary_target_words=target_words,
+                        summarizer_model=getattr(
+                            self._config, "summarizer_model", None
+                        ),
+                    )
 
         self._history_summary = summary
         return recent, summary
+
+    async def refresh_summary_cache_if_stale(self) -> bool:
+        """Compute and persist the history summary for the current JSONL
+        state, but only if the cache is missing or stale.
+
+        Safe to call from anywhere — short-circuits cheaply on cache hit.
+        Returns True if a new summary was written, False otherwise.
+
+        Used by:
+        - Session stop (write the summary the next reopen will need)
+        - Background safety nets (boot warmup, history reopen)
+        """
+        if self._jsonl_path is None or not self._jsonl_path.is_file():
+            return False
+        if summary_cache.is_fresh(self._jsonl_path):
+            return False
+
+        try:
+            history = HistoryLoader(self._jsonl_path).load()
+        except Exception:  # noqa: BLE001
+            logger.exception("summary refresh: history load failed")
+            return False
+        if not history:
+            return False
+
+        clipped = truncate_tool_results(history)
+        older, _ = split_by_token_budget(clipped, RECENT_VERBATIM_TOKENS)
+        if not older:
+            return False
+
+        prefix_tokens = sum(estimate_message_tokens(m) for m in older)
+        target_words = summary_target_word_range(len(older), prefix_tokens)
+        try:
+            summary = await self._summarize_history(
+                older, target_words=target_words
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("summary refresh: _summarize_history failed")
+            return False
+        if not summary:
+            return False
+
+        summary_cache.write(
+            self._jsonl_path,
+            summary_text=summary,
+            input_message_count=len(older),
+            summary_target_words=target_words,
+            summarizer_model=getattr(self._config, "summarizer_model", None),
+        )
+        return True
 
     @property
     def needs_voice_relay(self) -> bool:
@@ -1290,6 +1380,12 @@ class OrchestratorSession:
         Cancels every in-flight background-agent turn (with SDK interrupts so
         the bundled ``claude`` subprocesses actually stop) and unsubscribes
         the wake callback so notifications fired during shutdown go nowhere.
+
+        Also kicks off a fire-and-forget history-summary refresh: the
+        conversation just ended, so this is the cheapest moment to pay
+        for the LLM call — by the time the user comes back to this
+        session, the cache will be warm and ``voice_start`` won't have
+        to block on summarisation.
         """
         self._notifications.set_wake_callback(None)
         if self._runner is not None:
@@ -1301,6 +1397,14 @@ class OrchestratorSession:
             await self.stop_voice_relay()
         except Exception:  # noqa: BLE001
             logger.exception("stop_voice_relay failed during session stop")
+        # Spawn the cache-refresh as a detached task. We don't await
+        # because the session is shutting down and the JSONL is already
+        # written; the refresh just makes the next reopen faster.
+        if self._jsonl_path is not None and self._jsonl_path.is_file():
+            asyncio.create_task(
+                self.refresh_summary_cache_if_stale(),
+                name=f"summary-refresh-{self._local_id}",
+            )
         # Cancel the injection watchdog if it's still scheduled
         if self._injection_watchdog is not None and not self._injection_watchdog.done():
             self._injection_watchdog.cancel()

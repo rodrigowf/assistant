@@ -28,6 +28,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.pool import SessionPool
 from api.serializers import serialize_orchestrator_event
+from orchestrator import summary_cache
 from orchestrator.config import OrchestratorConfig, get_available_models
 from orchestrator.providers.discovery import list_orchestrator_models
 from orchestrator.session import OrchestratorSession
@@ -462,6 +463,18 @@ async def _handle_start(
 
         session.notifications.set_wake_callback(_make_wake(pool, session))
 
+    # Background history-summary refresh on session reopen. The chat WS
+    # `start` arrives whenever the user opens a session from history (or
+    # the Android app reconnects after waking). The summarisation is the
+    # critical-path cost for voice_start (see summary_cache), and here
+    # we have idle time to pay for it before the user presses the mic.
+    # No-op if the cache is already fresh.
+    if not voice:
+        asyncio.create_task(
+            session.refresh_summary_cache_if_stale(),
+            name=f"summary-refresh-start-{local_id}",
+        )
+
     _t_payload = time.monotonic()
     started_payload: dict = {
         "type": "session_started",
@@ -549,12 +562,37 @@ async def _attach_voice_payload(
     # the cost is almost always in get_session_update (system prompt +
     # tools build) or get_connection_info (ephemeral token / OAuth).
     _local_id = getattr(session, "local_id", "?")
+
+    # If the history-summary cache is stale, get_session_update is going
+    # to make a synchronous LLM call (15-25s on long sessions). Tell the
+    # UI so it can show a "summarizing" yellow state instead of the
+    # default "preparing" that suggests imminent readiness. Also tells
+    # the user something is happening so they don't try repeatedly.
+    pool_for_status = session._context.get("pool")
+    will_summarize = (
+        session._jsonl_path is not None
+        and session._jsonl_path.is_file()
+        and not summary_cache.is_fresh(session._jsonl_path)
+    )
+    if will_summarize and pool_for_status is not None:
+        try:
+            await pool_for_status.broadcast_orchestrator({
+                "type": "voice_event",
+                "event": {
+                    "type": "voice_status",
+                    "status": "summarizing",
+                },
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception("voice_status:summarizing broadcast failed")
+
     _t_su = time.monotonic()
     session_update = await session.get_session_update()
     logger.info(
-        "voice_start_timing local_id=%s step=get_session_update dt_ms=%d bytes=%d",
+        "voice_start_timing local_id=%s step=get_session_update dt_ms=%d bytes=%d cache_was_stale=%s",
         _local_id, int((time.monotonic() - _t_su) * 1000),
         len(orjson.dumps(session_update)) if session_update else 0,
+        will_summarize,
     )
     if session_update:
         payload["voice_session_update"] = session_update
