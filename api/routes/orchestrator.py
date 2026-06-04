@@ -37,34 +37,6 @@ from orchestrator.session import OrchestratorSession
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["orchestrator"])
 
-# App-level WS heartbeat. Both directions exchange a small
-# ``{"type":"ping"}`` message every N seconds. Replaces the okhttp
-# protocol-level ping on Android, which was closing healthy WSs with
-# ``1011 keepalive ping timeout`` on the A300M (verified: PONGs work
-# instantly when probed from every other client we tried — Jetson
-# localhost, the laptop over WiFi through nginx. Only the A300M sees
-# the issue, so rather than fight okhttp's protocol-layer
-# device-specific quirk we run our own bidirectional liveness check
-# end-to-end at the app layer).
-#
-# 15s is short enough that a 45s "no traffic" timeout (~3x interval)
-# detects a dead path quickly without being noisy. Cheap on bandwidth
-# (~2 bytes/s).
-_WS_HEARTBEAT_INTERVAL_S = 15.0
-
-# How long the server tolerates total silence from a client before
-# considering the WS dead. The receive loop drives this; if no message
-# of any kind (including the client's own heartbeat ping) arrives in
-# this window, we close the WS. The client-side mirror lives in
-# WebSocketManager.kt and uses the same window.
-_WS_CLIENT_SILENCE_TIMEOUT_S = 45.0
-
-# DIAG: per-ws counters for the wake-word-after-stop investigation.
-# Tagged "DIAG" in log lines so they're easy to grep + remove later.
-_mic_in_counter: dict[int, int] = {}
-_mic_drop_counter: dict[int, int] = {}
-
-
 async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
     """Send to a client WS, swallowing the post-close race.
 
@@ -97,27 +69,6 @@ async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
         return False
 
 
-async def _ws_heartbeat_task(ws: WebSocket) -> None:
-    """Push a tiny ping every _WS_HEARTBEAT_INTERVAL_S so okhttp's
-    pong-deadline never fires from radio sleep on power-saving Android.
-
-    Exits silently the moment the WS isn't connected anymore — the
-    finally block of the route handler will cancel us regardless.
-    """
-    ping_payload = orjson.dumps({"type": "ping"})
-    try:
-        while True:
-            await asyncio.sleep(_WS_HEARTBEAT_INTERVAL_S)
-            sent = await _safe_send_bytes(ws, ping_payload)
-            if not sent:
-                # WS gone — exit; the receive loop will see the disconnect.
-                return
-    except asyncio.CancelledError:
-        raise
-    except Exception:  # noqa: BLE001
-        logger.exception("WS heartbeat task crashed")
-
-
 @router.websocket("/api/orchestrator/chat")
 async def orchestrator_ws(ws: WebSocket):
     await ws.accept()
@@ -125,51 +76,18 @@ async def orchestrator_ws(ws: WebSocket):
     pool: SessionPool = ws.app.state.pool
     session: OrchestratorSession | None = None
     subscribed = False  # True once this ws is registered in pool._orchestrator_subs
-    # MUST be initialised before any path that can break/return out of
-    # the receive loop. The finally block reads it unconditionally, and
-    # the silence-timeout break path doesn't run either except handler
-    # (where the original assignments live). Failing to init here
-    # crashes the WS handler with UnboundLocalError on every silent
-    # disconnect — observed live as a crash spam loop where every
-    # Android reconnect after a clean voice stop hits the silence
-    # timeout, crashes the finally, and the cycle repeats.
+    # Defensive init — the finally block reads ``was_voice``
+    # unconditionally, and not every loop-exit path runs through one
+    # of the except handlers where ``was_voice`` is otherwise assigned.
+    # Without this default we'd hit UnboundLocalError on any clean exit.
     was_voice = False
 
     # Register as a watcher so this ws receives agent_session_opened/closed events
     pool.watch(ws)
 
-    # App-level heartbeat — see _WS_HEARTBEAT_INTERVAL_S for rationale.
-    heartbeat = asyncio.create_task(
-        _ws_heartbeat_task(ws), name=f"ws-heartbeat-{id(ws)}",
-    )
-
     try:
         while True:
-            # Bounded receive — if NOTHING arrives from the client for
-            # the silence window (not even their heartbeat ping), the
-            # path is dead and we should close. Without this the server
-            # task would sit forever on a TCP connection that's silently
-            # broken (NAT timeout, WiFi disconnect with no FIN, etc.).
-            try:
-                raw = await asyncio.wait_for(
-                    ws.receive_text(), timeout=_WS_CLIENT_SILENCE_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                # The path is dead — close and let the finally block
-                # tear down voice. MUST set was_voice here because we're
-                # exiting through `break`, not through either except
-                # handler (which is where was_voice would normally be
-                # assigned).
-                was_voice = bool(session is not None and session.is_voice)
-                logger.info(
-                    "WS silent for %.0fs — closing as dead (voice_active=%s)",
-                    _WS_CLIENT_SILENCE_TIMEOUT_S, was_voice,
-                )
-                try:
-                    await ws.close(code=1011, reason="client silence timeout")
-                except Exception:  # noqa: BLE001
-                    pass
-                break
+            raw = await ws.receive_text()
             try:
                 msg = orjson.loads(raw)
             except (orjson.JSONDecodeError, ValueError):
@@ -261,24 +179,9 @@ async def orchestrator_ws(ws: WebSocket):
                 # disposable — silently dropping them while we're not
                 # voice-ready is the right behaviour.
                 if session is None or not session.is_voice:
-                    _mic_drop_counter[id(ws)] = _mic_drop_counter.get(id(ws), 0) + 1
-                    if _mic_drop_counter[id(ws)] in (1, 10, 50, 250):
-                        logger.warning(
-                            "DIAG: dropping voice_audio_in (no voice session) ws=%s count=%d session=%s is_voice=%s",
-                            id(ws), _mic_drop_counter[id(ws)],
-                            session._local_id if session else None,
-                            session.is_voice if session else None,
-                        )
                     continue
                 audio_b64 = msg.get("audio", "")
                 if audio_b64:
-                    _mic_in_counter[id(ws)] = _mic_in_counter.get(id(ws), 0) + 1
-                    n = _mic_in_counter[id(ws)]
-                    if n == 1 or n % 50 == 0:
-                        logger.info(
-                            "DIAG: voice_audio_in ws=%s session=%s count=%d",
-                            id(ws), session._local_id, n,
-                        )
                     try:
                         await session.send_voice_audio_in(audio_b64)
                     except Exception as e:
@@ -370,13 +273,6 @@ async def orchestrator_ws(ws: WebSocket):
         was_voice = bool(session is not None and getattr(session, "is_voice", False))
         logger.exception("Orchestrator WS error voice_active=%s", was_voice)
     finally:
-        # Cancel the heartbeat first so it doesn't try to send into a
-        # closing socket while we're tearing down.
-        heartbeat.cancel()
-        try:
-            await heartbeat
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
         # On client WS disconnect: tear down the voice connection

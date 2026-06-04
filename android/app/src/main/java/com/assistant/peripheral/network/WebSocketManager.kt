@@ -40,26 +40,11 @@ class WebSocketManager {
     companion object {
         private const val TAG = "WebSocketManager"
         private const val RECONNECT_DELAY_MS = 3000L
-        // OkHttp's WS protocol-level pingInterval: disabled (0). The
-        // backend sends an app-level ``{"type":"ping"}`` every 15s and
-        // this client (see HeartbeatMonitor below) also sends one back.
-        // Liveness is detected via APP-LEVEL pings, not protocol-level
-        // ones, because in the field okhttp's PING was closing the WS
-        // with "1011 keepalive ping timeout" even when the WS was
-        // healthy (PONGs verified to arrive instantly when probed from
-        // every other client we tested — Jetson localhost, the laptop
-        // over WiFi via nginx).  The A300M is the only client that
-        // sees this; rather than fight okhttp's protocol layer on a
-        // device-specific bug, we run our own liveness check that we
-        // fully control.
-        private const val PING_INTERVAL_MS = 0L
-        // We expect a server heartbeat every 15s (configured in
-        // api/routes/orchestrator.py). If we go this long with no
-        // message of any kind, assume the path is dead and reconnect.
-        // 3x the heartbeat interval gives ample slack for jitter.
-        private const val APP_HEARTBEAT_TIMEOUT_MS = 45000L
-        // Cadence for our own client→server heartbeat ping.
-        private const val APP_HEARTBEAT_SEND_INTERVAL_MS = 15000L
+        // OkHttp's WS protocol-level pingInterval — 30s is the okhttp
+        // recommendation. The library sends a PING frame every interval
+        // and closes the WS with "1011 keepalive ping timeout" if no
+        // PONG arrives within the same window.
+        private const val PING_INTERVAL_MS = 30000L
     }
 
     private data class Connection(
@@ -69,16 +54,6 @@ class WebSocketManager {
         var localId: String? = null,
         var shouldReconnect: Boolean = false,
         val state: MutableStateFlow<ConnectionState> = MutableStateFlow(ConnectionState.Disconnected),
-        // App-level liveness tracking — see APP_HEARTBEAT_* constants.
-        @Volatile var lastMessageAtNs: Long = 0L,
-        var heartbeatSendJob: kotlinx.coroutines.Job? = null,
-        var heartbeatMonitorJob: kotlinx.coroutines.Job? = null,
-        // DIAG: ms epoch when onOpen fired — used to log WS lifetime
-        // on close so we can correlate with server-side death.
-        @Volatile var connectedAtMs: Long = 0L,
-        // DIAG: voice_audio_in chunks sent on this WS — logged on close
-        // so we know how much audio was dropped if the WS died mid-call.
-        @Volatile var voiceAudioInSent: Long = 0L,
     )
 
     private val connections: Map<WebSocketEndpoint, Connection> = mapOf(
@@ -137,15 +112,10 @@ class WebSocketManager {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "WebSocket connected ($endpoint)")
                 conn.state.value = ConnectionState.Connected
-                conn.lastMessageAtNs = System.nanoTime()
-                conn.connectedAtMs = System.currentTimeMillis()
-                conn.voiceAudioInSent = 0L
-                startHeartbeat(endpoint)
                 _events.tryEmit(endpoint to WebSocketEvent.Connected)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                conn.lastMessageAtNs = System.nanoTime()
                 // Skip logging high-rate audio frames; they're 4 KB each
                 // at ~50 Hz and the logging cost alone causes UI freezes.
                 if (!isAudioPayload(text)) {
@@ -155,7 +125,6 @@ class WebSocketManager {
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
-                conn.lastMessageAtNs = System.nanoTime()
                 val text = bytes.utf8()
                 if (!isAudioPayload(text)) {
                     Log.d(TAG, "Received binary ($endpoint): $text")
@@ -164,93 +133,22 @@ class WebSocketManager {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                val ageMs = System.currentTimeMillis() - conn.connectedAtMs
-                val msSinceMsg = (System.nanoTime() - conn.lastMessageAtNs) / 1_000_000L
-                Log.w(TAG, "DIAG-CLOSE onClosing ($endpoint): code=$code reason='$reason' " +
-                    "ws_age_ms=$ageMs ms_since_last_recv=$msSinceMsg audio_sent=${conn.voiceAudioInSent}")
+                Log.d(TAG, "WebSocket closing ($endpoint): $code - $reason")
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                val ageMs = System.currentTimeMillis() - conn.connectedAtMs
-                Log.w(TAG, "DIAG-CLOSE onClosed ($endpoint): code=$code reason='$reason' " +
-                    "ws_age_ms=$ageMs audio_sent=${conn.voiceAudioInSent}")
-                stopHeartbeat(endpoint)
+                Log.d(TAG, "WebSocket closed ($endpoint): $code - $reason")
                 handleDisconnect(endpoint)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val ageMs = System.currentTimeMillis() - conn.connectedAtMs
-                Log.e(TAG, "DIAG-CLOSE onFailure ($endpoint): ws_age_ms=$ageMs " +
-                    "throwable_class=${t.javaClass.name} msg='${t.message}' " +
-                    "response_code=${response?.code} response_msg='${response?.message}' " +
-                    "audio_sent=${conn.voiceAudioInSent}", t)
-                stopHeartbeat(endpoint)
+                Log.e(TAG, "WebSocket failure ($endpoint): ${t.message}", t)
                 conn.state.value = ConnectionState.Error(t.message ?: "Connection failed")
                 _events.tryEmit(endpoint to WebSocketEvent.Error(t.message ?: "Connection failed"))
                 handleDisconnect(endpoint)
             }
         })
-    }
-
-    /**
-     * Start the bidirectional app-level heartbeat for this endpoint.
-     *
-     * Two coroutines:
-     *  - SEND: every [APP_HEARTBEAT_SEND_INTERVAL_MS] push a tiny
-     *    ``{"type":"ping"}`` upstream. The server consumes it silently;
-     *    its purpose is to keep liveness mutual.
-     *  - MONITOR: once a second, check whether we've received ANY
-     *    message in the last [APP_HEARTBEAT_TIMEOUT_MS]. If not, the
-     *    path is dead — close the socket and let the reconnect loop
-     *    take it from there.
-     *
-     * We use this instead of okhttp's protocol-level pingInterval
-     * because okhttp was closing healthy WSs with "1011 keepalive
-     * ping timeout" on the A300M (verified: PONGs work fine when
-     * tested from every other client; only this device sees the
-     * timeout).
-     */
-    private fun startHeartbeat(endpoint: WebSocketEndpoint) {
-        val conn = connections.getValue(endpoint)
-        stopHeartbeat(endpoint)  // belt-and-braces
-
-        conn.heartbeatSendJob = scope.launch {
-            try {
-                while (isActive) {
-                    kotlinx.coroutines.delay(APP_HEARTBEAT_SEND_INTERVAL_MS)
-                    val ws = conn.webSocket ?: return@launch
-                    try {
-                        ws.send("""{"type":"ping"}""")
-                    } catch (e: Exception) {
-                        Log.w(TAG, "heartbeat send failed ($endpoint): ${e.message}")
-                    }
-                }
-            } catch (_: kotlinx.coroutines.CancellationException) { /* normal */ }
-        }
-
-        conn.heartbeatMonitorJob = scope.launch {
-            try {
-                while (isActive) {
-                    kotlinx.coroutines.delay(1000L)
-                    val sinceMs = (System.nanoTime() - conn.lastMessageAtNs) / 1_000_000L
-                    if (sinceMs > APP_HEARTBEAT_TIMEOUT_MS) {
-                        Log.w(TAG, "heartbeat timeout ($endpoint): ${sinceMs}ms since last message — closing")
-                        // Closing triggers onClosed → handleDisconnect → reconnect.
-                        conn.webSocket?.close(1000, "app heartbeat timeout")
-                        return@launch
-                    }
-                }
-            } catch (_: kotlinx.coroutines.CancellationException) { /* normal */ }
-        }
-    }
-
-    private fun stopHeartbeat(endpoint: WebSocketEndpoint) {
-        val conn = connections.getValue(endpoint)
-        conn.heartbeatSendJob?.cancel()
-        conn.heartbeatSendJob = null
-        conn.heartbeatMonitorJob?.cancel()
-        conn.heartbeatMonitorJob = null
     }
 
     private fun buildWebSocketUrl(baseUrl: String, endpoint: WebSocketEndpoint): String {
@@ -372,13 +270,10 @@ class WebSocketManager {
         // Don't log audio chunks — they fire ~50/s with ~4KB payloads
         // each, which floods logcat and causes UI freezes via the
         // logging subsystem alone.
-        val conn = connections.getValue(endpoint)
         if (message !is WebSocketMessage.VoiceAudioIn) {
             Log.d(TAG, "Sending ($endpoint): $jsonString")
-        } else {
-            conn.voiceAudioInSent++
         }
-        conn.webSocket?.send(jsonString)
+        connections.getValue(endpoint).webSocket?.send(jsonString)
     }
 
     @Suppress("UNCHECKED_CAST")
