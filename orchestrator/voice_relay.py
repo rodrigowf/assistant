@@ -629,6 +629,13 @@ class VoiceRelay:
         Gemini Live: ``realtimeInput.audio``).
         """
         if self._ws is None or self._closed.is_set():
+            self._diag_audio_drop = getattr(self, "_diag_audio_drop", 0) + 1
+            if self._diag_audio_drop in (1, 10, 50, 250):
+                logger.warning(
+                    "DIAG: relay.send_audio dropped — ws=%s closed=%s session=%s count=%d",
+                    self._ws is not None, self._closed.is_set(),
+                    self._session_id, self._diag_audio_drop,
+                )
             return  # Drop silently after upstream close — frontend already notified.
         # Wait for the upstream handshake to ack. Gemini Live force-closes
         # with WS 1008 "BidiGenerateContent session expired" when audio

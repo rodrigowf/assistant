@@ -59,6 +59,11 @@ _WS_HEARTBEAT_INTERVAL_S = 15.0
 # WebSocketManager.kt and uses the same window.
 _WS_CLIENT_SILENCE_TIMEOUT_S = 45.0
 
+# DIAG: per-ws counters for the wake-word-after-stop investigation.
+# Tagged "DIAG" in log lines so they're easy to grep + remove later.
+_mic_in_counter: dict[int, int] = {}
+_mic_drop_counter: dict[int, int] = {}
+
 
 async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
     """Send to a client WS, swallowing the post-close race.
@@ -256,9 +261,24 @@ async def orchestrator_ws(ws: WebSocket):
                 # disposable — silently dropping them while we're not
                 # voice-ready is the right behaviour.
                 if session is None or not session.is_voice:
+                    _mic_drop_counter[id(ws)] = _mic_drop_counter.get(id(ws), 0) + 1
+                    if _mic_drop_counter[id(ws)] in (1, 10, 50, 250):
+                        logger.warning(
+                            "DIAG: dropping voice_audio_in (no voice session) ws=%s count=%d session=%s is_voice=%s",
+                            id(ws), _mic_drop_counter[id(ws)],
+                            session._local_id if session else None,
+                            session.is_voice if session else None,
+                        )
                     continue
                 audio_b64 = msg.get("audio", "")
                 if audio_b64:
+                    _mic_in_counter[id(ws)] = _mic_in_counter.get(id(ws), 0) + 1
+                    n = _mic_in_counter[id(ws)]
+                    if n == 1 or n % 50 == 0:
+                        logger.info(
+                            "DIAG: voice_audio_in ws=%s session=%s count=%d",
+                            id(ws), session._local_id, n,
+                        )
                     try:
                         await session.send_voice_audio_in(audio_b64)
                     except Exception as e:

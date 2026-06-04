@@ -1094,6 +1094,12 @@ class OrchestratorSession:
         material that already exists elsewhere.
         """
         if self._voice_relay is None:
+            self._diag_relay_none = getattr(self, "_diag_relay_none", 0) + 1
+            if self._diag_relay_none in (1, 10, 50, 250):
+                logger.warning(
+                    "DIAG: send_voice_audio_in dropped — _voice_relay is None session=%s state=%s count=%d",
+                    self._local_id, self._voice_state.value, self._diag_relay_none,
+                )
             return
         if (
             not self.is_injecting
