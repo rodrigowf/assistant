@@ -342,6 +342,29 @@ class BaseVoiceProvider(ABC):
         """
         return None
 
+    def graceful_shutdown_frames(self) -> list[dict[str, Any]]:
+        """Frames the relay should send upstream just BEFORE closing the WS.
+
+        Lets each provider flush any in-flight state cleanly without
+        provoking a fresh model turn. Sent best-effort with a short
+        timeout — if the upstream is already gone the close still
+        proceeds.
+
+        Default: ``[]`` (just close the connection — appropriate for
+        OpenAI which has no backend WS, and as a safe fallback).
+
+        Providers override:
+
+        - Qwen: ``[{"type": "input_audio_buffer.commit"}]`` to flush any
+          buffered mic audio without firing ``response.create``.
+        - Gemini: ``[{"realtimeInput": {"activityEnd": {}}}]`` to close
+          the segment cleanly. Note that ``activityEnd`` does trigger a
+          reply on Gemini, but we're closing the WS immediately after
+          so the reply is moot — what matters is that the server-side
+          turn is closed instead of left dangling.
+        """
+        return []
+
     @property
     def handshake_direction(self) -> str:
         """Order of the WS handshake — ``"server_first"`` or ``"client_first"``.

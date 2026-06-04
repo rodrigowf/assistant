@@ -595,6 +595,32 @@ class VoiceRelay:
             # Upstream is gone; the drain task already surfaced the error.
             self._slog(f"WARN send dropped (upstream closed): type={event.get('type')} err={e}")
 
+    async def send_shutdown_frames(self, frames: list[dict[str, Any]]) -> None:
+        """Send the provider's graceful-shutdown frames just before WS close.
+
+        Bypasses gating (we're closing anyway) but honours the send lock
+        and the closed/handshake checks so we never write to a dead WS.
+        Errors are swallowed: ``end_voice`` always closes the WS after
+        this returns, so a flush failure just means the upstream sees
+        the close without a polite goodbye.
+        """
+        if self._ws is None or self._closed.is_set():
+            return
+        if not self._handshake_complete.is_set():
+            # No handshake → no point sending shutdown frames; just close.
+            return
+        for frame in frames:
+            try:
+                async with self._send_lock:
+                    if self._ws is None or self._closed.is_set():
+                        return
+                    await self._ws.send(json.dumps(frame))
+                self._last_send_at = time.monotonic()
+                self._slog(f"shutdown frame sent type={frame.get('type') or list(frame.keys())[:1]}")
+            except Exception as e:  # noqa: BLE001
+                self._slog(f"WARN shutdown frame send failed: {e}")
+                return  # upstream is gone; the close will catch up
+
     async def send_audio(self, pcm_b64: str) -> None:
         """Forward a frontend mic chunk upstream as a provider-specific append.
 

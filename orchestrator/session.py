@@ -12,6 +12,7 @@ fixed model for the session duration (WebRTC constraint).
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import uuid
@@ -64,6 +65,52 @@ logger = logging.getLogger(__name__)
 # to have an OpenAI key configured than an Anthropic one in this environment.
 # Override globally by editing ``summarizer_model`` in assistant_config.json.
 DEFAULT_SUMMARIZER_MODEL = "gpt-5.1"
+
+
+class VoiceLifecycle(enum.Enum):
+    """Voice session lifecycle states — guarded by ``OrchestratorSession._voice_lock``.
+
+    All transitions go through :meth:`OrchestratorSession._transition_voice_state`.
+    Only the transitions in :data:`_VALID_VOICE_TRANSITIONS` are allowed; anything
+    else is a bug and raises.
+
+    IDLE
+        No voice session active (text mode, or voice never started, or already
+        finished cleaning up).
+    STARTING
+        ``start_voice_relay`` is running. Upstream handshake in flight.
+    ACTIVE
+        Relay is up and pumping events. Normal operating state.
+    ENDING
+        ``end_voice`` is tearing down. Late events are dropped. New
+        ``voice_start`` for the same ``local_id`` must wait for ``ENDED``.
+    ENDED
+        Terminal. The session is cleaned up. A fresh start uses a new
+        ``OrchestratorSession`` instance.
+    """
+
+    IDLE = "idle"
+    STARTING = "starting"
+    ACTIVE = "active"
+    ENDING = "ending"
+    ENDED = "ended"
+
+
+# Source → set of allowed targets. Used to validate every transition so a
+# stray double-call (e.g. concurrent agent end_voice + user stop) becomes a
+# silent no-op instead of a corrupting double-teardown.
+_VALID_VOICE_TRANSITIONS: dict[VoiceLifecycle, set[VoiceLifecycle]] = {
+    VoiceLifecycle.IDLE: {VoiceLifecycle.STARTING, VoiceLifecycle.ENDING},
+    VoiceLifecycle.STARTING: {VoiceLifecycle.ACTIVE, VoiceLifecycle.ENDING},
+    VoiceLifecycle.ACTIVE: {VoiceLifecycle.ENDING},
+    VoiceLifecycle.ENDING: {VoiceLifecycle.ENDED},
+    VoiceLifecycle.ENDED: set(),  # terminal
+}
+
+# Best-effort timeout for the provider's graceful_shutdown_frames send.
+# If the upstream WS is already wedged we don't want teardown to block
+# forever; the WS close that follows will free the resource anyway.
+_GRACEFUL_SHUTDOWN_TIMEOUT_S = 0.5
 
 
 def _render_notifications(notes: list[Notification]) -> str:
@@ -172,6 +219,19 @@ class OrchestratorSession:
         self._history_summary: str | None = None
         self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
 
+        # Voice lifecycle state machine. ``IDLE`` for both text and
+        # not-yet-started voice; the route layer flips us to ``STARTING``
+        # before calling ``start_voice_relay``. ``_voice_lock`` guards every
+        # transition; ``_voice_ended`` is set when state == ENDED so callers
+        # waiting on a tear-down can piggyback on the in-flight one without
+        # racing.
+        self._voice_state: VoiceLifecycle = VoiceLifecycle.IDLE
+        self._voice_lock: asyncio.Lock = asyncio.Lock()
+        self._voice_ended: asyncio.Event = asyncio.Event()
+        # Last reason the session ended (or None). Useful for logging /
+        # exposing through the broadcast.
+        self._voice_end_reason: str | None = None
+
         # Track current provider for model switching
         self._current_provider = None
 
@@ -217,6 +277,20 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def voice_state(self) -> VoiceLifecycle:
+        """Current voice-lifecycle state. See :class:`VoiceLifecycle`."""
+        return self._voice_state
+
+    @property
+    def voice_is_ending(self) -> bool:
+        """True while :meth:`end_voice` is tearing the session down.
+
+        Used by the pool/route layer to block a fresh ``voice_start`` for
+        the same ``local_id`` so we don't reconnect into a dying relay.
+        """
+        return self._voice_state == VoiceLifecycle.ENDING
 
     @property
     def voice_provider(self) -> BaseVoiceProvider | None:
@@ -646,9 +720,33 @@ class OrchestratorSession:
         (e.g. to send to the frontend in the same handler) — saves a second
         round-trip through the LLM-backed history summarizer, which on the
         Jetson costs enough to blow the frontend's 10s start timeout.
+
+        Drives the lifecycle from IDLE → STARTING → ACTIVE. Bails early
+        with no side effects if the session is already past STARTING
+        (i.e. a teardown raced ahead).
         """
         if not self.needs_voice_relay:
             return
+
+        # Move IDLE → STARTING under the lock. If the session has already
+        # progressed beyond STARTING (concurrent end_voice, or a redundant
+        # rebuild from _attach_voice_payload's reconnect path), bail out
+        # without touching the relay.
+        async with self._voice_lock:
+            if self._voice_state == VoiceLifecycle.STARTING:
+                # Another caller is already opening the relay; let it win.
+                return
+            if self._voice_state == VoiceLifecycle.ACTIVE:
+                # Already up — idempotent.
+                return
+            if self._voice_state in (VoiceLifecycle.ENDING, VoiceLifecycle.ENDED):
+                logger.info(
+                    "start_voice_relay skipped — session %s is %s",
+                    self._local_id, self._voice_state.value,
+                )
+                return
+            self._set_voice_state_unlocked(VoiceLifecycle.STARTING)
+
         from orchestrator.voice_relay import VoiceRelay
         if session_update is None:
             session_update = await self.get_session_update()
@@ -671,13 +769,188 @@ class OrchestratorSession:
             session_id=self._local_id,
             rebuild_session_update=_rebuild_session_update,
         )
-        await relay.start(session_update)
-        self._voice_relay = relay
+        try:
+            await relay.start(session_update)
+        except Exception:
+            # Relay failed to open. Roll the state forward to ENDED so a
+            # retry creates a fresh session instead of seeing STARTING.
+            async with self._voice_lock:
+                if self._voice_state == VoiceLifecycle.STARTING:
+                    self._set_voice_state_unlocked(VoiceLifecycle.ENDING)
+                    self._set_voice_state_unlocked(VoiceLifecycle.ENDED)
+                    self._voice_end_reason = "start_failed"
+                    self._voice_ended.set()
+            raise
+
+        async with self._voice_lock:
+            self._voice_relay = relay
+            # If a teardown snuck in between relay.start() and here, honour
+            # it: don't transition to ACTIVE, let the ENDING path catch up.
+            if self._voice_state == VoiceLifecycle.STARTING:
+                self._set_voice_state_unlocked(VoiceLifecycle.ACTIVE)
 
     async def stop_voice_relay(self) -> None:
+        """Low-level relay teardown — closes the upstream WS only.
+
+        Does NOT touch the lifecycle state machine. Used for intra-session
+        relay rebuilds (e.g. ``_attach_voice_payload`` detecting a dead
+        relay on reconnect) and as a building block for :meth:`end_voice`.
+
+        For the full session-level teardown — provider release, audio
+        recorder stop, broadcast of ``voice_ended`` — call :meth:`end_voice`.
+        """
         if self._voice_relay is not None:
             await self._voice_relay.stop()
             self._voice_relay = None
+
+    def _set_voice_state_unlocked(self, target: VoiceLifecycle) -> None:
+        """Internal: transition state. Caller MUST hold ``_voice_lock``.
+
+        Validates against :data:`_VALID_VOICE_TRANSITIONS`. Invalid
+        transitions raise — they indicate a bug, not a recoverable race.
+        """
+        current = self._voice_state
+        if target == current:
+            return
+        if target not in _VALID_VOICE_TRANSITIONS[current]:
+            raise RuntimeError(
+                f"Invalid voice transition {current.value} → {target.value} "
+                f"for session {self._local_id}"
+            )
+        logger.info(
+            "voice_state session=%s %s → %s",
+            self._local_id, current.value, target.value,
+        )
+        self._voice_state = target
+
+    async def end_voice(self, reason: str) -> None:
+        """Tear the voice session down cleanly. The ONE canonical end path.
+
+        Idempotent: a second call observes ENDED and returns immediately.
+        Concurrent calls piggy-back: the second caller awaits the first's
+        :attr:`_voice_ended` event and then returns.
+
+        Sequence:
+            1. Acquire lock; short-circuit if already ENDING/ENDED.
+            2. Transition → ENDING.
+            3. Broadcast ``voice_ending`` so the UI can show a transient state.
+            4. Best-effort send of the provider's ``graceful_shutdown_frames``
+               (Qwen: commit; Gemini: activityEnd; OpenAI: nothing).
+            5. Close the relay (cancels drain/keepalive, closes upstream WS).
+            6. Release the audio recorder and clear the provider.
+            7. Transition → ENDED; broadcast ``voice_ended``; set the event.
+
+        :param reason: One of ``user_stop``, ``agent_end``, ``client_disconnect``,
+            ``error``, ``shutdown`` — surfaced in the broadcast for telemetry.
+        """
+        # Fast path: no voice session ever started — nothing to tear down,
+        # no broadcasts, no state churn. Text-mode ``stop()`` calls land
+        # here and exit immediately.
+        if self._voice_state == VoiceLifecycle.IDLE:
+            return
+        # Already ended — second caller observes the terminal state.
+        if self._voice_state == VoiceLifecycle.ENDED:
+            return
+        # Piggy-back on an in-flight teardown without re-running it.
+        if self._voice_state == VoiceLifecycle.ENDING:
+            await self._voice_ended.wait()
+            return
+
+        async with self._voice_lock:
+            # Re-check under the lock.
+            if self._voice_state == VoiceLifecycle.ENDED:
+                return
+            if self._voice_state == VoiceLifecycle.ENDING:
+                # Released the lock to a concurrent caller mid-teardown;
+                # wait for it to finish outside the lock below.
+                pass
+            else:
+                self._voice_end_reason = reason
+                self._set_voice_state_unlocked(VoiceLifecycle.ENDING)
+
+        if self._voice_state != VoiceLifecycle.ENDING:
+            # Concurrent finalisation happened — just wait for it.
+            await self._voice_ended.wait()
+            return
+
+        await self._broadcast_voice_lifecycle("voice_ending", reason)
+
+        # 1. Best-effort graceful shutdown frames (provider-specific). The
+        #    relay does the actual send so it can pace through the provider's
+        #    normal write path. Bounded by _GRACEFUL_SHUTDOWN_TIMEOUT_S.
+        if self._voice_relay is not None and self._voice_provider is not None:
+            try:
+                frames = self._voice_provider.graceful_shutdown_frames()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "graceful_shutdown_frames raised for provider %s",
+                    self._voice_provider.provider_name,
+                )
+                frames = []
+            if frames:
+                try:
+                    await asyncio.wait_for(
+                        self._voice_relay.send_shutdown_frames(frames),
+                        timeout=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "graceful_shutdown_frames timed out after %.1fs for session %s",
+                        _GRACEFUL_SHUTDOWN_TIMEOUT_S, self._local_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "graceful_shutdown_frames send failed for session %s",
+                        self._local_id,
+                    )
+
+        # 2. Close the relay (cancels drain/keepalive, closes upstream WS).
+        try:
+            await self.stop_voice_relay()
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_voice_relay raised during end_voice")
+
+        # 3. Release the audio recorder.
+        if self._audio_recorder is not None:
+            try:
+                self._audio_recorder.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("audio recorder stop raised during end_voice")
+            self._audio_recorder = None
+
+        # 4. Release the provider handle. The session object itself stays;
+        #    callers that want the whole session gone follow up with
+        #    pool.stop_orchestrator().
+        self._voice_provider = None
+
+        async with self._voice_lock:
+            if self._voice_state == VoiceLifecycle.ENDING:
+                self._set_voice_state_unlocked(VoiceLifecycle.ENDED)
+        self._voice_ended.set()
+
+        await self._broadcast_voice_lifecycle("voice_ended", reason)
+
+    async def _broadcast_voice_lifecycle(self, event_type: str, reason: str) -> None:
+        """Push a ``voice_ending`` / ``voice_ended`` event to all subscribers.
+
+        Swallow errors: the lifecycle must not depend on the broadcast
+        succeeding (subscribers may already be gone if the trigger was
+        ``client_disconnect``).
+        """
+        pool = self._context.get("pool")
+        if pool is None:
+            return
+        try:
+            await pool.broadcast_orchestrator({
+                "type": event_type,
+                "reason": reason,
+                "session_id": self._local_id,
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "broadcast of %s failed for session %s",
+                event_type, self._local_id,
+            )
 
     async def send_voice_audio_in(self, pcm_b64: str) -> None:
         """Forward a frontend mic chunk upstream (WS providers only).
@@ -1374,18 +1647,25 @@ class OrchestratorSession:
         tokens_after = estimate_tokens(self._agent.history)
         return {"tokens_before": tokens_before, "tokens_after": tokens_after}
 
-    async def stop(self) -> None:
+    async def stop(self, reason: str = "shutdown") -> None:
         """Clean up the session.
 
         Cancels every in-flight background-agent turn (with SDK interrupts so
         the bundled ``claude`` subprocesses actually stop) and unsubscribes
         the wake callback so notifications fired during shutdown go nowhere.
 
+        Voice teardown is delegated to :meth:`end_voice` so the canonical
+        lifecycle path runs (graceful shutdown frames, broadcasts, state
+        machine). Idempotent — calling ``stop`` after ``end_voice`` is fine.
+
         Also kicks off a fire-and-forget history-summary refresh: the
         conversation just ended, so this is the cheapest moment to pay
         for the LLM call — by the time the user comes back to this
         session, the cache will be warm and ``voice_start`` won't have
         to block on summarisation.
+
+        :param reason: Forwarded to :meth:`end_voice` if voice is active.
+            Defaults to ``shutdown``; the pool override path uses ``user_stop``.
         """
         self._notifications.set_wake_callback(None)
         if self._runner is not None:
@@ -1393,10 +1673,14 @@ class OrchestratorSession:
                 await self._runner.cancel_all()
             except Exception:  # noqa: BLE001
                 logger.exception("BackgroundAgentRunner.cancel_all failed during stop")
-        try:
-            await self.stop_voice_relay()
-        except Exception:  # noqa: BLE001
-            logger.exception("stop_voice_relay failed during session stop")
+        # Funnel voice teardown through the canonical path so the state
+        # machine and broadcasts stay coherent. ``end_voice`` is idempotent
+        # and handles the no-voice case (state == IDLE) implicitly.
+        if self._voice:
+            try:
+                await self.end_voice(reason)
+            except Exception:  # noqa: BLE001
+                logger.exception("end_voice failed during session stop")
         # Spawn the cache-refresh as a detached task. We don't await
         # because the session is shutting down and the JSONL is already
         # written; the refresh just makes the next reopen faster.
@@ -1415,7 +1699,9 @@ class OrchestratorSession:
         self._injection_watchdog = None
         self._injection_active = False
         self._injection_until = 0.0
-        # Stop audio recorder
+        # Audio recorder + voice_provider were already released by end_voice
+        # for voice sessions; clear here for non-voice sessions too (no-op
+        # if end_voice already ran).
         if self._audio_recorder is not None:
             try:
                 self._audio_recorder.stop()
