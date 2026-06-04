@@ -73,6 +73,12 @@ class WebSocketManager {
         @Volatile var lastMessageAtNs: Long = 0L,
         var heartbeatSendJob: kotlinx.coroutines.Job? = null,
         var heartbeatMonitorJob: kotlinx.coroutines.Job? = null,
+        // DIAG: ms epoch when onOpen fired — used to log WS lifetime
+        // on close so we can correlate with server-side death.
+        @Volatile var connectedAtMs: Long = 0L,
+        // DIAG: voice_audio_in chunks sent on this WS — logged on close
+        // so we know how much audio was dropped if the WS died mid-call.
+        @Volatile var voiceAudioInSent: Long = 0L,
     )
 
     private val connections: Map<WebSocketEndpoint, Connection> = mapOf(
@@ -132,6 +138,8 @@ class WebSocketManager {
                 Log.d(TAG, "WebSocket connected ($endpoint)")
                 conn.state.value = ConnectionState.Connected
                 conn.lastMessageAtNs = System.nanoTime()
+                conn.connectedAtMs = System.currentTimeMillis()
+                conn.voiceAudioInSent = 0L
                 startHeartbeat(endpoint)
                 _events.tryEmit(endpoint to WebSocketEvent.Connected)
             }
@@ -156,18 +164,27 @@ class WebSocketManager {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closing ($endpoint): $code - $reason")
+                val ageMs = System.currentTimeMillis() - conn.connectedAtMs
+                val msSinceMsg = (System.nanoTime() - conn.lastMessageAtNs) / 1_000_000L
+                Log.w(TAG, "DIAG-CLOSE onClosing ($endpoint): code=$code reason='$reason' " +
+                    "ws_age_ms=$ageMs ms_since_last_recv=$msSinceMsg audio_sent=${conn.voiceAudioInSent}")
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closed ($endpoint): $code - $reason")
+                val ageMs = System.currentTimeMillis() - conn.connectedAtMs
+                Log.w(TAG, "DIAG-CLOSE onClosed ($endpoint): code=$code reason='$reason' " +
+                    "ws_age_ms=$ageMs audio_sent=${conn.voiceAudioInSent}")
                 stopHeartbeat(endpoint)
                 handleDisconnect(endpoint)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WebSocket failure ($endpoint): ${t.message}", t)
+                val ageMs = System.currentTimeMillis() - conn.connectedAtMs
+                Log.e(TAG, "DIAG-CLOSE onFailure ($endpoint): ws_age_ms=$ageMs " +
+                    "throwable_class=${t.javaClass.name} msg='${t.message}' " +
+                    "response_code=${response?.code} response_msg='${response?.message}' " +
+                    "audio_sent=${conn.voiceAudioInSent}", t)
                 stopHeartbeat(endpoint)
                 conn.state.value = ConnectionState.Error(t.message ?: "Connection failed")
                 _events.tryEmit(endpoint to WebSocketEvent.Error(t.message ?: "Connection failed"))
@@ -355,10 +372,13 @@ class WebSocketManager {
         // Don't log audio chunks — they fire ~50/s with ~4KB payloads
         // each, which floods logcat and causes UI freezes via the
         // logging subsystem alone.
+        val conn = connections.getValue(endpoint)
         if (message !is WebSocketMessage.VoiceAudioIn) {
             Log.d(TAG, "Sending ($endpoint): $jsonString")
+        } else {
+            conn.voiceAudioInSent++
         }
-        connections.getValue(endpoint).webSocket?.send(jsonString)
+        conn.webSocket?.send(jsonString)
     }
 
     @Suppress("UNCHECKED_CAST")
