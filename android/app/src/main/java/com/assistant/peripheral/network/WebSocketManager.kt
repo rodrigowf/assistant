@@ -280,6 +280,15 @@ class WebSocketManager {
             fun emit(ev: WebSocketEvent) { _events.tryEmit(endpoint to ev) }
 
             when (type) {
+                // Heartbeat — backend sends {"type":"ping"} every 15s to
+                // keep the A300M's WiFi radio awake long enough for okhttp
+                // to receive its WS PONG. We don't need to do anything
+                // with it; receiving the bytes already wakes the radio.
+                // Silently consume — don't emit, don't ack (the bytes
+                // themselves are the ack).
+                "ping" -> { /* no-op */ }
+                "pong" -> { /* no-op — reserved for future client→server ping */ }
+
                 // Session lifecycle
                 "session_started" -> {
                     val sessionId = json.optString("session_id", "")

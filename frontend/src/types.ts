@@ -98,7 +98,9 @@ export type ServerEvent =
   | { type: "voice_audio_out"; audio: string }
   | { type: "voice_ending"; reason?: string; session_id?: string }
   | { type: "voice_ended"; reason?: string; session_id?: string }
-  | { type: "voice_stopped" };
+  | { type: "voice_stopped" }
+  | { type: "ping" }
+  | { type: "pong" };
 
 // OpenAI Realtime API event types (subset used by voice integration)
 export interface RealtimeEvent {

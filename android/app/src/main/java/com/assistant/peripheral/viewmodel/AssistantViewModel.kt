@@ -19,6 +19,7 @@ import com.assistant.peripheral.network.DiscoveredServer
 import com.assistant.peripheral.network.LiveSession
 import com.assistant.peripheral.network.NetworkScanner
 import com.assistant.peripheral.network.WebSocketEndpoint
+import com.assistant.peripheral.voice.VoiceConfig
 import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
@@ -180,6 +181,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // Voice state
     private val _voiceState = MutableStateFlow<VoiceState>(VoiceState.Off)
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
+
+    /**
+     * The voice config in use for the *current* voice session, or null if
+     * voice isn't active. Captured at [startVoiceSession] time. We hold
+     * onto it so that an unplanned WS reconnect (e.g. keepalive ping
+     * timeout from the A300M's WiFi power-saving) can re-arm voice on
+     * the new WS with the same provider/model/voice instead of falling
+     * back to text mode and leaving the local mic loop pumping into a
+     * voiceless socket. Cleared in [finalizeVoiceStop].
+     */
+    private var activeVoiceConfig: VoiceConfig? = null
 
     /**
      * One-shot transient message for the UI to display as a toast/snackbar.
@@ -573,13 +585,36 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         // Also track the sdk session id so we can load history
                         orchBucket.pendingResumeSessionId.value = existing.sdkSessionId
                         _noActiveOrchestrator.value = false
-                        webSocketManager.send(
-                            WebSocketMessage.Start(
-                                localId = existing.localId,
-                                resumeSdkId = existing.sdkSessionId
-                            ),
-                            endpoint = WebSocketEndpoint.ORCHESTRATOR
-                        )
+
+                        // If voice was active when the WS dropped, re-arm
+                        // voice on the new WS instead of falling back to
+                        // text mode. Without this, the local mic capture
+                        // loop kept pushing chunks at a voiceless socket
+                        // and the user-facing session appeared frozen.
+                        val voiceCfg = activeVoiceConfig
+                        if (voiceCfg != null) {
+                            Log.i(TAG, "WS reconnect during live voice — re-arming via voice_start")
+                            webSocketManager.send(
+                                WebSocketMessage.VoiceStart(
+                                    localId = existing.localId,
+                                    resumeSdkId = existing.sdkSessionId,
+                                    voiceProvider = voiceCfg.provider,
+                                    voiceModel = voiceCfg.model,
+                                    voiceName = voiceCfg.voice,
+                                    voiceTranscriptionLanguage = voiceCfg.transcriptionLanguage,
+                                    voiceEndpoint = voiceCfg.endpoint.takeIf { it.isNotBlank() },
+                                ),
+                                endpoint = WebSocketEndpoint.ORCHESTRATOR
+                            )
+                        } else {
+                            webSocketManager.send(
+                                WebSocketMessage.Start(
+                                    localId = existing.localId,
+                                    resumeSdkId = existing.sdkSessionId
+                                ),
+                                endpoint = WebSocketEndpoint.ORCHESTRATOR
+                            )
+                        }
                     } else {
                         // No live orchestrator. Stay idle — UI will switch to History.
                         orchBucket.pendingResumeSessionId.value = null
@@ -1509,6 +1544,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // assistant_config.json (toggled from the web frontend).
             val cfg = apiClient!!.getVoiceConfig()
 
+            // Remember the config so a WS reconnect during this session
+            // can re-arm voice (see handleWebSocketEvent's Connected
+            // handler). Cleared in finalizeVoiceStop.
+            activeVoiceConfig = cfg
+
             // Send voice_start with the orchestrator bucket's local_id and the true
             // JSONL session id so the backend resumes from the correct history file.
             // The voice fields come from the backend config we just fetched —
@@ -1578,6 +1618,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private fun finalizeVoiceStop() {
         endingTimeoutJob?.cancel()
         endingTimeoutJob = null
+        activeVoiceConfig = null  // voice over → no resume on reconnect
         viewModelScope.launch {
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off

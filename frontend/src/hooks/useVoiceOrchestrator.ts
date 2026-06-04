@@ -490,6 +490,13 @@ export function useVoiceOrchestrator(
       vlog("recv", event.type, event.type === "voice_event" ? (event.event as RealtimeEvent).type : "");
     }
     switch (event.type) {
+      // Heartbeat from backend (every 15s) — keeps the connection
+      // warm against power-saving WiFi clients. No-op here; receiving
+      // the bytes is the entire purpose.
+      case "ping":
+      case "pong":
+        return;
+
       case "session_started": {
         optsRef.current.onSessionStarted?.(event.session_id);
         const info = event.voice_connection_info;

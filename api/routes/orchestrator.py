@@ -25,6 +25,7 @@ from pathlib import Path
 
 import orjson
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from api.pool import SessionPool
 from api.serializers import serialize_orchestrator_event
@@ -35,6 +36,71 @@ from orchestrator.session import OrchestratorSession
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["orchestrator"])
+
+# Server-side WS heartbeat interval. Sends a small ``{"type":"ping"}``
+# message down to the client every N seconds so that low-end Android
+# devices (notably the A300M with aggressive WiFi power-saving) keep
+# the radio awake long enough to receive okhttp's WS PONG before its
+# 30s ping timeout fires. Without this the orchestrator WS dies with
+# ``1011 keepalive ping timeout`` whenever there's no Gemini audio
+# flowing back to the client.
+#
+# 15s ≪ okhttp's 30s ping interval so the radio is reliably awake for
+# every protocol-level ping. Cheap on bandwidth (~2 bytes/s).
+_WS_HEARTBEAT_INTERVAL_S = 15.0
+
+
+async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
+    """Send to a client WS, swallowing the post-close race.
+
+    Starlette's ``send`` raises ``RuntimeError: Cannot call "send" once a
+    close message has been sent.`` when we try to write to a WS that
+    closed mid-handler — for us that's the orchestrator-WS handler still
+    in flight when okhttp closes the socket on the other end. The crash
+    bubbles up through the handler, aborts whatever response we were
+    building, and the route shows ``Orchestrator WS error`` in the log.
+
+    Returns True if the bytes were sent, False if the WS was already
+    closed (caller can stop trying).
+    """
+    if ws.client_state != WebSocketState.CONNECTED:
+        return False
+    try:
+        await ws.send_bytes(payload)
+        return True
+    except RuntimeError as e:
+        # The specific message Starlette raises when the WS is already
+        # closing/closed. Treat as a clean "client gone" — the disconnect
+        # branch will tear down voice via end_voice as usual.
+        if "close message has been sent" in str(e) or "after sending close" in str(e):
+            logger.debug("safe_send: WS already closed, dropping payload")
+            return False
+        raise
+    except Exception:
+        # Unknown error — log and drop. Don't crash the handler.
+        logger.warning("safe_send: unexpected error, dropping payload", exc_info=True)
+        return False
+
+
+async def _ws_heartbeat_task(ws: WebSocket) -> None:
+    """Push a tiny ping every _WS_HEARTBEAT_INTERVAL_S so okhttp's
+    pong-deadline never fires from radio sleep on power-saving Android.
+
+    Exits silently the moment the WS isn't connected anymore — the
+    finally block of the route handler will cancel us regardless.
+    """
+    ping_payload = orjson.dumps({"type": "ping"})
+    try:
+        while True:
+            await asyncio.sleep(_WS_HEARTBEAT_INTERVAL_S)
+            sent = await _safe_send_bytes(ws, ping_payload)
+            if not sent:
+                # WS gone — exit; the receive loop will see the disconnect.
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("WS heartbeat task crashed")
 
 
 @router.websocket("/api/orchestrator/chat")
@@ -48,18 +114,30 @@ async def orchestrator_ws(ws: WebSocket):
     # Register as a watcher so this ws receives agent_session_opened/closed events
     pool.watch(ws)
 
+    # App-level heartbeat — see _WS_HEARTBEAT_INTERVAL_S for rationale.
+    heartbeat = asyncio.create_task(
+        _ws_heartbeat_task(ws), name=f"ws-heartbeat-{id(ws)}",
+    )
+
     try:
         while True:
             raw = await ws.receive_text()
             try:
                 msg = orjson.loads(raw)
             except (orjson.JSONDecodeError, ValueError):
-                await ws.send_bytes(orjson.dumps({
+                await _safe_send_bytes(ws, orjson.dumps({
                     "type": "error", "error": "invalid_json",
                 }))
                 continue
 
             msg_type = msg.get("type", "")
+
+            # Client-initiated heartbeat / heartbeat-ack — neither side
+            # needs to do anything but consume them silently. Allows the
+            # client to optionally send its own pings (or echo ours back
+            # as a "pong"); we just ignore both.
+            if msg_type in ("ping", "pong"):
+                continue
 
             if msg_type == "start":
                 session, subscribed = await _handle_start(ws, pool, msg, voice=False)
@@ -69,7 +147,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "send":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -78,7 +156,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "send_audio":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -93,7 +171,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "set_model":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -102,7 +180,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "get_model":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -115,7 +193,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "voice_event":
                 if session is None or not session.is_voice:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_voice_session",
                         "detail": "No active voice session",
                     }))
@@ -166,7 +244,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "compact":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -206,10 +284,10 @@ async def orchestrator_ws(ws: WebSocket):
                 await pool.stop_orchestrator()
                 session = None
                 subscribed = False
-                await ws.send_bytes(orjson.dumps({"type": "session_stopped"}))
+                await _safe_send_bytes(ws, orjson.dumps({"type": "session_stopped"}))
 
             else:
-                await ws.send_bytes(orjson.dumps({
+                await _safe_send_bytes(ws, orjson.dumps({
                     "type": "error", "error": "unknown_type",
                     "detail": f"Unknown message type: {msg_type!r}",
                 }))
@@ -229,6 +307,13 @@ async def orchestrator_ws(ws: WebSocket):
         was_voice = bool(session is not None and getattr(session, "is_voice", False))
         logger.exception("Orchestrator WS error voice_active=%s", was_voice)
     finally:
+        # Cancel the heartbeat first so it doesn't try to send into a
+        # closing socket while we're tearing down.
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
         # On client WS disconnect: tear down the voice connection
@@ -301,7 +386,7 @@ async def _handle_start(
                 "Timed out waiting for prior orchestrator %s to finish stopping",
                 local_id,
             )
-            await ws.send_bytes(orjson.dumps({
+            await _safe_send_bytes(ws, orjson.dumps({
                 "type": "error", "error": "orchestrator_stopping",
                 "detail": (
                     "Previous voice session is still ending. Please retry."
@@ -358,7 +443,7 @@ async def _handle_start(
                     "restart_voice failed for session %s; falling back to fresh session",
                     local_id,
                 )
-                await ws.send_bytes(orjson.dumps({
+                await _safe_send_bytes(ws, orjson.dumps({
                     "type": "error", "error": "voice_restart_failed",
                     "detail": str(e),
                 }))
@@ -372,7 +457,7 @@ async def _handle_start(
                 "model_info": session.get_model_info(),
             }
             await _attach_voice_payload(reconnect_payload, session)
-            await ws.send_bytes(orjson.dumps(reconnect_payload))
+            await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
             logger.info(
                 "voice rearm complete session=%s — same orchestrator, fresh voice connection",
                 local_id,
@@ -389,7 +474,7 @@ async def _handle_start(
                 "model_info": session.get_model_info(),
             }
             await _attach_voice_payload(reconnect_payload, session)
-            await ws.send_bytes(orjson.dumps(reconnect_payload))
+            await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
             return session, True
         else:
             # Same mode — check if the client is asking for a different
@@ -409,7 +494,7 @@ async def _handle_start(
                 )
                 if drift:
                     if session.is_busy:
-                        await ws.send_bytes(orjson.dumps({
+                        await _safe_send_bytes(ws, orjson.dumps({
                             "type": "error",
                             "error": "voice_config_busy",
                             "detail": (
@@ -435,7 +520,7 @@ async def _handle_start(
                         "model_info": session.get_model_info(),
                     }
                     await _attach_voice_payload(reconnect_payload, session)
-                    await ws.send_bytes(orjson.dumps(reconnect_payload))
+                    await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
                     return session, True
             else:
                 pool.subscribe_orchestrator(local_id, ws)
@@ -445,12 +530,12 @@ async def _handle_start(
                     "voice": current_voice,
                     "model_info": session.get_model_info(),
                 }
-                await ws.send_bytes(orjson.dumps(reconnect_payload))
+                await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
                 return session, True
 
     # --- A different orchestrator is already active ---
     if pool.has_orchestrator():
-        await ws.send_bytes(orjson.dumps({
+        await _safe_send_bytes(ws, orjson.dumps({
             "type": "error", "error": "orchestrator_active",
             "detail": "An orchestrator session is already active. Stop it first.",
         }))
@@ -516,7 +601,7 @@ async def _handle_start(
         voice_endpoint=voice_endpoint_req,
     )
 
-    await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
+    await _safe_send_bytes(ws, orjson.dumps({"type": "status", "status": "connecting"}))
     # Timing instrumentation — when a wake-word call hits a cold orchestrator
     # session, the gap between voice_start and session_started can balloon
     # to 20+ seconds. The labelled millisecond breakdown below tells us
@@ -531,7 +616,7 @@ async def _handle_start(
         session_id = await session.start()
     except Exception as e:
         logger.exception("Orchestrator session start failed")
-        await ws.send_bytes(orjson.dumps({
+        await _safe_send_bytes(ws, orjson.dumps({
             "type": "error", "error": "start_failed", "detail": str(e),
         }))
         return None, False
@@ -603,7 +688,7 @@ async def _handle_start(
         )
 
     _t_send = time.monotonic()
-    await ws.send_bytes(orjson.dumps(started_payload))
+    await _safe_send_bytes(ws, orjson.dumps(started_payload))
     if voice:
         logger.info(
             "voice_start_timing local_id=%s step=ws.send_started dt_ms=%d payload_bytes=%d TOTAL_ms=%d",
@@ -941,7 +1026,7 @@ async def _handle_set_model(
 
 async def _handle_get_model(ws: WebSocket, session: OrchestratorSession) -> None:
     """Get the current model info."""
-    await ws.send_bytes(orjson.dumps({
+    await _safe_send_bytes(ws, orjson.dumps({
         "type": "model_info",
         "model_info": session.get_model_info(),
     }))
@@ -954,7 +1039,7 @@ async def _handle_get_models(ws: WebSocket) -> None:
     except Exception:
         logger.exception("Live model discovery failed; falling back to static")
         models = get_available_models()
-    await ws.send_bytes(orjson.dumps({
+    await _safe_send_bytes(ws, orjson.dumps({
         "type": "models_list",
         "models": [m.to_dict() for m in models],
     }))
