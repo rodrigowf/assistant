@@ -104,7 +104,7 @@ _VALID_VOICE_TRANSITIONS: dict[VoiceLifecycle, set[VoiceLifecycle]] = {
     VoiceLifecycle.STARTING: {VoiceLifecycle.ACTIVE, VoiceLifecycle.ENDING},
     VoiceLifecycle.ACTIVE: {VoiceLifecycle.ENDING},
     VoiceLifecycle.ENDING: {VoiceLifecycle.ENDED},
-    VoiceLifecycle.ENDED: set(),  # terminal
+    VoiceLifecycle.ENDED: set(),  # terminal — session is gone, fresh start required
 }
 
 # Best-effort timeout for the provider's graceful_shutdown_frames send.
@@ -557,7 +557,14 @@ class OrchestratorSession:
         conversation, not whatever snapshot was loaded at start(). The
         summarizer is also re-run here so the digest covers recent turns.
         """
-        if not self._voice or self._voice_provider is None:
+        # Capture a local reference so a concurrent end_voice() that
+        # nulls ``self._voice_provider`` mid-build doesn't crash us with
+        # an AttributeError on the next dereference. If we got past the
+        # initial check and have a provider in hand, the build can finish
+        # cleanly even if the session is being torn down — the result is
+        # discarded by the caller in that case.
+        provider = self._voice_provider
+        if not self._voice or provider is None:
             return None
 
         from orchestrator.prompt import build_system_prompt
@@ -569,10 +576,10 @@ class OrchestratorSession:
             self._context,
             recent_messages=recent_messages,
             history_summary=history_summary,
-            voice_provider_id=self._voice_provider.provider_name,
+            voice_provider_id=provider.provider_name,
         )
         tools = registry.get_openai_definitions()
-        return self._voice_provider.get_session_update_payload(system, tools)
+        return provider.get_session_update_payload(system, tools)
 
     async def _build_history_for_prompt(
         self,
@@ -918,9 +925,8 @@ class OrchestratorSession:
                 logger.exception("audio recorder stop raised during end_voice")
             self._audio_recorder = None
 
-        # 4. Release the provider handle. The session object itself stays;
-        #    callers that want the whole session gone follow up with
-        #    pool.stop_orchestrator().
+        # 4. Release the provider handle. The session object itself stays
+        #    until the caller explicitly drops it via pool.stop_orchestrator.
         self._voice_provider = None
 
         async with self._voice_lock:
@@ -1111,13 +1117,19 @@ class OrchestratorSession:
         Transcript events (TextDelta, TextComplete) and interruptions
         (VoiceInterrupted) are persisted to JSONL here.
         """
-        if not self._voice or self._voice_provider is None:
+        # Capture a local reference: end_voice() may null
+        # ``self._voice_provider`` while this method is mid-await (the
+        # agent's end_voice_session tool produces exactly this race —
+        # the tool result arrives via the relay drain loop AFTER
+        # end_voice has run).
+        provider = self._voice_provider
+        if not self._voice or provider is None:
             return []
 
         commands: list[dict[str, Any]] = []
 
         if inject:
-            await self._voice_provider.inject_event(event)
+            await provider.inject_event(event)
 
         event_type = event.get("type", "")
 
@@ -1128,7 +1140,7 @@ class OrchestratorSession:
         # turn-complete / interruption signals under ``serverContent``.
         # Translate to the same persistence behaviour the OpenAI / Qwen
         # branches below provide.
-        if not event_type and self._voice_provider.provider_name == "google":
+        if not event_type and provider.provider_name == "google":
             sc = event.get("serverContent") or {}
             input_t = sc.get("inputTranscription") if isinstance(sc, dict) else None
             output_t = sc.get("outputTranscription") if isinstance(sc, dict) else None
@@ -1224,7 +1236,14 @@ class OrchestratorSession:
                         "source": "voice",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
-                    commands.extend(self._voice_provider.format_tool_result(call_id, result))
+                    # Background tool-execution tasks can land here after
+                    # end_voice() has already nulled the provider (the
+                    # agent's own end_voice_session tool produces exactly
+                    # this race). Skip the format step silently — the
+                    # frontend has nothing to display either way.
+                    provider = self._voice_provider
+                    if provider is not None:
+                        commands.extend(provider.format_tool_result(call_id, result))
 
             return commands
 
@@ -1286,14 +1305,14 @@ class OrchestratorSession:
             name = event.get("name", "")
 
             # Get name from pending_calls if not in event
-            if not name and call_id in self._voice_provider.pending_calls:
-                name = self._voice_provider.pending_calls[call_id]
+            if not name and call_id in provider.pending_calls:
+                name = provider.pending_calls[call_id]
 
             # Prefer accumulated streaming args over the done event's arguments field
             # (OpenAI may send an empty/missing arguments in the done event when
             # the args were streamed incrementally via delta events)
             args_str = (
-                self._voice_provider._pending_args.get(call_id)
+                provider._pending_args.get(call_id)
                 or event.get("arguments", "")
                 or "{}"
             )
@@ -1323,8 +1342,13 @@ class OrchestratorSession:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
                 # Provider-specific command sequence to ship the result back
-                # and ask for the next response.
-                commands.extend(self._voice_provider.format_tool_result(call_id, result))
+                # and ask for the next response. Re-fetch provider in case
+                # the registered tool itself ended the voice session (e.g.
+                # end_voice_session) — the captured local would still be
+                # valid object-wise, but we'd be acting on a dead provider.
+                current_provider = self._voice_provider
+                if current_provider is not None:
+                    commands.extend(current_provider.format_tool_result(call_id, result))
 
         # Assistant transcript complete — STAGE it; we only persist if the
         # turn ended in status="completed" (response.done below). Otherwise
