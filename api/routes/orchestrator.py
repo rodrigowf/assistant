@@ -123,12 +123,18 @@ async def orchestrator_ws(ws: WebSocket):
                 await _handle_voice_event(pool, session, msg.get("event", {}))
 
             elif msg_type == "voice_audio_in":
-                # WS-provider mic chunk from the browser → forward upstream.
+                # WS-provider mic chunk → forward upstream.
+                # Drop silently if no voice session is set up on this WS.
+                # Why: when Android's WS reconnects mid-call, the local
+                # mic-capture loop keeps running and starts pushing chunks
+                # on the new WS before our voice_start has been processed.
+                # The previous "error: not_voice_session" reply per chunk
+                # caused an error storm in both directions (Android logged:
+                # 28x error events before the start reply landed on a
+                # single reconnect). Mic frames are inherently
+                # disposable — silently dropping them while we're not
+                # voice-ready is the right behaviour.
                 if session is None or not session.is_voice:
-                    await ws.send_bytes(orjson.dumps({
-                        "type": "error", "error": "not_voice_session",
-                        "detail": "No active voice session",
-                    }))
                     continue
                 audio_b64 = msg.get("audio", "")
                 if audio_b64:
