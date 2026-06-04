@@ -723,10 +723,28 @@ async def _attach_voice_payload(
                 "conversation.item.input_audio_transcription.completed",
             })
 
+            # Frontend-irrelevant events that should never be mirrored.
+            # Gemini Live emits a fresh ``sessionResumptionUpdate`` every
+            # ~0.5s during an active session (one observed: 1000+ in a
+            # 9-minute call). The handle is purely backend state for
+            # reconnect — the provider's on_inbound_event already
+            # captures it. Mirroring them just clogs the orchestrator WS
+            # and the Android event-dispatch pipeline, which on the A300M
+            # is enough to make the conversation feel sluggish.
+            def _is_frontend_irrelevant(ev: dict) -> bool:
+                # Gemini shape: no top-level "type", payload under a
+                # camelCase root key.
+                if not ev.get("type"):
+                    if "sessionResumptionUpdate" in ev:
+                        return True
+                return False
+
             async def _on_event_for_frontend(event: dict) -> None:
                 # Mirror provider events to the frontend so the UI can
                 # reflect transcripts, status, etc.
-                if not (
+                if _is_frontend_irrelevant(event):
+                    pass  # skip the broadcast — still flows to backend logic below
+                elif not (
                     session.is_injecting
                     and event.get("type") in _INJECTION_SUPPRESSED_TYPES
                 ):
