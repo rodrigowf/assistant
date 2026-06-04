@@ -564,4 +564,21 @@ sealed class VoiceEvent {
      * don't confuse the user.
      */
     data class RoutingFallback(val message: String) : VoiceEvent()
+
+    /**
+     * Heads-up that the upstream voice provider is about to cycle the
+     * connection (Gemini Live's goAway frame, fired ~30-60s before the
+     * actual cutover). [timeLeftSeconds] is the upstream-supplied
+     * countdown (may be null if not present).
+     *
+     * UX: brief beep + yellow banner ("Pausing for a second to reconnect…").
+     */
+    data class ReconnectWarning(val timeLeftSeconds: Int?) : VoiceEvent()
+
+    /**
+     * The relay is actively cutting over to a new upstream WS. Mic
+     * audio is being dropped during this window. Cleared by the next
+     * [SessionCreated]-style ready signal (state flips back to Active).
+     */
+    object Reconnecting : VoiceEvent()
 }

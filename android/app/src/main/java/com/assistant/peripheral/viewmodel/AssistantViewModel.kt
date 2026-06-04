@@ -2,7 +2,10 @@ package com.assistant.peripheral.viewmodel
 
 import android.app.Application
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTrack
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
@@ -191,6 +194,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         _toastMessage.value = null
     }
 
+    /**
+     * Transient banner for the voice reconnect lifecycle. null = no
+     * banner. Set by [VoiceEvent.ReconnectWarning] (early heads-up
+     * from Gemini's goAway) and [VoiceEvent.Reconnecting] (relay is
+     * actively cycling). Cleared when [VoiceState] flips back to
+     * Active after the new upstream's setupComplete arrives.
+     */
+    private val _voiceReconnectBanner = MutableStateFlow<String?>(null)
+    val voiceReconnectBanner: StateFlow<String?> = _voiceReconnectBanner.asStateFlow()
+
     // Muted state for voice
     private val _isMuted = MutableStateFlow(false)
     val isMuted: StateFlow<Boolean> = _isMuted.asStateFlow()
@@ -369,6 +382,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             viewModelScope.launch {
                 vm.state.collect { state ->
                     _voiceState.value = state
+                    // Clear the reconnect banner once we're back in Active —
+                    // setupComplete on the new upstream re-fires
+                    // voice_status:ready which flips state here.
+                    if (state == VoiceState.Active && _voiceReconnectBanner.value != null) {
+                        _voiceReconnectBanner.value = null
+                    }
                 }
             }
 
@@ -453,9 +472,25 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 Log.w(TAG, "Routing fallback: ${event.message}")
                 _toastMessage.value = event.message
             }
+            is VoiceEvent.ReconnectWarning -> {
+                // Upstream goAway — fired ~30-60s before the actual cut.
+                // Light banner + a soft beep so the user can pause speech.
+                val secs = event.timeLeftSeconds
+                _voiceReconnectBanner.value = if (secs != null) {
+                    "Pausing in ~${secs}s to reconnect…"
+                } else {
+                    "Reconnecting shortly…"
+                }
+                playReconnectBeep()
+            }
+            is VoiceEvent.Reconnecting -> {
+                // Active cutover — mic chunks are being dropped right now.
+                _voiceReconnectBanner.value = "Pausing for a second to reconnect…"
+            }
             is VoiceEvent.SessionEnded -> {
                 _voiceState.value = VoiceState.Off
                 _isMuted.value = false
+                _voiceReconnectBanner.value = null
             }
             is VoiceEvent.SessionCreated -> {
                 Log.d(TAG, "Voice session created")
@@ -1884,6 +1919,61 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val next = cfg.enabledMcps.toMutableList()
         if (next.contains(name)) next.remove(name) else next.add(name)
         updateSystemConfig(ConfigPatch(enabledMcps = next))
+    }
+
+    /**
+     * Play a short tone (~150ms 880Hz sine) on the notification stream
+     * so the user gets an audible cue that a voice reconnect is about
+     * to happen. Notification stream so it slips past the mic-ducking
+     * gain (which only affects the voice plane) and is audible even on
+     * the speaker route during a call.
+     *
+     * Fire-and-forget — we don't block the caller. If audio init fails
+     * (very old device, unusual route, etc.) we just log and continue;
+     * the banner still appears.
+     */
+    private fun playReconnectBeep() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val sr = 22050
+                val durationMs = 150
+                val frames = sr * durationMs / 1000
+                val pcm = ShortArray(frames)
+                val freq = 880.0
+                val twoPiF = 2.0 * Math.PI * freq
+                // Fade in/out 20ms each to avoid clicks.
+                val fadeFrames = sr * 20 / 1000
+                for (i in 0 until frames) {
+                    val env = when {
+                        i < fadeFrames -> i.toDouble() / fadeFrames
+                        i > frames - fadeFrames -> (frames - i).toDouble() / fadeFrames
+                        else -> 1.0
+                    }
+                    // ~30% amplitude — clearly audible, not jarring.
+                    val sample = (Math.sin(twoPiF * i / sr) * env * 0.30 * Short.MAX_VALUE).toInt()
+                    pcm[i] = sample.toShort()
+                }
+                val bufSize = AudioTrack.getMinBufferSize(
+                    sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                ).coerceAtLeast(frames * 2)
+                val track = AudioTrack(
+                    AudioManager.STREAM_NOTIFICATION,
+                    sr,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufSize,
+                    AudioTrack.MODE_STATIC,
+                )
+                track.write(pcm, 0, frames)
+                track.play()
+                // Block this IO coroutine until the tone finishes, then release.
+                kotlinx.coroutines.delay(durationMs.toLong() + 50)
+                try { track.stop() } catch (_: Exception) {}
+                track.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "playReconnectBeep failed: ${e.message}")
+            }
+        }
     }
 
     override fun onCleared() {

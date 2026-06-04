@@ -949,6 +949,18 @@ class VoiceRelay:
                 # of waiting for Gemini's punitive 1008 "policy violation"
                 # force-close (which the drain would catch as an error).
                 if self._provider.should_close_after_event(event) and self._ws is not None:
+                    # Heads-up to the frontend BEFORE we close: Gemini's
+                    # goAway carries a ``timeLeft`` (~30-60s warning).
+                    # The Android UI uses this to flash a banner + beep
+                    # so the user knows a brief drop is coming.
+                    go_away = event.get("goAway") if isinstance(event, dict) else None
+                    time_left = go_away.get("timeLeft") if isinstance(go_away, dict) else None
+                    await self._on_event_for_frontend({
+                        "type": "voice_status",
+                        "status": "reconnect_warning",
+                        "time_left": time_left,
+                    })
+                    self._slog(f"reconnect_warning broadcast (time_left={time_left})")
                     self._slog("provider requested upstream close; closing 1000 to trigger reconnect")
                     logger.info(
                         "voice_relay provider-requested close session_id=%s",
@@ -1145,12 +1157,14 @@ class VoiceRelay:
         # Re-close the handshake gate so the new upstream gets a fresh
         # setup → setupComplete round trip before audio/events resume.
         self._handshake_complete.clear()
-        # Mirror "preparing" to the frontend on reconnect too so the UI
-        # accurately reflects the upstream WS state during recovery.
+        # Tell the frontend we're cutting over right now. Distinct from
+        # ``preparing`` (initial connect) so the Android UI can show the
+        # mid-call "pausing for a second to reconnect" banner instead
+        # of the initial "preparing" spinner.
         try:
             await self._on_event_for_frontend({
                 "type": "voice_status",
-                "status": "preparing",
+                "status": "reconnecting",
             })
         except Exception:  # noqa: BLE001
             pass

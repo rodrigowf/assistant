@@ -432,6 +432,26 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         }
 
         if (isVoiceActive) {
+            val reconnectBanner by viewModel.voiceReconnectBanner.collectAsState()
+            reconnectBanner?.let { msg ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                ) {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        contentAlignment = androidx.compose.ui.Alignment.Center,
+                    ) {
+                        Text(
+                            text = msg,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                    }
+                }
+            }
             VoiceControls(
                 voiceState = voiceState,
                 isMuted = isMuted,

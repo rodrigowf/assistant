@@ -489,6 +489,20 @@ abstract class WebSocketPcmProvider(
             when (event["status"] as? String) {
                 "preparing" -> setState(VoiceState.Connecting)
                 "ready" -> setState(VoiceState.Active)
+                "reconnect_warning" -> {
+                    // Gemini goAway. timeLeft is a Number (Int|Double|Long)
+                    // depending on JSON parser; coerce to Int.
+                    val tl = when (val v = event["time_left"]) {
+                        is Number -> v.toInt()
+                        else -> null
+                    }
+                    Log.i(tag, "Reconnect warning (timeLeft=${tl}s)")
+                    _events.tryEmit(VoiceEvent.ReconnectWarning(tl))
+                }
+                "reconnecting" -> {
+                    Log.i(tag, "Reconnecting (upstream cycling)")
+                    _events.tryEmit(VoiceEvent.Reconnecting)
+                }
             }
             return
         }
