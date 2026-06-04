@@ -149,6 +149,15 @@ class VoiceVAD:
         self._carry_input_pcm = b""
         self._bytes_consumed = 0
 
+        # Per-window probability sampling for VOICE_DEBUG_VAD=1.
+        # Logs one line per ~1s with min/max/mean over the window
+        # batch so we can see whether Silero is even seeing speech-like
+        # input (vs. flat silence/noise) without spamming the log with
+        # 31 lines/sec. Initialised in feed_pcm16.
+        self._debug_window_probs: list[float] = []
+        self._debug_last_emit_at = 0
+        self._debug_enabled = os.environ.get("VOICE_DEBUG_VAD") == "1"
+
         # Cheap log so we can confirm initialisation in the per-session
         # voice log.
         logger.info(
@@ -231,6 +240,21 @@ class VoiceVAD:
             # of consumed_this_call.
             window_bytes = consumed_this_call // n_windows if n_windows else 0
             self._bytes_consumed += window_bytes
+
+            # Diagnostic sampling. Emit one summary line per ~32 windows
+            # (~1s of audio at 32ms/window). Min/max/mean tells us
+            # immediately if Silero sees only flat values (~all 0 = pure
+            # silence to the model; mid-range = noise; > threshold_on = speech).
+            if self._debug_enabled:
+                self._debug_window_probs.append(prob)
+                if len(self._debug_window_probs) >= 31:  # ~1s
+                    ps = self._debug_window_probs
+                    logger.info(
+                        "VAD_PROBE n=%d min=%.3f mean=%.3f max=%.3f thr_on=%.2f thr_off=%.2f speech=%s",
+                        len(ps), min(ps), sum(ps) / len(ps), max(ps),
+                        self._threshold_on, self._threshold_off, self._is_speech,
+                    )
+                    self._debug_window_probs = []
 
             event = self._update_state(prob)
             if event is not None:

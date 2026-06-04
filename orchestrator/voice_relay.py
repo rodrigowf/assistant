@@ -200,6 +200,15 @@ class VoiceRelay:
         # Used by the safety-commit watchdog.
         self._manual_vad_speech_started_at: float | None = None
 
+        # ``VOICE_DEBUG_DUMP_MIC=1`` — write every received mic byte to
+        # ``logs/voice/<ts>_<sid>.mic.wav`` (16-bit PCM, mono, at the
+        # provider's declared audio_in_sample_rate). Lets us listen to
+        # what Silero is actually receiving when the manual-VAD path
+        # silently fails to detect speech.
+        self._mic_dump_path: Path | None = None
+        self._mic_dump_file = None  # type: ignore[assignment]
+        self._mic_dump_bytes: int = 0
+
     @property
     def is_running(self) -> bool:
         return self._drain_task is not None and not self._drain_task.done()
@@ -247,12 +256,87 @@ class VoiceRelay:
             pass
 
     def _close_session_log(self) -> None:
+        # Finalise the mic WAV (if open) before closing the text log
+        # so its "mic dump closed" line lands in the same session log.
+        self._close_mic_dump()
         if self._log_file is not None:
             try:
                 self._log_file.close()
             except Exception:  # noqa: BLE001
                 pass
             self._log_file = None
+
+    def _open_mic_dump(self, sample_rate: int) -> None:
+        """Open ``logs/voice/<ts>_<sid>.mic.wav`` for raw mic capture.
+
+        Opt-in via ``VOICE_DEBUG_DUMP_MIC=1``. Writes a placeholder WAV
+        header now (we'll patch the byte count in ``_close_mic_dump``
+        once we know the total). Mono, 16-bit PCM, sample rate from
+        the provider.
+        """
+        if os.environ.get("VOICE_DEBUG_DUMP_MIC") != "1":
+            return
+        if self._log_file_path is None:
+            return
+        try:
+            self._mic_dump_path = self._log_file_path.with_suffix(".mic.wav")
+            self._mic_dump_file = open(self._mic_dump_path, "wb")
+            # 44-byte RIFF/WAVE header; fmt = PCM16 mono. Sizes are
+            # placeholders — patched on close.
+            self._mic_dump_file.write(self._wav_header(
+                sample_rate=sample_rate, num_channels=1, bits_per_sample=16,
+                data_size=0,
+            ))
+            self._mic_dump_bytes = 0
+            self._slog(f"mic dump open: {self._mic_dump_path.name} sr={sample_rate}Hz")
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to open mic dump file")
+            self._mic_dump_file = None
+
+    @staticmethod
+    def _wav_header(sample_rate: int, num_channels: int, bits_per_sample: int, data_size: int) -> bytes:
+        import struct
+        byte_rate = sample_rate * num_channels * bits_per_sample // 8
+        block_align = num_channels * bits_per_sample // 8
+        return (
+            b"RIFF"
+            + struct.pack("<I", 36 + data_size)
+            + b"WAVE"
+            + b"fmt "
+            + struct.pack("<IHHIIHH", 16, 1, num_channels, sample_rate, byte_rate, block_align, bits_per_sample)
+            + b"data"
+            + struct.pack("<I", data_size)
+        )
+
+    def _write_mic_dump(self, pcm: bytes) -> None:
+        if self._mic_dump_file is None:
+            return
+        try:
+            self._mic_dump_file.write(pcm)
+            self._mic_dump_bytes += len(pcm)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close_mic_dump(self) -> None:
+        """Patch the WAV header with the real data size and close."""
+        if self._mic_dump_file is None:
+            return
+        try:
+            sr = getattr(self._provider, "audio_in_sample_rate", 16000) or 16000
+            self._mic_dump_file.seek(0)
+            self._mic_dump_file.write(self._wav_header(
+                sample_rate=sr, num_channels=1, bits_per_sample=16,
+                data_size=self._mic_dump_bytes,
+            ))
+            self._mic_dump_file.close()
+            self._slog(
+                f"mic dump closed: {self._mic_dump_bytes}B "
+                f"(~{self._mic_dump_bytes / (sr * 2):.1f}s)"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to finalise mic dump")
+        finally:
+            self._mic_dump_file = None
 
     async def start(self, session_config: dict[str, Any]) -> None:
         """Open the upstream WS and seed it with ``session.update``.
@@ -315,6 +399,13 @@ class VoiceRelay:
             except Exception:  # noqa: BLE001
                 logger.exception("manual_vad init failed; falling back to server VAD")
                 self._manual_vad = None
+
+        # Optional raw-mic capture (VOICE_DEBUG_DUMP_MIC=1). Independent
+        # of manual VAD so it works even when server VAD is in use; the
+        # captured WAV lets us listen to exactly what the relay (and
+        # Silero, if active) is receiving.
+        if in_sr is not None:
+            self._open_mic_dump(in_sr)
 
         # Keepalive task — only if the provider opts in via
         # build_keepalive_chunk() returning a non-None chunk.  Qwen-Omni
@@ -538,6 +629,14 @@ class VoiceRelay:
         except Exception as e:  # noqa: BLE001
             self._slog(f"WARN audio_in dropped (upstream closed): err={e}")
             return
+
+        # Mirror to the WAV dump (cheap, infrequent decode — only when
+        # VOICE_DEBUG_DUMP_MIC=1 opened the file).
+        if self._mic_dump_file is not None:
+            try:
+                self._write_mic_dump(base64.b64decode(pcm_b64))
+            except Exception:  # noqa: BLE001
+                pass
 
         # Manual-VAD path: feed the same chunk to our local VAD and
         # commit + response.create when the user stops speaking. We do

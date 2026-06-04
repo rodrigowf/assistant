@@ -861,6 +861,13 @@ abstract class WebSocketPcmProvider(
         captureJob = scope.launch {
             val chunkBytes = MIC_CHUNK_FRAMES * 2  // 16-bit samples
             val buf = ByteArray(chunkBytes)
+            // Per-second RMS probe: accumulate over ~50 chunks (1s at 20ms each)
+            // then emit one line. Lets us see ground-truth mic amplitude
+            // without spamming the log. Pre-gain so it reflects the raw
+            // signal from AudioRecord, not what ducking did to it.
+            var probeRmsAccum = 0.0
+            var probeChunks = 0
+            var probePeak = 0
             while (isActive && running.get()) {
                 val read = record.read(buf, 0, chunkBytes)
                 if (read <= 0) {
@@ -884,6 +891,20 @@ abstract class WebSocketPcmProvider(
                     }
                 }
 
+                // Pre-gain RMS probe. We compute over the raw bytes so
+                // duck attenuation doesn't distort the diagnostic.
+                val chunkStats = computeRmsAndPeakPcm16(buf, 0, read)
+                probeRmsAccum += chunkStats.first
+                probePeak = maxOf(probePeak, chunkStats.second)
+                probeChunks++
+                if (probeChunks >= 50) {
+                    val avgRms = probeRmsAccum / probeChunks
+                    Log.i(tag, "[MIC_PROBE] rms_avg=${avgRms.toInt()} peak=$probePeak gain=$micGainLevel ducking=${agentSpeaking}")
+                    probeRmsAccum = 0.0
+                    probeChunks = 0
+                    probePeak = 0
+                }
+
                 val gain = micGainLevel
                 if (gain != 1.0f) applyGainPcm16(buf, 0, read, gain)
 
@@ -896,6 +917,29 @@ abstract class WebSocketPcmProvider(
             }
             Log.d(tag, "Mic capture loop exited")
         }
+    }
+
+    /** Returns (rms, peak) of a PCM16 little-endian buffer slice.
+     *  RMS is the diagnostic for "is there signal here at all"; peak
+     *  catches transients that average away. Both in raw int16 units. */
+    private fun computeRmsAndPeakPcm16(buf: ByteArray, offset: Int, length: Int): Pair<Double, Int> {
+        var i = offset
+        val end = offset + length
+        var sumSq = 0.0
+        var peak = 0
+        var n = 0
+        while (i < end - 1) {
+            val lo = buf[i].toInt() and 0xff
+            val hi = buf[i + 1].toInt()
+            val sample = ((hi shl 8) or lo).toShort().toInt()
+            sumSq += (sample * sample).toDouble()
+            val abs = if (sample < 0) -sample else sample
+            if (abs > peak) peak = abs
+            n++
+            i += 2
+        }
+        val rms = if (n > 0) kotlin.math.sqrt(sumSq / n) else 0.0
+        return Pair(rms, peak)
     }
 
     private fun applyGainPcm16(buf: ByteArray, offset: Int, length: Int, gain: Float) {
