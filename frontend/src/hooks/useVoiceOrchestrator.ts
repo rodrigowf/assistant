@@ -726,15 +726,16 @@ export function useVoiceOrchestrator(
   ]);
 
   const stopVoice = useCallback(() => {
-    // Tell the backend we want to stop, then wait for the voice_ended
-    // ack before flipping to Off. Show "Ending..." in the meantime so
-    // the user gets feedback that the request is in flight. A safety
-    // timeout flips to Off after 5s in case the ack never arrives
-    // (server crash, dropped WS). The previous design flipped to Off
-    // immediately and ran local cleanup, which masked backend hangs and
-    // caused "frontend shows ended but backend still running" desync.
+    // Tell the backend to end ONLY the voice connection (keeping the
+    // orchestrator session alive in the pool for re-arm), then wait
+    // for the voice_ended ack before flipping to Off. Show "Ending..."
+    // in the meantime so the user gets feedback that the request is in
+    // flight. A safety timeout flips to Off after 5s in case the ack
+    // never arrives (server crash, dropped WS). The previous design
+    // sent {type:"stop"} which dropped the entire session — wrong: the
+    // tab should survive, voice is one mode of interacting with it.
     if (wsRef.current) {
-      wsRef.current.send({ type: "stop" });
+      wsRef.current.send({ type: "voice_stop" });
     } else {
       // No socket → nothing to await. Tear down locally.
       cleanup();

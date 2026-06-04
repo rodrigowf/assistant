@@ -178,18 +178,31 @@ async def orchestrator_ws(ws: WebSocket):
                     await session.interrupt()
                     await pool.broadcast_orchestrator({"type": "status", "status": "interrupted"})
 
-            elif msg_type == "stop":
-                # For voice sessions, drive the canonical teardown path
-                # so the graceful shutdown frames fire and the
-                # voice_ending/voice_ended broadcasts go out with the
-                # right reason. The follow-up pool.stop_orchestrator
-                # call is the no-op idempotent path (end_voice already
-                # ran inside session.stop).
+            elif msg_type == "voice_stop":
+                # End ONLY the voice connection — keep the orchestrator
+                # session alive in the pool so the user can re-arm voice
+                # later with the wake word (the tab survives). The
+                # session.stop() / end_voice path closes the upstream
+                # WS and releases the audio recorder; nothing leaks.
                 if session is not None and session.is_voice:
                     try:
                         await session.end_voice("user_stop")
                     except Exception:  # noqa: BLE001
-                        logger.exception("end_voice failed during user stop")
+                        logger.exception("end_voice failed during voice_stop")
+                # No session_stopped ack here — the voice_ended broadcast
+                # that end_voice fires is the ack the frontend waits for.
+
+            elif msg_type == "stop":
+                # Stop the orchestrator session entirely (close the tab).
+                # For voice sessions, also tear down the voice connection
+                # on the way out so the graceful shutdown frames fire
+                # and tokens stop accruing immediately. The follow-up
+                # pool.stop_orchestrator drops the session from the pool.
+                if session is not None and session.is_voice:
+                    try:
+                        await session.end_voice("user_stop")
+                    except Exception:  # noqa: BLE001
+                        logger.exception("end_voice failed during stop")
                 await pool.stop_orchestrator()
                 session = None
                 subscribed = False
@@ -218,34 +231,27 @@ async def orchestrator_ws(ws: WebSocket):
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
-        # Text mode: the orchestrator session keeps running headlessly
-        # until explicitly stopped — background-agent work survives a
-        # browser-tab close.
+        # On client WS disconnect: tear down the voice connection
+        # (relay, upstream WS to Gemini/Qwen, audio recorder, provider
+        # handle) so we don't keep burning provider tokens with no
+        # client listening — but KEEP the OrchestratorSession alive in
+        # the pool. The tab survives like text mode does, and a
+        # subsequent ``voice_start`` re-arms voice on this same session
+        # via ``restart_voice`` (same JSONL, same agent context, no
+        # resume dance).
         #
-        # Voice mode: the session is fully torn down. An open upstream
-        # WS to Gemini / Qwen burns tokens continuously with no client
-        # listening; worse, leaving the session in the pool means the
-        # next ``voice_start`` for the same ``local_id`` reconnects
-        # into a half-dead husk (the "frozen on restart" bug). Funnel
-        # through ``end_voice`` so the lifecycle state machine, the
-        # graceful shutdown frames, and the voice_ending/voice_ended
-        # broadcasts all run; then drop the session from the pool so a
-        # subsequent ``voice_start`` creates a fresh one.
+        # ``end_voice`` is idempotent and handles non-voice sessions as
+        # a fast no-op, so calling it unconditionally here is safe.
         if was_voice and session is not None:
             try:
                 await session.end_voice("client_disconnect")
                 logger.info(
-                    "Voice session ended on client disconnect session=%s",
+                    "Voice connection ended on client disconnect session=%s "
+                    "(orchestrator session kept in pool for re-arm)",
                     getattr(session, "local_id", "?"),
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("end_voice on disconnect failed")
-            try:
-                await pool.stop_orchestrator()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "pool.stop_orchestrator on voice-mode disconnect failed",
-                )
 
 
 async def _handle_start(
@@ -329,9 +335,49 @@ async def _handle_start(
         if skip_reconnect:
             pass  # fall through to "Start a new session" below
         elif voice and not current_voice:
-            # Text→voice transition: stop text session, fall through to create voice
-            await pool.stop_orchestrator()
-            await pool.await_orchestrator_stop(local_id, timeout=5.0)
+            # Text-mode session + voice_start = re-arm voice on the SAME
+            # OrchestratorSession instead of dropping and recreating it.
+            # This is the canonical "wake word after end_voice_session"
+            # path: the tab is the same conversation (same JSONL, same
+            # agent state, same background work); only the voice
+            # connection is being reconstructed.
+            #
+            # Equivalent to a fresh voice_start in every observable way
+            # (session_started payload, voice_session_update, relay
+            # boot) except the JSONL is the existing one.
+            try:
+                await session.restart_voice(
+                    voice_provider=voice_provider_req,
+                    voice_model=voice_model_req,
+                    voice_name=voice_name_req,
+                    voice_transcription_language=voice_lang_req,
+                    voice_endpoint=voice_endpoint_req,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception(
+                    "restart_voice failed for session %s; falling back to fresh session",
+                    local_id,
+                )
+                await ws.send_bytes(orjson.dumps({
+                    "type": "error", "error": "voice_restart_failed",
+                    "detail": str(e),
+                }))
+                return None, False
+
+            pool.subscribe_orchestrator(local_id, ws)
+            reconnect_payload: dict = {
+                "type": "session_started",
+                "session_id": local_id,
+                "voice": True,
+                "model_info": session.get_model_info(),
+            }
+            await _attach_voice_payload(reconnect_payload, session)
+            await ws.send_bytes(orjson.dumps(reconnect_payload))
+            logger.info(
+                "voice rearm complete session=%s — same orchestrator, fresh voice connection",
+                local_id,
+            )
+            return session, True
         elif not voice and current_voice:
             # Text WS reconnecting while voice is active — subscribe without
             # disrupting the voice session (the text WS auto-connects on mount).

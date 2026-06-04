@@ -30,20 +30,25 @@ logger = logging.getLogger(__name__)
     },
 )
 async def end_voice_session(context: dict, farewell_message: str = "") -> str:
-    """End the current voice session through the canonical teardown path.
+    """End the current voice connection while keeping the orchestrator
+    session alive in the pool for re-arming.
 
     Awaits :meth:`OrchestratorSession.end_voice` directly (no
-    fire-and-forget, no sleep). The previous implementation slept 1.5s
-    "to let the farewell broadcast through" — but the broadcast and the
-    tear-down were both fire-and-forget, so a WS drop in the sleep
-    window left the upstream relay running for an unbounded time while
-    the frontend already showed "off". The state machine inside
-    ``end_voice`` now handles the broadcast ordering: ``voice_ending``
-    fires before the relay closes, ``voice_ended`` fires after.
+    fire-and-forget, no sleep). The teardown closes the upstream
+    provider WS, releases the audio recorder, clears the voice provider,
+    and broadcasts ``voice_ending`` / ``voice_ended``.
 
-    The farewell line itself is spoken by the model **before** this tool
-    fires — the system prompt instructs the assistant to say goodbye and
-    then call ``end_voice_session``. No sleep is needed.
+    The orchestrator session itself stays in the pool. This is
+    intentional: the tab — its JSONL, agent state, background work — is
+    the durable thing; the voice connection is one ephemeral mode of
+    interacting with it. When the user calls the wake word again, the
+    route handler finds the same session and re-arms voice via
+    ``restart_voice()`` on it (same JSONL, no resume dance, no fresh
+    session).
+
+    The farewell line is spoken by the model **before** this tool fires
+    — the system prompt instructs the assistant to say goodbye and then
+    call ``end_voice_session``.
     """
     pool = context.get("pool")
     if pool is None:
@@ -58,14 +63,5 @@ async def end_voice_session(context: dict, farewell_message: str = "") -> str:
     except Exception as e:  # noqa: BLE001
         logger.exception("end_voice failed during agent-initiated stop")
         return f"Voice session ended with error: {e}"
-
-    # After end_voice the session object is still in the pool but its
-    # voice provider/recorder are gone. Drop it so a follow-up
-    # voice_start for the same local_id creates a fresh session
-    # instead of reattaching to the husk.
-    try:
-        await pool.stop_orchestrator()
-    except Exception:  # noqa: BLE001
-        logger.exception("pool.stop_orchestrator failed after end_voice")
 
     return "Voice session ended."

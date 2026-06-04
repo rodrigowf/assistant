@@ -105,8 +105,15 @@ class TestStateMachine:
                 reachable |= _VALID_VOICE_TRANSITIONS[state]
         assert reachable == set(VoiceLifecycle)
 
-    def test_ended_is_terminal(self):
-        assert _VALID_VOICE_TRANSITIONS[VoiceLifecycle.ENDED] == set()
+    def test_ended_can_rearm_to_idle(self):
+        """ENDED → IDLE is the re-arm transition driven by
+        :meth:`OrchestratorSession.restart_voice`. The OrchestratorSession
+        is the tab and outlives its voice connection; ending voice doesn't
+        forbid arming a fresh voice connection later on the same session.
+        """
+        assert _VALID_VOICE_TRANSITIONS[VoiceLifecycle.ENDED] == {
+            VoiceLifecycle.IDLE,
+        }
 
     @pytest.mark.asyncio
     async def test_self_transition_is_noop(self):
@@ -178,11 +185,16 @@ class TestEndVoiceCanonical:
         # Relay was stopped (low-level teardown).
         relay.stop.assert_awaited_once()
 
-        # Recorder was released, provider handle cleared.
+        # Recorder was released, provider handle cleared, voice flag flipped.
         recorder.stop.assert_called_once()
         assert s._voice_provider is None
         assert s._voice_relay is None
         assert s._audio_recorder is None
+        # _voice flips back to False so the session is genuinely demoted
+        # to text mode and the route handler routes a follow-up
+        # voice_start through the "text→voice" restart_voice path
+        # instead of "already-voice subscribe" path.
+        assert s._voice is False
 
         # Both broadcasts fired, in order, with the right reason.
         broadcast_calls = pool.broadcast_orchestrator.await_args_list
@@ -296,6 +308,111 @@ class TestEndVoiceCanonical:
 
 
 # ---------------------------------------------------------------------------
+# restart_voice — re-arm voice on the same OrchestratorSession
+# ---------------------------------------------------------------------------
+
+
+class TestRestartVoice:
+    @pytest.mark.asyncio
+    async def test_restart_after_end_voice_rearms_state_and_provider(self):
+        """After end_voice puts the session in ENDED, restart_voice
+        moves it back to IDLE, builds a fresh provider, and flips
+        _voice back to True. The session object (and its JSONL,
+        agent context, pool slot) is the same — only voice was rebuilt.
+        """
+        pool = MagicMock()
+        pool.broadcast_orchestrator = AsyncMock()
+        s = _make_session(voice=True, pool=pool)
+        provider = _stub_provider(frames=[])
+        relay = _stub_relay()
+        s._voice_provider = provider
+        s._voice_relay = relay
+        async with s._voice_lock:
+            s._set_voice_state_unlocked(VoiceLifecycle.STARTING)
+            s._set_voice_state_unlocked(VoiceLifecycle.ACTIVE)
+
+        await s.end_voice("user_stop")
+        assert s.voice_state is VoiceLifecycle.ENDED
+        assert s._voice is False
+        assert s._voice_provider is None
+
+        # Mock the voice registry so restart_voice doesn't need real
+        # provider SDKs.
+        fresh_provider = MagicMock()
+        fresh_provider.provider_name = "google"
+        with patch(
+            "orchestrator.providers.voice_registry.resolve_voice_target",
+            return_value=("google", {"id": "gemini-x"}, "Puck", "auto"),
+        ), patch(
+            "orchestrator.providers.voice_registry.instantiate_provider",
+            return_value=fresh_provider,
+        ), patch(
+            "orchestrator.session.is_recording_enabled",
+            return_value=False,
+        ):
+            await s.restart_voice(
+                voice_provider="google",
+                voice_model="gemini-x",
+                voice_name="Puck",
+            )
+
+        # State is back to IDLE — start_voice_relay can now drive
+        # IDLE → STARTING → ACTIVE as on a fresh voice_start.
+        assert s.voice_state is VoiceLifecycle.IDLE
+        # Voice flag restored, fresh provider installed.
+        assert s._voice is True
+        assert s._voice_provider is fresh_provider
+        # _voice_ended Event was reset so the next end_voice can be awaited.
+        assert not s._voice_ended.is_set()
+
+    @pytest.mark.asyncio
+    async def test_restart_on_idle_session_is_noop_for_state(self):
+        """Calling restart_voice on a session that never armed voice
+        (state == IDLE, _voice == False) just builds the provider and
+        flips _voice. No state churn — start_voice_relay will drive
+        IDLE → STARTING → ACTIVE as usual.
+        """
+        s = _make_session(voice=False)
+        assert s.voice_state is VoiceLifecycle.IDLE
+
+        fresh_provider = MagicMock()
+        fresh_provider.provider_name = "google"
+        with patch(
+            "orchestrator.providers.voice_registry.resolve_voice_target",
+            return_value=("google", {"id": "gemini-x"}, "Puck", "auto"),
+        ), patch(
+            "orchestrator.providers.voice_registry.instantiate_provider",
+            return_value=fresh_provider,
+        ), patch(
+            "orchestrator.session.is_recording_enabled",
+            return_value=False,
+        ):
+            await s.restart_voice(
+                voice_provider="google",
+                voice_model="gemini-x",
+                voice_name="Puck",
+            )
+
+        assert s.voice_state is VoiceLifecycle.IDLE
+        assert s._voice is True
+        assert s._voice_provider is fresh_provider
+
+    @pytest.mark.asyncio
+    async def test_restart_on_active_session_raises(self):
+        """Refuse to restart while voice is live (ACTIVE/STARTING/ENDING)
+        — the caller is supposed to await end_voice first. Silently
+        corrupting state would be worse than the explicit error.
+        """
+        s = _make_session(voice=True)
+        async with s._voice_lock:
+            s._set_voice_state_unlocked(VoiceLifecycle.STARTING)
+            s._set_voice_state_unlocked(VoiceLifecycle.ACTIVE)
+
+        with pytest.raises(RuntimeError, match="restart_voice called"):
+            await s.restart_voice(voice_provider="google", voice_model="x", voice_name="Puck")
+
+
+# ---------------------------------------------------------------------------
 # Pool: await_orchestrator_stop
 # ---------------------------------------------------------------------------
 
@@ -360,7 +477,12 @@ class TestPoolAwaitOrchestratorStop:
 
 class TestEndVoiceSessionTool:
     @pytest.mark.asyncio
-    async def test_tool_awaits_end_voice_then_stops_pool(self):
+    async def test_tool_awaits_end_voice_and_keeps_session_alive(self):
+        """The tool ends the voice connection but MUST NOT drop the pool
+        slot. The orchestrator session (= the tab) outlives any single
+        voice connection; the user can re-arm voice via the wake word
+        and resume the same conversation.
+        """
         from orchestrator.tools.voice_control import end_voice_session
 
         session = MagicMock()
@@ -373,8 +495,9 @@ class TestEndVoiceSessionTool:
 
         # Awaited the canonical path with the right reason.
         session.end_voice.assert_awaited_once_with("agent_end")
-        # Then dropped the pool slot.
-        pool.stop_orchestrator.assert_awaited_once()
+        # MUST NOT drop the pool slot — that breaks history continuity
+        # because the next wake word would start a fresh JSONL.
+        pool.stop_orchestrator.assert_not_awaited()
         assert "ended" in result.lower()
 
     @pytest.mark.asyncio

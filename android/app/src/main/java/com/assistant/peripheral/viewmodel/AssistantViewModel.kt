@@ -1539,20 +1539,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val ENDING_ACK_TIMEOUT_MS = 5000L
 
     /**
-     * User-initiated stop: ask the backend to tear the session down and
-     * show "Ending..." until VoiceEnded arrives. The previous design
-     * tore down locally immediately and flipped to Off, which masked
-     * backend hangs and caused "frontend shows ended but backend still
-     * running" desync. The full local cleanup now happens in
-     * [finalizeVoiceStop] when the ack arrives (or the safety timeout
-     * fires).
+     * User-initiated stop: ask the backend to end ONLY the voice
+     * connection (keeping the orchestrator session alive in the pool
+     * for re-arm) and show "Ending..." until VoiceEnded arrives.
+     *
+     * The orchestrator session IS the tab — it survives the voice
+     * connection ending, the same way it survives a WS disconnect.
+     * The next wake word re-arms voice on the same session via
+     * restart_voice, preserving JSONL / agent context. Sending
+     * WebSocketMessage.Stop (which drops the whole pool slot) was
+     * wrong: it forced every wake word to start a fresh session with
+     * empty history. Use VoiceStop instead.
+     *
+     * The full local cleanup happens in [finalizeVoiceStop] when the
+     * ack arrives (or the safety timeout fires).
      */
     fun stopVoiceSession() {
-        // Tell the backend we want to stop. The session_stopped reply
-        // happens on the WS route handler; the voice_ended broadcast is
-        // what we wait for here to confirm the relay is actually down.
         webSocketManager.send(
-            WebSocketMessage.Stop,
+            WebSocketMessage.VoiceStop,
             endpoint = WebSocketEndpoint.ORCHESTRATOR,
         )
         _voiceState.value = VoiceState.Ending

@@ -104,7 +104,13 @@ _VALID_VOICE_TRANSITIONS: dict[VoiceLifecycle, set[VoiceLifecycle]] = {
     VoiceLifecycle.STARTING: {VoiceLifecycle.ACTIVE, VoiceLifecycle.ENDING},
     VoiceLifecycle.ACTIVE: {VoiceLifecycle.ENDING},
     VoiceLifecycle.ENDING: {VoiceLifecycle.ENDED},
-    VoiceLifecycle.ENDED: set(),  # terminal — session is gone, fresh start required
+    # ENDED → IDLE re-arms voice on the SAME OrchestratorSession (same
+    # JSONL, same agent context). Triggered by ``restart_voice()`` when
+    # a new voice_start arrives on a session whose voice connection was
+    # torn down (by user stop, agent's end_voice_session, or client
+    # disconnect). The orchestrator session itself is the tab — it
+    # outlives any individual voice connection.
+    VoiceLifecycle.ENDED: {VoiceLifecycle.IDLE},
 }
 
 # Best-effort timeout for the provider's graceful_shutdown_frames send.
@@ -925,9 +931,19 @@ class OrchestratorSession:
                 logger.exception("audio recorder stop raised during end_voice")
             self._audio_recorder = None
 
-        # 4. Release the provider handle. The session object itself stays
-        #    until the caller explicitly drops it via pool.stop_orchestrator.
+        # 4. Release the provider handle AND demote the session out of
+        #    voice mode. The OrchestratorSession itself stays in the
+        #    pool as a *resumable shell* — the tab is the durable thing,
+        #    the voice connection is one ephemeral mode of interacting
+        #    with it. A subsequent ``voice_start`` for the same local_id
+        #    re-arms voice via ``restart_voice()`` on this same session,
+        #    preserving JSONL / agent context / background tasks.
+        #
+        #    What we DO release here is anything that costs tokens or
+        #    holds a remote resource: the relay, the upstream WS, the
+        #    audio recorder, the provider handle. No zombie behaviour.
         self._voice_provider = None
+        self._voice = False
 
         async with self._voice_lock:
             if self._voice_state == VoiceLifecycle.ENDING:
@@ -970,6 +986,103 @@ class OrchestratorSession:
                     "legacy voice_stopped broadcast failed for session %s",
                     self._local_id,
                 )
+
+    async def restart_voice(
+        self,
+        *,
+        voice_provider: str | None = None,
+        voice_model: str | None = None,
+        voice_name: str | None = None,
+        voice_transcription_language: str | None = None,
+        voice_endpoint: str | None = None,
+    ) -> None:
+        """Re-arm voice on this same OrchestratorSession after ``end_voice``.
+
+        Keeps the JSONL, agent context, background tasks, and pool slot
+        intact — only the voice connection (provider + relay + recorder)
+        is reconstructed. The caller then invokes ``start_voice_relay``
+        the same way it would for a fresh voice session.
+
+        State machine: ENDED → IDLE → (caller drives) → STARTING → ACTIVE.
+        Or, if voice was never armed at all (``IDLE``), this is a no-op
+        for the state machine and the provider is instantiated fresh
+        (which is the same path ``start()`` takes).
+
+        Any None-valued voice config arg means "keep what the session
+        already had" — supports the wake-word case where the Android
+        client may omit fields it doesn't care about.
+        """
+        # Update config (None = keep prior).
+        if voice_provider is not None:
+            self._voice_provider_id = voice_provider
+        if voice_model is not None:
+            self._voice_model_id = voice_model
+        if voice_name is not None:
+            self._voice_name = voice_name
+        if voice_transcription_language is not None:
+            self._voice_transcription_language = voice_transcription_language
+        if voice_endpoint is not None:
+            self._voice_endpoint = voice_endpoint
+
+        # Move state back to IDLE so start_voice_relay can drive the
+        # normal IDLE → STARTING → ACTIVE cycle. Only meaningful if
+        # we're coming from ENDED; from IDLE this is a no-op.
+        async with self._voice_lock:
+            if self._voice_state == VoiceLifecycle.ENDED:
+                self._set_voice_state_unlocked(VoiceLifecycle.IDLE)
+                # Fresh Event so the next end_voice can be awaited cleanly
+                # (an Event that's already set never blocks).
+                self._voice_ended = asyncio.Event()
+            elif self._voice_state != VoiceLifecycle.IDLE:
+                # ACTIVE / STARTING / ENDING → caller asked for restart on
+                # a session that isn't currently torn down. Refuse rather
+                # than corrupt state; the route handler should have either
+                # awaited end_voice first or detected the live relay and
+                # reused it.
+                raise RuntimeError(
+                    f"restart_voice called on session {self._local_id} "
+                    f"in state {self._voice_state.value}; expected ENDED or IDLE"
+                )
+
+        # Instantiate a fresh provider mirroring the start() path.
+        from orchestrator.providers.voice_registry import (
+            instantiate_provider,
+            resolve_voice_target,
+        )
+        provider_id, model_entry, voice_name_resolved, language = resolve_voice_target(
+            self._voice_provider_id,
+            self._voice_model_id,
+            self._voice_name,
+            self._voice_transcription_language,
+        )
+        self._voice_provider_id = provider_id
+        self._voice_model_id = model_entry["id"]
+        self._voice_name = voice_name_resolved
+        self._voice_transcription_language = language
+        self._voice_provider = instantiate_provider(
+            provider_id, model_entry["id"], voice_name_resolved, language,
+            endpoint=self._voice_endpoint,
+        )
+        self._voice = True
+
+        # Re-arm the audio recorder if recording is enabled.
+        if is_recording_enabled() and self._audio_recorder is None:
+            self._audio_recorder = AudioRecorder(
+                session_id=self._local_id,
+                provider=self._voice_provider_id or "",
+                model=self._voice_model_id or "",
+                voice=self._voice_name or "",
+            )
+            self._audio_recorder.start()
+            logger.info(
+                "Audio recorder re-armed for session %s on restart_voice",
+                self._local_id,
+            )
+
+        logger.info(
+            "voice rearm session=%s provider=%s model=%s",
+            self._local_id, provider_id, self._voice_model_id,
+        )
 
     async def send_voice_audio_in(self, pcm_b64: str) -> None:
         """Forward a frontend mic chunk upstream (WS providers only).
