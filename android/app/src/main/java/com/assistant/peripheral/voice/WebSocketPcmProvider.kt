@@ -497,7 +497,21 @@ abstract class WebSocketPcmProvider(
         if (event["type"] == "voice_status") {
             when (event["status"] as? String) {
                 "preparing" -> setState(VoiceState.Connecting)
-                "summarizing" -> setState(VoiceState.Summarizing)
+                "summarizing" -> {
+                    // ``summarizing`` is a *pre-connect* status. If we're
+                    // already past Connecting/Summarizing (i.e. mid-call),
+                    // this is a stale broadcast from a reconnect probe
+                    // that ran ``_attach_voice_payload`` again — ignore it
+                    // so the UI doesn't bounce back to yellow mid-talk.
+                    val s = state.value
+                    if (s == VoiceState.Off || s is VoiceState.Error ||
+                        s == VoiceState.Connecting || s == VoiceState.Summarizing
+                    ) {
+                        setState(VoiceState.Summarizing)
+                    } else {
+                        Log.d(tag, "ignoring stale voice_status:summarizing (state=$s)")
+                    }
+                }
                 "ready" -> setState(VoiceState.Active)
                 "reconnect_warning" -> {
                     // Gemini's goAway.timeLeft is a Go-style duration

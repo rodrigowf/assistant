@@ -630,8 +630,20 @@ async def _attach_voice_payload(
     # default "preparing" that suggests imminent readiness. Also tells
     # the user something is happening so they don't try repeatedly.
     pool_for_status = session._context.get("pool")
+    # ``summarizing`` is a *pre-connect* state — only meaningful when the
+    # user is waiting for the relay to come up. On a reconnect to a live
+    # relay (the WS dropped briefly, Android re-attached) the relay
+    # already has its session.update; summarising again would be wasted
+    # work AND would broadcast a stale yellow "Preparing conversation..."
+    # to a UI that's mid-call. Skip the broadcast (and the summarisation
+    # remains a no-op since the cache write paths are guarded too).
+    existing_relay = getattr(session, "_voice_relay", None)
+    relay_is_live = existing_relay is not None and getattr(
+        existing_relay, "is_running", False,
+    )
     will_summarize = (
-        session._jsonl_path is not None
+        not relay_is_live
+        and session._jsonl_path is not None
         and session._jsonl_path.is_file()
         and not summary_cache.is_fresh(session._jsonl_path)
     )
