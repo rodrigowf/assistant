@@ -37,17 +37,27 @@ from orchestrator.session import OrchestratorSession
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["orchestrator"])
 
-# Server-side WS heartbeat interval. Sends a small ``{"type":"ping"}``
-# message down to the client every N seconds so that low-end Android
-# devices (notably the A300M with aggressive WiFi power-saving) keep
-# the radio awake long enough to receive okhttp's WS PONG before its
-# 30s ping timeout fires. Without this the orchestrator WS dies with
-# ``1011 keepalive ping timeout`` whenever there's no Gemini audio
-# flowing back to the client.
+# App-level WS heartbeat. Both directions exchange a small
+# ``{"type":"ping"}`` message every N seconds. Replaces the okhttp
+# protocol-level ping on Android, which was closing healthy WSs with
+# ``1011 keepalive ping timeout`` on the A300M (verified: PONGs work
+# instantly when probed from every other client we tried — Jetson
+# localhost, the laptop over WiFi through nginx. Only the A300M sees
+# the issue, so rather than fight okhttp's protocol-layer
+# device-specific quirk we run our own bidirectional liveness check
+# end-to-end at the app layer).
 #
-# 15s ≪ okhttp's 30s ping interval so the radio is reliably awake for
-# every protocol-level ping. Cheap on bandwidth (~2 bytes/s).
+# 15s is short enough that a 45s "no traffic" timeout (~3x interval)
+# detects a dead path quickly without being noisy. Cheap on bandwidth
+# (~2 bytes/s).
 _WS_HEARTBEAT_INTERVAL_S = 15.0
+
+# How long the server tolerates total silence from a client before
+# considering the WS dead. The receive loop drives this; if no message
+# of any kind (including the client's own heartbeat ping) arrives in
+# this window, we close the WS. The client-side mirror lives in
+# WebSocketManager.kt and uses the same window.
+_WS_CLIENT_SILENCE_TIMEOUT_S = 45.0
 
 
 async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
@@ -121,7 +131,25 @@ async def orchestrator_ws(ws: WebSocket):
 
     try:
         while True:
-            raw = await ws.receive_text()
+            # Bounded receive — if NOTHING arrives from the client for
+            # the silence window (not even their heartbeat ping), the
+            # path is dead and we should close. Without this the server
+            # task would sit forever on a TCP connection that's silently
+            # broken (NAT timeout, WiFi disconnect with no FIN, etc.).
+            try:
+                raw = await asyncio.wait_for(
+                    ws.receive_text(), timeout=_WS_CLIENT_SILENCE_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "WS silent for %.0fs — closing as dead",
+                    _WS_CLIENT_SILENCE_TIMEOUT_S,
+                )
+                try:
+                    await ws.close(code=1011, reason="client silence timeout")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
             try:
                 msg = orjson.loads(raw)
             except (orjson.JSONDecodeError, ValueError):
