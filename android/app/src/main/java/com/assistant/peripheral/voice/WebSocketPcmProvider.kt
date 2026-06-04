@@ -454,6 +454,15 @@ abstract class WebSocketPcmProvider(
             // exit it immediately.
             running.set(true)
             startSpeaker()
+            // HAL settling delay between wake-word AudioRecord release
+            // and the call's AudioRecord open. Observed 2026-06-04:
+            // post-wake-word call mic came up with ~half the amplitude
+            // of a cold-start call until ~30s into the session. Symptom
+            // matches the Samsung HAL re-initialising AGC state between
+            // sources too quickly. 200ms is enough to let the HAL settle
+            // without a perceptible UX delay (the user already waited
+            // for wake-word recognition + WS handshake).
+            kotlinx.coroutines.delay(200L)
             startMic()
             _state.value = VoiceState.Active
             _events.tryEmit(VoiceEvent.SessionCreated)

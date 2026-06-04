@@ -241,6 +241,19 @@ class WakeWordDetector(
         val bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
             .coerceAtLeast(3200)  // at least 100ms of audio at 16kHz 16-bit mono
 
+        // Match the voice call's mic source. Originally MIC, which on
+        // Samsung Lollipop left the HAL's AGC in a different state than
+        // the call's VOICE_RECOGNITION expected — the first 30s of the
+        // post-wake-word call came up with half the amplitude of a
+        // cold-start call (observed 2026-06-04: max RMS 989 vs 1972 in
+        // back-to-back sessions with same speaker distance). Sharing
+        // the source keeps the HAL state continuous.
+        @Suppress("DEPRECATION")
+        val wakeWordSource = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N)
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        else
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+
         silenceMonitorJob = scope.launch(Dispatchers.IO) {
             // Retry loop: mic may be held by AudioRecorder (turn-based recording) for a few seconds.
             // Keep trying until the mic is free or we're no longer active.
@@ -248,7 +261,7 @@ class WakeWordDetector(
             while (isActive && recorder == null) {
                 val candidate = try {
                     AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
+                        wakeWordSource,
                         SAMPLE_RATE,
                         CHANNEL_CONFIG,
                         AUDIO_FORMAT,
