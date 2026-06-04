@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from pathlib import Path
 
 import orjson
@@ -402,6 +403,16 @@ async def _handle_start(
     )
 
     await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
+    # Timing instrumentation — when a wake-word call hits a cold orchestrator
+    # session, the gap between voice_start and session_started can balloon
+    # to 20+ seconds. The labelled millisecond breakdown below tells us
+    # which step (session.start, voice-payload attach, prompt assembly,
+    # tools build, relay open) is eating the time so we can target the
+    # right fix instead of guessing. Cheap to leave on; one INFO line per
+    # voice-start.
+    _t0 = time.monotonic()
+    def _ms_since(t: float) -> int:
+        return int((time.monotonic() - t) * 1000)
     try:
         session_id = await session.start()
     except Exception as e:
@@ -410,9 +421,20 @@ async def _handle_start(
             "type": "error", "error": "start_failed", "detail": str(e),
         }))
         return None, False
+    if voice:
+        logger.info(
+            "voice_start_timing local_id=%s step=session.start dt_ms=%d",
+            local_id, _ms_since(_t0),
+        )
 
+    _t_pool = time.monotonic()
     pool.set_orchestrator(session_id, session)
     pool.subscribe_orchestrator(session_id, ws)
+    if voice:
+        logger.info(
+            "voice_start_timing local_id=%s step=pool.register dt_ms=%d",
+            local_id, _ms_since(_t_pool),
+        )
 
     # Install the wake callback for background-agent notifications.  When a
     # fire-and-forget agent turn finishes while the orchestrator is idle, the
@@ -440,6 +462,7 @@ async def _handle_start(
 
         session.notifications.set_wake_callback(_make_wake(pool, session))
 
+    _t_payload = time.monotonic()
     started_payload: dict = {
         "type": "session_started",
         "session_id": session_id,
@@ -448,8 +471,19 @@ async def _handle_start(
     }
     if voice:
         await _attach_voice_payload(started_payload, session)
+        logger.info(
+            "voice_start_timing local_id=%s step=attach_voice_payload dt_ms=%d",
+            local_id, _ms_since(_t_payload),
+        )
 
+    _t_send = time.monotonic()
     await ws.send_bytes(orjson.dumps(started_payload))
+    if voice:
+        logger.info(
+            "voice_start_timing local_id=%s step=ws.send_started dt_ms=%d payload_bytes=%d TOTAL_ms=%d",
+            local_id, _ms_since(_t_send), len(orjson.dumps(started_payload)),
+            _ms_since(_t0),
+        )
     return session, True
 
 
@@ -511,17 +545,32 @@ async def _attach_voice_payload(
     # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
     payload["voice_recording_enabled"] = session.audio_recorder is not None
 
+    # Sub-step timing inside _attach_voice_payload — when start is slow,
+    # the cost is almost always in get_session_update (system prompt +
+    # tools build) or get_connection_info (ephemeral token / OAuth).
+    _local_id = getattr(session, "local_id", "?")
+    _t_su = time.monotonic()
     session_update = await session.get_session_update()
+    logger.info(
+        "voice_start_timing local_id=%s step=get_session_update dt_ms=%d bytes=%d",
+        _local_id, int((time.monotonic() - _t_su) * 1000),
+        len(orjson.dumps(session_update)) if session_update else 0,
+    )
     if session_update:
         payload["voice_session_update"] = session_update
 
     provider_obj = getattr(session, "_voice_provider", None)
     if provider_obj is not None:
+        _t_ci = time.monotonic()
         try:
             payload["voice_connection_info"] = await provider_obj.get_connection_info()
         except Exception as e:
             logger.warning("Voice connection info fetch failed: %s", e)
             payload["voice_connection_error"] = str(e)
+        logger.info(
+            "voice_start_timing local_id=%s step=get_connection_info dt_ms=%d",
+            _local_id, int((time.monotonic() - _t_ci) * 1000),
+        )
 
     # Start the backend relay for WS providers (Qwen / Gemini / locals).
     # Idempotent for healthy relays; rebuilds if the previous drain crashed
