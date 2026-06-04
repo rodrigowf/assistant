@@ -306,6 +306,26 @@ class VoiceVAD:
         """Whether the VAD currently considers the user to be speaking."""
         return self._is_speech
 
+    def reset(self) -> None:
+        """Re-zero all per-stream state — call after a long discontinuity.
+
+        Use case: the voice relay drops upstream audio while reconnecting
+        after a goAway. A 20s gap leaves Silero's recurrent hidden state
+        in an attractor that doesn't respond to fresh input — speech
+        probabilities stay flat regardless of what audio arrives next.
+        Resetting brings us back to the same blank slate as a fresh
+        :class:`VoiceVAD` instance, without re-initialising the ONNX
+        session (which costs ~50ms on a Jetson).
+        """
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._is_speech = False
+        self._consec_above = 0
+        self._consec_below = 0
+        self._carry_input_pcm = b""
+        self._bytes_consumed = 0
+        self._debug_window_probs = []
+        logger.info("VoiceVAD reset (Silero state + state machine cleared)")
+
 
 def is_enabled_for(provider_name: str) -> bool:
     """Manual-VAD opt-out per provider.

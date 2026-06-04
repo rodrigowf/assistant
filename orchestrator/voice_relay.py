@@ -1177,6 +1177,19 @@ class VoiceRelay:
             "voice_relay reconnect #%d succeeded session_id=%s",
             self._reconnect_count, self._session_id,
         )
+
+        # Reset the local VAD's hidden state. The reconnect path drops
+        # mic chunks while the upstream WS is down (see WARN audio_in
+        # dropped above), and Silero's recurrent state doesn't
+        # gracefully recover from a multi-second discontinuity — the
+        # probability output stays flat for the rest of the session
+        # and speech_started never fires again. Resetting brings the
+        # model back to a blank slate so the post-reconnect audio is
+        # classified correctly.
+        if self._manual_vad is not None:
+            self._manual_vad.reset()
+            self._slog("manual_vad state reset after reconnect")
+
         return True
 
 
