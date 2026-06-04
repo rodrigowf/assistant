@@ -152,6 +152,21 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Bluetooth connect permission (Android 12+). The manifest declares
+        // BLUETOOTH_CONNECT for API 31+, but it's a runtime grant. Without
+        // it BluetoothAdapter.getProfileConnectionState() throws
+        // SecurityException — AudioRouter catches that and reports "no BT"
+        // as a safety net, so denying this permission just means the
+        // BLUETOOTH routing option stays unavailable. The OS-managed AUTO
+        // routing default still works fine without it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        }
+
         if (permissionsToRequest.isNotEmpty()) {
             requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
         }
