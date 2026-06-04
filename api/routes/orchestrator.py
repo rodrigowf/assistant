@@ -173,6 +173,17 @@ async def orchestrator_ws(ws: WebSocket):
                     await pool.broadcast_orchestrator({"type": "status", "status": "interrupted"})
 
             elif msg_type == "stop":
+                # For voice sessions, drive the canonical teardown path
+                # so the graceful shutdown frames fire and the
+                # voice_ending/voice_ended broadcasts go out with the
+                # right reason. The follow-up pool.stop_orchestrator
+                # call is the no-op idempotent path (end_voice already
+                # ran inside session.stop).
+                if session is not None and session.is_voice:
+                    try:
+                        await session.end_voice("user_stop")
+                    except Exception:  # noqa: BLE001
+                        logger.exception("end_voice failed during user stop")
                 await pool.stop_orchestrator()
                 session = None
                 subscribed = False
@@ -201,26 +212,34 @@ async def orchestrator_ws(ws: WebSocket):
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
-        # Orchestrator session keeps running headlessly until explicitly
-        # stopped — that's intentional so background work survives a
-        # browser-tab close.  BUT the voice relay must NOT survive: an
-        # open upstream WS to Gemini Live / Qwen burns provider tokens
-        # continuously for as long as it stays connected, even with no
-        # client listening.  Without this teardown, a single client-side
-        # disconnect (network glitch, app crash, user backgrounds the
-        # phone) silently keeps the upstream open until the relay's
-        # natural error or the upstream's session-age limit closes it
-        # — repeated goAway reconnects can hold the session open for
-        # hours, racking up costs nobody is using.
+        # Text mode: the orchestrator session keeps running headlessly
+        # until explicitly stopped — background-agent work survives a
+        # browser-tab close.
+        #
+        # Voice mode: the session is fully torn down. An open upstream
+        # WS to Gemini / Qwen burns tokens continuously with no client
+        # listening; worse, leaving the session in the pool means the
+        # next ``voice_start`` for the same ``local_id`` reconnects
+        # into a half-dead husk (the "frozen on restart" bug). Funnel
+        # through ``end_voice`` so the lifecycle state machine, the
+        # graceful shutdown frames, and the voice_ending/voice_ended
+        # broadcasts all run; then drop the session from the pool so a
+        # subsequent ``voice_start`` creates a fresh one.
         if was_voice and session is not None:
             try:
-                await session.stop_voice_relay()
+                await session.end_voice("client_disconnect")
                 logger.info(
-                    "Voice relay stopped on client disconnect session=%s",
+                    "Voice session ended on client disconnect session=%s",
                     getattr(session, "local_id", "?"),
                 )
             except Exception:  # noqa: BLE001
-                logger.exception("stop_voice_relay on disconnect failed")
+                logger.exception("end_voice on disconnect failed")
+            try:
+                await pool.stop_orchestrator()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "pool.stop_orchestrator on voice-mode disconnect failed",
+                )
 
 
 async def _handle_start(
@@ -258,14 +277,55 @@ async def _handle_start(
             local_id, resume_id, voice_provider_req, voice_model_req, voice_name_req, voice_lang_req, voice_endpoint_req,
         )
 
+    # If a prior session with this local_id is in the middle of being
+    # torn down (state == ENDING), wait for it to finish before deciding
+    # reconnect vs new. Skipping this is what caused the "frozen on
+    # restart" bug — a fresh voice_start would hit the reconnect branch
+    # and reattach to a session whose relay was already dying.
+    if local_id:
+        ok = await pool.await_orchestrator_stop(local_id, timeout=5.0)
+        if not ok:
+            logger.warning(
+                "Timed out waiting for prior orchestrator %s to finish stopping",
+                local_id,
+            )
+            await ws.send_bytes(orjson.dumps({
+                "type": "error", "error": "orchestrator_stopping",
+                "detail": (
+                    "Previous voice session is still ending. Please retry."
+                ),
+            }))
+            return None, False
+
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
         session = pool.get_orchestrator()
         current_voice = getattr(session, "is_voice", False)
+        skip_reconnect = False
 
-        if voice and not current_voice:
+        # Belt-and-braces: if the session's voice lifecycle has already
+        # entered ENDING (the await_orchestrator_stop above would
+        # normally catch this, but state can advance between the check
+        # and here on a fast teardown), drop it and fall through to
+        # create a fresh session.
+        if voice and current_voice and getattr(session, "voice_is_ending", False):
+            logger.info(
+                "Voice session %s reached ENDING during start; dropping for fresh start",
+                local_id,
+            )
+            try:
+                await pool.stop_orchestrator()
+            except Exception:  # noqa: BLE001
+                logger.exception("stop_orchestrator during ENDING-drop failed")
+            await pool.await_orchestrator_stop(local_id, timeout=5.0)
+            skip_reconnect = True
+
+        if skip_reconnect:
+            pass  # fall through to "Start a new session" below
+        elif voice and not current_voice:
             # Text→voice transition: stop text session, fall through to create voice
             await pool.stop_orchestrator()
+            await pool.await_orchestrator_stop(local_id, timeout=5.0)
         elif not voice and current_voice:
             # Text WS reconnecting while voice is active — subscribe without
             # disrupting the voice session (the text WS auto-connects on mount).
@@ -312,6 +372,7 @@ async def _handle_start(
                         drift,
                     )
                     await pool.stop_orchestrator()
+                    await pool.await_orchestrator_stop(local_id, timeout=5.0)
                     # Fall through to the new-session creation path below.
                 else:
                     pool.subscribe_orchestrator(local_id, ws)

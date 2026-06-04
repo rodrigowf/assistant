@@ -933,6 +933,11 @@ class OrchestratorSession:
     async def _broadcast_voice_lifecycle(self, event_type: str, reason: str) -> None:
         """Push a ``voice_ending`` / ``voice_ended`` event to all subscribers.
 
+        For ``voice_ended`` also emit the legacy ``voice_stopped`` event
+        so older frontends (web, Android) keep flipping to Off until
+        they're upgraded to the new ``voice_ended`` handler. The legacy
+        alias will be removed once both clients ship the new event.
+
         Swallow errors: the lifecycle must not depend on the broadcast
         succeeding (subscribers may already be gone if the trigger was
         ``client_disconnect``).
@@ -951,6 +956,14 @@ class OrchestratorSession:
                 "broadcast of %s failed for session %s",
                 event_type, self._local_id,
             )
+        if event_type == "voice_ended":
+            try:
+                await pool.broadcast_orchestrator({"type": "voice_stopped"})
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "legacy voice_stopped broadcast failed for session %s",
+                    self._local_id,
+                )
 
     async def send_voice_audio_in(self, pcm_b64: str) -> None:
         """Forward a frontend mic chunk upstream (WS providers only).
