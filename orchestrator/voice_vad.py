@@ -26,14 +26,20 @@ Silero expects, runs each through the model, and yields state-transition
 events when the smoothed speech probability crosses the threshold.
 
 The detection logic mirrors Silero's official `VADIterator`:
-- `threshold` (default 0.5) — speech is "on" when prob crosses up; "off"
-  when prob falls below `threshold - 0.15` (hysteresis to avoid chatter).
-- `min_silence_duration_ms` (default 1200) — once below the off-threshold,
-  wait this long before emitting `speech_stopped`. This is the analogue of
-  the upstream `silence_duration_ms` we used to send to DashScope.
+- `threshold` (default 0.35) — speech is "on" when prob crosses up; "off"
+  when prob falls below `threshold - 0.15` (= 0.20, hysteresis to avoid
+  chatter). Tuned down from Silero's vanilla 0.5 default after 2026-06-04
+  far-field tests: at arm's length the user's RMS dipped to ~600-1000
+  and Silero probability never sustained above 0.5, so speech_started
+  fired late or not at all. 0.35 / 0.20 catches the far-field case
+  without false-positives from typical room noise.
+- `min_silence_duration_ms` (default 2500) — once below the off-threshold,
+  wait this long before emitting `speech_stopped`. Long enough to ride
+  through breathing pauses and "uh"-style hesitations mid-sentence
+  (which were committing turns prematurely at the old 1200ms).
 - `speech_pad_ms` (default 300) — informational only here; pre-roll
   trimming is the relay's job (it knows where the audio buffer started).
-- `min_speech_duration_ms` (default 250) — suppress micro-blips (a single
+- `min_speech_duration_ms` (default 200) — suppress micro-blips (a single
   cough triggering one above-threshold window doesn't cause `speech_started`
   → `speech_stopped` events).
 """
@@ -101,9 +107,9 @@ class VoiceVAD:
     def __init__(
         self,
         input_sample_rate: int = 24000,
-        threshold: float = 0.5,
-        min_silence_duration_ms: int = 1200,
-        min_speech_duration_ms: int = 250,
+        threshold: float = 0.35,
+        min_silence_duration_ms: int = 2500,
+        min_speech_duration_ms: int = 200,
     ) -> None:
         if not _MODEL_PATH.exists():
             raise FileNotFoundError(
