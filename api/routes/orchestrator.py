@@ -120,6 +120,15 @@ async def orchestrator_ws(ws: WebSocket):
     pool: SessionPool = ws.app.state.pool
     session: OrchestratorSession | None = None
     subscribed = False  # True once this ws is registered in pool._orchestrator_subs
+    # MUST be initialised before any path that can break/return out of
+    # the receive loop. The finally block reads it unconditionally, and
+    # the silence-timeout break path doesn't run either except handler
+    # (where the original assignments live). Failing to init here
+    # crashes the WS handler with UnboundLocalError on every silent
+    # disconnect — observed live as a crash spam loop where every
+    # Android reconnect after a clean voice stop hits the silence
+    # timeout, crashes the finally, and the cycle repeats.
+    was_voice = False
 
     # Register as a watcher so this ws receives agent_session_opened/closed events
     pool.watch(ws)
@@ -141,9 +150,15 @@ async def orchestrator_ws(ws: WebSocket):
                     ws.receive_text(), timeout=_WS_CLIENT_SILENCE_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
+                # The path is dead — close and let the finally block
+                # tear down voice. MUST set was_voice here because we're
+                # exiting through `break`, not through either except
+                # handler (which is where was_voice would normally be
+                # assigned).
+                was_voice = bool(session is not None and session.is_voice)
                 logger.info(
-                    "WS silent for %.0fs — closing as dead",
-                    _WS_CLIENT_SILENCE_TIMEOUT_S,
+                    "WS silent for %.0fs — closing as dead (voice_active=%s)",
+                    _WS_CLIENT_SILENCE_TIMEOUT_S, was_voice,
                 )
                 try:
                     await ws.close(code=1011, reason="client silence timeout")
