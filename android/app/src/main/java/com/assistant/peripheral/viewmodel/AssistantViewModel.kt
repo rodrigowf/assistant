@@ -1922,56 +1922,83 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     /**
-     * Play a short tone (~150ms 880Hz sine) on the notification stream
-     * so the user gets an audible cue that a voice reconnect is about
-     * to happen. Notification stream so it slips past the mic-ducking
-     * gain (which only affects the voice plane) and is audible even on
-     * the speaker route during a call.
+     * Play a short two-tone cue (~300ms total) signalling that the voice
+     * upstream is about to cycle. The first attempt at this (single tone
+     * on STREAM_NOTIFICATION, 2026-06-04) was inaudible on the A300M
+     * during an active call because the notification stream is
+     * effectively muted by the call audio plane. Switched to STREAM_MUSIC
+     * which is the same stream the voice playback is using — guaranteed
+     * audible whenever the agent's voice is.
+     *
+     * Two tones (880Hz → 660Hz) chosen because a single beep blended too
+     * easily with the agent's own speech. The descending interval is a
+     * clear "wrap up" cue without sounding alarming.
      *
      * Fire-and-forget — we don't block the caller. If audio init fails
-     * (very old device, unusual route, etc.) we just log and continue;
-     * the banner still appears.
+     * (very old device, unusual route, etc.) we log and continue; the
+     * banner still appears.
      */
     private fun playReconnectBeep() {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val sr = 22050
-                val durationMs = 150
-                val frames = sr * durationMs / 1000
-                val pcm = ShortArray(frames)
-                val freq = 880.0
-                val twoPiF = 2.0 * Math.PI * freq
-                // Fade in/out 20ms each to avoid clicks.
-                val fadeFrames = sr * 20 / 1000
-                for (i in 0 until frames) {
-                    val env = when {
-                        i < fadeFrames -> i.toDouble() / fadeFrames
-                        i > frames - fadeFrames -> (frames - i).toDouble() / fadeFrames
-                        else -> 1.0
+                val toneMs = 130
+                val gapMs = 40
+                val toneFrames = sr * toneMs / 1000
+                val gapFrames = sr * gapMs / 1000
+                val totalFrames = toneFrames * 2 + gapFrames
+                val pcm = ShortArray(totalFrames)
+                val fadeFrames = sr * 15 / 1000
+                // Volume — 50% amplitude. We're sharing the music stream
+                // with the agent's voice (which clips at 100%) so being
+                // distinctly audible matters more than being polite.
+                val amplitude = 0.50
+                fun fillTone(offset: Int, freq: Double) {
+                    val twoPiF = 2.0 * Math.PI * freq
+                    for (i in 0 until toneFrames) {
+                        val env = when {
+                            i < fadeFrames -> i.toDouble() / fadeFrames
+                            i > toneFrames - fadeFrames -> (toneFrames - i).toDouble() / fadeFrames
+                            else -> 1.0
+                        }
+                        val sample = (Math.sin(twoPiF * i / sr) * env * amplitude * Short.MAX_VALUE).toInt()
+                        pcm[offset + i] = sample.toShort()
                     }
-                    // ~30% amplitude — clearly audible, not jarring.
-                    val sample = (Math.sin(twoPiF * i / sr) * env * 0.30 * Short.MAX_VALUE).toInt()
-                    pcm[i] = sample.toShort()
                 }
+                fillTone(0, 880.0)
+                // Gap stays as zero-filled silence.
+                fillTone(toneFrames + gapFrames, 660.0)
+
                 val bufSize = AudioTrack.getMinBufferSize(
                     sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-                ).coerceAtLeast(frames * 2)
+                ).coerceAtLeast(totalFrames * 2)
+                @Suppress("DEPRECATION")
                 val track = AudioTrack(
-                    AudioManager.STREAM_NOTIFICATION,
+                    AudioManager.STREAM_MUSIC,
                     sr,
                     AudioFormat.CHANNEL_OUT_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufSize,
                     AudioTrack.MODE_STATIC,
                 )
-                track.write(pcm, 0, frames)
+                if (track.state != AudioTrack.STATE_INITIALIZED) {
+                    Log.w(TAG, "playReconnectBeep: AudioTrack init failed state=${track.state}")
+                    track.release()
+                    return@launch
+                }
+                val written = track.write(pcm, 0, totalFrames)
+                if (written < 0) {
+                    Log.w(TAG, "playReconnectBeep: AudioTrack write failed code=$written")
+                } else {
+                    Log.i(TAG, "playReconnectBeep: starting tone (frames=$totalFrames, stream=STREAM_MUSIC)")
+                }
                 track.play()
-                // Block this IO coroutine until the tone finishes, then release.
-                kotlinx.coroutines.delay(durationMs.toLong() + 50)
+                val playMs = ((toneFrames * 2 + gapFrames) * 1000L) / sr
+                kotlinx.coroutines.delay(playMs + 80)
                 try { track.stop() } catch (_: Exception) {}
                 track.release()
             } catch (e: Exception) {
-                Log.w(TAG, "playReconnectBeep failed: ${e.message}")
+                Log.w(TAG, "playReconnectBeep failed: ${e.message}", e)
             }
         }
     }

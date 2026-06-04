@@ -491,13 +491,17 @@ abstract class WebSocketPcmProvider(
                 "summarizing" -> setState(VoiceState.Summarizing)
                 "ready" -> setState(VoiceState.Active)
                 "reconnect_warning" -> {
-                    // Gemini goAway. timeLeft is a Number (Int|Double|Long)
-                    // depending on JSON parser; coerce to Int.
-                    val tl = when (val v = event["time_left"]) {
+                    // Gemini's goAway.timeLeft is a Go-style duration
+                    // string like "50s", "30m0s", "1h30m0s" — NOT a
+                    // plain number. Parse defensively: also accept a
+                    // bare Number on the off-chance the backend gets
+                    // updated to send seconds directly.
+                    val tl: Int? = when (val v = event["time_left"]) {
                         is Number -> v.toInt()
+                        is String -> parseGoDurationToSeconds(v)
                         else -> null
                     }
-                    Log.i(tag, "Reconnect warning (timeLeft=${tl}s)")
+                    Log.i(tag, "Reconnect warning (timeLeft=${tl}s, raw=${event["time_left"]})")
                     _events.tryEmit(VoiceEvent.ReconnectWarning(tl))
                 }
                 "reconnecting" -> {
@@ -932,6 +936,37 @@ abstract class WebSocketPcmProvider(
             }
             Log.d(tag, "Mic capture loop exited")
         }
+    }
+
+    /** Parse a Go-style duration string ("50s", "30m0s", "1h30m0s",
+     *  "500ms") to seconds. Returns null on anything we don't recognise.
+     *  Used for Gemini Live's goAway.timeLeft field. */
+    private fun parseGoDurationToSeconds(s: String): Int? {
+        if (s.isBlank()) return null
+        var total = 0.0
+        var i = 0
+        while (i < s.length) {
+            // Read a number (may include a decimal point).
+            val numStart = i
+            while (i < s.length && (s[i].isDigit() || s[i] == '.')) i++
+            if (numStart == i) return null  // expected a digit
+            val num = s.substring(numStart, i).toDoubleOrNull() ?: return null
+            // Read the unit.
+            val unitStart = i
+            while (i < s.length && s[i].isLetter()) i++
+            val unit = s.substring(unitStart, i)
+            val mult = when (unit) {
+                "ns" -> 1e-9
+                "us", "µs" -> 1e-6
+                "ms" -> 1e-3
+                "s" -> 1.0
+                "m" -> 60.0
+                "h" -> 3600.0
+                else -> return null
+            }
+            total += num * mult
+        }
+        return total.toInt()
     }
 
     /** Returns (rms, peak) of a PCM16 little-endian buffer slice.

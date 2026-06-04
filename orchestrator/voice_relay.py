@@ -72,6 +72,15 @@ _KEEPALIVE_INTERVAL_S = 30.0
 # enough below the ceiling that wire jitter never trips it.
 _MANUAL_VAD_SAFETY_COMMIT_S = 50.0
 
+# Bound the goAway-driven reconnect: if the new upstream WS connect +
+# session.update handshake doesn't complete within this window, give
+# up and surface a clean error so the frontend can tear down. Observed
+# 2026-06-04: a stuck ``websockets.connect`` left the relay silently
+# jammed for 40s+ with the audio_in queue draining into a void.
+# Generous so a slow Anthropic/Gemini handshake doesn't trigger it,
+# but tight enough that the user notices something is wrong.
+_RECONNECT_HANDSHAKE_TIMEOUT_S = 15.0
+
 
 class VoiceRelay:
     """Owns one upstream WS to the voice provider for the lifetime of a session.
@@ -1176,8 +1185,27 @@ class VoiceRelay:
             logger.exception("voice_relay rebuild_session_update failed")
             return False
 
+        # Bound the reconnect handshake so a stuck upstream connect
+        # (observed 2026-06-04: ``websockets.connect`` hung for 40s+
+        # on goAway #3 of a long session, never resolved) doesn't
+        # leave the relay silently jammed. Past this, surface as a
+        # failed reconnect so the frontend tears down cleanly and the
+        # user can wake-word a fresh session.
         try:
-            await self._open_and_handshake(session_config)
+            await asyncio.wait_for(
+                self._open_and_handshake(session_config),
+                timeout=_RECONNECT_HANDSHAKE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            self._slog(
+                f"reconnect failed: open_and_handshake timed out after "
+                f"{_RECONNECT_HANDSHAKE_TIMEOUT_S}s"
+            )
+            logger.warning(
+                "voice_relay reconnect timed out session_id=%s after %ds",
+                self._session_id, _RECONNECT_HANDSHAKE_TIMEOUT_S,
+            )
+            return False
         except Exception as e:  # noqa: BLE001
             self._slog(f"reconnect failed: open_and_handshake raised: {e}")
             logger.warning(
