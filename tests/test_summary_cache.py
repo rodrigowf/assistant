@@ -57,6 +57,44 @@ def test_cache_invalidated_when_jsonl_grows(jsonl: Path) -> None:
     assert summary_cache.is_fresh(jsonl) is False
 
 
+def test_read_any_returns_stale_cache_after_append(jsonl: Path) -> None:
+    """read_any survives the stat-stale window so callers can reuse the
+    cached summary when the older-prefix slice hasn't actually changed
+    (the JSONL only grew with new turns that stayed in recent verbatim).
+    """
+    summary_cache.write(
+        jsonl, summary_text="summary-text", input_message_count=3,
+        summary_target_words=(100, 300), summarizer_model="claude-sonnet-4-6",
+    )
+    time.sleep(0.01)
+    with open(jsonl, "a") as f:
+        f.write('{"role":"user","content":"new turn"}\n')
+
+    # Fresh read fails (size changed).
+    assert summary_cache.read(jsonl) is None
+    # read_any returns the cached payload anyway.
+    stale = summary_cache.read_any(jsonl)
+    assert stale is not None
+    assert stale.summary_text == "summary-text"
+    assert stale.input_message_count == 3
+    assert stale.summary_target_words == (100, 300)
+
+
+def test_read_any_returns_none_when_cache_missing(jsonl: Path) -> None:
+    assert summary_cache.read_any(jsonl) is None
+
+
+def test_read_any_returns_none_on_schema_mismatch(
+    jsonl: Path, monkeypatch
+) -> None:
+    summary_cache.write(
+        jsonl, summary_text="s", input_message_count=1,
+        summary_target_words=None, summarizer_model=None,
+    )
+    monkeypatch.setattr(summary_cache, "SCHEMA_VERSION", 999)
+    assert summary_cache.read_any(jsonl) is None
+
+
 def test_is_fresh_short_circuits_without_reading_summary(jsonl: Path) -> None:
     # No cache → not fresh.
     assert summary_cache.is_fresh(jsonl) is False

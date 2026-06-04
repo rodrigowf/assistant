@@ -634,26 +634,61 @@ class OrchestratorSession:
                 )
                 summary = cached.summary_text
             else:
-                logger.info(
-                    "history summary cache MISS for %s — recomputing "
-                    "(input_messages=%d, target_words=%s)",
-                    self._jsonl_path.name, len(older), target_words,
+                # Stat-stale miss — but if all that happened is "new turns
+                # were appended and they all stayed in the recent-verbatim
+                # window", the older prefix is byte-identical to what the
+                # stale cache summarised. Try the stale cache: if its
+                # ``input_message_count`` matches the current older slice,
+                # the summary still describes the same prefix and we can
+                # use it as-is without a 60-90s LLM call.
+                #
+                # When older grew (some previously-recent messages crossed
+                # into older), we still use the stale summary and let those
+                # delta messages ride along by extending ``recent`` with
+                # them — the prompt gets older-summary + a slightly larger
+                # verbatim tail. Imprecise but cheap and correct; the
+                # background refresh on end_voice will catch up.
+                stale = summary_cache.read_any(self._jsonl_path)
+                stale_usable = (
+                    stale is not None
+                    and stale.input_message_count <= len(older)
                 )
-                summary = await self._summarize_history(
-                    older, target_words=target_words
-                )
-                # Write through. Failures are logged inside summary_cache
-                # and never propagate — at worst the next call recomputes.
-                if summary:
-                    summary_cache.write(
-                        self._jsonl_path,
-                        summary_text=summary,
-                        input_message_count=len(older),
-                        summary_target_words=target_words,
-                        summarizer_model=getattr(
-                            self._config, "summarizer_model", None
-                        ),
+                if stale_usable:
+                    delta = len(older) - stale.input_message_count
+                    logger.info(
+                        "history summary cache STALE-REUSE for %s "
+                        "(cached_input=%d, current_older=%d, delta=%d, "
+                        "generated_at=%s)",
+                        self._jsonl_path.name, stale.input_message_count,
+                        len(older), delta, stale.generated_at,
                     )
+                    summary = stale.summary_text
+                    if delta > 0:
+                        # Promote the delta (previously-recent messages
+                        # that crossed into older) back into verbatim so
+                        # the prompt loses no context vs. a fresh summary.
+                        recent = older[stale.input_message_count:] + recent
+                else:
+                    logger.info(
+                        "history summary cache MISS for %s — recomputing "
+                        "(input_messages=%d, target_words=%s)",
+                        self._jsonl_path.name, len(older), target_words,
+                    )
+                    summary = await self._summarize_history(
+                        older, target_words=target_words
+                    )
+                    # Write through. Failures are logged inside summary_cache
+                    # and never propagate — at worst the next call recomputes.
+                    if summary:
+                        summary_cache.write(
+                            self._jsonl_path,
+                            summary_text=summary,
+                            input_message_count=len(older),
+                            summary_target_words=target_words,
+                            summarizer_model=getattr(
+                                self._config, "summarizer_model", None
+                            ),
+                        )
 
         self._history_summary = summary
         return recent, summary
@@ -951,6 +986,25 @@ class OrchestratorSession:
         self._voice_ended.set()
 
         await self._broadcast_voice_lifecycle("voice_ended", reason)
+
+        # Background pre-warm: the conversation just gained new turns,
+        # so the summary cache is now stat-stale. Kick off a refresh
+        # off the critical path so the NEXT voice_start (e.g. user says
+        # the wake word again) doesn't pay the 60-90s LLM cost
+        # synchronously. If the user fires the wake word before this
+        # finishes, the STALE-REUSE path in ``_build_history_for_prompt``
+        # uses the existing summary + the new turns as verbatim — also
+        # instant, no LLM call. Either way: no long freeze.
+        try:
+            asyncio.create_task(
+                self.refresh_summary_cache_if_stale(),
+                name=f"summary-refresh-end-voice-{self._local_id}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to schedule end_voice summary refresh for session %s",
+                self._local_id,
+            )
 
     async def _broadcast_voice_lifecycle(self, event_type: str, reason: str) -> None:
         """Push a ``voice_ending`` / ``voice_ended`` event to all subscribers.

@@ -139,6 +139,24 @@ def read(jsonl_path: Path) -> CachedSummary | None:
     Never raises — any failure path returns None and the caller
     falls back to recomputing.
     """
+    return _read(jsonl_path, require_fresh=True)
+
+
+def read_any(jsonl_path: Path) -> CachedSummary | None:
+    """Read the cached summary regardless of freshness vs JSONL.
+
+    Returns the cached summary even if the JSONL has grown since the
+    cache was written. Caller is responsible for checking whether the
+    cache's ``input_message_count`` is still semantically valid for
+    the current older-prefix slice (this matters when an append-only
+    JSONL grew with new turns that stayed inside the recent-verbatim
+    window — the older prefix is byte-identical, so the same summary
+    still describes it).
+    """
+    return _read(jsonl_path, require_fresh=False)
+
+
+def _read(jsonl_path: Path, *, require_fresh: bool) -> CachedSummary | None:
     cp = cache_path_for(jsonl_path)
     if not cp.is_file():
         return None
@@ -157,11 +175,12 @@ def read(jsonl_path: Path) -> CachedSummary | None:
     if raw.get("schema_version") != SCHEMA_VERSION:
         return None
 
-    cached_size = raw.get("jsonl_size")
-    cached_mtime = raw.get("jsonl_mtime_ns")
-    if cached_size != key[0] or cached_mtime != key[1]:
-        # JSONL grew (new turn appended) or was modified — stale.
-        return None
+    if require_fresh:
+        cached_size = raw.get("jsonl_size")
+        cached_mtime = raw.get("jsonl_mtime_ns")
+        if cached_size != key[0] or cached_mtime != key[1]:
+            # JSONL grew (new turn appended) or was modified — stale.
+            return None
 
     summary_text = raw.get("summary_text")
     if not isinstance(summary_text, str):
