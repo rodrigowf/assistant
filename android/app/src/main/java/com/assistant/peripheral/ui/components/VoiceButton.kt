@@ -55,7 +55,8 @@ fun VoiceButton(
         targetValue = when (voiceState) {
             is VoiceState.Off -> MaterialTheme.colorScheme.primaryContainer
             is VoiceState.Connecting,
-            is VoiceState.Summarizing -> MaterialTheme.colorScheme.tertiaryContainer
+            is VoiceState.Summarizing,
+            is VoiceState.Ending -> MaterialTheme.colorScheme.tertiaryContainer
             is VoiceState.Active -> Color(0xFF4AAA7A).copy(alpha = 0.2f) // success
             is VoiceState.Speaking -> Color(0xFF5888CC).copy(alpha = 0.2f) // blue
             is VoiceState.Listening -> Color(0xFF4AAA7A).copy(alpha = 0.3f) // success
@@ -70,7 +71,8 @@ fun VoiceButton(
         targetValue = when (voiceState) {
             is VoiceState.Off -> MaterialTheme.colorScheme.onPrimaryContainer
             is VoiceState.Connecting,
-            is VoiceState.Summarizing -> MaterialTheme.colorScheme.onTertiaryContainer
+            is VoiceState.Summarizing,
+            is VoiceState.Ending -> MaterialTheme.colorScheme.onTertiaryContainer
             is VoiceState.Active, is VoiceState.Listening -> Color(0xFF4AAA7A)
             is VoiceState.Speaking -> Color(0xFF5888CC)
             is VoiceState.Thinking -> Color(0xFFC4923A)
@@ -129,7 +131,8 @@ fun VoiceButton(
     ) {
         when (voiceState) {
             is VoiceState.Connecting,
-            is VoiceState.Summarizing -> {
+            is VoiceState.Summarizing,
+            is VoiceState.Ending -> {
                 CircularProgressIndicator(
                     modifier = Modifier.size(24.dp),
                     strokeWidth = 2.dp,
@@ -202,6 +205,7 @@ fun VoiceControls(
                     is VoiceState.Speaking -> "Speaking..."
                     is VoiceState.Thinking -> "Thinking..."
                     is VoiceState.ToolUse -> "Using tools..."
+                    is VoiceState.Ending -> "Ending..."
                     else -> ""
                 },
                 style = MaterialTheme.typography.labelMedium,
@@ -257,7 +261,8 @@ private fun VoiceStatusIndicator(state: VoiceState) {
     val color = when (state) {
         // Yellow — connection lifecycle in progress, not ready yet.
         is VoiceState.Connecting,
-        is VoiceState.Summarizing -> Color(0xFFD4A24A)
+        is VoiceState.Summarizing,
+        is VoiceState.Ending -> Color(0xFFD4A24A)
         // Green — session is live (any operational sub-state).
         is VoiceState.Active,
         is VoiceState.Listening,
@@ -285,6 +290,7 @@ private fun VoiceStatusIndicator(state: VoiceState) {
     val isPulsing = state in listOf(
         VoiceState.Connecting,
         VoiceState.Summarizing,
+        VoiceState.Ending,
         VoiceState.Listening,
         VoiceState.Speaking,
         VoiceState.Thinking

@@ -111,6 +111,7 @@ export type VoiceStatus =
   | "speaking"
   | "thinking"
   | "tool_use"
+  | "ending"
   | "error";
 
 // Chat state types

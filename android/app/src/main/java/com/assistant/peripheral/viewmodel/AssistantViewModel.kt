@@ -834,9 +834,28 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 voiceManager?.pushSpeakerChunk(event.audioBase64)
             }
 
+            is WebSocketEvent.VoiceEnding -> {
+                // Backend has begun teardown — show "Ending..." until
+                // VoiceEnded confirms. If the user already pressed stop,
+                // we're already in Ending and the timer is running;
+                // otherwise (agent-initiated end) we set state here.
+                if (_voiceState.value !is VoiceState.Ending) {
+                    _voiceState.value = VoiceState.Ending
+                    endingTimeoutJob?.cancel()
+                    endingTimeoutJob = viewModelScope.launch {
+                        kotlinx.coroutines.delay(ENDING_ACK_TIMEOUT_MS)
+                        Log.w(TAG, "voice_ended ack timeout after voice_ending")
+                        finalizeVoiceStop()
+                    }
+                }
+            }
+
+            is WebSocketEvent.VoiceEnded,
             is WebSocketEvent.VoiceStopped -> {
-                // AI-initiated clean end (end_voice_session tool) — mirror web frontend behaviour.
-                // Finalize any in-progress streaming message (TurnComplete never arrives in voice mode).
+                // Backend teardown finished (or AI-initiated end via the
+                // legacy voice_stopped event). Finalize any in-progress
+                // streaming message (TurnComplete never arrives in voice
+                // mode), then do the local teardown via finalizeVoiceStop.
                 b.streamingMessageId?.let { messageId ->
                     b.messages.update { messages ->
                         messages.map { msg ->
@@ -857,7 +876,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 b.streamingMessageId = null
                 b.sessionStatus.value = "idle"
-                stopVoiceSession()
+                finalizeVoiceStop()
             }
 
             is WebSocketEvent.VoiceTranscript -> {
@@ -1513,7 +1532,48 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Job for the "Ending..." → Off safety timeout. The backend emits
+    // VoiceEnded once teardown finishes; this fires only if the ack
+    // never arrives so the UI doesn't stay stuck on "Ending" forever.
+    private var endingTimeoutJob: kotlinx.coroutines.Job? = null
+    private val ENDING_ACK_TIMEOUT_MS = 5000L
+
+    /**
+     * User-initiated stop: ask the backend to tear the session down and
+     * show "Ending..." until VoiceEnded arrives. The previous design
+     * tore down locally immediately and flipped to Off, which masked
+     * backend hangs and caused "frontend shows ended but backend still
+     * running" desync. The full local cleanup now happens in
+     * [finalizeVoiceStop] when the ack arrives (or the safety timeout
+     * fires).
+     */
     fun stopVoiceSession() {
+        // Tell the backend we want to stop. The session_stopped reply
+        // happens on the WS route handler; the voice_ended broadcast is
+        // what we wait for here to confirm the relay is actually down.
+        webSocketManager.send(
+            WebSocketMessage.Stop,
+            endpoint = WebSocketEndpoint.ORCHESTRATOR,
+        )
+        _voiceState.value = VoiceState.Ending
+        // Safety timeout — covers server crash, dropped WS, etc.
+        endingTimeoutJob?.cancel()
+        endingTimeoutJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(ENDING_ACK_TIMEOUT_MS)
+            Log.w(TAG, "voice_ended ack timeout — forcing local stop")
+            finalizeVoiceStop()
+        }
+    }
+
+    /**
+     * Local teardown of the voice session. Called when the backend
+     * confirms teardown ([WebSocketEvent.VoiceEnded] / legacy
+     * [WebSocketEvent.VoiceStopped]) or when the safety timeout fires.
+     * Idempotent — safe to call after the session is already Off.
+     */
+    private fun finalizeVoiceStop() {
+        endingTimeoutJob?.cancel()
+        endingTimeoutJob = null
         viewModelScope.launch {
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off

@@ -95,6 +95,12 @@ sealed class VoiceState {
     object Listening : VoiceState()
     object Thinking : VoiceState()
     object ToolUse : VoiceState()
+    /** Backend is tearing the voice session down — flushing graceful
+     *  shutdown frames, closing the upstream WS. Shown as "Ending..."
+     *  with a spinner so the user knows the stop request is in flight
+     *  and not just frozen. Flips to [Off] on the [WebSocketEvent.VoiceEnded]
+     *  ack (or after a 5s safety timeout if the ack never arrives). */
+    object Ending : VoiceState()
     data class Error(val message: String) : VoiceState()
 }
 
@@ -152,7 +158,14 @@ sealed class WebSocketEvent {
     // Voice events (for WebRTC integration)
     data class VoiceCommand(val command: Map<String, Any?>) : WebSocketEvent()
     data class VoiceTranscript(val text: String, val isFinal: Boolean) : WebSocketEvent()
-    object VoiceStopped : WebSocketEvent()  // AI-initiated clean session end
+    /** Backend has begun teardown — UI should show "Ending..." until
+     *  [VoiceEnded] arrives. */
+    data class VoiceEnding(val reason: String) : WebSocketEvent()
+    /** Backend teardown is complete — UI flips to Off. */
+    data class VoiceEnded(val reason: String) : WebSocketEvent()
+    /** Legacy: emitted alongside [VoiceEnded] by the backend for one
+     *  release of the migration. Remove after the new path is verified. */
+    object VoiceStopped : WebSocketEvent()
 
     /** Provider event mirrored from backend (WebSocket providers only). */
     data class VoiceProviderEvent(val event: Map<String, Any?>) : WebSocketEvent()

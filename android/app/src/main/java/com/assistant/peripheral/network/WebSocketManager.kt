@@ -375,6 +375,14 @@ class WebSocketManager {
                         emit(WebSocketEvent.VoiceAudioOut(audio))
                     }
                 }
+                "voice_ending" -> {
+                    val reason = json.optString("reason", "")
+                    emit(WebSocketEvent.VoiceEnding(reason))
+                }
+                "voice_ended" -> {
+                    val reason = json.optString("reason", "")
+                    emit(WebSocketEvent.VoiceEnded(reason))
+                }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 
                 // Compact

@@ -131,6 +131,13 @@ export function useVoiceOrchestrator(
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Safety timeout for the "Ending..." → "Off" transition. The backend
+  // emits voice_ended once teardown completes; this fires only if the
+  // ack never arrives (server crash, WS drop, etc.) so the UI doesn't
+  // stay stuck on "Ending" forever.
+  const endingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ENDING_ACK_TIMEOUT_MS = 5000;
+
   const optsRef = useRef(options);
   optsRef.current = options;
 
@@ -521,7 +528,28 @@ export function useVoiceOrchestrator(
         break;
       }
 
-      case "voice_stopped":
+      case "voice_ending":
+        // Backend has begun teardown. Reflect it in the UI so the user
+        // sees "Ending..." instead of a stuck "Active" until voice_ended
+        // arrives. Idempotent if we already set Ending in stopVoice().
+        if (endingTimeoutRef.current === null) {
+          endingTimeoutRef.current = setTimeout(() => {
+            console.warn("[voice-orchestrator] voice_ended ack timeout");
+            cleanup();
+            updateStatus("off");
+            optsRef.current.onAfterStop?.();
+            endingTimeoutRef.current = null;
+          }, ENDING_ACK_TIMEOUT_MS);
+        }
+        updateStatus("ending");
+        break;
+
+      case "voice_ended":
+      case "voice_stopped":  // legacy alias — remove after one release
+        if (endingTimeoutRef.current !== null) {
+          clearTimeout(endingTimeoutRef.current);
+          endingTimeoutRef.current = null;
+        }
         cleanup();
         updateStatus("off");
         optsRef.current.onAfterStop?.();
@@ -698,14 +726,45 @@ export function useVoiceOrchestrator(
   ]);
 
   const stopVoice = useCallback(() => {
-    if (wsRef.current) wsRef.current.send({ type: "stop" });
-    cleanup();
-    updateStatus("off");
-    optsRef.current.onAfterStop?.();
+    // Tell the backend we want to stop, then wait for the voice_ended
+    // ack before flipping to Off. Show "Ending..." in the meantime so
+    // the user gets feedback that the request is in flight. A safety
+    // timeout flips to Off after 5s in case the ack never arrives
+    // (server crash, dropped WS). The previous design flipped to Off
+    // immediately and ran local cleanup, which masked backend hangs and
+    // caused "frontend shows ended but backend still running" desync.
+    if (wsRef.current) {
+      wsRef.current.send({ type: "stop" });
+    } else {
+      // No socket → nothing to await. Tear down locally.
+      cleanup();
+      updateStatus("off");
+      optsRef.current.onAfterStop?.();
+      return;
+    }
+    updateStatus("ending");
+    if (endingTimeoutRef.current !== null) {
+      clearTimeout(endingTimeoutRef.current);
+    }
+    endingTimeoutRef.current = setTimeout(() => {
+      console.warn(
+        "[voice-orchestrator] voice_ended ack timeout — forcing local Off",
+      );
+      cleanup();
+      updateStatus("off");
+      optsRef.current.onAfterStop?.();
+      endingTimeoutRef.current = null;
+    }, ENDING_ACK_TIMEOUT_MS);
   }, [cleanup, updateStatus]);
 
   useEffect(() => {
-    return () => { cleanup(); };
+    return () => {
+      if (endingTimeoutRef.current !== null) {
+        clearTimeout(endingTimeoutRef.current);
+        endingTimeoutRef.current = null;
+      }
+      cleanup();
+    };
   }, [cleanup]);
 
   return {
