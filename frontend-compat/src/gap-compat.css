@@ -126,8 +126,12 @@
 .compact-divider > * + * { margin-top: 6px; }
 
 /* ── Compact divider label (row, gap: 6px) ─────────────────────────────── */
+/* JSX is <span icon> + raw text "Context compacted" + optional <span toggle>.
+   Give the leading icon a right-margin so the text doesn't crash into it,
+   and the trailing toggle a left-margin for the same reason. */
 .compact-divider-label { gap: 0; }
-.compact-divider-label > * + * { margin-left: 6px; }
+.compact-divider-label > .compact-divider-icon { margin-right: 6px; }
+.compact-divider-label > .compact-divider-toggle { margin-left: 6px; }
 
 /* ── Voice record active (row, gap: 8px) ───────────────────────────────── */
 .voice-record-active { gap: 0; }
@@ -186,8 +190,10 @@
 .mcp-server-info > * + * { margin-top: 4px; }
 
 /* ── Sidebar config button (row, gap: 7px) ─────────────────────────────── */
+/* Button content is <svg>+ raw text node — `* + *` doesn't match a text
+   node, so we add a trailing margin to the icon instead. */
 .sidebar-config-btn { gap: 0; }
-.sidebar-config-btn > * + * { margin-left: 7px; }
+.sidebar-config-btn > svg { margin-right: 7px; }
 
 /* ── Config panel header (row, gap: 10px) ──────────────────────────────── */
 .config-panel-header { gap: 0; }
@@ -259,12 +265,14 @@
 .session-list-overlay > * + * { margin-top: 10px; }
 
 /* ── Session menu item (row, gap: 8px) ─────────────────────────────────── */
+/* JSX is <svg> + raw text — `* + *` won't match a text node, so the
+   leading svg/icon owns the right-margin instead. */
 .session-menu-item { gap: 0; }
-.session-menu-item > * + * { margin-left: 8px; }
+.session-menu-item > svg { margin-right: 8px; }
 
 /* ── Message actions item (row, gap: 8px) ──────────────────────────────── */
 .message-actions-item { gap: 0; }
-.message-actions-item > * + * { margin-left: 8px; }
+.message-actions-item > svg { margin-right: 8px; }
 
 /* ── Stall banner (row, gap: 12px) ─────────────────────────────────────── */
 .stall-banner { gap: 0; }
