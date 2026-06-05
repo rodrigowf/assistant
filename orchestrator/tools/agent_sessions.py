@@ -79,9 +79,10 @@ def _open_agent_session_schema(static: dict[str, Any]) -> dict[str, Any]:
 @registry.register(
     name="open_agent_session",
     description=(
-        "Start a new Claude Code agent session or resume a past one from history. "
-        "To resume a past session, pass its sdk_session_id (returned by list_agent_sessions "
-        "or list_history). Omit all parameters to start a fresh session. "
+        "Start a new Claude Code agent session OR re-open a past one from history. "
+        "This is the single entry point for both: omit all parameters to start fresh, "
+        "or pass resume_sdk_id with any sdk_session_id from list_history / "
+        "list_agent_sessions to resume that exact conversation (full context restored). "
         "You can specify which MCP servers to load for extended capabilities — "
         "valid names are listed in the system prompt's 'Available MCPs' section. "
         "Returns the session_id; you MUST use that exact session_id in the very "
@@ -242,11 +243,13 @@ async def close_agent_session(context: dict[str, Any], session_id: str) -> str:
 @registry.register(
     name="read_agent_session",
     description=(
-        "Read messages from a Claude Code session's persisted history, "
-        "newest-first priority (returns the last N messages in chronological "
-        "order). Pass max_messages=null to load the full conversation — useful "
-        "when the most recent assistant reply is long and you need its full "
-        "content. Message text is returned verbatim (no truncation)."
+        "Read a Claude Code session's conversation, returning the last N messages "
+        "(default 5; pass max_messages=null for the full transcript). The response "
+        "also tells you whether a turn is actively running on this session: "
+        "'live.status' is 'running' (a turn is in flight — events shows the live "
+        "tail of text/tool_use/permission events) or 'idle' (no turn running — "
+        "messages is the canonical record). Use this single tool whether you want "
+        "the finished output of a past turn or a progress check on an in-flight one."
     ),
     input_schema={
         "type": "object",
@@ -258,7 +261,7 @@ async def close_agent_session(context: dict[str, Any], session_id: str) -> str:
             "max_messages": {
                 "type": ["integer", "null"],
                 "description": (
-                    "How many of the most recent messages to return "
+                    "How many of the most recent persisted messages to return "
                     "(default: 5). Use null to return the entire conversation."
                 ),
             },
@@ -273,23 +276,47 @@ async def read_agent_session(
 ) -> str:
     pool = context["pool"]
     store = context["store"]
+    runner = context.get("runner")
 
     # session_id is the local_id; look up the SDK session ID for JSONL store
     sm = pool.get(session_id)
     sdk_id = sm.sdk_session_id if sm else session_id
 
     previews = store.get_preview(sdk_id, max_messages=max_messages)
-    if not previews:
-        return json.dumps({"error": f"No messages found for session {session_id}"})
-
-    messages = []
-    for p in previews:
-        messages.append({
+    messages = [
+        {
             "role": p.role,
             "text": p.text,
             "timestamp": p.timestamp.isoformat() if p.timestamp else None,
+        }
+        for p in previews
+    ]
+
+    # Live status: is a background turn currently driving this session?
+    # The runner's ring buffer is the single source of truth for in-flight
+    # state — pool membership alone only means the session is open.
+    live: dict[str, Any] = {"status": "idle"}
+    if runner is not None:
+        snapshot = runner.peek(session_id)
+        if snapshot.get("status") == "running" and not snapshot.get("finished", True):
+            live = {
+                "status": "running",
+                "turn_id": snapshot.get("turn_id"),
+                "last_assistant_text": snapshot.get("last_assistant_text", ""),
+                "events": snapshot.get("events", []),
+            }
+
+    if not messages and live["status"] == "idle":
+        return json.dumps({
+            "error": f"No messages found for session {session_id}",
+            "live": live,
         })
-    return json.dumps({"session_id": session_id, "messages": messages})
+
+    return json.dumps({
+        "session_id": session_id,
+        "messages": messages,
+        "live": live,
+    })
 
 
 @registry.register(
@@ -299,11 +326,10 @@ async def read_agent_session(
         "with a turn_id; the agent runs in the background. The result will arrive "
         "as a structured background event ('[SESSION xxx event: turn finished]') at "
         "the start of your next turn — do NOT loop calling this tool waiting for a "
-        "response. While the turn is in flight you can: spawn other agents, peek at "
-        "live output via peek_agent_session, read persisted history via "
-        "read_agent_session, answer permission requests via "
-        "respond_to_agent_permission, or simply respond to the user. "
-        "Use interrupt_agent_session to stop a turn early."
+        "response. While the turn is in flight you can: spawn other agents, check "
+        "progress or read persisted output via read_agent_session, answer "
+        "permission requests via respond_to_agent_permission, or simply respond "
+        "to the user. Use interrupt_agent_session to stop a turn early."
     ),
     input_schema={
         "type": "object",
@@ -352,59 +378,10 @@ async def send_to_agent_session(
         "started_at": handle.started_at,
         "hint": (
             "Result arrives as a background event next turn. "
-            "peek_agent_session for live output; read_agent_session for history."
+            "Call read_agent_session(session_id) at any time — "
+            "it returns persisted messages plus 'live.status' (running/idle) for in-flight progress."
         ),
     })
-
-
-@registry.register(
-    name="peek_agent_session",
-    description=(
-        "Read live events from an in-flight agent turn (text deltas, tool calls, "
-        "permission requests).  Use this to monitor an agent's progress without "
-        "waiting for the turn to finish.  For completed turns prefer "
-        "read_agent_session which goes against persisted JSONL.  Pass since_seq "
-        "from a previous response's next_seq to read incrementally."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "The session whose turn to peek at.",
-            },
-            "turn_id": {
-                "type": "string",
-                "description": (
-                    "Optional. Defaults to the most recent turn for this session. "
-                    "Useful when an agent has had multiple turns dispatched."
-                ),
-            },
-            "since_seq": {
-                "type": "integer",
-                "description": "Return only events with seq > this. Default 0.",
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Max events to return. Default 50.",
-            },
-        },
-        "required": ["session_id"],
-    },
-)
-async def peek_agent_session(
-    context: dict[str, Any],
-    session_id: str,
-    turn_id: str = "",
-    since_seq: int = 0,
-    limit: int = 50,
-) -> str:
-    runner = context.get("runner")
-    if runner is None:
-        return json.dumps({"error": "BackgroundAgentRunner not available in context"})
-    return json.dumps(
-        runner.peek(session_id, turn_id=turn_id or None, since_seq=since_seq, limit=limit)
-    )
 
 
 @registry.register(
@@ -517,9 +494,11 @@ async def respond_to_agent_permission(
 @registry.register(
     name="list_history",
     description=(
-        "List all past conversation sessions. Each session has a 'type' field: "
-        "'agent' sessions can be resumed with open_agent_session, "
-        "'orchestrator' sessions CANNOT be resumed as agent sessions."
+        "List all past conversation sessions (closed agents from history). "
+        "Each entry has a 'session_id' (the sdk_session_id) and a 'type': "
+        "pass any 'agent' entry's session_id to open_agent_session(resume_sdk_id=...) "
+        "to re-open and continue that exact conversation with full context. "
+        "'orchestrator' sessions CANNOT be re-opened as agent sessions."
     ),
     input_schema={
         "type": "object",

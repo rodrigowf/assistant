@@ -123,8 +123,8 @@ def _render_notifications(notes: list[Notification]) -> str:
     """Render a batch of background-agent notifications as a status block.
 
     Status lines only (per design choice): the orchestrator must call
-    read_agent_session or peek_agent_session to retrieve actual content.
-    Keeps the synthetic prompt cheap and forces explicit follow-up reads.
+    read_agent_session to retrieve actual content. Keeps the synthetic
+    prompt cheap and forces explicit follow-up reads.
     """
     if not notes:
         return ""
@@ -145,8 +145,8 @@ def _render_notifications(notes: list[Notification]) -> str:
             bits.append(f'error="{n.error}"')
         lines.append(", ".join(bits) + "]")
     lines.append(
-        "(Use read_agent_session(session_id) for persisted output, "
-        "peek_agent_session(session_id, turn_id) for live in-flight events.)"
+        "(Use read_agent_session(session_id) for the actual content — it returns "
+        "persisted messages plus a 'live' block with status and in-flight events.)"
     )
     return "\n".join(lines)
 
@@ -253,7 +253,7 @@ class OrchestratorSession:
                 pool, store, self._notifications,
             )
             # Make the runner reachable from tools that get only the
-            # context dict (e.g. send_to_agent_session, peek_agent_session).
+            # context dict (e.g. send_to_agent_session, read_agent_session).
             context["runner"] = self._runner
             context["notifications"] = self._notifications
         else:

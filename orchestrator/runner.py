@@ -2,8 +2,9 @@
 
 Owns asyncio tasks that drive ``pool.send()`` for fire-and-forget agent
 calls (the orchestrator's ``send_to_agent_session`` tool), buffers per-turn
-events for ``peek_agent_session``, and pushes structured ``Notification``
-records onto a queue the orchestrator drains at the start of each turn.
+events so ``read_agent_session`` can return a live tail while a turn is in
+flight, and pushes structured ``Notification`` records onto a queue the
+orchestrator drains at the start of each turn.
 
 The runner does **not** import from ``orchestrator.session`` or
 ``orchestrator.agent`` — it depends only on ``SessionPool``, ``SessionStore``,
@@ -54,10 +55,9 @@ logger = logging.getLogger(__name__)
 class AgentTurnEvent:
     """A single buffered event from an in-flight agent turn.
 
-    Buffered in a bounded ring so peek_agent_session can return recent
-    activity without holding the entire turn in memory.  ``seq`` is
-    monotonic per (session_id, turn_id) so the LLM can resume incrementally
-    using ``since_seq``.
+    Buffered in a bounded ring so read_agent_session can return a live tail
+    of recent activity without holding the entire turn in memory.  ``seq``
+    is monotonic per (session_id, turn_id).
     """
 
     seq: int

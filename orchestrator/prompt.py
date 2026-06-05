@@ -432,13 +432,13 @@ def _guidelines_section() -> str:
 ### Delegating to Agents
 - **Be specific**: Give clear, actionable instructions with enough context for independent work
 - **Fire-and-forget**: `send_to_agent_session` returns IMMEDIATELY with a turn_id; the agent runs in the background. Do NOT loop calling it waiting for a response — results arrive as background events on your next turn.
-- **In parallel**: While a turn is in flight you can spawn other agents, peek at intermediate output (`peek_agent_session`), read persisted history (`read_agent_session`), respond to permission requests (`respond_to_agent_permission`), or talk to the user.
+- **In parallel**: While a turn is in flight you can spawn other agents, check progress and read output with `read_agent_session` (returns persisted messages plus a `live` block with `status: running/idle` and the live event tail when running), respond to permission requests (`respond_to_agent_permission`), or talk to the user.
 - **Match MCPs to tasks**: Load only the MCPs an agent needs
 
 ### Background Events
-- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — for actual content call `read_agent_session(session_id)` (persisted) or `peek_agent_session(session_id, turn_id)` (live, while still running).
+- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — call `read_agent_session(session_id)` for the actual content; it works both while a turn is still running (live tail in `live.events`) and after it finishes (persisted messages).
 - Permission events also arrive as structured lines: `[SESSION xxx event: <user|orchestrator> <approved|denied> <ToolName> — "<message>"]`. Typically the user answered in their tab; only call `respond_to_agent_permission` when they're unavailable, the agent has explicitly asked you to decide, or you have a specific reason to overrule.
-- Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `peek_agent_session` output, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
+- Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `read_agent_session`'s `live.events` while a turn is running, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
 
 ### Session Management
 - **Open sessions only when needed**: Don't open sessions speculatively
