@@ -1,12 +1,18 @@
 // Compat shim: remark-gfm uses lookbehind regexes unsupported in Safari 12.
 // This shim implements GFM table parsing only, using Safari 12-safe regexes.
 // Other GFM features (strikethrough, autolinks) remain disabled.
+//
+// Inline formatting inside cells: bold (**x**), italic (*x* / _x_),
+// inline code (`x`), links ([text](url)) and <br> are parsed into proper
+// mdast nodes so react-markdown renders them — the prior version dumped the
+// raw cell text into a single text node and bold/code/etc. appeared as
+// literal asterisks/backticks (or got swallowed by react-markdown).
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Node = any;
 
 // Parse a table row string into cell strings.
-// Splits on | but NOT on \| (escaped pipes).
+// Splits on | but NOT on \| (escaped pipes) and NOT on | inside `inline code`.
 // Uses a simple state machine — no lookbehind needed.
 function parseCells(row: string): string[] {
   // Strip leading/trailing pipes and whitespace
@@ -16,13 +22,18 @@ function parseCells(row: string): string[] {
 
   const cells: string[] = [];
   let current = '';
+  let inCode = false;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === '\\' && i + 1 < s.length) {
       // Escaped character — keep both chars, advance past next
       current += ch + s[i + 1];
       i++;
-    } else if (ch === '|') {
+    } else if (ch === '`') {
+      // Toggle inline-code state. Pipes inside backticks are literal.
+      inCode = !inCode;
+      current += ch;
+    } else if (ch === '|' && !inCode) {
       cells.push(current.trim());
       current = '';
     } else {
@@ -53,16 +64,134 @@ function getAlign(cell: string): 'left' | 'right' | 'center' | null {
   return null;
 }
 
-// Build a remark text node
+// Build remark nodes
 function textNode(value: string): Node {
   return { type: 'text', value };
 }
+function strongNode(children: Node[]): Node {
+  return { type: 'strong', children };
+}
+function emphasisNode(children: Node[]): Node {
+  return { type: 'emphasis', children };
+}
+function inlineCodeNode(value: string): Node {
+  return { type: 'inlineCode', value };
+}
+function linkNode(url: string, children: Node[]): Node {
+  return { type: 'link', url, title: null, children };
+}
+function breakNode(): Node {
+  return { type: 'break' };
+}
+
+// Parse a cell string into mdast inline children.
+//
+// Supports (kept minimal — this is a compat shim, not a full markdown parser):
+//   `code`                    → inlineCode
+//   **bold** / __bold__       → strong (children recursively parsed)
+//   *italic* / _italic_       → emphasis (children recursively parsed)
+//   [text](url)               → link (text recursively parsed)
+//   <br> / <br/> / <br />     → break
+//   \X                        → literal X (escape)
+//
+// Anything that doesn't match a delimiter pair is emitted as text so the cell
+// is never empty just because we failed to recognise some construct.
+function parseInline(text: string): Node[] {
+  const out: Node[] = [];
+  let buf = '';
+  const flush = function () {
+    if (buf.length > 0) { out.push(textNode(buf)); buf = ''; }
+  };
+
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text.charAt(i);
+
+    // Escape: \X — emit literal X, advance past both chars.
+    if (ch === '\\' && i + 1 < n) {
+      buf += text.charAt(i + 1);
+      i += 2;
+      continue;
+    }
+
+    // <br>, <br/>, <br /> — line break inside a cell.
+    if (ch === '<') {
+      const rest = text.slice(i);
+      const m = /^<br\s*\/?\s*>/i.exec(rest);
+      if (m) {
+        flush();
+        out.push(breakNode());
+        i += m[0].length;
+        continue;
+      }
+    }
+
+    // Inline code: `...` — find the next unescaped backtick.
+    if (ch === '`') {
+      const end = text.indexOf('`', i + 1);
+      if (end !== -1) {
+        flush();
+        out.push(inlineCodeNode(text.slice(i + 1, end)));
+        i = end + 1;
+        continue;
+      }
+    }
+
+    // Link: [text](url) — text may contain inline markdown, url is literal.
+    if (ch === '[') {
+      const close = text.indexOf(']', i + 1);
+      if (close !== -1 && text.charAt(close + 1) === '(') {
+        const urlEnd = text.indexOf(')', close + 2);
+        if (urlEnd !== -1) {
+          flush();
+          const linkText = text.slice(i + 1, close);
+          const url = text.slice(close + 2, urlEnd);
+          out.push(linkNode(url, parseInline(linkText)));
+          i = urlEnd + 1;
+          continue;
+        }
+      }
+    }
+
+    // Bold (** or __) — greedy but bounded: find the matching closing pair.
+    if ((ch === '*' || ch === '_') && i + 1 < n && text.charAt(i + 1) === ch) {
+      const marker = ch + ch;
+      const end = text.indexOf(marker, i + 2);
+      // Require non-empty content so "****" isn't treated as a pair.
+      if (end !== -1 && end > i + 2) {
+        flush();
+        out.push(strongNode(parseInline(text.slice(i + 2, end))));
+        i = end + 2;
+        continue;
+      }
+    }
+
+    // Italic (* or _) — single delimiter.
+    if (ch === '*' || ch === '_') {
+      const end = text.indexOf(ch, i + 1);
+      if (end !== -1 && end > i + 1) {
+        flush();
+        out.push(emphasisNode(parseInline(text.slice(i + 1, end))));
+        i = end + 1;
+        continue;
+      }
+    }
+
+    buf += ch;
+    i++;
+  }
+
+  flush();
+  return out;
+}
 
 // Build a remark table cell node
-function cellNode(text: string, isHeader: boolean): Node {
+function cellNode(text: string, _isHeader: boolean): Node {
+  const children = parseInline(text);
   return {
-    type: isHeader ? 'tableCell' : 'tableCell',
-    children: [textNode(text)],
+    type: 'tableCell',
+    children: children.length > 0 ? children : [textNode('')],
   };
 }
 

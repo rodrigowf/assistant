@@ -248,3 +248,80 @@
 @media (max-width: 640px) {
   .chat-input > * + * { margin-left: 8px; }
 }
+
+/* ============================================================
+   Additional gap shims — classes added/discovered after the
+   initial pass. Same row/column rules as above.
+   ============================================================ */
+
+/* ── Session list overlay (column, gap: 10px) ──────────────────────────── */
+.session-list-overlay { gap: 0; }
+.session-list-overlay > * + * { margin-top: 10px; }
+
+/* ── Session menu item (row, gap: 8px) ─────────────────────────────────── */
+.session-menu-item { gap: 0; }
+.session-menu-item > * + * { margin-left: 8px; }
+
+/* ── Message actions item (row, gap: 8px) ──────────────────────────────── */
+.message-actions-item { gap: 0; }
+.message-actions-item > * + * { margin-left: 8px; }
+
+/* ── Stall banner (row, gap: 12px) ─────────────────────────────────────── */
+.stall-banner { gap: 0; }
+.stall-banner > * + * { margin-left: 12px; }
+
+/* ── Permission bar inner (row, gap: 16px) ─────────────────────────────── */
+.permission-bar-inner { gap: 0; }
+.permission-bar-inner > * + * { margin-left: 16px; }
+
+/* ── Permission bar text (column, gap: 2px) ────────────────────────────── */
+.permission-bar-text { gap: 0; }
+.permission-bar-text > * + * { margin-top: 2px; }
+
+/* ── Permission bar actions (row, gap: 8px) ────────────────────────────── */
+.permission-bar-actions { gap: 0; }
+.permission-bar-actions > * + * { margin-left: 8px; }
+
+/* ── Working-directory list: info (column, gap: 2px) ───────────────────── */
+.wd-list-info { gap: 0; }
+.wd-list-info > * + * { margin-top: 2px; }
+
+/* ── Working-directory list: path row (row, gap: 6px) ──────────────────── */
+.wd-list-path-row { gap: 0; }
+.wd-list-path-row > * + * { margin-left: 6px; }
+
+/* ── Working-directory type tabs (row, gap: 4px) ───────────────────────── */
+.wd-type-tabs { gap: 0; }
+.wd-type-tabs > * + * { margin-left: 4px; }
+
+/* ── Working-directory field (column, gap: 4px) ────────────────────────── */
+.wd-field { gap: 0; }
+.wd-field > * + * { margin-top: 4px; }
+
+/* ── Working-directory field row (row, gap: 10px) ──────────────────────── */
+.wd-field-row { gap: 0; }
+.wd-field-row > * + * { margin-left: 10px; }
+
+/* ── Working-directory add actions (row, gap: 8px) ─────────────────────── */
+.wd-add-actions { gap: 0; }
+.wd-add-actions > * + * { margin-left: 8px; }
+
+/* ── Model dropdowns (row wrap, gap: 12px). Wrap breaks the simple
+       sibling rule because wrapped rows still get the top margin.
+       For a config panel that's acceptable — visually the extra spacing
+       between wrapped rows reads as deliberate. ─────────────────────── */
+.model-dropdowns { gap: 0; }
+.model-dropdowns > * + * { margin-left: 12px; }
+
+/* ── Model dropdown field (column, gap: 5px) ───────────────────────────── */
+.model-dropdown-field { gap: 0; }
+.model-dropdown-field > * + * { margin-top: 5px; }
+
+/* ── Config section header (row, gap: 10px) ────────────────────────────── */
+.config-section-header { gap: 0; }
+.config-section-header > * + * { margin-left: 10px; }
+
+/* ── Session config footer (row, gap: 14px) ────────────────────────────── */
+.session-config-footer { gap: 0; }
+.session-config-footer > * + * { margin-left: 14px; }
+
