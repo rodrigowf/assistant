@@ -846,10 +846,22 @@ class OrchestratorSession:
 
         For the full session-level teardown — provider release, audio
         recorder stop, broadcast of ``voice_ended`` — call :meth:`end_voice`.
+
+        Also clears any Gemini ``sessionResumption`` handle the provider
+        was holding. The handle is bound to the upstream WS we just tore
+        down — Google invalidates it server-side on close, and reusing it
+        on the next setup makes Google accept the handshake and then 1008
+        the WS ~150s later ("operation aborted"). Observed 2026-06-04:
+        three back-to-back ``voice_start`` calls all reused the same dead
+        handle and got the duplicate-handle abort, surfacing as a spike
+        of 400 BadRequest in AI Studio's dashboard.
         """
         if self._voice_relay is not None:
             await self._voice_relay.stop()
             self._voice_relay = None
+        provider = self._voice_provider
+        if provider is not None and hasattr(provider, "_resumption_handle"):
+            provider._resumption_handle = None
 
     def _set_voice_state_unlocked(self, target: VoiceLifecycle) -> None:
         """Internal: transition state. Caller MUST hold ``_voice_lock``.

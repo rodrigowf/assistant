@@ -37,6 +37,31 @@ from orchestrator.session import OrchestratorSession
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["orchestrator"])
 
+# Per-session locks serializing concurrent ``voice_start`` handlers for the
+# same ``local_id``.  Android (and other clients with reconnect-on-blip
+# behaviour) can fire ``voice_start`` multiple times within ~1s when the
+# socket flutters; without this guard each call independently raced
+# through ``_handle_start`` → ``_attach_voice_payload`` → relay rebuild,
+# opening multiple Google Live WS handshakes against the same stale
+# ``sessionResumption`` handle. Google accepted the duplicate handshakes
+# and then 1008'd them ~150s later ("operation aborted"), surfacing as a
+# spike of 400 BadRequest in AI Studio's dashboard (observed
+# 2026-06-04: three back-to-back opens, all reusing the same handle).
+#
+# Keyed on ``local_id``. The dict is intentionally never pruned — locks
+# are tiny (~100 bytes), local_ids are UUIDs, and a long-lived backend
+# accumulates O(distinct sessions/day) ≈ a handful, not enough to leak.
+_VOICE_START_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _voice_start_lock_for(local_id: str) -> asyncio.Lock:
+    lock = _VOICE_START_LOCKS.get(local_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _VOICE_START_LOCKS[local_id] = lock
+    return lock
+
+
 async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
     """Send to a client WS, swallowing the post-close race.
 
@@ -114,7 +139,32 @@ async def orchestrator_ws(ws: WebSocket):
                 session, subscribed = await _handle_start(ws, pool, msg, voice=False)
 
             elif msg_type == "voice_start":
-                session, subscribed = await _handle_start(ws, pool, msg, voice=True)
+                # Serialize concurrent voice_start for the same local_id
+                # so a burst of duplicate triggers from a reconnecting
+                # client can't open multiple upstream WS handshakes. See
+                # ``_VOICE_START_LOCKS`` docstring for the failure mode
+                # this guards against. If no local_id was supplied,
+                # ``_handle_start`` generates one — we accept the race
+                # for that path (no clear key to lock on, and a missing
+                # local_id is already a one-off "fresh tab" case where
+                # duplicates are extremely unlikely).
+                _vs_local_id = msg.get("local_id")
+                if _vs_local_id:
+                    _vs_lock = _voice_start_lock_for(_vs_local_id)
+                    if _vs_lock.locked():
+                        logger.info(
+                            "voice_start coalesce: local_id=%s already in flight; "
+                            "waiting for the in-progress handler",
+                            _vs_local_id,
+                        )
+                    async with _vs_lock:
+                        session, subscribed = await _handle_start(
+                            ws, pool, msg, voice=True,
+                        )
+                else:
+                    session, subscribed = await _handle_start(
+                        ws, pool, msg, voice=True,
+                    )
                 if session is not None:
                     voice_owner = True
 
