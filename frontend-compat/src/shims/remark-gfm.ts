@@ -250,6 +250,51 @@ function tryParseTable(lines: string[], start: number): { node: Node; consumed: 
   return { node, consumed: i - start };
 }
 
+// Reconstruct the raw markdown source of an inline mdast node.
+//
+// Critical: remark (without remark-gfm) still runs the *inline* phase on the
+// table-row text, so `| **Hacker News** | … |` arrives as a paragraph whose
+// children are e.g. [text "| ", strong{children:[text "Hacker News"]}, text " | …"].
+// If we only read `child.value`, the bold content vanishes from our
+// reconstructed line and the cell is parsed as empty — which is exactly the
+// "first column blank" bug.
+//
+// So we walk every inline node type remark can emit and re-emit it in
+// markdown source form. Anything we don't recognise falls back to
+// `child.value || ''` (same as the old code) so the worst case is still no
+// worse than before.
+function reconstructInline(node: Node): string {
+  if (!node) return '';
+  const t: string = node.type;
+  if (t === 'text') return node.value || '';
+  if (t === 'inlineCode') return '`' + (node.value || '') + '`';
+  if (t === 'break') return '\n';
+  if (t === 'strong') {
+    return '**' + reconstructChildren(node.children) + '**';
+  }
+  if (t === 'emphasis') {
+    return '*' + reconstructChildren(node.children) + '*';
+  }
+  if (t === 'delete') {
+    return '~~' + reconstructChildren(node.children) + '~~';
+  }
+  if (t === 'link') {
+    return '[' + reconstructChildren(node.children) + '](' + (node.url || '') + ')';
+  }
+  if (t === 'image') {
+    return '![' + (node.alt || '') + '](' + (node.url || '') + ')';
+  }
+  if (t === 'html') return node.value || '';
+  if (node.children) return reconstructChildren(node.children);
+  return node.value || '';
+}
+function reconstructChildren(children: Node[] | undefined): string {
+  if (!children) return '';
+  let s = '';
+  for (let i = 0; i < children.length; i++) s += reconstructInline(children[i]);
+  return s;
+}
+
 // The remark plugin
 function remarkGfmShim() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -265,10 +310,10 @@ function remarkGfmShim() {
         continue;
       }
 
-      // Reconstruct the raw text of this paragraph
-      const raw: string = node.children
-        .map(function(c: Node) { return c.value || ''; })
-        .join('');
+      // Reconstruct the raw text of this paragraph — including inline markdown
+      // that remark's default parser already turned into nodes (strong, emphasis,
+      // inlineCode, link, …). See reconstructInline for the why.
+      const raw: string = reconstructChildren(node.children);
 
       const lines = raw.split('\n');
 
