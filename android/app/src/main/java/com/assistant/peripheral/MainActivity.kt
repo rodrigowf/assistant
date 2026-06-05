@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.core.content.ContextCompat
@@ -151,6 +152,21 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Bluetooth connect permission (Android 12+). The manifest declares
+        // BLUETOOTH_CONNECT for API 31+, but it's a runtime grant. Without
+        // it BluetoothAdapter.getProfileConnectionState() throws
+        // SecurityException — AudioRouter catches that and reports "no BT"
+        // as a safety net, so denying this permission just means the
+        // BLUETOOTH routing option stays unavailable. The OS-managed AUTO
+        // routing default still works fine without it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        }
+
         if (permissionsToRequest.isNotEmpty()) {
             requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
         }
@@ -188,6 +204,19 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isScanning by viewModel.isScanning.collectAsState()
     val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
     val systemConfig by viewModel.systemConfig.collectAsState()
+    val toastMessage by viewModel.toastMessage.collectAsState()
+
+    // Surface one-shot router messages (e.g. "BT speaker unsupported on
+    // OpenAI") as a system Toast.  Compose-side LaunchedEffect drains the
+    // state flow so each new message fires once.
+    val toastContext = LocalContext.current
+    LaunchedEffect(toastMessage) {
+        val msg = toastMessage
+        if (msg != null) {
+            android.widget.Toast.makeText(toastContext, msg, android.widget.Toast.LENGTH_LONG).show()
+            viewModel.clearToast()
+        }
+    }
 
     // Wire wake word detection: start turn-based recording and navigate to chat
     val coroutineScope = rememberCoroutineScope()
@@ -294,6 +323,13 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         mutableStateOf<Pair<String, Int>?>(null) // (kind, uiIndex)
     }
 
+    // Pending delete confirmation, mirroring the web frontend's ConfirmModal.
+    // We hold (sessionId, title) so the dialog can display the human-readable
+    // title even after the user navigates away from the sessions list.
+    var pendingDeleteSession by remember {
+        mutableStateOf<Pair<String, String>?>(null)
+    }
+
     Scaffold { innerPadding ->
     Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
         // Page content
@@ -328,7 +364,10 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                             navController.navigate(Screen.Chat.route)
                         },
                         onRenameSession = viewModel::renameSession,
-                        onDeleteSession = viewModel::deleteSession,
+                        onDeleteSession = { sid ->
+                            val title = sessions.find { it.sessionId == sid }?.title ?: "this conversation"
+                            pendingDeleteSession = sid to title
+                        },
                         onDuplicateSession = viewModel::duplicateSession,
                         onCloseSession = viewModel::closeSession,
                         onRefresh = viewModel::refreshSessions
@@ -355,6 +394,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         // TODO: surface this via a StateFlow if we want live updates without
                         // leaving Settings.
                         isBluetoothAvailable = viewModel.isBluetoothAudioAvailable(),
+                        isWiredHeadphoneAvailable = viewModel.isWiredHeadphoneAvailable(),
                         onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
                         onUpdateWakeWord = viewModel::updateWakeWord,
                         onUpdateVoiceWord = viewModel::updateVoiceWord,
@@ -369,6 +409,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         onLoadSystemConfig = viewModel::loadSystemConfig,
                         onUpdateSystemConfig = viewModel::updateSystemConfig,
                         onToggleMcp = viewModel::toggleMcp,
+                        onDismissVoiceModelAutoCorrected = viewModel::dismissVoiceModelAutoCorrected,
                     )
                 }
             }
@@ -406,6 +447,26 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         }
 
         if (isVoiceActive) {
+            val reconnectBanner by viewModel.voiceReconnectBanner.collectAsState()
+            reconnectBanner?.let { msg ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                ) {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        contentAlignment = androidx.compose.ui.Alignment.Center,
+                    ) {
+                        Text(
+                            text = msg,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                    }
+                }
+            }
             VoiceControls(
                 voiceState = voiceState,
                 isMuted = isMuted,
@@ -461,6 +522,35 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             }
         }
     }
+    }
+
+    // Delete-conversation confirmation, matching the web ConfirmModal. The
+    // file is moved to context/trash/ on the backend and can be recovered
+    // manually, but the user shouldn't lose a conversation to a stray tap.
+    pendingDeleteSession?.let { (sessionId, title) ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteSession = null },
+            title = { Text("Delete conversation?") },
+            text = {
+                Text(
+                    "\"$title\" will be moved to trash and hidden from the assistant. " +
+                        "The file is kept on disk and can be recovered manually from context/trash/."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.deleteSession(sessionId)
+                    pendingDeleteSession = null
+                }) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteSession = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     // Rewind / fork confirmation dialog. Rendered outside the Scaffold's

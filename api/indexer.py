@@ -50,6 +50,8 @@ class MemoryWatcher:
         self._project_dir = project_dir.resolve()
         self._debounce_ms = debounce_ms
         self._running = True
+        # Eager Event so stop() before run() reaches awatch is race-free.
+        self._stop_event = asyncio.Event()
 
     def _get_memory_dir(self) -> Path:
         """Get the memory directory (uses context/memory/ directly)."""
@@ -70,8 +72,17 @@ class MemoryWatcher:
         logger.info(f"Memory watcher started: {memory_dir}")
 
         try:
-            from watchfiles import awatch, Change
+            from watchfiles import awatch
+        except ImportError:
+            logger.error("watchfiles not installed, memory watcher disabled")
+            return
 
+        # awatch wraps a blocking Rust call in anyio.to_thread; that thread
+        # only honors stop_event, not asyncio cancellation. If we don't set
+        # the event in the cancel path, anyio's CancelScope retries
+        # cancellation forever and burns 100% CPU. Set it in finally so it
+        # fires for both CancelledError and any other exit.
+        try:
             async for changes in awatch(
                 memory_dir,
                 debounce=self._debounce_ms,
@@ -80,7 +91,6 @@ class MemoryWatcher:
                 if not self._running:
                     break
 
-                # Filter to only .md file changes
                 md_changes = [
                     (change, path) for change, path in changes
                     if path.endswith(".md")
@@ -90,25 +100,16 @@ class MemoryWatcher:
                     logger.info(f"Memory files changed: {len(md_changes)} file(s)")
                     if await _run_index_script(self._project_dir, "--memory-only"):
                         logger.info("Memory indexed successfully")
-
-        except ImportError:
-            logger.error("watchfiles not installed, memory watcher disabled")
         except Exception as e:
             if self._running:
                 logger.error(f"Memory watcher error: {e}")
-
-    @property
-    def _stop_event(self) -> asyncio.Event:
-        """Create a stop event that's set when _running is False."""
-        if not hasattr(self, "_event"):
-            self._event = asyncio.Event()
-        return self._event
+        finally:
+            self._stop_event.set()
 
     def stop(self) -> None:
         """Signal the watcher to stop."""
         self._running = False
-        if hasattr(self, "_event"):
-            self._event.set()
+        self._stop_event.set()
         logger.info("Memory watcher stopping")
 
 

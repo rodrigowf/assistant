@@ -114,6 +114,12 @@ export function useVoiceOrchestrator(
   // — misleading boilerplate for any malformed/unexpected request) and
   // closes the upstream WS, killing the voice session.
   const responseInFlightRef = useRef(false);
+  // Gemini Live ``serverContent.inputTranscription`` arrives as
+  // token-level deltas. Accumulate them and emit a single
+  // ``onUserTranscript`` per turn (flushed on first output delta or
+  // turnComplete). Without this, each fragment became its own user
+  // bubble — one bubble per word.
+  const pendingUserTranscriptRef = useRef("");
 
   // Mute state
   const [isMuted, setIsMuted] = useState(false);
@@ -124,6 +130,13 @@ export function useVoiceOrchestrator(
   const [speakerLevel, setSpeakerLevel] = useState(0);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Safety timeout for the "Ending..." → "Off" transition. The backend
+  // emits voice_ended once teardown completes; this fires only if the
+  // ack never arrives (server crash, WS drop, etc.) so the UI doesn't
+  // stay stuck on "Ending" forever.
+  const endingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ENDING_ACK_TIMEOUT_MS = 5000;
 
   const optsRef = useRef(options);
   optsRef.current = options;
@@ -198,6 +211,21 @@ export function useVoiceOrchestrator(
   const handleProviderEvent = useCallback((event: RealtimeEvent) => {
     const eventType = event.type;
 
+    // Backend-synthesised status for the upstream handshake (sent before
+    // the WS provider's own greeting). "preparing" keeps the connecting
+    // spinner up; "ready" flips to active so the user knows they can
+    // start talking. Other voice_status payloads are reserved for future
+    // states and ignored here.
+    if (eventType === "voice_status") {
+      const status = (event as { status?: string }).status;
+      if (status === "preparing") {
+        updateStatus("connecting");
+      } else if (status === "ready") {
+        updateStatus("active");
+      }
+      return;
+    }
+
     // Gemini Live event shape: no top-level ``type`` field. Top-level
     // keys are camelCase (``setupComplete``, ``serverContent``,
     // ``toolCall``). Map to the same callbacks the OpenAI/Qwen branches
@@ -208,17 +236,29 @@ export function useVoiceOrchestrator(
       if (sc) {
         const inputT = sc.inputTranscription as Record<string, unknown> | undefined;
         if (inputT) {
+          // Accumulate — Gemini Live sends one event per word/fragment.
+          // Flushed on the first output delta of this turn (model
+          // started replying) or on turnComplete.
           const text = (inputT.text as string) || "";
-          if (text) optsRef.current.onUserTranscript?.(text);
+          if (text) pendingUserTranscriptRef.current += text;
         }
+        const flushPendingUser = () => {
+          const staged = pendingUserTranscriptRef.current;
+          if (staged) {
+            pendingUserTranscriptRef.current = "";
+            optsRef.current.onUserTranscript?.(staged);
+          }
+        };
         const outputT = sc.outputTranscription as Record<string, unknown> | undefined;
         if (outputT) {
+          flushPendingUser();
           const text = (outputT.text as string) || "";
           if (text) optsRef.current.onAssistantDelta?.(text);
         }
         // Streaming text via modelTurn.parts[].text (half-cascade Live preview)
         const modelTurn = sc.modelTurn as Record<string, unknown> | undefined;
         if (modelTurn) {
+          flushPendingUser();
           const parts = (modelTurn.parts as Array<Record<string, unknown>>) || [];
           for (const p of parts) {
             const t = p.text as string | undefined;
@@ -237,6 +277,9 @@ export function useVoiceOrchestrator(
           updateStatus("active");
         }
         if (sc.turnComplete) {
+          // Failsafe: covers audio-only turns where neither
+          // outputTranscription nor modelTurn fired.
+          flushPendingUser();
           responseInFlightRef.current = false;
           updateStatus("active");
           optsRef.current.onAssistantComplete?.("");
@@ -447,6 +490,13 @@ export function useVoiceOrchestrator(
       vlog("recv", event.type, event.type === "voice_event" ? (event.event as RealtimeEvent).type : "");
     }
     switch (event.type) {
+      // Heartbeat from backend (every 15s) — keeps the connection
+      // warm against power-saving WiFi clients. No-op here; receiving
+      // the bytes is the entire purpose.
+      case "ping":
+      case "pong":
+        return;
+
       case "session_started": {
         optsRef.current.onSessionStarted?.(event.session_id);
         const info = event.voice_connection_info;
@@ -485,7 +535,28 @@ export function useVoiceOrchestrator(
         break;
       }
 
-      case "voice_stopped":
+      case "voice_ending":
+        // Backend has begun teardown. Reflect it in the UI so the user
+        // sees "Ending..." instead of a stuck "Active" until voice_ended
+        // arrives. Idempotent if we already set Ending in stopVoice().
+        if (endingTimeoutRef.current === null) {
+          endingTimeoutRef.current = setTimeout(() => {
+            console.warn("[voice-orchestrator] voice_ended ack timeout");
+            cleanup();
+            updateStatus("off");
+            optsRef.current.onAfterStop?.();
+            endingTimeoutRef.current = null;
+          }, ENDING_ACK_TIMEOUT_MS);
+        }
+        updateStatus("ending");
+        break;
+
+      case "voice_ended":
+      case "voice_stopped":  // legacy alias — remove after one release
+        if (endingTimeoutRef.current !== null) {
+          clearTimeout(endingTimeoutRef.current);
+          endingTimeoutRef.current = null;
+        }
         cleanup();
         updateStatus("off");
         optsRef.current.onAfterStop?.();
@@ -662,14 +733,46 @@ export function useVoiceOrchestrator(
   ]);
 
   const stopVoice = useCallback(() => {
-    if (wsRef.current) wsRef.current.send({ type: "stop" });
-    cleanup();
-    updateStatus("off");
-    optsRef.current.onAfterStop?.();
+    // Tell the backend to end ONLY the voice connection (keeping the
+    // orchestrator session alive in the pool for re-arm), then wait
+    // for the voice_ended ack before flipping to Off. Show "Ending..."
+    // in the meantime so the user gets feedback that the request is in
+    // flight. A safety timeout flips to Off after 5s in case the ack
+    // never arrives (server crash, dropped WS). The previous design
+    // sent {type:"stop"} which dropped the entire session — wrong: the
+    // tab should survive, voice is one mode of interacting with it.
+    if (wsRef.current) {
+      wsRef.current.send({ type: "voice_stop" });
+    } else {
+      // No socket → nothing to await. Tear down locally.
+      cleanup();
+      updateStatus("off");
+      optsRef.current.onAfterStop?.();
+      return;
+    }
+    updateStatus("ending");
+    if (endingTimeoutRef.current !== null) {
+      clearTimeout(endingTimeoutRef.current);
+    }
+    endingTimeoutRef.current = setTimeout(() => {
+      console.warn(
+        "[voice-orchestrator] voice_ended ack timeout — forcing local Off",
+      );
+      cleanup();
+      updateStatus("off");
+      optsRef.current.onAfterStop?.();
+      endingTimeoutRef.current = null;
+    }, ENDING_ACK_TIMEOUT_MS);
   }, [cleanup, updateStatus]);
 
   useEffect(() => {
-    return () => { cleanup(); };
+    return () => {
+      if (endingTimeoutRef.current !== null) {
+        clearTimeout(endingTimeoutRef.current);
+        endingTimeoutRef.current = null;
+      }
+      cleanup();
+    };
   }, [cleanup]);
 
   return {

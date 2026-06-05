@@ -2,7 +2,10 @@ package com.assistant.peripheral.viewmodel
 
 import android.app.Application
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTrack
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
@@ -16,6 +19,7 @@ import com.assistant.peripheral.network.DiscoveredServer
 import com.assistant.peripheral.network.LiveSession
 import com.assistant.peripheral.network.NetworkScanner
 import com.assistant.peripheral.network.WebSocketEndpoint
+import com.assistant.peripheral.voice.VoiceConfig
 import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
@@ -178,6 +182,40 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _voiceState = MutableStateFlow<VoiceState>(VoiceState.Off)
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
 
+    /**
+     * The voice config in use for the *current* voice session, or null if
+     * voice isn't active. Captured at [startVoiceSession] time. We hold
+     * onto it so that an unplanned WS reconnect (e.g. keepalive ping
+     * timeout from the A300M's WiFi power-saving) can re-arm voice on
+     * the new WS with the same provider/model/voice instead of falling
+     * back to text mode and leaving the local mic loop pumping into a
+     * voiceless socket. Cleared in [finalizeVoiceStop].
+     */
+    private var activeVoiceConfig: VoiceConfig? = null
+
+    /**
+     * One-shot transient message for the UI to display as a toast/snackbar.
+     * Set to a non-null string when something noteworthy happens (e.g. the
+     * audio router downgrades the user's requested output).  The UI consumes
+     * it and calls [clearToast] when it's done showing.
+     */
+    private val _toastMessage = MutableStateFlow<String?>(null)
+    val toastMessage: StateFlow<String?> = _toastMessage.asStateFlow()
+
+    fun clearToast() {
+        _toastMessage.value = null
+    }
+
+    /**
+     * Transient banner for the voice reconnect lifecycle. null = no
+     * banner. Set by [VoiceEvent.ReconnectWarning] (early heads-up
+     * from Gemini's goAway) and [VoiceEvent.Reconnecting] (relay is
+     * actively cycling). Cleared when [VoiceState] flips back to
+     * Active after the new upstream's setupComplete arrives.
+     */
+    private val _voiceReconnectBanner = MutableStateFlow<String?>(null)
+    val voiceReconnectBanner: StateFlow<String?> = _voiceReconnectBanner.asStateFlow()
+
     // Muted state for voice
     private val _isMuted = MutableStateFlow(false)
     val isMuted: StateFlow<Boolean> = _isMuted.asStateFlow()
@@ -284,15 +322,29 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
                     .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
                 // Update API client when server URL changes
-                apiClient = ApiClient(_settings.value.serverUrl)
-                // Update VoiceManager with new API client
-                voiceManager?.release()
-                voiceManager = VoiceManager(getApplication(), apiClient!!).also {
-                    it.setMicGain(_settings.value.micGainLevel)
-                    it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                    it.setAudioOutput(_settings.value.audioOutput)
+                val needNewVoiceManager = voiceManager == null || serverUrlChanged
+                if (needNewVoiceManager) {
+                    apiClient = ApiClient(_settings.value.serverUrl)
+                    voiceManager?.release()
+                    voiceManager = VoiceManager(getApplication(), apiClient!!).also {
+                        it.setMicGain(_settings.value.micGainLevel)
+                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
+                        it.setAudioOutput(_settings.value.audioOutput)
+                    }
+                    setupVoiceManagerCallbacks()
+                } else {
+                    // Same server — just refresh tunables on the existing manager.
+                    // Rebuilding here on every DataStore emission was creating
+                    // overlapping VoiceManager instances + stale flow collectors,
+                    // which produced phantom duplicate sessions when the wake
+                    // word fired (two .start() calls slipping past the off-state
+                    // guard during the HTTP await).
+                    voiceManager?.let {
+                        it.setMicGain(_settings.value.micGainLevel)
+                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
+                        it.setAudioOutput(_settings.value.audioOutput)
+                    }
                 }
-                setupVoiceManagerCallbacks()
 
                 // Clear all session state when switching servers
                 if (serverUrlChanged) {
@@ -342,6 +394,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             viewModelScope.launch {
                 vm.state.collect { state ->
                     _voiceState.value = state
+                    // Clear the reconnect banner once we're back in Active —
+                    // setupComplete on the new upstream re-fires
+                    // voice_status:ready which flips state here.
+                    if (state == VoiceState.Active && _voiceReconnectBanner.value != null) {
+                        _voiceReconnectBanner.value = null
+                    }
                 }
             }
 
@@ -420,9 +478,31 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 )
                 b.messages.update { it + errorMessage }
             }
+            is VoiceEvent.RoutingFallback -> {
+                // Surface as a toast so the user knows the requested
+                // audio output was downgraded (e.g. JBL on OpenAI).
+                Log.w(TAG, "Routing fallback: ${event.message}")
+                _toastMessage.value = event.message
+            }
+            is VoiceEvent.ReconnectWarning -> {
+                // Upstream goAway — fired ~30-60s before the actual cut.
+                // Light banner + a soft beep so the user can pause speech.
+                val secs = event.timeLeftSeconds
+                _voiceReconnectBanner.value = if (secs != null) {
+                    "Pausing in ~${secs}s to reconnect…"
+                } else {
+                    "Reconnecting shortly…"
+                }
+                playReconnectBeep()
+            }
+            is VoiceEvent.Reconnecting -> {
+                // Active cutover — mic chunks are being dropped right now.
+                _voiceReconnectBanner.value = "Pausing for a second to reconnect…"
+            }
             is VoiceEvent.SessionEnded -> {
                 _voiceState.value = VoiceState.Off
                 _isMuted.value = false
+                _voiceReconnectBanner.value = null
             }
             is VoiceEvent.SessionCreated -> {
                 Log.d(TAG, "Voice session created")
@@ -505,13 +585,36 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         // Also track the sdk session id so we can load history
                         orchBucket.pendingResumeSessionId.value = existing.sdkSessionId
                         _noActiveOrchestrator.value = false
-                        webSocketManager.send(
-                            WebSocketMessage.Start(
-                                localId = existing.localId,
-                                resumeSdkId = existing.sdkSessionId
-                            ),
-                            endpoint = WebSocketEndpoint.ORCHESTRATOR
-                        )
+
+                        // If voice was active when the WS dropped, re-arm
+                        // voice on the new WS instead of falling back to
+                        // text mode. Without this, the local mic capture
+                        // loop kept pushing chunks at a voiceless socket
+                        // and the user-facing session appeared frozen.
+                        val voiceCfg = activeVoiceConfig
+                        if (voiceCfg != null) {
+                            Log.i(TAG, "WS reconnect during live voice — re-arming via voice_start")
+                            webSocketManager.send(
+                                WebSocketMessage.VoiceStart(
+                                    localId = existing.localId,
+                                    resumeSdkId = existing.sdkSessionId,
+                                    voiceProvider = voiceCfg.provider,
+                                    voiceModel = voiceCfg.model,
+                                    voiceName = voiceCfg.voice,
+                                    voiceTranscriptionLanguage = voiceCfg.transcriptionLanguage,
+                                    voiceEndpoint = voiceCfg.endpoint.takeIf { it.isNotBlank() },
+                                ),
+                                endpoint = WebSocketEndpoint.ORCHESTRATOR
+                            )
+                        } else {
+                            webSocketManager.send(
+                                WebSocketMessage.Start(
+                                    localId = existing.localId,
+                                    resumeSdkId = existing.sdkSessionId
+                                ),
+                                endpoint = WebSocketEndpoint.ORCHESTRATOR
+                            )
+                        }
                     } else {
                         // No live orchestrator. Stay idle — UI will switch to History.
                         orchBucket.pendingResumeSessionId.value = null
@@ -766,9 +869,28 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 voiceManager?.pushSpeakerChunk(event.audioBase64)
             }
 
+            is WebSocketEvent.VoiceEnding -> {
+                // Backend has begun teardown — show "Ending..." until
+                // VoiceEnded confirms. If the user already pressed stop,
+                // we're already in Ending and the timer is running;
+                // otherwise (agent-initiated end) we set state here.
+                if (_voiceState.value !is VoiceState.Ending) {
+                    _voiceState.value = VoiceState.Ending
+                    endingTimeoutJob?.cancel()
+                    endingTimeoutJob = viewModelScope.launch {
+                        kotlinx.coroutines.delay(ENDING_ACK_TIMEOUT_MS)
+                        Log.w(TAG, "voice_ended ack timeout after voice_ending")
+                        finalizeVoiceStop()
+                    }
+                }
+            }
+
+            is WebSocketEvent.VoiceEnded,
             is WebSocketEvent.VoiceStopped -> {
-                // AI-initiated clean end (end_voice_session tool) — mirror web frontend behaviour.
-                // Finalize any in-progress streaming message (TurnComplete never arrives in voice mode).
+                // Backend teardown finished (or AI-initiated end via the
+                // legacy voice_stopped event). Finalize any in-progress
+                // streaming message (TurnComplete never arrives in voice
+                // mode), then do the local teardown via finalizeVoiceStop.
                 b.streamingMessageId?.let { messageId ->
                     b.messages.update { messages ->
                         messages.map { msg ->
@@ -789,7 +911,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 }
                 b.streamingMessageId = null
                 b.sessionStatus.value = "idle"
-                stopVoiceSession()
+                finalizeVoiceStop()
             }
 
             is WebSocketEvent.VoiceTranscript -> {
@@ -1213,6 +1335,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 _sessions.update { it.filter { s -> s.sessionId != sessionId } }
                 // Also remove from cache
                 sessionCache.remove(sessionId)
+            } else {
+                Log.w(TAG, "deleteSession: backend rejected $sessionId")
+                _toastMessage.value = "Delete failed."
             }
         }
     }
@@ -1240,21 +1365,32 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             if (newId != null) {
                 lastRefreshTime = 0L  // bypass refresh debounce
                 refreshSessions()
+                _toastMessage.value = "Conversation duplicated."
             } else {
                 Log.w(TAG, "duplicateSession: backend rejected $sessionId")
+                _toastMessage.value = "Duplicate failed."
             }
         }
     }
 
     /**
      * Rewind a session: drop the last [dropLastN] visible messages.
-     * The session must be closed first (backend rejects truncate on live sessions).
-     * If the rewound session is the currently-loaded one, closes it first.
+     * The session must be closed first (backend rejects truncate on live
+     * sessions, including the orchestrator). [explicitLocalId] is the live
+     * pool's local_id for [sessionId] when known by the caller — required
+     * for orchestrator rewinds, since `_sdkToLocalId` only reliably tracks
+     * agent sessions.
      */
-    fun truncateSession(sessionId: String, dropLastN: Int) {
+    fun truncateSession(
+        sessionId: String,
+        dropLastN: Int,
+        explicitLocalId: String? = null,
+    ) {
         viewModelScope.launch {
-            // If the session is open, close it first.
-            val localId = _sdkToLocalId.value[sessionId]
+            // Close the live session first if we can identify one. Prefer the
+            // explicit local_id (from the active bucket); fall back to the
+            // SDK→local map for callers that only know the JSONL id.
+            val localId = explicitLocalId ?: _sdkToLocalId.value[sessionId]
             if (localId != null) {
                 apiClient?.closePoolSession(localId)
                 _liveSessionIds.update { it - sessionId }
@@ -1264,6 +1400,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             val ok = apiClient?.truncateSession(sessionId, dropLastN) ?: false
             if (!ok) {
                 Log.w(TAG, "truncateSession: backend rejected $sessionId drop=$dropLastN")
+                _toastMessage.value = "Rewind failed — session may still be open."
                 return@launch
             }
 
@@ -1275,10 +1412,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     b.currentSessionId.value = null
                     b.currentSessionIdForPagination = null
                     b.hasMoreMessages.value = false
+                    b.jsonlSessionId = null
                 }
             }
             sessionCache.remove(sessionId)
 
+            _toastMessage.value = "Conversation rewound."
             lastRefreshTime = 0L
             refreshSessions()
         }
@@ -1294,8 +1433,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             if (newId != null) {
                 lastRefreshTime = 0L
                 refreshSessions()
+                _toastMessage.value = "Conversation forked."
             } else {
                 Log.w(TAG, "forkSession: backend rejected $sessionId drop=$dropLastN")
+                _toastMessage.value = "Fork failed."
             }
         }
     }
@@ -1305,6 +1446,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * position [uiIndex]. Converts to a bottom-relative drop count so the
      * action survives pagination — the frontend may only have the most
      * recent page loaded, so an absolute top-index would be unreliable.
+     *
+     * Passes the bucket's live local_id through to [truncateSession] so the
+     * orchestrator path (which isn't reliably indexed in `_sdkToLocalId`)
+     * can still close the pool session before the truncate call.
      */
     fun rewindCurrentSessionAt(uiIndex: Int) {
         val b = activeBucket()
@@ -1315,7 +1460,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
         val total = b.messages.value.size
         val dropLastN = (total - 1 - uiIndex).coerceAtLeast(0)
-        truncateSession(sessionId, dropLastN)
+        truncateSession(sessionId, dropLastN, explicitLocalId = b.currentLocalId.value)
     }
 
     /**
@@ -1399,6 +1544,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // assistant_config.json (toggled from the web frontend).
             val cfg = apiClient!!.getVoiceConfig()
 
+            // Remember the config so a WS reconnect during this session
+            // can re-arm voice (see handleWebSocketEvent's Connected
+            // handler). Cleared in finalizeVoiceStop.
+            activeVoiceConfig = cfg
+
             // Send voice_start with the orchestrator bucket's local_id and the true
             // JSONL session id so the backend resumes from the correct history file.
             // The voice fields come from the backend config we just fetched —
@@ -1422,7 +1572,53 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Job for the "Ending..." → Off safety timeout. The backend emits
+    // VoiceEnded once teardown finishes; this fires only if the ack
+    // never arrives so the UI doesn't stay stuck on "Ending" forever.
+    private var endingTimeoutJob: kotlinx.coroutines.Job? = null
+    private val ENDING_ACK_TIMEOUT_MS = 5000L
+
+    /**
+     * User-initiated stop: ask the backend to end ONLY the voice
+     * connection (keeping the orchestrator session alive in the pool
+     * for re-arm) and show "Ending..." until VoiceEnded arrives.
+     *
+     * The orchestrator session IS the tab — it survives the voice
+     * connection ending, the same way it survives a WS disconnect.
+     * The next wake word re-arms voice on the same session via
+     * restart_voice, preserving JSONL / agent context. Sending
+     * WebSocketMessage.Stop (which drops the whole pool slot) was
+     * wrong: it forced every wake word to start a fresh session with
+     * empty history. Use VoiceStop instead.
+     *
+     * The full local cleanup happens in [finalizeVoiceStop] when the
+     * ack arrives (or the safety timeout fires).
+     */
     fun stopVoiceSession() {
+        webSocketManager.send(
+            WebSocketMessage.VoiceStop,
+            endpoint = WebSocketEndpoint.ORCHESTRATOR,
+        )
+        _voiceState.value = VoiceState.Ending
+        // Safety timeout — covers server crash, dropped WS, etc.
+        endingTimeoutJob?.cancel()
+        endingTimeoutJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(ENDING_ACK_TIMEOUT_MS)
+            Log.w(TAG, "voice_ended ack timeout — forcing local stop")
+            finalizeVoiceStop()
+        }
+    }
+
+    /**
+     * Local teardown of the voice session. Called when the backend
+     * confirms teardown ([WebSocketEvent.VoiceEnded] / legacy
+     * [WebSocketEvent.VoiceStopped]) or when the safety timeout fires.
+     * Idempotent — safe to call after the session is already Off.
+     */
+    private fun finalizeVoiceStop() {
+        endingTimeoutJob?.cancel()
+        endingTimeoutJob = null
+        activeVoiceConfig = null  // voice over → no resume on reconnect
         viewModelScope.launch {
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off
@@ -1578,6 +1774,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun isBluetoothAudioAvailable(): Boolean =
         voiceManager?.isBluetoothAudioAvailable() == true
 
+    /**
+     * Whether a wired 3.5mm headphone/headset is currently plugged in.
+     * UI should call this to decide whether to enable the WIRED segment.
+     */
+    fun isWiredHeadphoneAvailable(): Boolean =
+        voiceManager?.isWiredHeadphoneAvailable() == true
+
     fun updateSpeakerVolumeLevel(level: Float) {
         viewModelScope.launch {
             val clamped = level.coerceIn(0.0f, 1.5f)
@@ -1684,14 +1887,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 val voiceProviders = voiceDef.await().toMutableMap()
                 if (googleVoice.isNotEmpty()) voiceProviders["google"] = googleVoice
 
+                // Auto-correct: if the saved Gemini model is no longer in the
+                // discovered catalog (Google renames Live ids periodically),
+                // write through to the new default and surface a banner.
+                val (correctedCfg, correction) = maybeAutoCorrectVoiceModel(
+                    client, cfg, googleVoice,
+                )
+
                 _systemConfig.value = SystemConfigState(
-                    config = cfg,
+                    config = correctedCfg,
                     mcpServers = mcpDef.await(),
                     models = modelsDef.await(),
                     voiceProviders = voiceProviders,
                     qwenHarnessModels = qwenDef.await(),
                     sessionProviders = providersDef.await(),
                     loading = false,
+                    voiceModelAutoCorrected = correction,
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "loadSystemConfig error: ${e.message}", e)
@@ -1719,21 +1930,35 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     // Refetch the Google voice catalog when the user flips the
                     // backend, since the model list is per-endpoint. Mirrors
                     // the web ConfigPage useEffect.
+                    var effectiveCfg = newCfg
+                    var correction: VoiceModelAutoCorrection? = _systemConfig.value.voiceModelAutoCorrected
                     val voiceProviders = if (
                         newCfg.defaultVoiceEndpoint != prevEndpoint
                     ) {
                         val googleVoice = client.listGoogleVoiceModels(newCfg.defaultVoiceEndpoint)
                         val merged = _systemConfig.value.voiceProviders.toMutableMap()
-                        if (googleVoice.isNotEmpty()) merged["google"] = googleVoice
+                        if (googleVoice.isNotEmpty()) {
+                            merged["google"] = googleVoice
+                            // The newly-fetched catalog may not include the
+                            // saved model id (especially after flipping
+                            // Vertex↔AI Studio, where the canonical id
+                            // differs). Auto-correct here too.
+                            val (corrected, c) = maybeAutoCorrectVoiceModel(
+                                client, newCfg, googleVoice,
+                            )
+                            effectiveCfg = corrected
+                            if (c != null) correction = c
+                        }
                         merged
                     } else {
                         _systemConfig.value.voiceProviders
                     }
                     _systemConfig.value = _systemConfig.value.copy(
-                        config = newCfg,
+                        config = effectiveCfg,
                         voiceProviders = voiceProviders,
                         saving = false,
                         savedFlash = true,
+                        voiceModelAutoCorrected = correction,
                     )
                     savedFlashJob?.cancel()
                     savedFlashJob = viewModelScope.launch {
@@ -1751,12 +1976,136 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun dismissVoiceModelAutoCorrected() {
+        _systemConfig.value = _systemConfig.value.copy(voiceModelAutoCorrected = null)
+    }
+
+    /**
+     * Snap the saved Gemini Live model to the discovered default when
+     * the catalog no longer lists it. Returns the (possibly updated)
+     * config and the correction record (null = no change needed).
+     *
+     * Empty catalog → no-op: we only correct when we have a known-good
+     * list. Failures fall through silently, leaving the saved value as
+     * the source of truth.
+     */
+    private suspend fun maybeAutoCorrectVoiceModel(
+        client: ApiClient,
+        cfg: AssistantConfig,
+        discovered: List<VoiceModelEntry>,
+    ): Pair<AssistantConfig, VoiceModelAutoCorrection?> {
+        if (cfg.defaultVoiceProvider != "google") return cfg to null
+        if (discovered.isEmpty()) return cfg to null
+        if (discovered.any { it.id == cfg.defaultVoiceModel }) return cfg to null
+        val newDefault = discovered.firstOrNull { it.isDefault } ?: discovered.first()
+        val voiceListed = newDefault.voices.any { it.id == cfg.defaultVoiceName }
+        val patch = ConfigPatch(
+            defaultVoiceModel = newDefault.id,
+            defaultVoiceName = if (voiceListed) null else newDefault.voice,
+        )
+        val result = client.updateAssistantConfig(patch)
+        return result.fold(
+            onSuccess = { updated ->
+                updated to VoiceModelAutoCorrection(
+                    from = cfg.defaultVoiceModel,
+                    to = newDefault.id,
+                )
+            },
+            onFailure = { e ->
+                Log.w(TAG, "auto-correct voice model failed: ${e.message}")
+                cfg to null
+            },
+        )
+    }
+
     /** Toggle a single MCP server in `enabled_mcps`. */
     fun toggleMcp(name: String) {
         val cfg = _systemConfig.value.config ?: return
         val next = cfg.enabledMcps.toMutableList()
         if (next.contains(name)) next.remove(name) else next.add(name)
         updateSystemConfig(ConfigPatch(enabledMcps = next))
+    }
+
+    /**
+     * Play a short two-tone cue (~300ms total) signalling that the voice
+     * upstream is about to cycle. The first attempt at this (single tone
+     * on STREAM_NOTIFICATION, 2026-06-04) was inaudible on the A300M
+     * during an active call because the notification stream is
+     * effectively muted by the call audio plane. Switched to STREAM_MUSIC
+     * which is the same stream the voice playback is using — guaranteed
+     * audible whenever the agent's voice is.
+     *
+     * Two tones (880Hz → 660Hz) chosen because a single beep blended too
+     * easily with the agent's own speech. The descending interval is a
+     * clear "wrap up" cue without sounding alarming.
+     *
+     * Fire-and-forget — we don't block the caller. If audio init fails
+     * (very old device, unusual route, etc.) we log and continue; the
+     * banner still appears.
+     */
+    private fun playReconnectBeep() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val sr = 22050
+                val toneMs = 130
+                val gapMs = 40
+                val toneFrames = sr * toneMs / 1000
+                val gapFrames = sr * gapMs / 1000
+                val totalFrames = toneFrames * 2 + gapFrames
+                val pcm = ShortArray(totalFrames)
+                val fadeFrames = sr * 15 / 1000
+                // Volume — 50% amplitude. We're sharing the music stream
+                // with the agent's voice (which clips at 100%) so being
+                // distinctly audible matters more than being polite.
+                val amplitude = 0.50
+                fun fillTone(offset: Int, freq: Double) {
+                    val twoPiF = 2.0 * Math.PI * freq
+                    for (i in 0 until toneFrames) {
+                        val env = when {
+                            i < fadeFrames -> i.toDouble() / fadeFrames
+                            i > toneFrames - fadeFrames -> (toneFrames - i).toDouble() / fadeFrames
+                            else -> 1.0
+                        }
+                        val sample = (Math.sin(twoPiF * i / sr) * env * amplitude * Short.MAX_VALUE).toInt()
+                        pcm[offset + i] = sample.toShort()
+                    }
+                }
+                fillTone(0, 880.0)
+                // Gap stays as zero-filled silence.
+                fillTone(toneFrames + gapFrames, 660.0)
+
+                val bufSize = AudioTrack.getMinBufferSize(
+                    sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                ).coerceAtLeast(totalFrames * 2)
+                @Suppress("DEPRECATION")
+                val track = AudioTrack(
+                    AudioManager.STREAM_MUSIC,
+                    sr,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufSize,
+                    AudioTrack.MODE_STATIC,
+                )
+                if (track.state != AudioTrack.STATE_INITIALIZED) {
+                    Log.w(TAG, "playReconnectBeep: AudioTrack init failed state=${track.state}")
+                    track.release()
+                    return@launch
+                }
+                val written = track.write(pcm, 0, totalFrames)
+                if (written < 0) {
+                    Log.w(TAG, "playReconnectBeep: AudioTrack write failed code=$written")
+                } else {
+                    Log.i(TAG, "playReconnectBeep: starting tone (frames=$totalFrames, stream=STREAM_MUSIC)")
+                }
+                track.play()
+                val playMs = ((toneFrames * 2 + gapFrames) * 1000L) / sr
+                kotlinx.coroutines.delay(playMs + 80)
+                try { track.stop() } catch (_: Exception) {}
+                track.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "playReconnectBeep failed: ${e.message}", e)
+            }
+        }
     }
 
     override fun onCleared() {

@@ -20,19 +20,53 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from pathlib import Path
 
 import orjson
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from api.pool import SessionPool
 from api.serializers import serialize_orchestrator_event
+from orchestrator import summary_cache
 from orchestrator.config import OrchestratorConfig, get_available_models
 from orchestrator.providers.discovery import list_orchestrator_models
 from orchestrator.session import OrchestratorSession
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["orchestrator"])
+
+async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
+    """Send to a client WS, swallowing the post-close race.
+
+    Starlette's ``send`` raises ``RuntimeError: Cannot call "send" once a
+    close message has been sent.`` when we try to write to a WS that
+    closed mid-handler — for us that's the orchestrator-WS handler still
+    in flight when okhttp closes the socket on the other end. The crash
+    bubbles up through the handler, aborts whatever response we were
+    building, and the route shows ``Orchestrator WS error`` in the log.
+
+    Returns True if the bytes were sent, False if the WS was already
+    closed (caller can stop trying).
+    """
+    if ws.client_state != WebSocketState.CONNECTED:
+        return False
+    try:
+        await ws.send_bytes(payload)
+        return True
+    except RuntimeError as e:
+        # The specific message Starlette raises when the WS is already
+        # closing/closed. Treat as a clean "client gone" — the disconnect
+        # branch will tear down voice via end_voice as usual.
+        if "close message has been sent" in str(e) or "after sending close" in str(e):
+            logger.debug("safe_send: WS already closed, dropping payload")
+            return False
+        raise
+    except Exception:
+        # Unknown error — log and drop. Don't crash the handler.
+        logger.warning("safe_send: unexpected error, dropping payload", exc_info=True)
+        return False
 
 
 @router.websocket("/api/orchestrator/chat")
@@ -42,6 +76,11 @@ async def orchestrator_ws(ws: WebSocket):
     pool: SessionPool = ws.app.state.pool
     session: OrchestratorSession | None = None
     subscribed = False  # True once this ws is registered in pool._orchestrator_subs
+    # Defensive init — the finally block reads ``was_voice``
+    # unconditionally, and not every loop-exit path runs through one
+    # of the except handlers where ``was_voice`` is otherwise assigned.
+    # Without this default we'd hit UnboundLocalError on any clean exit.
+    was_voice = False
 
     # Register as a watcher so this ws receives agent_session_opened/closed events
     pool.watch(ws)
@@ -52,12 +91,19 @@ async def orchestrator_ws(ws: WebSocket):
             try:
                 msg = orjson.loads(raw)
             except (orjson.JSONDecodeError, ValueError):
-                await ws.send_bytes(orjson.dumps({
+                await _safe_send_bytes(ws, orjson.dumps({
                     "type": "error", "error": "invalid_json",
                 }))
                 continue
 
             msg_type = msg.get("type", "")
+
+            # Client-initiated heartbeat / heartbeat-ack — neither side
+            # needs to do anything but consume them silently. Allows the
+            # client to optionally send its own pings (or echo ours back
+            # as a "pong"); we just ignore both.
+            if msg_type in ("ping", "pong"):
+                continue
 
             if msg_type == "start":
                 session, subscribed = await _handle_start(ws, pool, msg, voice=False)
@@ -67,7 +113,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "send":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -76,7 +122,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "send_audio":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -91,7 +137,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "set_model":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -100,7 +146,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "get_model":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -113,7 +159,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "voice_event":
                 if session is None or not session.is_voice:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_voice_session",
                         "detail": "No active voice session",
                     }))
@@ -121,12 +167,18 @@ async def orchestrator_ws(ws: WebSocket):
                 await _handle_voice_event(pool, session, msg.get("event", {}))
 
             elif msg_type == "voice_audio_in":
-                # WS-provider mic chunk from the browser → forward upstream.
+                # WS-provider mic chunk → forward upstream.
+                # Drop silently if no voice session is set up on this WS.
+                # Why: when Android's WS reconnects mid-call, the local
+                # mic-capture loop keeps running and starts pushing chunks
+                # on the new WS before our voice_start has been processed.
+                # The previous "error: not_voice_session" reply per chunk
+                # caused an error storm in both directions (Android logged:
+                # 28x error events before the start reply landed on a
+                # single reconnect). Mic frames are inherently
+                # disposable — silently dropping them while we're not
+                # voice-ready is the right behaviour.
                 if session is None or not session.is_voice:
-                    await ws.send_bytes(orjson.dumps({
-                        "type": "error", "error": "not_voice_session",
-                        "detail": "No active voice session",
-                    }))
                     continue
                 audio_b64 = msg.get("audio", "")
                 if audio_b64:
@@ -158,7 +210,7 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "compact":
                 if session is None:
-                    await ws.send_bytes(orjson.dumps({
+                    await _safe_send_bytes(ws, orjson.dumps({
                         "type": "error", "error": "not_started",
                         "detail": "Send a 'start' message first",
                     }))
@@ -170,14 +222,38 @@ async def orchestrator_ws(ws: WebSocket):
                     await session.interrupt()
                     await pool.broadcast_orchestrator({"type": "status", "status": "interrupted"})
 
+            elif msg_type == "voice_stop":
+                # End ONLY the voice connection — keep the orchestrator
+                # session alive in the pool so the user can re-arm voice
+                # later with the wake word (the tab survives). The
+                # session.stop() / end_voice path closes the upstream
+                # WS and releases the audio recorder; nothing leaks.
+                if session is not None and session.is_voice:
+                    try:
+                        await session.end_voice("user_stop")
+                    except Exception:  # noqa: BLE001
+                        logger.exception("end_voice failed during voice_stop")
+                # No session_stopped ack here — the voice_ended broadcast
+                # that end_voice fires is the ack the frontend waits for.
+
             elif msg_type == "stop":
+                # Stop the orchestrator session entirely (close the tab).
+                # For voice sessions, also tear down the voice connection
+                # on the way out so the graceful shutdown frames fire
+                # and tokens stop accruing immediately. The follow-up
+                # pool.stop_orchestrator drops the session from the pool.
+                if session is not None and session.is_voice:
+                    try:
+                        await session.end_voice("user_stop")
+                    except Exception:  # noqa: BLE001
+                        logger.exception("end_voice failed during stop")
                 await pool.stop_orchestrator()
                 session = None
                 subscribed = False
-                await ws.send_bytes(orjson.dumps({"type": "session_stopped"}))
+                await _safe_send_bytes(ws, orjson.dumps({"type": "session_stopped"}))
 
             else:
-                await ws.send_bytes(orjson.dumps({
+                await _safe_send_bytes(ws, orjson.dumps({
                     "type": "error", "error": "unknown_type",
                     "detail": f"Unknown message type: {msg_type!r}",
                 }))
@@ -199,7 +275,27 @@ async def orchestrator_ws(ws: WebSocket):
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
-        # Orchestrator session keeps running headlessly until explicitly stopped.
+        # On client WS disconnect: tear down the voice connection
+        # (relay, upstream WS to Gemini/Qwen, audio recorder, provider
+        # handle) so we don't keep burning provider tokens with no
+        # client listening — but KEEP the OrchestratorSession alive in
+        # the pool. The tab survives like text mode does, and a
+        # subsequent ``voice_start`` re-arms voice on this same session
+        # via ``restart_voice`` (same JSONL, same agent context, no
+        # resume dance).
+        #
+        # ``end_voice`` is idempotent and handles non-voice sessions as
+        # a fast no-op, so calling it unconditionally here is safe.
+        if was_voice and session is not None:
+            try:
+                await session.end_voice("client_disconnect")
+                logger.info(
+                    "Voice connection ended on client disconnect session=%s "
+                    "(orchestrator session kept in pool for re-arm)",
+                    getattr(session, "local_id", "?"),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("end_voice on disconnect failed")
 
 
 async def _handle_start(
@@ -237,14 +333,95 @@ async def _handle_start(
             local_id, resume_id, voice_provider_req, voice_model_req, voice_name_req, voice_lang_req, voice_endpoint_req,
         )
 
+    # If a prior session with this local_id is in the middle of being
+    # torn down (state == ENDING), wait for it to finish before deciding
+    # reconnect vs new. Skipping this is what caused the "frozen on
+    # restart" bug — a fresh voice_start would hit the reconnect branch
+    # and reattach to a session whose relay was already dying.
+    if local_id:
+        ok = await pool.await_orchestrator_stop(local_id, timeout=5.0)
+        if not ok:
+            logger.warning(
+                "Timed out waiting for prior orchestrator %s to finish stopping",
+                local_id,
+            )
+            await _safe_send_bytes(ws, orjson.dumps({
+                "type": "error", "error": "orchestrator_stopping",
+                "detail": (
+                    "Previous voice session is still ending. Please retry."
+                ),
+            }))
+            return None, False
+
     # --- Reconnect: an orchestrator with this local_id is already running ---
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
         session = pool.get_orchestrator()
         current_voice = getattr(session, "is_voice", False)
+        skip_reconnect = False
 
-        if voice and not current_voice:
-            # Text→voice transition: stop text session, fall through to create voice
-            await pool.stop_orchestrator()
+        # Belt-and-braces: if the session's voice lifecycle has already
+        # entered ENDING (the await_orchestrator_stop above would
+        # normally catch this, but state can advance between the check
+        # and here on a fast teardown), drop it and fall through to
+        # create a fresh session.
+        if voice and current_voice and getattr(session, "voice_is_ending", False):
+            logger.info(
+                "Voice session %s reached ENDING during start; dropping for fresh start",
+                local_id,
+            )
+            try:
+                await pool.stop_orchestrator()
+            except Exception:  # noqa: BLE001
+                logger.exception("stop_orchestrator during ENDING-drop failed")
+            await pool.await_orchestrator_stop(local_id, timeout=5.0)
+            skip_reconnect = True
+
+        if skip_reconnect:
+            pass  # fall through to "Start a new session" below
+        elif voice and not current_voice:
+            # Text-mode session + voice_start = re-arm voice on the SAME
+            # OrchestratorSession instead of dropping and recreating it.
+            # This is the canonical "wake word after end_voice_session"
+            # path: the tab is the same conversation (same JSONL, same
+            # agent state, same background work); only the voice
+            # connection is being reconstructed.
+            #
+            # Equivalent to a fresh voice_start in every observable way
+            # (session_started payload, voice_session_update, relay
+            # boot) except the JSONL is the existing one.
+            try:
+                await session.restart_voice(
+                    voice_provider=voice_provider_req,
+                    voice_model=voice_model_req,
+                    voice_name=voice_name_req,
+                    voice_transcription_language=voice_lang_req,
+                    voice_endpoint=voice_endpoint_req,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception(
+                    "restart_voice failed for session %s; falling back to fresh session",
+                    local_id,
+                )
+                await _safe_send_bytes(ws, orjson.dumps({
+                    "type": "error", "error": "voice_restart_failed",
+                    "detail": str(e),
+                }))
+                return None, False
+
+            pool.subscribe_orchestrator(local_id, ws)
+            reconnect_payload: dict = {
+                "type": "session_started",
+                "session_id": local_id,
+                "voice": True,
+                "model_info": session.get_model_info(),
+            }
+            await _attach_voice_payload(reconnect_payload, session)
+            await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
+            logger.info(
+                "voice rearm complete session=%s — same orchestrator, fresh voice connection",
+                local_id,
+            )
+            return session, True
         elif not voice and current_voice:
             # Text WS reconnecting while voice is active — subscribe without
             # disrupting the voice session (the text WS auto-connects on mount).
@@ -256,25 +433,68 @@ async def _handle_start(
                 "model_info": session.get_model_info(),
             }
             await _attach_voice_payload(reconnect_payload, session)
-            await ws.send_bytes(orjson.dumps(reconnect_payload))
+            await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
             return session, True
         else:
-            # Same mode — just reconnect
-            pool.subscribe_orchestrator(local_id, ws)
-            reconnect_payload = {
-                "type": "session_started",
-                "session_id": local_id,
-                "voice": current_voice,
-                "model_info": session.get_model_info(),
-            }
-            if current_voice:
-                await _attach_voice_payload(reconnect_payload, session)
-            await ws.send_bytes(orjson.dumps(reconnect_payload))
-            return session, True
+            # Same mode — check if the client is asking for a different
+            # voice provider/model/voice/endpoint than the live session.
+            # If so, we need to rebuild the relay; the existing relay's
+            # provider object is bound to the original config and won't
+            # honour mid-session changes. Block the swap while a turn is
+            # in flight so we don't tear down upstream audio mid-reply.
+            if voice and current_voice:
+                drift = _voice_config_drift(
+                    session,
+                    voice_provider_req,
+                    voice_model_req,
+                    voice_name_req,
+                    voice_lang_req,
+                    voice_endpoint_req,
+                )
+                if drift:
+                    if session.is_busy:
+                        await _safe_send_bytes(ws, orjson.dumps({
+                            "type": "error",
+                            "error": "voice_config_busy",
+                            "detail": (
+                                "Cannot switch voice provider/model mid-turn"
+                                f" ({drift}). Wait for the current response"
+                                " to finish, then try again."
+                            ),
+                        }))
+                        return None, False
+                    logger.info(
+                        "voice config drift on reconnect (%s) — tearing down to rebuild",
+                        drift,
+                    )
+                    await pool.stop_orchestrator()
+                    await pool.await_orchestrator_stop(local_id, timeout=5.0)
+                    # Fall through to the new-session creation path below.
+                else:
+                    pool.subscribe_orchestrator(local_id, ws)
+                    reconnect_payload = {
+                        "type": "session_started",
+                        "session_id": local_id,
+                        "voice": current_voice,
+                        "model_info": session.get_model_info(),
+                    }
+                    await _attach_voice_payload(reconnect_payload, session)
+                    await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
+                    return session, True
+            else:
+                pool.subscribe_orchestrator(local_id, ws)
+                reconnect_payload = {
+                    "type": "session_started",
+                    "session_id": local_id,
+                    "voice": current_voice,
+                    "model_info": session.get_model_info(),
+                }
+                await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
+                return session, True
 
     # --- A different orchestrator is already active ---
     if pool.has_orchestrator():
-        await ws.send_bytes(orjson.dumps({
+        await _safe_send_bytes(ws, orjson.dumps({
             "type": "error", "error": "orchestrator_active",
             "detail": "An orchestrator session is already active. Stop it first.",
         }))
@@ -290,8 +510,8 @@ async def _handle_start(
     # clients that pass provider/model/voice/lang but omit endpoint (e.g. the
     # Android peripheral before the voice_endpoint field was added) get
     # endpoint=None → Vertex default, even when the user has configured AI
-    # Studio. That breaks AI-Studio-only models like
-    # ``gemini-3.1-flash-live-preview`` with a Vertex policy error.
+    # Studio. That breaks AI-Studio-named ids like
+    # ``gemini-2.5-flash-native-audio-latest`` with a Vertex policy error.
     if voice and (
         voice_provider_req is None
         or voice_model_req is None
@@ -340,18 +560,39 @@ async def _handle_start(
         voice_endpoint=voice_endpoint_req,
     )
 
-    await ws.send_bytes(orjson.dumps({"type": "status", "status": "connecting"}))
+    await _safe_send_bytes(ws, orjson.dumps({"type": "status", "status": "connecting"}))
+    # Timing instrumentation — when a wake-word call hits a cold orchestrator
+    # session, the gap between voice_start and session_started can balloon
+    # to 20+ seconds. The labelled millisecond breakdown below tells us
+    # which step (session.start, voice-payload attach, prompt assembly,
+    # tools build, relay open) is eating the time so we can target the
+    # right fix instead of guessing. Cheap to leave on; one INFO line per
+    # voice-start.
+    _t0 = time.monotonic()
+    def _ms_since(t: float) -> int:
+        return int((time.monotonic() - t) * 1000)
     try:
         session_id = await session.start()
     except Exception as e:
         logger.exception("Orchestrator session start failed")
-        await ws.send_bytes(orjson.dumps({
+        await _safe_send_bytes(ws, orjson.dumps({
             "type": "error", "error": "start_failed", "detail": str(e),
         }))
         return None, False
+    if voice:
+        logger.info(
+            "voice_start_timing local_id=%s step=session.start dt_ms=%d",
+            local_id, _ms_since(_t0),
+        )
 
+    _t_pool = time.monotonic()
     pool.set_orchestrator(session_id, session)
     pool.subscribe_orchestrator(session_id, ws)
+    if voice:
+        logger.info(
+            "voice_start_timing local_id=%s step=pool.register dt_ms=%d",
+            local_id, _ms_since(_t_pool),
+        )
 
     # Install the wake callback for background-agent notifications.  When a
     # fire-and-forget agent turn finishes while the orchestrator is idle, the
@@ -379,6 +620,19 @@ async def _handle_start(
 
         session.notifications.set_wake_callback(_make_wake(pool, session))
 
+    # Background history-summary refresh on session reopen. The chat WS
+    # `start` arrives whenever the user opens a session from history (or
+    # the Android app reconnects after waking). The summarisation is the
+    # critical-path cost for voice_start (see summary_cache), and here
+    # we have idle time to pay for it before the user presses the mic.
+    # No-op if the cache is already fresh.
+    if not voice:
+        asyncio.create_task(
+            session.refresh_summary_cache_if_stale(),
+            name=f"summary-refresh-start-{local_id}",
+        )
+
+    _t_payload = time.monotonic()
     started_payload: dict = {
         "type": "session_started",
         "session_id": session_id,
@@ -387,9 +641,59 @@ async def _handle_start(
     }
     if voice:
         await _attach_voice_payload(started_payload, session)
+        logger.info(
+            "voice_start_timing local_id=%s step=attach_voice_payload dt_ms=%d",
+            local_id, _ms_since(_t_payload),
+        )
 
-    await ws.send_bytes(orjson.dumps(started_payload))
+    _t_send = time.monotonic()
+    await _safe_send_bytes(ws, orjson.dumps(started_payload))
+    if voice:
+        logger.info(
+            "voice_start_timing local_id=%s step=ws.send_started dt_ms=%d payload_bytes=%d TOTAL_ms=%d",
+            local_id, _ms_since(_t_send), len(orjson.dumps(started_payload)),
+            _ms_since(_t0),
+        )
     return session, True
+
+
+def _voice_config_drift(
+    session: OrchestratorSession,
+    provider: str | None,
+    model: str | None,
+    voice_name: str | None,
+    language: str | None,
+    endpoint: str | None,
+) -> str | None:
+    """Return a short description of which voice fields the client asked
+    to change vs. the live session, or ``None`` if they match.
+
+    Fields the client didn't send (``None``) are skipped — same-mode
+    reconnect WS messages frequently omit settings the client doesn't
+    care about. Endpoint comparison uses the live provider's classname
+    via ``endpoint_id`` for Gemini, falling back to ``_voice_endpoint``.
+    """
+    changed: list[str] = []
+    if provider is not None and provider != session.voice_provider_id:
+        changed.append(f"provider {session.voice_provider_id!r}→{provider!r}")
+    if model is not None and model != session.voice_model_id:
+        changed.append(f"model {session.voice_model_id!r}→{model!r}")
+    if voice_name is not None and voice_name != session.voice_name_id:
+        changed.append(f"voice {session.voice_name_id!r}→{voice_name!r}")
+    if language is not None and language != session.voice_transcription_language:
+        changed.append(
+            f"language {session.voice_transcription_language!r}→{language!r}"
+        )
+    if endpoint is not None:
+        live_endpoint: str | None = None
+        provider_obj = getattr(session, "_voice_provider", None)
+        if provider_obj is not None:
+            live_endpoint = getattr(provider_obj, "endpoint_id", None)
+        if live_endpoint is None:
+            live_endpoint = getattr(session, "_voice_endpoint", None)
+        if endpoint != live_endpoint:
+            changed.append(f"endpoint {live_endpoint!r}→{endpoint!r}")
+    return ", ".join(changed) if changed else None
 
 
 async def _attach_voice_payload(
@@ -411,17 +715,69 @@ async def _attach_voice_payload(
     # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
     payload["voice_recording_enabled"] = session.audio_recorder is not None
 
+    # Sub-step timing inside _attach_voice_payload — when start is slow,
+    # the cost is almost always in get_session_update (system prompt +
+    # tools build) or get_connection_info (ephemeral token / OAuth).
+    _local_id = getattr(session, "local_id", "?")
+
+    # If the history-summary cache is stale, get_session_update is going
+    # to make a synchronous LLM call (15-25s on long sessions). Tell the
+    # UI so it can show a "summarizing" yellow state instead of the
+    # default "preparing" that suggests imminent readiness. Also tells
+    # the user something is happening so they don't try repeatedly.
+    pool_for_status = session._context.get("pool")
+    # ``summarizing`` is a *pre-connect* state — only meaningful when the
+    # user is waiting for the relay to come up. On a reconnect to a live
+    # relay (the WS dropped briefly, Android re-attached) the relay
+    # already has its session.update; summarising again would be wasted
+    # work AND would broadcast a stale yellow "Preparing conversation..."
+    # to a UI that's mid-call. Skip the broadcast (and the summarisation
+    # remains a no-op since the cache write paths are guarded too).
+    existing_relay = getattr(session, "_voice_relay", None)
+    relay_is_live = existing_relay is not None and getattr(
+        existing_relay, "is_running", False,
+    )
+    will_summarize = (
+        not relay_is_live
+        and session._jsonl_path is not None
+        and session._jsonl_path.is_file()
+        and not summary_cache.is_fresh(session._jsonl_path)
+    )
+    if will_summarize and pool_for_status is not None:
+        try:
+            await pool_for_status.broadcast_orchestrator({
+                "type": "voice_event",
+                "event": {
+                    "type": "voice_status",
+                    "status": "summarizing",
+                },
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception("voice_status:summarizing broadcast failed")
+
+    _t_su = time.monotonic()
     session_update = await session.get_session_update()
+    logger.info(
+        "voice_start_timing local_id=%s step=get_session_update dt_ms=%d bytes=%d cache_was_stale=%s",
+        _local_id, int((time.monotonic() - _t_su) * 1000),
+        len(orjson.dumps(session_update)) if session_update else 0,
+        will_summarize,
+    )
     if session_update:
         payload["voice_session_update"] = session_update
 
     provider_obj = getattr(session, "_voice_provider", None)
     if provider_obj is not None:
+        _t_ci = time.monotonic()
         try:
             payload["voice_connection_info"] = await provider_obj.get_connection_info()
         except Exception as e:
             logger.warning("Voice connection info fetch failed: %s", e)
             payload["voice_connection_error"] = str(e)
+        logger.info(
+            "voice_start_timing local_id=%s step=get_connection_info dt_ms=%d",
+            _local_id, int((time.monotonic() - _t_ci) * 1000),
+        )
 
     # Start the backend relay for WS providers (Qwen / Gemini / locals).
     # Idempotent for healthy relays; rebuilds if the previous drain crashed
@@ -463,10 +819,28 @@ async def _attach_voice_payload(
                 "conversation.item.input_audio_transcription.completed",
             })
 
+            # Frontend-irrelevant events that should never be mirrored.
+            # Gemini Live emits a fresh ``sessionResumptionUpdate`` every
+            # ~0.5s during an active session (one observed: 1000+ in a
+            # 9-minute call). The handle is purely backend state for
+            # reconnect — the provider's on_inbound_event already
+            # captures it. Mirroring them just clogs the orchestrator WS
+            # and the Android event-dispatch pipeline, which on the A300M
+            # is enough to make the conversation feel sluggish.
+            def _is_frontend_irrelevant(ev: dict) -> bool:
+                # Gemini shape: no top-level "type", payload under a
+                # camelCase root key.
+                if not ev.get("type"):
+                    if "sessionResumptionUpdate" in ev:
+                        return True
+                return False
+
             async def _on_event_for_frontend(event: dict) -> None:
                 # Mirror provider events to the frontend so the UI can
                 # reflect transcripts, status, etc.
-                if not (
+                if _is_frontend_irrelevant(event):
+                    pass  # skip the broadcast — still flows to backend logic below
+                elif not (
                     session.is_injecting
                     and event.get("type") in _INJECTION_SUPPRESSED_TYPES
                 ):
@@ -611,7 +985,7 @@ async def _handle_set_model(
 
 async def _handle_get_model(ws: WebSocket, session: OrchestratorSession) -> None:
     """Get the current model info."""
-    await ws.send_bytes(orjson.dumps({
+    await _safe_send_bytes(ws, orjson.dumps({
         "type": "model_info",
         "model_info": session.get_model_info(),
     }))
@@ -624,7 +998,7 @@ async def _handle_get_models(ws: WebSocket) -> None:
     except Exception:
         logger.exception("Live model discovery failed; falling back to static")
         models = get_available_models()
-    await ws.send_bytes(orjson.dumps({
+    await _safe_send_bytes(ws, orjson.dumps({
         "type": "models_list",
         "models": [m.to_dict() for m in models],
     }))
@@ -702,11 +1076,29 @@ async def _handle_voice_event(
         # (OpenAI) skip this path — the frontend talks to the provider
         # directly via the data channel and only mirrors events here for
         # backend persistence.
+        #
+        # Filter through the provider's ``accepts_upstream_event`` first:
+        # if the client is still mirroring events shaped for a previously
+        # active provider (e.g. OpenAI ``session.created`` / ``error``
+        # leaking onto a Gemini session during a provider crossover), we
+        # drop them here instead of letting the upstream WS close with a
+        # fatal 1007/1008 schema-mismatch error.  Without this filter,
+        # resuming any session with a different voice provider was a
+        # silent kill.
         if session.needs_voice_relay:
-            try:
-                await session.send_voice_event_upstream(event)
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to forward client voice event upstream")
+            provider = session.voice_provider  # type: ignore[union-attr]
+            if provider is not None and not provider.accepts_upstream_event(event):
+                logger.info(
+                    "voice_event_drop session=%s type=%s reason=provider_schema_mismatch provider=%s",
+                    session.local_id,
+                    event_type or "?",
+                    provider.provider_name,
+                )
+            else:
+                try:
+                    await session.send_voice_event_upstream(event)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to forward client voice event upstream")
 
         commands = await session.process_voice_event(event)
         await _dispatch_voice_commands(pool, session, commands)

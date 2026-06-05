@@ -48,8 +48,12 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
 
         logger.info("Starting search server subprocess...")
         try:
+            # `--socket` opens a Unix domain socket transport in addition
+            # to the stdio one used by this client. The socket lets
+            # external writers (embed.py, manager/index_utils.py) reach
+            # the same warm server, keeping chroma single-writer.
             proc = await asyncio.create_subprocess_exec(
-                str(_RUN_SH), str(_SEARCH_SERVER),
+                str(_RUN_SH), str(_SEARCH_SERVER), "--socket",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -57,6 +61,12 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
         except Exception as e:
             logger.error("Failed to start search server: %s", e)
             return None
+
+        # Forward the server's stderr to our logger so boot-probe /
+        # boot-repair / write-error messages surface in journalctl.
+        # We start this BEFORE waiting on `ready` so any messages
+        # emitted during the model-load window aren't lost.
+        asyncio.create_task(_forward_stderr(proc))
 
         # Wait for the "ready" signal (model loaded)
         try:
@@ -67,7 +77,11 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
             if ready_data.get("status") == "ready":
                 _server_proc = proc
                 _server_ready = True
-                logger.info("Search server ready (PID %d)", proc.pid)
+                socket_path = ready_data.get("socket")
+                if socket_path:
+                    logger.info("Search server ready (PID %d, socket=%s)", proc.pid, socket_path)
+                else:
+                    logger.info("Search server ready (PID %d)", proc.pid)
                 return proc
             else:
                 logger.error("Unexpected ready response: %s", ready_data)
@@ -83,9 +97,54 @@ async def _ensure_server() -> asyncio.subprocess.Process | None:
             return None
 
 
+async def _forward_stderr(proc: asyncio.subprocess.Process) -> None:
+    """Pipe the search server's stderr into our logger one line at a time.
+
+    Lines that look like our own `[search-server]` markers (boot-probe,
+    boot-repair, etc.) are logged at WARNING — they're once-per-boot
+    events worth surfacing under the default log config without
+    needing to flip the orchestrator logger to INFO. Lines from chatty
+    libraries we trust (sentence-transformers' "Loading weights:"
+    progress bar, huggingface_hub's auth warning) are dropped.
+    Anything else also goes to WARNING — that's the bucket for genuine
+    surprises like chroma tracebacks."""
+    if proc.stderr is None:
+        return
+    # Patterns we silence outright — high-volume noise that's not
+    # actionable. Anything not matched falls through to WARNING.
+    NOISE_PREFIXES = (
+        "Loading weights",
+        "BertModel LOAD REPORT",
+        "Warning: You are sending unauthenticated requests to the HF Hub",
+        "Notes:",
+        "- UNEXPECTED",
+        "Key",
+        "embeddings.position_ids",
+        "------------------------",
+    )
+    try:
+        while True:
+            raw = await proc.stderr.readline()
+            if not raw:
+                return
+            line = raw.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            if line.startswith("[search-server]"):
+                logger.warning("search-server: %s", line[len("[search-server] "):])
+                continue
+            if any(line.startswith(p) for p in NOISE_PREFIXES):
+                continue
+            logger.warning("search-server stderr: %s", line)
+    except Exception as e:
+        logger.warning("search-server stderr reader stopped: %s", e)
+
+
 async def _query_server(
     proc: asyncio.subprocess.Process,
     request: dict,
+    *,
+    timeout: float = 30.0,
 ) -> dict | None:
     """Send a query to the warm server and read the response."""
     try:
@@ -94,7 +153,7 @@ async def _query_server(
         await proc.stdin.drain()
 
         response_line = await asyncio.wait_for(
-            proc.stdout.readline(), timeout=30,  # Warm queries should be fast
+            proc.stdout.readline(), timeout=timeout,  # Warm queries should be fast
         )
 
         if not response_line:
@@ -337,3 +396,5 @@ async def search_memory(
 ) -> str:
     results = await _do_search(query, "memory", max_results)
     return json.dumps({"query": query, "results": results, "count": len(results)})
+
+

@@ -26,14 +26,20 @@ Silero expects, runs each through the model, and yields state-transition
 events when the smoothed speech probability crosses the threshold.
 
 The detection logic mirrors Silero's official `VADIterator`:
-- `threshold` (default 0.5) — speech is "on" when prob crosses up; "off"
-  when prob falls below `threshold - 0.15` (hysteresis to avoid chatter).
-- `min_silence_duration_ms` (default 1200) — once below the off-threshold,
-  wait this long before emitting `speech_stopped`. This is the analogue of
-  the upstream `silence_duration_ms` we used to send to DashScope.
+- `threshold` (default 0.35) — speech is "on" when prob crosses up; "off"
+  when prob falls below `threshold - 0.15` (= 0.20, hysteresis to avoid
+  chatter). Tuned down from Silero's vanilla 0.5 default after 2026-06-04
+  far-field tests: at arm's length the user's RMS dipped to ~600-1000
+  and Silero probability never sustained above 0.5, so speech_started
+  fired late or not at all. 0.35 / 0.20 catches the far-field case
+  without false-positives from typical room noise.
+- `min_silence_duration_ms` (default 2500) — once below the off-threshold,
+  wait this long before emitting `speech_stopped`. Long enough to ride
+  through breathing pauses and "uh"-style hesitations mid-sentence
+  (which were committing turns prematurely at the old 1200ms).
 - `speech_pad_ms` (default 300) — informational only here; pre-roll
   trimming is the relay's job (it knows where the audio buffer started).
-- `min_speech_duration_ms` (default 250) — suppress micro-blips (a single
+- `min_speech_duration_ms` (default 200) — suppress micro-blips (a single
   cough triggering one above-threshold window doesn't cause `speech_started`
   → `speech_stopped` events).
 """
@@ -101,9 +107,9 @@ class VoiceVAD:
     def __init__(
         self,
         input_sample_rate: int = 24000,
-        threshold: float = 0.5,
-        min_silence_duration_ms: int = 1200,
-        min_speech_duration_ms: int = 250,
+        threshold: float = 0.35,
+        min_silence_duration_ms: int = 2500,
+        min_speech_duration_ms: int = 200,
     ) -> None:
         if not _MODEL_PATH.exists():
             raise FileNotFoundError(
@@ -148,6 +154,15 @@ class VoiceVAD:
         # fill a complete 16k window get prepended to the next call.
         self._carry_input_pcm = b""
         self._bytes_consumed = 0
+
+        # Per-window probability sampling for VOICE_DEBUG_VAD=1.
+        # Logs one line per ~1s with min/max/mean over the window
+        # batch so we can see whether Silero is even seeing speech-like
+        # input (vs. flat silence/noise) without spamming the log with
+        # 31 lines/sec. Initialised in feed_pcm16.
+        self._debug_window_probs: list[float] = []
+        self._debug_last_emit_at = 0
+        self._debug_enabled = os.environ.get("VOICE_DEBUG_VAD") == "1"
 
         # Cheap log so we can confirm initialisation in the per-session
         # voice log.
@@ -232,6 +247,21 @@ class VoiceVAD:
             window_bytes = consumed_this_call // n_windows if n_windows else 0
             self._bytes_consumed += window_bytes
 
+            # Diagnostic sampling. Emit one summary line per ~32 windows
+            # (~1s of audio at 32ms/window). Min/max/mean tells us
+            # immediately if Silero sees only flat values (~all 0 = pure
+            # silence to the model; mid-range = noise; > threshold_on = speech).
+            if self._debug_enabled:
+                self._debug_window_probs.append(prob)
+                if len(self._debug_window_probs) >= 31:  # ~1s
+                    ps = self._debug_window_probs
+                    logger.info(
+                        "VAD_PROBE n=%d min=%.3f mean=%.3f max=%.3f thr_on=%.2f thr_off=%.2f speech=%s",
+                        len(ps), min(ps), sum(ps) / len(ps), max(ps),
+                        self._threshold_on, self._threshold_off, self._is_speech,
+                    )
+                    self._debug_window_probs = []
+
             event = self._update_state(prob)
             if event is not None:
                 yield event
@@ -276,15 +306,61 @@ class VoiceVAD:
         """Whether the VAD currently considers the user to be speaking."""
         return self._is_speech
 
+    def reset(self) -> None:
+        """Re-zero all per-stream state — call after a long discontinuity.
+
+        Use case: the voice relay drops upstream audio while reconnecting
+        after a goAway. A 20s gap leaves Silero's recurrent hidden state
+        in an attractor that doesn't respond to fresh input — speech
+        probabilities stay flat regardless of what audio arrives next.
+        Resetting brings us back to the same blank slate as a fresh
+        :class:`VoiceVAD` instance, without re-initialising the ONNX
+        session (which costs ~50ms on a Jetson).
+        """
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._is_speech = False
+        self._consec_above = 0
+        self._consec_below = 0
+        self._carry_input_pcm = b""
+        self._bytes_consumed = 0
+        self._debug_window_probs = []
+        logger.info("VoiceVAD reset (Silero state + state machine cleared)")
+
+
+def is_enabled_for(provider_name: str) -> bool:
+    """Manual-VAD opt-out per provider.
+
+    Each provider has its own env switch (``QWEN_MANUAL_VAD``,
+    ``GEMINI_MANUAL_VAD``, …). All default to **on** because every
+    realtime voice service we've shipped has shown a force-commit /
+    early-end-of-turn pathology on long utterances:
+
+    - **Qwen / DashScope (2026-05-20)**: server VAD force-commits
+      utterances at ~30–40s of continuous audio, splitting one turn
+      into two ``conversation.item`` entries.
+    - **Gemini Live (2026-06-03)**: server VAD ends turns
+      mid-sentence on natural breathing pauses even with
+      ``endOfSpeechSensitivity: LOW`` and ``silenceDurationMs: 2500``.
+
+    Opt back into server VAD per-provider:
+    ``export QWEN_MANUAL_VAD=0`` or ``export GEMINI_MANUAL_VAD=0``.
+
+    Unknown provider names default to True (opt-in via override only
+    matters for the providers we've actually wired hooks for).
+    """
+    env_var = {
+        "qwen": "QWEN_MANUAL_VAD",
+        "google": "GEMINI_MANUAL_VAD",
+    }.get(provider_name)
+    if env_var is None:
+        return True
+    return os.environ.get(env_var, "1") != "0"
+
 
 def is_enabled() -> bool:
-    """True unless QWEN_MANUAL_VAD=0 is set explicitly.
+    """Back-compat shim — equivalent to ``is_enabled_for("qwen")``.
 
-    Default-on as of 2026-05-20: DashScope's server VAD reliably
-    force-commits long utterances mid-speech, splitting one user turn
-    into two conversation.item entries with a phantom response.create
-    between them. Manual VAD avoids that. Opt back into server VAD by
-    exporting ``QWEN_MANUAL_VAD=0`` (useful if Alibaba ever fixes the
-    upstream).
+    Existing callers (and tests) that don't yet route through the
+    per-provider gate keep the old Qwen-only behaviour.
     """
-    return os.environ.get("QWEN_MANUAL_VAD", "1") != "0"
+    return is_enabled_for("qwen")

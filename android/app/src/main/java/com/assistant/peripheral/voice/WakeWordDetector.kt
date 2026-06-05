@@ -137,6 +137,13 @@ class WakeWordDetector(
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+    // True only after the recognizer pushed audioManager.mode into
+    // MODE_IN_COMMUNICATION itself, so we know it's safe to revert.
+    // If a voice session is also in MODE_IN_COMMUNICATION, we'd otherwise
+    // flip the route to earpiece by resetting to MODE_NORMAL after a
+    // non-match recognition cycle.
+    private var weChangedAudioMode: Boolean = false
+
     private val BEEP_STREAMS = intArrayOf(
         AudioManager.STREAM_RING,
         AudioManager.STREAM_NOTIFICATION,
@@ -194,13 +201,28 @@ class WakeWordDetector(
         isPaused = false
         isRecognizing = false
         consecutiveMisses = 0
-        try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
+        revertAudioModeIfOurs()
         unmuteBeep()
         silenceMonitorJob?.cancel()
         silenceMonitorJob = null
         stopAudioRecord()
         destroyRecognizer()
         scope.coroutineContext.cancelChildren()
+    }
+
+    /**
+     * Only revert audioManager.mode to MODE_NORMAL if we were the ones
+     * who set it to MODE_IN_COMMUNICATION.  If a voice session is
+     * concurrently active, it set the mode itself for its own routing,
+     * and flipping it to NORMAL here would force STREAM_VOICE_CALL to
+     * the earpiece (Android pins that stream to the earpiece outside
+     * MODE_IN_COMMUNICATION).  Symptom: dedicated phone's audio
+     * silently routes to the earpiece regardless of speakerphone state.
+     */
+    private fun revertAudioModeIfOurs() {
+        if (!weChangedAudioMode) return
+        try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
+        weChangedAudioMode = false
     }
 
     fun release() {
@@ -219,6 +241,19 @@ class WakeWordDetector(
         val bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
             .coerceAtLeast(3200)  // at least 100ms of audio at 16kHz 16-bit mono
 
+        // Match the voice call's mic source. Originally MIC, which on
+        // Samsung Lollipop left the HAL's AGC in a different state than
+        // the call's VOICE_RECOGNITION expected — the first 30s of the
+        // post-wake-word call came up with half the amplitude of a
+        // cold-start call (observed 2026-06-04: max RMS 989 vs 1972 in
+        // back-to-back sessions with same speaker distance). Sharing
+        // the source keeps the HAL state continuous.
+        @Suppress("DEPRECATION")
+        val wakeWordSource = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N)
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        else
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+
         silenceMonitorJob = scope.launch(Dispatchers.IO) {
             // Retry loop: mic may be held by AudioRecorder (turn-based recording) for a few seconds.
             // Keep trying until the mic is free or we're no longer active.
@@ -226,7 +261,7 @@ class WakeWordDetector(
             while (isActive && recorder == null) {
                 val candidate = try {
                     AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
+                        wakeWordSource,
                         SAMPLE_RATE,
                         CHANNEL_CONFIG,
                         AUDIO_FORMAT,
@@ -337,8 +372,14 @@ class WakeWordDetector(
         isRecognizing = true
 
         muteBeep()
-        // Set communication mode to suppress system beep on older devices
-        try { audioManager.mode = AudioManager.MODE_IN_COMMUNICATION } catch (_: Exception) {}
+        // Set communication mode to suppress system beep on older devices.
+        // Track that the change is ours so we don't fight a concurrent
+        // voice session (which also sets MODE_IN_COMMUNICATION but for
+        // routing, not beep suppression).
+        try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            weChangedAudioMode = true
+        } catch (_: Exception) {}
         destroyRecognizer()
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
 
@@ -426,8 +467,9 @@ class WakeWordDetector(
     private fun finishRecognition(wakeWordDetected: Boolean, delay: Long = -1L) {
         isRecognizing = false
         destroyRecognizer()
-        // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership
-        if (!wakeWordDetected) try { audioManager.mode = AudioManager.MODE_NORMAL } catch (_: Exception) {}
+        // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership.
+        // Guarded: only revert if we set the mode ourselves (see revertAudioModeIfOurs).
+        if (!wakeWordDetected) revertAudioModeIfOurs() else weChangedAudioMode = false
         unmuteBeep()
         val restartDelay = when {
             delay >= 0 -> delay

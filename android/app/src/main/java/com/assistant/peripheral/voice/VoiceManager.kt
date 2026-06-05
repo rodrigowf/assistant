@@ -1,7 +1,5 @@
 package com.assistant.peripheral.voice
 
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
@@ -57,6 +55,20 @@ class VoiceManager(
     private var audioFocusRequest: AudioFocusRequest? = null
     private var audioOutput: AudioOutput = AudioOutput.LOUDSPEAKER
 
+    /**
+     * Owns the routing decision tree (HFP-vs-A2DP, call-audio vs
+     * media-audio) plus all the AudioManager mode/communicationDevice
+     * mutations.  Lifecycle is the same as VoiceManager — created in
+     * [requestAudioFocus] and released in [releaseAudioFocus].
+     */
+    private val audioRouter: AudioRouter = AudioRouter(context)
+
+    /**
+     * Tracks devices changing during a session so the router can
+     * re-evaluate.  Stays null when no session is active.
+     */
+    private var deviceCallback: android.media.AudioDeviceCallback? = null
+
     // --- Persisted-across-sessions settings (apply to whichever provider) -
     private var pendingMicGain: Float = 1.0f
     private var pendingEchoDuckingGain: Float = 0.05f
@@ -64,6 +76,17 @@ class VoiceManager(
     // --- Active provider --------------------------------------------------
     private var currentProvider: VoiceProvider? = null
     private var providerJob: Job? = null   // collects state + events into our flows
+    private var routeReapplyJob: Job? = null  // re-applies routing after provider audio stack init
+
+    // Synchronous reentrancy gate.  `_state.value` only flips to non-Off
+    // after the HTTP roundtrip in step 1, so concurrent callers (e.g.
+    // two viewModelScope.launch blocks if a stale collector ever fires
+    // start twice) would both slip past the `_state == Off` guard and
+    // each spin up an independent provider + WebRTC peer connection.
+    // Symptom: two SDP exchanges with different ufrag values, two
+    // SESSION START log lines a few hundred ms apart, audio doubled,
+    // and only one of the sessions gets stopped on disconnect.
+    @Volatile private var starting: Boolean = false
 
     // --- Pre-provider command queue --------------------------------------
     // The backend replies to ``voice_start`` with a ``session_started``
@@ -136,6 +159,23 @@ class VoiceManager(
      * which receive their events via the data channel directly.
      */
     fun handleProviderEvent(event: Map<String, Any?>) {
+        // Some backend-synthesised voice_status events arrive BEFORE the
+        // provider is created — most notably `summarizing` (emitted
+        // inside _attach_voice_payload, before session_started is sent
+        // to the client, since the LLM summarisation runs in-between).
+        // Surface those on the VoiceManager's own state flow so the UI
+        // can flip to yellow during the slow window. The provider will
+        // pick up subsequent status events normally once it exists.
+        if (event["type"] == "voice_status" && currentProvider == null) {
+            when (event["status"] as? String) {
+                "summarizing" -> _state.value = VoiceState.Summarizing
+                "preparing" -> _state.value = VoiceState.Connecting
+                // "ready" / "reconnect_warning" / "reconnecting" never
+                // arrive before the provider in practice; ignore them
+                // here rather than handle without a provider to clear.
+            }
+            return
+        }
         currentProvider?.handleProviderEvent(event)
     }
 
@@ -159,11 +199,29 @@ class VoiceManager(
      * has the values.
      */
     suspend fun start(cfg: VoiceConfig) {
-        if (_state.value != VoiceState.Off && _state.value !is VoiceState.Error) {
-            Log.w(TAG, "start: already active state=${_state.value}")
+        // Summarizing is a backend-pushed pre-start state (the
+        // history-summary LLM call is running before session_started
+        // lands). Treat it as "not yet started" so the local provider
+        // start can proceed normally — the provider will overwrite the
+        // state to Connecting once it begins its own handshake.
+        val s = _state.value
+        if (s != VoiceState.Off && s !is VoiceState.Error && s != VoiceState.Summarizing) {
+            Log.w(TAG, "start: already active state=$s")
             return
         }
+        // Synchronous gate — prevents a second start() from sneaking past
+        // while the first is awaiting the HTTP roundtrip below.  Cleared
+        // once we've wired the provider's state flow, after which the
+        // _state guard above takes over (provider flips to Connecting).
+        synchronized(this) {
+            if (starting) {
+                Log.w(TAG, "start: already in progress (starting=true), ignoring duplicate call")
+                return
+            }
+            starting = true
+        }
 
+        try {
         // 1. Fetch the connection metadata for this provider/model/voice.
         val info = apiClient.startVoiceSession(
             provider = cfg.provider,
@@ -193,7 +251,20 @@ class VoiceManager(
         providerJob?.cancel()
         providerJob = scope.launch {
             launch {
-                provider.state.collect { _state.value = it }
+                provider.state.collect { ps ->
+                    // Don't let the provider's initial Off emission clobber
+                    // a backend-pushed Summarizing/Connecting state that we
+                    // surfaced before the provider was created. Any later
+                    // state from the provider (including its own Connecting
+                    // a few ms later) wins normally.
+                    if (ps == VoiceState.Off &&
+                        (_state.value == VoiceState.Summarizing ||
+                         _state.value == VoiceState.Connecting)
+                    ) {
+                        return@collect
+                    }
+                    _state.value = ps
+                }
             }
             launch {
                 provider.events.collect { _events.tryEmit(it) }
@@ -214,6 +285,24 @@ class VoiceManager(
 
         // 5. Acquire OS-level audio resources (focus, routing) and connect.
         requestAudioFocus()
+
+        // 5b. Schedule post-connect routing re-apply.  WebRTC's
+        // JavaAudioDeviceModule (and Samsung Lollipop's HAL more
+        // broadly) can pin the audio route to the call earpiece
+        // during native audio-module init — well after our initial
+        // applySpeakerRouting fires.  Re-assert at +1s/+3s/+5s.
+        // Dynamic device-connect events are handled separately via
+        // [registerDeviceCallback].
+        routeReapplyJob?.cancel()
+        routeReapplyJob = scope.launch {
+            for (delayMs in longArrayOf(1000L, 3000L, 5000L)) {
+                delay(delayMs)
+                if (!isActive) return@launch
+                Log.d(TAG, "[ROUTE] post-connect re-apply at +${delayMs}ms")
+                applySpeakerRouting()
+            }
+        }
+
         provider.connect(
             info = info,
             mirrorEventToBackend = { event ->
@@ -223,6 +312,12 @@ class VoiceManager(
                 micChunkCallback?.invoke(b64)
             },
         )
+        } finally {
+            // Clear the gate.  By here either provider.connect has
+            // returned (success — _state guard now blocks reentry) or we
+            // bailed early (error — caller should be able to retry).
+            starting = false
+        }
     }
 
     /**
@@ -235,6 +330,8 @@ class VoiceManager(
     }
 
     private suspend fun stopInternal() {
+        routeReapplyJob?.cancel()
+        routeReapplyJob = null
         currentProvider?.disconnect()
         currentProvider = null
         providerJob?.cancel()
@@ -330,25 +427,25 @@ class VoiceManager(
             )
         }
 
-        // MODE_IN_COMMUNICATION matters for both transports — WebRTC
-        // forces it internally; AudioRecord on the WS path also works
-        // best in this mode on Lollipop devices.
-        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
         applySpeakerRouting()
+        ensureCallStreamAudible()
+        registerDeviceCallback()
+    }
 
-        // Ensure STREAM_VOICE_CALL is audible — voice output routes through
-        // this stream; if at 0 the user hears nothing.
-        val am = audioManager
-        if (am != null) {
-            val maxVoice = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
-            val curVoice = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
-            if (curVoice == 0) {
-                val target = (maxVoice * 0.75).toInt().coerceAtLeast(1)
-                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, target, 0)
-                Log.d(TAG, "STREAM_VOICE_CALL was 0, raised to $target/$maxVoice")
-            }
+    /**
+     * STREAM_VOICE_CALL ships muted on some devices — bring it up to a
+     * reasonable level so the user actually hears the agent.  Only
+     * needed for routes on the communication-audio plane.
+     */
+    private fun ensureCallStreamAudible() {
+        val am = audioManager ?: return
+        val maxVoice = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+        val curVoice = am.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
+        if (curVoice == 0) {
+            val target = (maxVoice * 0.75).toInt().coerceAtLeast(1)
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, target, 0)
+            Log.d(TAG, "STREAM_VOICE_CALL was 0, raised to $target/$maxVoice")
         }
-        Log.d(TAG, "Audio routed to ${audioOutput.name.lowercase()}")
     }
 
     private fun releaseAudioFocus() {
@@ -358,18 +455,8 @@ class VoiceManager(
             @Suppress("DEPRECATION")
             audioManager?.abandonAudioFocus(null)
         }
-        audioManager?.mode = AudioManager.MODE_NORMAL
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager?.clearCommunicationDevice()
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.let {
-                if (it.isBluetoothScoOn) {
-                    it.stopBluetoothSco()
-                    it.isBluetoothScoOn = false
-                }
-            }
-        }
+        audioRouter.release()
+        unregisterDeviceCallback()
         audioFocusRequest = null
     }
 
@@ -384,98 +471,89 @@ class VoiceManager(
         if (audioManager != null) applySpeakerRouting()
     }
 
-    fun isBluetoothAudioAvailable(): Boolean {
-        val am = audioManager ?: (context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
-            ?.also { audioManager = it }
-            ?: return false
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val devices = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            return devices.any { isBluetoothDevice(it.type) }
-        }
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
-        if (!adapter.isEnabled) return false
-        @Suppress("DEPRECATION")
-        val headsetState = adapter.getProfileConnectionState(BluetoothProfile.HEADSET)
-        @Suppress("DEPRECATION")
-        val a2dpState = adapter.getProfileConnectionState(BluetoothProfile.A2DP)
-        return headsetState == BluetoothProfile.STATE_CONNECTED ||
-               a2dpState == BluetoothProfile.STATE_CONNECTED
-    }
+    fun isBluetoothAudioAvailable(): Boolean = audioRouter.isBluetoothAudioAvailable()
 
-    private fun isBluetoothDevice(type: Int): Boolean = when (type) {
-        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> true
-        else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-            type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
-            type == AudioDeviceInfo.TYPE_BLE_BROADCAST
-        else false
-    }
+    fun isWiredHeadphoneAvailable(): Boolean = audioRouter.isWiredHeadphoneAvailable()
 
+    /**
+     * Pick a [AudioRouter.Route] for the current audioOutput + active
+     * provider, apply it to the system, and forward the resulting
+     * [AudioRouter.SpeakerMode] to the provider's AudioTrack so the
+     * media-vs-call decision propagates end-to-end.
+     *
+     * Also emits [VoiceEvent.RoutingFallback] when the router had to
+     * downgrade (e.g. user picked BT but only an A2DP-only sink is
+     * available on a WebRTC provider) — the ViewModel surfaces this
+     * as a toast.
+     */
     private fun applySpeakerRouting() {
-        val am = audioManager ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            applyRoutingModern(am)
-        } else {
-            applyRoutingLegacy(am)
+        audioManager ?: return
+        val provider = currentProvider
+        val providerKind = when (provider?.connectionType) {
+            VoiceConnectionType.WEBSOCKET -> AudioRouter.ProviderKind.WEBSOCKET
+            VoiceConnectionType.WEBRTC -> AudioRouter.ProviderKind.WEBRTC
+            null -> AudioRouter.ProviderKind.WEBRTC  // conservative default
         }
-        @Suppress("DEPRECATION")
-        Log.d(TAG, "[ROUTE] after applySpeakerRouting: target=$audioOutput speakerOn=${am.isSpeakerphoneOn} scoOn=${am.isBluetoothScoOn} mode=${am.mode}")
-    }
+        val route = audioRouter.pickRoute(audioOutput, providerKind)
+        val mode = audioRouter.apply(route)
 
-    @androidx.annotation.RequiresApi(Build.VERSION_CODES.S)
-    private fun applyRoutingModern(am: AudioManager) {
-        val devices = am.availableCommunicationDevices
-        val target: AudioDeviceInfo? = when (audioOutput) {
-            AudioOutput.EARPIECE ->
-                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
-            AudioOutput.LOUDSPEAKER ->
-                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-            AudioOutput.BLUETOOTH ->
-                devices.firstOrNull { isBluetoothDevice(it.type) }
+        // Forward the speaker mode + preferred device to the provider so
+        // its AudioTrack picks the right audio plane (WS providers
+        // only; WebRTC ignores).
+        val preferredDevice = when (route) {
+            is AudioRouter.Route.BluetoothMedia -> route.device
+            is AudioRouter.Route.BluetoothCallAudio -> route.device
+            is AudioRouter.Route.WiredHeadphone -> route.device
+            else -> null
         }
-        if (target != null) {
-            val ok = am.setCommunicationDevice(target)
-            Log.d(TAG, "setCommunicationDevice(${audioOutput.name}, type=${target.type}) → $ok")
-            if (!ok && audioOutput == AudioOutput.BLUETOOTH) {
-                Log.w(TAG, "Bluetooth setCommunicationDevice failed; falling back to loudspeaker")
-                devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                    ?.let { am.setCommunicationDevice(it) }
+        provider?.setSpeakerMode(mode, preferredDevice)
+
+        if (route is AudioRouter.Route.BluetoothUnsupported) {
+            val msg = when (route.reason) {
+                AudioRouter.FallbackReason.BT_NOT_AVAILABLE ->
+                    "Bluetooth not available — using loudspeaker"
+                AudioRouter.FallbackReason.BT_A2DP_REQUIRES_WS_PROVIDER ->
+                    "OpenAI Realtime can't route to Bluetooth speakers " +
+                        "(no mic on this device). Switch to Qwen or Gemini, " +
+                        "or use a BT headset. Using loudspeaker for now."
             }
-        } else {
-            Log.w(TAG, "No communication device for $audioOutput in $devices — clearing + falling back to speaker")
-            am.clearCommunicationDevice()
-            @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = true
+            _events.tryEmit(VoiceEvent.RoutingFallback(msg))
         }
     }
 
-    private fun applyRoutingLegacy(am: AudioManager) {
-        @Suppress("DEPRECATION")
-        when (audioOutput) {
-            AudioOutput.EARPIECE -> {
-                am.stopBluetoothSco()
-                am.isBluetoothScoOn = false
-                am.isSpeakerphoneOn = false
+    // --- Device-change observer -----------------------------------------
+
+    /**
+     * Watch for BT devices connecting/disconnecting mid-session and
+     * re-run the routing decision.  Without this, plugging in the JBL
+     * mid-conversation leaves audio on the loudspeaker until the next
+     * full session start.
+     */
+    private fun registerDeviceCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        if (deviceCallback != null) return
+        val cb = object : android.media.AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                Log.d(TAG, "[ROUTE] device added — re-applying routing")
+                applySpeakerRouting()
             }
-            AudioOutput.LOUDSPEAKER -> {
-                am.stopBluetoothSco()
-                am.isBluetoothScoOn = false
-                am.isSpeakerphoneOn = true
-            }
-            AudioOutput.BLUETOOTH -> {
-                if (isBluetoothAudioAvailable()) {
-                    am.isSpeakerphoneOn = false
-                    am.startBluetoothSco()
-                    am.isBluetoothScoOn = true
-                } else {
-                    Log.w(TAG, "BLUETOOTH requested but no BT device available; falling back to loudspeaker")
-                    am.stopBluetoothSco()
-                    am.isBluetoothScoOn = false
-                    am.isSpeakerphoneOn = true
-                }
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                Log.d(TAG, "[ROUTE] device removed — re-applying routing")
+                applySpeakerRouting()
             }
         }
+        deviceCallback = cb
+        audioManager?.registerAudioDeviceCallback(cb, null)
+    }
+
+    private fun unregisterDeviceCallback() {
+        val cb = deviceCallback ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                audioManager?.unregisterAudioDeviceCallback(cb)
+            }
+        } catch (_: Exception) {}
+        deviceCallback = null
     }
 }
 
@@ -514,4 +592,29 @@ sealed class VoiceEvent {
 
     /** Error occurred. */
     data class Error(val message: String) : VoiceEvent()
+
+    /**
+     * The router downgraded the user's requested audio output (e.g. user
+     * selected Bluetooth but only an A2DP-only speaker is connected on
+     * a WebRTC provider).  Surfaced as a toast so silent route fallbacks
+     * don't confuse the user.
+     */
+    data class RoutingFallback(val message: String) : VoiceEvent()
+
+    /**
+     * Heads-up that the upstream voice provider is about to cycle the
+     * connection (Gemini Live's goAway frame, fired ~30-60s before the
+     * actual cutover). [timeLeftSeconds] is the upstream-supplied
+     * countdown (may be null if not present).
+     *
+     * UX: brief beep + yellow banner ("Pausing for a second to reconnect…").
+     */
+    data class ReconnectWarning(val timeLeftSeconds: Int?) : VoiceEvent()
+
+    /**
+     * The relay is actively cutting over to a new upstream WS. Mic
+     * audio is being dropped during this window. Cleared by the next
+     * [SessionCreated]-style ready signal (state flips back to Active).
+     */
+    object Reconnecting : VoiceEvent()
 }

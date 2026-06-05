@@ -111,6 +111,37 @@ def _load_private_memory(config: OrchestratorConfig) -> str:
         return "(failed to read memory file)"
 
 
+def _provider_memory_path(
+    config: OrchestratorConfig, provider_id: str
+) -> Path | None:
+    """Return the path to a provider-specific memory file, or None if missing.
+
+    Looked up as `ORCHESTRATOR_MEMORY_<provider_id>.md` next to the main
+    orchestrator memory file. Used only in realtime voice sessions.
+    """
+    if not provider_id or not config.memory_path:
+        return None
+    base = Path(config.memory_path)
+    candidate = base.parent / f"{base.stem}_{provider_id}.md"
+    return candidate if candidate.is_file() else None
+
+
+def _load_provider_memory(
+    config: OrchestratorConfig, provider_id: str
+) -> tuple[str, Path | None]:
+    """Read a provider-specific memory file. Returns (contents, path) or ("", None)."""
+    path = _provider_memory_path(config, provider_id)
+    if path is None:
+        return "", None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if len(raw) > MAX_MEMORY_CHARS:
+            raw = raw[:MAX_MEMORY_CHARS] + "\n... (truncated)"
+        return raw, path
+    except Exception:
+        return "(failed to read provider memory file)", path
+
+
 # ---------------------------------------------------------------------------
 # Prompt Section Builders
 # ---------------------------------------------------------------------------
@@ -274,8 +305,17 @@ def _mcp_section() -> str:
     return "\n".join(lines)
 
 
-def _memory_section(config: OrchestratorConfig) -> str:
-    """Build the memory system section explaining both shared and private memory."""
+def _memory_section(
+    config: OrchestratorConfig,
+    voice_provider_id: str | None = None,
+) -> str:
+    """Build the memory system section explaining both shared and private memory.
+
+    When ``voice_provider_id`` is set (only in realtime voice sessions) and a
+    matching `ORCHESTRATOR_MEMORY_<provider>.md` file exists, its contents are
+    appended as a separate "Provider-Specific Memory" subsection along with
+    short editing instructions.
+    """
     # Get relative path for display
     relative_path = config.memory_path
     if config.project_dir and config.memory_path.startswith("/"):
@@ -287,6 +327,11 @@ def _memory_section(config: OrchestratorConfig) -> str:
     # Load memory contents
     memory_index = _load_memory_index(config)
     private_memory = _load_private_memory(config)
+    provider_memory, provider_memory_path = (
+        _load_provider_memory(config, voice_provider_id)
+        if voice_provider_id
+        else ("", None)
+    )
 
     section = f"""## Memory System
 
@@ -350,6 +395,29 @@ Never omit existing entries unless they are clearly obsolete."""
 
 Your private memory is currently empty."""
 
+    # Add voice-provider-specific memory (only loaded in realtime voice sessions
+    # when an ORCHESTRATOR_MEMORY_<provider>.md file exists).
+    if provider_memory and provider_memory_path is not None:
+        provider_rel = str(provider_memory_path)
+        if config.project_dir and provider_rel.startswith("/"):
+            try:
+                provider_rel = str(
+                    provider_memory_path.relative_to(Path(config.project_dir))
+                )
+            except ValueError:
+                pass
+        section += f"""
+
+---
+
+### Provider-Specific Memory (`{provider_rel}`)
+
+This file is loaded **only** when you are running on the `{voice_provider_id}` realtime voice provider. Use it for guidance, alignment, or context that applies just to this provider — not the general orchestrator behavior. Edit this file (not the main private memory) when feedback or learnings only apply when speaking through `{voice_provider_id}` voice.
+
+```
+{provider_memory}
+```"""
+
     return section
 
 
@@ -364,13 +432,13 @@ def _guidelines_section() -> str:
 ### Delegating to Agents
 - **Be specific**: Give clear, actionable instructions with enough context for independent work
 - **Fire-and-forget**: `send_to_agent_session` returns IMMEDIATELY with a turn_id; the agent runs in the background. Do NOT loop calling it waiting for a response — results arrive as background events on your next turn.
-- **In parallel**: While a turn is in flight you can spawn other agents, peek at intermediate output (`peek_agent_session`), read persisted history (`read_agent_session`), respond to permission requests (`respond_to_agent_permission`), or talk to the user.
+- **In parallel**: While a turn is in flight you can spawn other agents, check progress and read output with `read_agent_session` (returns persisted messages plus a `live` block with `status: running/idle` and the live event tail when running), respond to permission requests (`respond_to_agent_permission`), or talk to the user.
 - **Match MCPs to tasks**: Load only the MCPs an agent needs
 
 ### Background Events
-- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — for actual content call `read_agent_session(session_id)` (persisted) or `peek_agent_session(session_id, turn_id)` (live, while still running).
+- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — call `read_agent_session(session_id)` for the actual content; it works both while a turn is still running (live tail in `live.events`) and after it finishes (persisted messages).
 - Permission events also arrive as structured lines: `[SESSION xxx event: <user|orchestrator> <approved|denied> <ToolName> — "<message>"]`. Typically the user answered in their tab; only call `respond_to_agent_permission` when they're unavailable, the agent has explicitly asked you to decide, or you have a specific reason to overrule.
-- Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `peek_agent_session` output, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
+- Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `read_agent_session`'s `live.events` while a turn is running, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
 
 ### Session Management
 - **Open sessions only when needed**: Don't open sessions speculatively
@@ -476,6 +544,7 @@ def build_system_prompt(
     context: dict[str, Any],
     recent_messages: list[dict[str, Any]] | None = None,
     history_summary: str | None = None,
+    voice_provider_id: str | None = None,
 ) -> str:
     """Build the orchestrator's system prompt.
 
@@ -491,12 +560,18 @@ def build_system_prompt(
     ``recent_messages`` (kept verbatim, with tool results pre-clipped) and
     ``history_summary`` (digest of older messages) using the token-budget
     helpers in ``orchestrator.token_budget``.
+
+    ``voice_provider_id`` is only passed by realtime voice sessions; when set
+    and a matching ``ORCHESTRATOR_MEMORY_<provider>.md`` file exists next to
+    the main orchestrator memory, its contents are appended to the memory
+    section. Text and audio modes never pass this argument, so provider-
+    specific memory never leaks into non-voice prompts.
     """
     sections = [
         _role_section(),
         _active_sessions_section(context),
         _mcp_section(),
-        _memory_section(config),
+        _memory_section(config, voice_provider_id=voice_provider_id),
         _guidelines_section(),
         _history_section(recent_messages, history_summary),
     ]

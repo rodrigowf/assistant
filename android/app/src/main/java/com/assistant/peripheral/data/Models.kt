@@ -84,11 +84,23 @@ sealed class ConnectionState {
 sealed class VoiceState {
     object Off : VoiceState()
     object Connecting : VoiceState()
+    /** Backend is rebuilding the history summary (the LLM call inside
+     *  get_session_update). Shown as a yellow "Preparing conversation"
+     *  state so the user knows the wake-word landed but the session
+     *  isn't ready yet. Distinct from [Connecting] (network handshake)
+     *  because this can take 15-25s on long sessions. */
+    object Summarizing : VoiceState()
     object Active : VoiceState()
     object Speaking : VoiceState()
     object Listening : VoiceState()
     object Thinking : VoiceState()
     object ToolUse : VoiceState()
+    /** Backend is tearing the voice session down — flushing graceful
+     *  shutdown frames, closing the upstream WS. Shown as "Ending..."
+     *  with a spinner so the user knows the stop request is in flight
+     *  and not just frozen. Flips to [Off] on the [WebSocketEvent.VoiceEnded]
+     *  ack (or after a 5s safety timeout if the ack never arrives). */
+    object Ending : VoiceState()
     data class Error(val message: String) : VoiceState()
 }
 
@@ -146,7 +158,14 @@ sealed class WebSocketEvent {
     // Voice events (for WebRTC integration)
     data class VoiceCommand(val command: Map<String, Any?>) : WebSocketEvent()
     data class VoiceTranscript(val text: String, val isFinal: Boolean) : WebSocketEvent()
-    object VoiceStopped : WebSocketEvent()  // AI-initiated clean session end
+    /** Backend has begun teardown — UI should show "Ending..." until
+     *  [VoiceEnded] arrives. */
+    data class VoiceEnding(val reason: String) : WebSocketEvent()
+    /** Backend teardown is complete — UI flips to Off. */
+    data class VoiceEnded(val reason: String) : WebSocketEvent()
+    /** Legacy: emitted alongside [VoiceEnded] by the backend for one
+     *  release of the migration. Remove after the new path is verified. */
+    object VoiceStopped : WebSocketEvent()
 
     /** Provider event mirrored from backend (WebSocket providers only). */
     data class VoiceProviderEvent(val event: Map<String, Any?>) : WebSocketEvent()
@@ -234,24 +253,38 @@ data class AppSettings(
     val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for wake word detection
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
-    val audioOutput: AudioOutput = AudioOutput.LOUDSPEAKER,  // where voice session audio is routed
+    val audioOutput: AudioOutput = AudioOutput.AUTO,  // where voice session audio is routed; AUTO lets the OS pick
     val enableButtonTrigger: Boolean = false   // long-press recents button starts voice session
 )
 
 /**
  * Audio output routing for voice sessions.
  *
- * BLUETOOTH requires a connected Bluetooth audio device — UI should gray this option out
- * when none is available. VoiceManager.isBluetoothAudioAvailable() exposes that state.
+ * AUTO is the default: hand routing to the Android system audio policy and let it pick
+ * whatever output device is appropriate (wired headphone if plugged, BT A2DP if paired
+ * and active, otherwise built-in loudspeaker). The OS automatically reacts to
+ * plug/unplug events without app involvement, so this is the most robust choice for
+ * the dedicated-device use case where the user just wants "use whatever's connected".
+ *
+ * The other modes are explicit overrides for power users:
+ *   - LOUDSPEAKER: force built-in speaker even if a headphone is plugged.
+ *   - EARPIECE: force the phone earpiece (private listening).
+ *   - BLUETOOTH: force the call-audio plane through a BT HFP headset (gives you the
+ *     BT device's mic too). Requires a connected BT audio device.
+ *   - WIRED: force the 3.5mm jack via the call-audio plane. Mostly obsoleted by AUTO,
+ *     kept for cases where MODE_NORMAL routing isn't what the user wants. Requires a
+ *     wired plug.
  */
 enum class AudioOutput {
-    EARPIECE,
+    AUTO,
     LOUDSPEAKER,
-    BLUETOOTH;
+    EARPIECE,
+    BLUETOOTH,
+    WIRED;
 
     companion object {
-        /** Safe parse for DataStore — falls back to LOUDSPEAKER on unknown / null. */
+        /** Safe parse for DataStore — falls back to AUTO on unknown / null. */
         fun fromString(value: String?): AudioOutput =
-            values().firstOrNull { it.name == value } ?: LOUDSPEAKER
+            values().firstOrNull { it.name == value } ?: AUTO
     }
 }

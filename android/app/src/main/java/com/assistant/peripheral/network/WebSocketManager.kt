@@ -40,6 +40,10 @@ class WebSocketManager {
     companion object {
         private const val TAG = "WebSocketManager"
         private const val RECONNECT_DELAY_MS = 3000L
+        // OkHttp's WS protocol-level pingInterval — 30s is the okhttp
+        // recommendation. The library sends a PING frame every interval
+        // and closes the WS with "1011 keepalive ping timeout" if no
+        // PONG arrives within the same window.
         private const val PING_INTERVAL_MS = 30000L
     }
 
@@ -49,7 +53,7 @@ class WebSocketManager {
         var url: String? = null,
         var localId: String? = null,
         var shouldReconnect: Boolean = false,
-        val state: MutableStateFlow<ConnectionState> = MutableStateFlow(ConnectionState.Disconnected)
+        val state: MutableStateFlow<ConnectionState> = MutableStateFlow(ConnectionState.Disconnected),
     )
 
     private val connections: Map<WebSocketEndpoint, Connection> = mapOf(
@@ -280,6 +284,15 @@ class WebSocketManager {
             fun emit(ev: WebSocketEvent) { _events.tryEmit(endpoint to ev) }
 
             when (type) {
+                // Heartbeat — backend sends {"type":"ping"} every 15s to
+                // keep the A300M's WiFi radio awake long enough for okhttp
+                // to receive its WS PONG. We don't need to do anything
+                // with it; receiving the bytes already wakes the radio.
+                // Silently consume — don't emit, don't ack (the bytes
+                // themselves are the ack).
+                "ping" -> { /* no-op */ }
+                "pong" -> { /* no-op — reserved for future client→server ping */ }
+
                 // Session lifecycle
                 "session_started" -> {
                     val sessionId = json.optString("session_id", "")
@@ -374,6 +387,14 @@ class WebSocketManager {
                     if (audio.isNotEmpty()) {
                         emit(WebSocketEvent.VoiceAudioOut(audio))
                     }
+                }
+                "voice_ending" -> {
+                    val reason = json.optString("reason", "")
+                    emit(WebSocketEvent.VoiceEnding(reason))
+                }
+                "voice_ended" -> {
+                    val reason = json.optString("reason", "")
+                    emit(WebSocketEvent.VoiceEnded(reason))
                 }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 

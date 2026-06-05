@@ -21,6 +21,9 @@ interface Props {
 export function VoiceButton({ status, onStart, onStop }: Props) {
   const isOff = status === "off" || status === "error";
   const isConnecting = status === "connecting";
+  // While Ending, swallow extra clicks — the backend is already
+  // tearing the session down and a second stop is just noise.
+  const isEnding = status === "ending";
 
   const label = {
     off: "Start Voice",
@@ -29,6 +32,7 @@ export function VoiceButton({ status, onStart, onStop }: Props) {
     speaking: "Speaking",
     thinking: "Thinking",
     tool_use: "Working",
+    ending: "Ending…",
     error: "Retry",
   }[status];
 
@@ -38,10 +42,10 @@ export function VoiceButton({ status, onStart, onStop }: Props) {
       onClick={isOff ? onStart : onStop}
       title={label}
       aria-label={label}
-      disabled={isConnecting}
+      disabled={isConnecting || isEnding}
     >
       {status === "off" && <MicIcon />}
-      {status === "connecting" && <SpinnerIcon />}
+      {(status === "connecting" || status === "ending") && <SpinnerIcon />}
       {status === "error" && <ErrorIcon />}
       <span className="voice-start-label">{label}</span>
     </button>

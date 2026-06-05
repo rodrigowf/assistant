@@ -45,6 +45,7 @@ fun SystemSettingsTabContent(
     onReload: () -> Unit,
     onUpdate: (ConfigPatch) -> Unit,
     onToggleMcp: (String) -> Unit,
+    onDismissVoiceModelAutoCorrected: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val cfg = state.config
@@ -95,6 +96,33 @@ fun SystemSettingsTabContent(
                             Text("Saved", style = MaterialTheme.typography.bodyMedium)
                         }
                     }
+                }
+            }
+        }
+
+        state.voiceModelAutoCorrected?.let { correction ->
+            Surface(
+                color = MaterialTheme.colorScheme.tertiaryContainer,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.Info, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onTertiaryContainer,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Gemini model \"${correction.from}\" was deprecated by Google. " +
+                            "Switched to \"${correction.to}\".",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = onDismissVoiceModelAutoCorrected) { Text("Dismiss") }
                 }
             }
         }

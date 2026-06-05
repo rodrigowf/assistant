@@ -333,13 +333,22 @@ VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
     # calls fail and exists to satisfy ``get_model_entry`` lookups for
     # either backend's canonical model id.
     #
-    # Entries map to Live models on:
-    # - Vertex AI: ``gemini-live-2.5-flash-native-audio`` (default)
-    # - AI Studio: ``gemini-2.5-flash-native-audio-latest`` +
-    #   ``gemini-3.1-flash-live-preview`` (not mirrored to Vertex yet).
+    # Live-capable Gemini ids diverge by backend:
+    # - AI Studio: ``gemini-3.1-flash-live-preview`` (current preview) and
+    #   ``gemini-2.5-flash-native-audio-latest`` (stable). Both are returned
+    #   by /v1beta/models when the request is paginated past the default
+    #   50-model cutoff.
+    # - Vertex AI: ``gemini-live-2.5-flash-native-audio`` (Vertex kept the
+    #   ``-live-`` prefix when AI Studio renamed; no 3.1 Live variant in
+    #   the Vertex publisher catalog as of 2026-05-28).
+    #
+    # AI Studio entry is default because most users start there (no GCP
+    # project required). When the user picks Vertex via
+    # ``default_voice_endpoint``, the discovery endpoint provides the
+    # Vertex catalog and the saved model id is honoured.
     "google": [
-        {"id": "gemini-live-2.5-flash-native-audio",
-         "label": "Gemini Live 2.5 Flash Native Audio",
+        {"id": "gemini-3.1-flash-live-preview",
+         "label": "Gemini 3.1 Flash Live Preview (AI Studio)",
          "voice": "Puck",
          "voices": _GEMINI_LIVE_VOICES,
          "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
@@ -352,8 +361,8 @@ VOICE_MODELS: dict[str, list[VoiceModelEntry]] = {
          "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,
          "default_transcription_language": "",
          "default": False},
-        {"id": "gemini-3.1-flash-live-preview",
-         "label": "Gemini 3.1 Flash Live (AI Studio, preview)",
+        {"id": "gemini-live-2.5-flash-native-audio",
+         "label": "Gemini Live 2.5 Flash Native Audio (Vertex)",
          "voice": "Puck",
          "voices": _GEMINI_LIVE_VOICES,
          "transcription_languages": _GEMINI_TRANSCRIPTION_LANGUAGES,

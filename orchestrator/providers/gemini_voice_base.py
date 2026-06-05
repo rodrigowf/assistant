@@ -27,8 +27,9 @@ Please contact support."* — for preview Live models on previously
 working keys. Google maintainers' documented workaround is to switch to
 Vertex AI, which uses GCP IAM instead of AI Studio's allowlist. We keep
 both backends available because Vertex doesn't yet mirror every preview
-model AI Studio carries (e.g. ``gemini-3.1-flash-live-preview`` is AI
-Studio-only at the time of writing).
+model AI Studio carries (e.g. ``gemini-2.5-flash-native-audio-latest``
+is AI Studio's canonical id; Vertex still serves it as
+``gemini-live-2.5-flash-native-audio``).
 
 References:
 - https://ai.google.dev/api/live (AI Studio Live API)
@@ -54,6 +55,7 @@ from typing import Any
 
 import websockets
 
+from orchestrator import voice_vad
 from orchestrator.providers.voice_base import BaseVoiceProvider
 from orchestrator.types import (
     ErrorEvent,
@@ -148,6 +150,16 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         # "project denied access") is genuinely fatal and reconnecting
         # would just loop. Cleared on ``setupComplete`` after reconnect.
         self._goaway_received: bool = False
+        # Single-shot guard for the "stale handle" recovery path: when
+        # we observe 1008 "BidiGenerateContent session expired" with no
+        # prior goAway, the saved ``_resumption_handle`` is poisoned
+        # (server invalidated it — common when the session was
+        # force-closed previously, or has aged out across an
+        # orchestrator restart). We drop the handle and reconnect once
+        # with a fresh setup. If that fresh attempt ALSO gets 1008, we
+        # treat it as genuinely fatal instead of looping. Reset on the
+        # next ``setupComplete``.
+        self._stale_handle_recovery_used: bool = False
 
     # --- identity ---------------------------------------------------------
 
@@ -168,6 +180,15 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
     @property
     def connection_type(self) -> str:
         return "websocket"
+
+    @property
+    def audio_in_sample_rate(self) -> int | None:
+        """16 kHz mono PCM16 — declared so the relay can initialise
+        Silero for manual VAD (see ``manual_vad_*`` hooks). Matches the
+        hardcoded ``audio/pcm;rate=16000`` in :meth:`format_audio_in`
+        and what the Android client ships.
+        """
+        return 16000
 
     @property
     def model(self) -> str:
@@ -426,22 +447,38 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
             # and our chat window has nothing to show.
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
-            # Tune activity (VAD) detection.  The defaults are
-            # aggressive enough that an open mic with ambient noise
-            # keeps resetting the model's pending turn and the second
-            # reply never lands.  Higher-sensitivity end-of-speech and
-            # a longer silence gap let the model actually finish.
+            # Activity (VAD) detection.  Two modes:
+            #
+            # Manual (default, GEMINI_MANUAL_VAD=1 — opt out with =0):
+            #   ``disabled: True`` hands turn boundaries to us. The
+            #   relay runs Silero locally over the mic stream and
+            #   demarcates each user turn with
+            #   ``realtimeInput.activityStart`` / ``activityEnd``
+            #   (see ``manual_vad_start_frames`` / ``stop_frames``).
+            #   Why: Gemini's server VAD ends turns mid-sentence on
+            #   natural breathing pauses even with
+            #   ``endOfSpeechSensitivity: LOW`` and
+            #   ``silenceDurationMs: 2500``. The same client-side VAD
+            #   architecture that fixed Qwen's force-commit issue
+            #   fixes this here.
+            #
+            # Server (GEMINI_MANUAL_VAD=0):
+            #   Fall back to the upstream's VAD, tuned as conservatively
+            #   as the API allows. Tradeoff is ~1s extra latency at
+            #   real end-of-turn from the 2.5s silence window; you
+            #   still get cut off mid-sentence on longer pauses.
             "realtimeInputConfig": {
-                "automaticActivityDetection": {
-                    "disabled": False,
-                    "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
-                    "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
-                    "prefixPaddingMs": 300,
-                    # Wait 1.5s of silence before deciding the user is
-                    # done; matches our Qwen tuning so users can pause
-                    # mid-sentence without the model cutting in.
-                    "silenceDurationMs": 1500,
-                },
+                "automaticActivityDetection": (
+                    {"disabled": True}
+                    if voice_vad.is_enabled_for("google")
+                    else {
+                        "disabled": False,
+                        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                        "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                        "prefixPaddingMs": 300,
+                        "silenceDurationMs": 2500,
+                    }
+                ),
             },
             # Opt into session resumption. First setup sends an empty
             # object (no handle) to ask the server to start emitting
@@ -479,6 +516,64 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
                 },
             },
         }
+
+    # --- manual-VAD upstream frames --------------------------------------
+    #
+    # When ``automaticActivityDetection.disabled = True`` (see
+    # format_session_config), Gemini Live expects the client to send
+    # ``realtimeInput.activityStart`` to open a user turn and
+    # ``realtimeInput.activityEnd`` to close it. The model only
+    # generates a response after receiving ``activityEnd``. There's no
+    # separate ``response.create`` like the OpenAI-realtime wire shape.
+
+    def manual_vad_start_frames(self) -> list[dict[str, Any]]:
+        """Mark start of a user turn — sent on local-VAD speech_started."""
+        return [{"realtimeInput": {"activityStart": {}}}]
+
+    def manual_vad_stop_frames(self) -> list[dict[str, Any]]:
+        """Mark end of a user turn — triggers the model's reply."""
+        return [{"realtimeInput": {"activityEnd": {}}}]
+
+    def manual_vad_safety_commit_frames(self) -> list[dict[str, Any]]:
+        """No safety commit for Gemini — return ``[]`` to disable.
+
+        History: we initially copied Qwen's safety-commit pattern as
+        ``activityEnd`` + ``activityStart`` on the assumption that
+        Gemini would batch the response generation until a real pause.
+        Live test 2026-06-04 disproved that hypothesis: when the user
+        spoke continuously for 50s, our safety commit fired and
+        Gemini started replying within 290ms of the ``activityEnd``,
+        cutting the user off mid-sentence. The architectural reality:
+        Qwen's wire shape SEPARATES ``input_audio_buffer.commit``
+        (close segment) from ``response.create`` (ask for reply), so
+        a "commit-only" safety chunking works. Gemini Live's
+        ``activityEnd`` collapses those into one — there is no
+        documented or empirical way to chunk a long utterance without
+        provoking a reply.
+
+        Gemini Live also has NO documented per-utterance cap in
+        manual mode (vs. DashScope's documented 60s) and no observed
+        cap in 200+s monologues. So the safety path was guarding
+        against a problem that does not exist; removing it cleanly
+        fixes the only real issue (false interruption).
+        """
+        return []
+
+    def graceful_shutdown_frames(self) -> list[dict[str, Any]]:
+        """Close any in-flight user turn before we tear the WS down.
+
+        Gemini's ``activityEnd`` ALSO triggers a model reply (see
+        :meth:`manual_vad_safety_commit_frames` for the long story).
+        That's normally a problem, but here it's harmless: the relay
+        closes the WS immediately after sending these frames, so the
+        reply — if any — never reaches us. What matters is that the
+        server-side activity gets a clean close instead of dangling
+        until the session age-out.
+
+        If no manual-VAD activity is open the frame is benign;
+        Gemini ignores ``activityEnd`` outside an active turn.
+        """
+        return [{"realtimeInput": {"activityEnd": {}}}]
 
     @classmethod
     def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
@@ -527,6 +622,7 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """
         if "setupComplete" in event:
             self._goaway_received = False
+            self._stale_handle_recovery_used = False
         update = event.get("sessionResumptionUpdate")
         if isinstance(update, dict):
             handle = update.get("newHandle")
@@ -557,25 +653,74 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """
         return isinstance(event.get("goAway"), dict)
 
-    def is_recoverable_error(self, exc: BaseException) -> bool:
-        """Reconnect when the upstream closed *after* a goAway.
+    # Client-mirrored events on Gemini Live's wire schema that we
+    # actually forward upstream.  Gemini doesn't use OpenAI's ``type=...``
+    # envelopes; its top-level keys are camelCase ``clientContent``,
+    # ``realtimeInput``, ``toolResponse``, ``setup``.  Anything else
+    # (most importantly: stray OpenAI-shape events that leak in when
+    # the user resumes a session whose previous voice mode was OpenAI)
+    # is dropped at the relay edge to avoid WS 1007 "Invalid JSON
+    # payload: Unknown name 'type'" close.
+    _ACCEPTED_UPSTREAM_KEYS = frozenset({
+        "clientContent",
+        "realtimeInput",
+        "toolResponse",
+        "setup",
+        # ``sessionResumptionUpdate`` is sent by us during reconnect
+        # but always passes through ``send_event`` from the relay's own
+        # rebuild path, so it's also accepted here for completeness.
+        "sessionResumptionUpdate",
+    })
 
-        Any other 1008 is treated as fatal: AI Studio's "project denied
-        access" close shares the same code but isn't recoverable —
-        retrying would just loop. We also require a captured resumption
-        handle so the rebuilt setup can actually restore state instead
-        of silently starting a fresh session.
+    def accepts_upstream_event(self, event: dict[str, Any]) -> bool:
+        if "type" in event:
+            # OpenAI-Realtime envelope.  Definitely not for us.
+            return False
+        return any(k in event for k in self._ACCEPTED_UPSTREAM_KEYS)
+
+    def is_recoverable_error(self, exc: BaseException) -> bool:
+        """Reconnect when the upstream closed *after* a goAway, OR when
+        the close was a "BidiGenerateContent session expired" 1008
+        triggered by a stale resumption handle (one-shot recovery).
+
+        Other 1008 closes are treated as fatal: AI Studio's "project
+        denied access" close shares the same code but isn't recoverable
+        — retrying would just loop.
         """
-        if not self._goaway_received:
-            return False
-        if not self._resumption_handle:
-            return False
-        # We don't inspect ``exc`` further — once goAway has fired, the
-        # next close (whatever code) is the duration kill we're prepared
-        # for. Returning True hands control to the relay's reconnect
-        # machinery, which calls ``rebuild_session_update`` (→ our
-        # ``format_session_config`` reads ``_resumption_handle``).
-        return True
+        if self._goaway_received and self._resumption_handle:
+            # Standard goAway recovery: rebuild with the live handle.
+            return True
+
+        # Stale-handle recovery: we DID have a handle on this attempt
+        # but it was rejected with "session expired" without a prior
+        # goAway. The handle is poisoned (server invalidated it across
+        # a previous force-close, or it aged out). Drop it and let the
+        # relay rebuild with an empty resumption block. One-shot to
+        # prevent infinite loops if the fresh setup also dies.
+        if (
+            self._resumption_handle
+            and not self._stale_handle_recovery_used
+            and self._is_session_expired_close(exc)
+        ):
+            logger.warning(
+                "gemini stale resumption handle rejected; dropping handle and "
+                "reconnecting with fresh setup"
+            )
+            self._resumption_handle = None
+            self._stale_handle_recovery_used = True
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_session_expired_close(exc: BaseException) -> bool:
+        """Detect Gemini's 1008 "BidiGenerateContent session expired"
+        close. The reason string travels in ``str(exc)`` because
+        ``websockets`` formats ``ConnectionClosedError`` as
+        ``received <code> (<short>) <reason>; then sent ...``.
+        """
+        msg = str(exc)
+        return "1008" in msg and "session expired" in msg.lower()
 
     # --- connection metadata ---------------------------------------------
 

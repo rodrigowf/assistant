@@ -23,6 +23,43 @@ const VOICE_PROVIDER_LABELS: Record<string, string> = {
   google: "Google Gemini",
 };
 
+// When Google deprecates a Gemini Live model id (which they do
+// periodically — e.g. "gemini-live-2.5-flash-native-audio" was renamed
+// to "gemini-2.5-flash-native-audio-latest" on AI Studio in 2026-05),
+// a stale ``default_voice_model`` in assistant_config.json breaks
+// every voice session with a WS 1008 policy violation before the user
+// has any chance to notice. Auto-correct by snapping the saved value
+// to the discovered default and surfacing a banner so the change is
+// visible. Only fires when the discovered list is non-empty (no list
+// = upstream is unhealthy, don't second-guess the user).
+async function maybeAutoCorrectVoiceModel(
+  cfg: AssistantConfig,
+  discovered: VoiceModelEntry[],
+  setBanner: (b: { from: string; to: string } | null) => void,
+): Promise<AssistantConfig> {
+  if (cfg.default_voice_provider !== "google") return cfg;
+  if (discovered.length === 0) return cfg;
+  if (discovered.some(m => m.id === cfg.default_voice_model)) return cfg;
+  const newDefault = discovered.find(m => m.default) ?? discovered[0];
+  const from = cfg.default_voice_model;
+  try {
+    const updated = await updateConfig({
+      default_voice_model: newDefault.id,
+      // Voice name often pairs with a specific model — snap to the
+      // new model's default voice unless the current voice is still
+      // listed under it.
+      default_voice_name: newDefault.voices.some(v => v.id === cfg.default_voice_name)
+        ? cfg.default_voice_name
+        : newDefault.voice,
+    });
+    setBanner({ from, to: newDefault.id });
+    return updated;
+  } catch (e) {
+    console.warn("auto-correct voice model failed:", e);
+    return cfg;
+  }
+}
+
 interface Props {
   isOpen: boolean;
   onClose: () => void;
@@ -42,6 +79,13 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState(false);
+  // Surfaces when the previously-saved Google voice model is no longer
+  // in the discovered catalog (Google deprecates Live model ids
+  // periodically). The Config page silently writes through to the new
+  // default; the banner tells the user that happened.
+  const [voiceModelAutoCorrected, setVoiceModelAutoCorrected] = useState<
+    { from: string; to: string } | null
+  >(null);
 
   const savedMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wasOpen = useRef(false);
@@ -77,7 +121,6 @@ export function ConfigPage({ isOpen, onClose }: Props) {
         }),
         listSessionProviders(),
       ]);
-      setConfig(cfg);
       setMcpServers(mcpRes.servers);
       setModels(modelsRes.models);
       // Merge the dynamic Gemini Live list into voiceProviders, replacing
@@ -91,6 +134,13 @@ export function ConfigPage({ isOpen, onClose }: Props) {
       setVoiceProviders(mergedVoiceProviders);
       setQwenHarnessModels(qwenHarnessRes.models);
       setSessionProviders(providersRes.providers);
+      // Auto-correct: if the saved Gemini model is no longer in the
+      // discovered catalog (Google renames Live ids occasionally),
+      // write through to the new default and tell the user.
+      const correctedCfg = await maybeAutoCorrectVoiceModel(
+        cfg, googleVoiceRes.models, setVoiceModelAutoCorrected,
+      );
+      setConfig(correctedCfg);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load configuration");
     } finally {
@@ -125,12 +175,17 @@ export function ConfigPage({ isOpen, onClose }: Props) {
     if (endpointRef.current === ep) return;
     endpointRef.current = ep;
     listGoogleVoiceModels(ep)
-      .then(res => {
+      .then(async res => {
         if (res.models.length === 0) return;
         setVoiceProviders(prev => ({ ...prev, google: res.models }));
+        if (!config) return;
+        const corrected = await maybeAutoCorrectVoiceModel(
+          config, res.models, setVoiceModelAutoCorrected,
+        );
+        if (corrected !== config) setConfig(corrected);
       })
       .catch(e => console.warn("listGoogleVoiceModels refetch failed:", e));
-  }, [config?.default_voice_endpoint]);
+  }, [config, config?.default_voice_endpoint]);
 
   const showSaved = () => {
     setSavedMsg(true);
@@ -167,6 +222,13 @@ export function ConfigPage({ isOpen, onClose }: Props) {
   const selectedModel = models.find(m => m.model_id === config?.default_model);
   const selectedProvider = selectedModel?.provider ?? providers[0] ?? "";
   const providerModels = models.filter(m => m.provider === selectedProvider);
+
+  // Summarizer model — uses the same provider/model catalog as Text mode.
+  // Empty saved value falls back to the backend's DEFAULT_SUMMARIZER_MODEL.
+  const summarizerModelId = (config?.summarizer_model ?? "").trim();
+  const selectedSummarizerModel = models.find(m => m.model_id === summarizerModelId);
+  const selectedSummarizerProvider = selectedSummarizerModel?.provider ?? providers[0] ?? "";
+  const summarizerProviderModels = models.filter(m => m.provider === selectedSummarizerProvider);
 
   // Derived voice-provider/model/voice/language state for dropdowns
   const voiceProviderIds = Object.keys(voiceProviders);
@@ -213,6 +275,22 @@ export function ConfigPage({ isOpen, onClose }: Props) {
         <div className="config-panel-body">
           {loading && <div className="config-loading">Loading…</div>}
           {error && <div className="config-error">{error}</div>}
+          {voiceModelAutoCorrected && (
+            <div className="config-warning" role="status" style={{
+              background: "#fef3c7", color: "#78350f", padding: "0.75em 1em",
+              borderRadius: 6, marginBottom: "1em", fontSize: "0.9em",
+            }}>
+              The previously-saved Gemini Live model <code>{voiceModelAutoCorrected.from}</code> is no longer
+              available from Google. Switched to <code>{voiceModelAutoCorrected.to}</code>.
+              <button
+                type="button"
+                onClick={() => setVoiceModelAutoCorrected(null)}
+                style={{ marginLeft: "1em", background: "transparent", border: "none", color: "inherit", cursor: "pointer", fontWeight: 600 }}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           {!loading && config && (
             <>
@@ -265,6 +343,57 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                             <option key={m.model_id} value={m.model_id}>
                               {m.display_name}
                               {m.supports_audio ? " 🎤" : ""}
+                              {m.supports_vision ? " 👁" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* History summarizer */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">History summarizer</h4>
+                  <p className="config-subsection-desc">
+                    Compresses older conversation history into the digest the
+                    voice agent reads at session start. Picked separately
+                    because realtime/audio models aren't reliable summarizers
+                    — use a frontier reasoning model here.
+                  </p>
+                  {models.length === 0 ? (
+                    <div className="config-empty">No models available</div>
+                  ) : (
+                    <div className="model-dropdowns">
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Provider</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={selectedSummarizerProvider}
+                          disabled={saving}
+                          onChange={(e) => {
+                            const first = models.find(m => m.provider === e.target.value);
+                            if (first) save({ summarizer_model: first.model_id }).catch(err => setError(String(err)));
+                          }}
+                        >
+                          {providers.map(p => (
+                            <option key={p} value={p}>
+                              {p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="model-dropdown-field">
+                        <label className="model-dropdown-label">Model</label>
+                        <select
+                          className="model-dropdown-select"
+                          value={summarizerModelId}
+                          disabled={saving}
+                          onChange={(e) => save({ summarizer_model: e.target.value }).catch(err => setError(String(err)))}
+                        >
+                          {summarizerProviderModels.map(m => (
+                            <option key={m.model_id} value={m.model_id}>
+                              {m.display_name}
                               {m.supports_vision ? " 👁" : ""}
                             </option>
                           ))}

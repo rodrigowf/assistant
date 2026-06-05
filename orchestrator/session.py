@@ -12,6 +12,7 @@ fixed model for the session duration (WebRTC constraint).
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import uuid
@@ -31,6 +32,7 @@ from orchestrator.config import (
     get_model_info,
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
+from orchestrator.providers.voice_base import BaseVoiceProvider
 from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 # Provider classes are imported lazily inside the methods that need them so
 # this module remains importable on machines where the corresponding SDK
@@ -38,11 +40,12 @@ from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 # Missing SDKs surface as a 400 at config-save time and a friendly runtime
 # error at send time — never as a backend that won't boot.
 from orchestrator.runner import BackgroundAgentRunner, Notification, NotificationQueue
+from orchestrator import summary_cache
 from orchestrator.token_budget import (
     RECENT_VERBATIM_TOKENS,
     estimate_message_tokens,
-    scale_summary_max_tokens,
     split_by_token_budget,
+    summary_target_word_range,
     truncate_tool_results,
 )
 from orchestrator.tools import registry
@@ -57,13 +60,71 @@ from orchestrator.types import (
 
 logger = logging.getLogger(__name__)
 
+# Fallback when ``summarizer_model`` is unset in assistant_config.json.
+# A frontier model with a long context, picked because the user is more likely
+# to have an OpenAI key configured than an Anthropic one in this environment.
+# Override globally by editing ``summarizer_model`` in assistant_config.json.
+DEFAULT_SUMMARIZER_MODEL = "gpt-5.1"
+
+
+class VoiceLifecycle(enum.Enum):
+    """Voice session lifecycle states — guarded by ``OrchestratorSession._voice_lock``.
+
+    All transitions go through :meth:`OrchestratorSession._transition_voice_state`.
+    Only the transitions in :data:`_VALID_VOICE_TRANSITIONS` are allowed; anything
+    else is a bug and raises.
+
+    IDLE
+        No voice session active (text mode, or voice never started, or already
+        finished cleaning up).
+    STARTING
+        ``start_voice_relay`` is running. Upstream handshake in flight.
+    ACTIVE
+        Relay is up and pumping events. Normal operating state.
+    ENDING
+        ``end_voice`` is tearing down. Late events are dropped. New
+        ``voice_start`` for the same ``local_id`` must wait for ``ENDED``.
+    ENDED
+        Terminal. The session is cleaned up. A fresh start uses a new
+        ``OrchestratorSession`` instance.
+    """
+
+    IDLE = "idle"
+    STARTING = "starting"
+    ACTIVE = "active"
+    ENDING = "ending"
+    ENDED = "ended"
+
+
+# Source → set of allowed targets. Used to validate every transition so a
+# stray double-call (e.g. concurrent agent end_voice + user stop) becomes a
+# silent no-op instead of a corrupting double-teardown.
+_VALID_VOICE_TRANSITIONS: dict[VoiceLifecycle, set[VoiceLifecycle]] = {
+    VoiceLifecycle.IDLE: {VoiceLifecycle.STARTING, VoiceLifecycle.ENDING},
+    VoiceLifecycle.STARTING: {VoiceLifecycle.ACTIVE, VoiceLifecycle.ENDING},
+    VoiceLifecycle.ACTIVE: {VoiceLifecycle.ENDING},
+    VoiceLifecycle.ENDING: {VoiceLifecycle.ENDED},
+    # ENDED → IDLE re-arms voice on the SAME OrchestratorSession (same
+    # JSONL, same agent context). Triggered by ``restart_voice()`` when
+    # a new voice_start arrives on a session whose voice connection was
+    # torn down (by user stop, agent's end_voice_session, or client
+    # disconnect). The orchestrator session itself is the tab — it
+    # outlives any individual voice connection.
+    VoiceLifecycle.ENDED: {VoiceLifecycle.IDLE},
+}
+
+# Best-effort timeout for the provider's graceful_shutdown_frames send.
+# If the upstream WS is already wedged we don't want teardown to block
+# forever; the WS close that follows will free the resource anyway.
+_GRACEFUL_SHUTDOWN_TIMEOUT_S = 0.5
+
 
 def _render_notifications(notes: list[Notification]) -> str:
     """Render a batch of background-agent notifications as a status block.
 
     Status lines only (per design choice): the orchestrator must call
-    read_agent_session or peek_agent_session to retrieve actual content.
-    Keeps the synthetic prompt cheap and forces explicit follow-up reads.
+    read_agent_session to retrieve actual content. Keeps the synthetic
+    prompt cheap and forces explicit follow-up reads.
     """
     if not notes:
         return ""
@@ -84,8 +145,8 @@ def _render_notifications(notes: list[Notification]) -> str:
             bits.append(f'error="{n.error}"')
         lines.append(", ".join(bits) + "]")
     lines.append(
-        "(Use read_agent_session(session_id) for persisted output, "
-        "peek_agent_session(session_id, turn_id) for live in-flight events.)"
+        "(Use read_agent_session(session_id) for the actual content — it returns "
+        "persisted messages plus a 'live' block with status and in-flight events.)"
     )
     return "\n".join(lines)
 
@@ -164,6 +225,19 @@ class OrchestratorSession:
         self._history_summary: str | None = None
         self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
 
+        # Voice lifecycle state machine. ``IDLE`` for both text and
+        # not-yet-started voice; the route layer flips us to ``STARTING``
+        # before calling ``start_voice_relay``. ``_voice_lock`` guards every
+        # transition; ``_voice_ended`` is set when state == ENDED so callers
+        # waiting on a tear-down can piggyback on the in-flight one without
+        # racing.
+        self._voice_state: VoiceLifecycle = VoiceLifecycle.IDLE
+        self._voice_lock: asyncio.Lock = asyncio.Lock()
+        self._voice_ended: asyncio.Event = asyncio.Event()
+        # Last reason the session ended (or None). Useful for logging /
+        # exposing through the broadcast.
+        self._voice_end_reason: str | None = None
+
         # Track current provider for model switching
         self._current_provider = None
 
@@ -179,7 +253,7 @@ class OrchestratorSession:
                 pool, store, self._notifications,
             )
             # Make the runner reachable from tools that get only the
-            # context dict (e.g. send_to_agent_session, peek_agent_session).
+            # context dict (e.g. send_to_agent_session, read_agent_session).
             context["runner"] = self._runner
             context["notifications"] = self._notifications
         else:
@@ -209,6 +283,31 @@ class OrchestratorSession:
     @property
     def is_voice(self) -> bool:
         return self._voice
+
+    @property
+    def voice_state(self) -> VoiceLifecycle:
+        """Current voice-lifecycle state. See :class:`VoiceLifecycle`."""
+        return self._voice_state
+
+    @property
+    def voice_is_ending(self) -> bool:
+        """True while :meth:`end_voice` is tearing the session down.
+
+        Used by the pool/route layer to block a fresh ``voice_start`` for
+        the same ``local_id`` so we don't reconnect into a dying relay.
+        """
+        return self._voice_state == VoiceLifecycle.ENDING
+
+    @property
+    def voice_provider(self) -> BaseVoiceProvider | None:
+        """The active voice provider instance, or None outside a voice session.
+
+        Exposed so callers (notably the WebSocket route's voice-event
+        filter) can consult provider-specific hooks like
+        ``accepts_upstream_event`` without reaching through the private
+        attribute.
+        """
+        return self._voice_provider
 
     @property
     def voice_provider_id(self) -> str | None:
@@ -464,7 +563,14 @@ class OrchestratorSession:
         conversation, not whatever snapshot was loaded at start(). The
         summarizer is also re-run here so the digest covers recent turns.
         """
-        if not self._voice or self._voice_provider is None:
+        # Capture a local reference so a concurrent end_voice() that
+        # nulls ``self._voice_provider`` mid-build doesn't crash us with
+        # an AttributeError on the next dereference. If we got past the
+        # initial check and have a provider in hand, the build can finish
+        # cleanly even if the session is being torn down — the result is
+        # discarded by the caller in that case.
+        provider = self._voice_provider
+        if not self._voice or provider is None:
             return None
 
         from orchestrator.prompt import build_system_prompt
@@ -476,15 +582,23 @@ class OrchestratorSession:
             self._context,
             recent_messages=recent_messages,
             history_summary=history_summary,
+            voice_provider_id=provider.provider_name,
         )
         tools = registry.get_openai_definitions()
-        return self._voice_provider.get_session_update_payload(system, tools)
+        return provider.get_session_update_payload(system, tools)
 
     async def _build_history_for_prompt(
         self,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """Load history fresh from JSONL, clip tool results, split by token
         budget, and summarize the older prefix.
+
+        The summary of the older prefix is the expensive part — a 15-25s
+        LLM call on long sessions. We consult ``summary_cache`` first
+        (sibling ``.summary.json`` file keyed on JSONL size+mtime). On
+        cache hit we skip the LLM call entirely. On miss we compute
+        synchronously (so the caller still gets a correct prompt) and
+        write the result back so the next call is fast.
 
         Returns (recent_verbatim_messages, summary_or_none).
         """
@@ -504,13 +618,130 @@ class OrchestratorSession:
         summary: str | None = None
         if older:
             prefix_tokens = sum(estimate_message_tokens(m) for m in older)
-            summary_budget = scale_summary_max_tokens(len(older), prefix_tokens)
-            summary = await self._summarize_history(
-                older, max_tokens=summary_budget
-            )
+            target_words = summary_target_word_range(len(older), prefix_tokens)
+
+            cached = summary_cache.read(self._jsonl_path)
+            if cached is not None:
+                # Hit. The cache key is (jsonl_size, jsonl_mtime_ns) so
+                # any new turn appended to the JSONL invalidates this.
+                # We don't re-verify the input slice — the splitter is
+                # deterministic given file content.
+                logger.info(
+                    "history summary cache HIT for %s (input_messages=%d, "
+                    "summary_chars=%d, generated_at=%s)",
+                    self._jsonl_path.name, cached.input_message_count,
+                    len(cached.summary_text), cached.generated_at,
+                )
+                summary = cached.summary_text
+            else:
+                # Stat-stale miss — but if all that happened is "new turns
+                # were appended and they all stayed in the recent-verbatim
+                # window", the older prefix is byte-identical to what the
+                # stale cache summarised. Try the stale cache: if its
+                # ``input_message_count`` matches the current older slice,
+                # the summary still describes the same prefix and we can
+                # use it as-is without a 60-90s LLM call.
+                #
+                # When older grew (some previously-recent messages crossed
+                # into older), we still use the stale summary and let those
+                # delta messages ride along by extending ``recent`` with
+                # them — the prompt gets older-summary + a slightly larger
+                # verbatim tail. Imprecise but cheap and correct; the
+                # background refresh on end_voice will catch up.
+                stale = summary_cache.read_any(self._jsonl_path)
+                stale_usable = (
+                    stale is not None
+                    and stale.input_message_count <= len(older)
+                )
+                if stale_usable:
+                    delta = len(older) - stale.input_message_count
+                    logger.info(
+                        "history summary cache STALE-REUSE for %s "
+                        "(cached_input=%d, current_older=%d, delta=%d, "
+                        "generated_at=%s)",
+                        self._jsonl_path.name, stale.input_message_count,
+                        len(older), delta, stale.generated_at,
+                    )
+                    summary = stale.summary_text
+                    if delta > 0:
+                        # Promote the delta (previously-recent messages
+                        # that crossed into older) back into verbatim so
+                        # the prompt loses no context vs. a fresh summary.
+                        recent = older[stale.input_message_count:] + recent
+                else:
+                    logger.info(
+                        "history summary cache MISS for %s — recomputing "
+                        "(input_messages=%d, target_words=%s)",
+                        self._jsonl_path.name, len(older), target_words,
+                    )
+                    summary = await self._summarize_history(
+                        older, target_words=target_words
+                    )
+                    # Write through. Failures are logged inside summary_cache
+                    # and never propagate — at worst the next call recomputes.
+                    if summary:
+                        summary_cache.write(
+                            self._jsonl_path,
+                            summary_text=summary,
+                            input_message_count=len(older),
+                            summary_target_words=target_words,
+                            summarizer_model=getattr(
+                                self._config, "summarizer_model", None
+                            ),
+                        )
 
         self._history_summary = summary
         return recent, summary
+
+    async def refresh_summary_cache_if_stale(self) -> bool:
+        """Compute and persist the history summary for the current JSONL
+        state, but only if the cache is missing or stale.
+
+        Safe to call from anywhere — short-circuits cheaply on cache hit.
+        Returns True if a new summary was written, False otherwise.
+
+        Used by:
+        - Session stop (write the summary the next reopen will need)
+        - Background safety nets (boot warmup, history reopen)
+        """
+        if self._jsonl_path is None or not self._jsonl_path.is_file():
+            return False
+        if summary_cache.is_fresh(self._jsonl_path):
+            return False
+
+        try:
+            history = HistoryLoader(self._jsonl_path).load()
+        except Exception:  # noqa: BLE001
+            logger.exception("summary refresh: history load failed")
+            return False
+        if not history:
+            return False
+
+        clipped = truncate_tool_results(history)
+        older, _ = split_by_token_budget(clipped, RECENT_VERBATIM_TOKENS)
+        if not older:
+            return False
+
+        prefix_tokens = sum(estimate_message_tokens(m) for m in older)
+        target_words = summary_target_word_range(len(older), prefix_tokens)
+        try:
+            summary = await self._summarize_history(
+                older, target_words=target_words
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("summary refresh: _summarize_history failed")
+            return False
+        if not summary:
+            return False
+
+        summary_cache.write(
+            self._jsonl_path,
+            summary_text=summary,
+            input_message_count=len(older),
+            summary_target_words=target_words,
+            summarizer_model=getattr(self._config, "summarizer_model", None),
+        )
+        return True
 
     @property
     def needs_voice_relay(self) -> bool:
@@ -537,9 +768,33 @@ class OrchestratorSession:
         (e.g. to send to the frontend in the same handler) — saves a second
         round-trip through the LLM-backed history summarizer, which on the
         Jetson costs enough to blow the frontend's 10s start timeout.
+
+        Drives the lifecycle from IDLE → STARTING → ACTIVE. Bails early
+        with no side effects if the session is already past STARTING
+        (i.e. a teardown raced ahead).
         """
         if not self.needs_voice_relay:
             return
+
+        # Move IDLE → STARTING under the lock. If the session has already
+        # progressed beyond STARTING (concurrent end_voice, or a redundant
+        # rebuild from _attach_voice_payload's reconnect path), bail out
+        # without touching the relay.
+        async with self._voice_lock:
+            if self._voice_state == VoiceLifecycle.STARTING:
+                # Another caller is already opening the relay; let it win.
+                return
+            if self._voice_state == VoiceLifecycle.ACTIVE:
+                # Already up — idempotent.
+                return
+            if self._voice_state in (VoiceLifecycle.ENDING, VoiceLifecycle.ENDED):
+                logger.info(
+                    "start_voice_relay skipped — session %s is %s",
+                    self._local_id, self._voice_state.value,
+                )
+                return
+            self._set_voice_state_unlocked(VoiceLifecycle.STARTING)
+
         from orchestrator.voice_relay import VoiceRelay
         if session_update is None:
             session_update = await self.get_session_update()
@@ -562,13 +817,326 @@ class OrchestratorSession:
             session_id=self._local_id,
             rebuild_session_update=_rebuild_session_update,
         )
-        await relay.start(session_update)
-        self._voice_relay = relay
+        try:
+            await relay.start(session_update)
+        except Exception:
+            # Relay failed to open. Roll the state forward to ENDED so a
+            # retry creates a fresh session instead of seeing STARTING.
+            async with self._voice_lock:
+                if self._voice_state == VoiceLifecycle.STARTING:
+                    self._set_voice_state_unlocked(VoiceLifecycle.ENDING)
+                    self._set_voice_state_unlocked(VoiceLifecycle.ENDED)
+                    self._voice_end_reason = "start_failed"
+                    self._voice_ended.set()
+            raise
+
+        async with self._voice_lock:
+            self._voice_relay = relay
+            # If a teardown snuck in between relay.start() and here, honour
+            # it: don't transition to ACTIVE, let the ENDING path catch up.
+            if self._voice_state == VoiceLifecycle.STARTING:
+                self._set_voice_state_unlocked(VoiceLifecycle.ACTIVE)
 
     async def stop_voice_relay(self) -> None:
+        """Low-level relay teardown — closes the upstream WS only.
+
+        Does NOT touch the lifecycle state machine. Used for intra-session
+        relay rebuilds (e.g. ``_attach_voice_payload`` detecting a dead
+        relay on reconnect) and as a building block for :meth:`end_voice`.
+
+        For the full session-level teardown — provider release, audio
+        recorder stop, broadcast of ``voice_ended`` — call :meth:`end_voice`.
+        """
         if self._voice_relay is not None:
             await self._voice_relay.stop()
             self._voice_relay = None
+
+    def _set_voice_state_unlocked(self, target: VoiceLifecycle) -> None:
+        """Internal: transition state. Caller MUST hold ``_voice_lock``.
+
+        Validates against :data:`_VALID_VOICE_TRANSITIONS`. Invalid
+        transitions raise — they indicate a bug, not a recoverable race.
+        """
+        current = self._voice_state
+        if target == current:
+            return
+        if target not in _VALID_VOICE_TRANSITIONS[current]:
+            raise RuntimeError(
+                f"Invalid voice transition {current.value} → {target.value} "
+                f"for session {self._local_id}"
+            )
+        logger.info(
+            "voice_state session=%s %s → %s",
+            self._local_id, current.value, target.value,
+        )
+        self._voice_state = target
+
+    async def end_voice(self, reason: str) -> None:
+        """Tear the voice session down cleanly. The ONE canonical end path.
+
+        Idempotent: a second call observes ENDED and returns immediately.
+        Concurrent calls piggy-back: the second caller awaits the first's
+        :attr:`_voice_ended` event and then returns.
+
+        Sequence:
+            1. Acquire lock; short-circuit if already ENDING/ENDED.
+            2. Transition → ENDING.
+            3. Broadcast ``voice_ending`` so the UI can show a transient state.
+            4. Best-effort send of the provider's ``graceful_shutdown_frames``
+               (Qwen: commit; Gemini: activityEnd; OpenAI: nothing).
+            5. Close the relay (cancels drain/keepalive, closes upstream WS).
+            6. Release the audio recorder and clear the provider.
+            7. Transition → ENDED; broadcast ``voice_ended``; set the event.
+
+        :param reason: One of ``user_stop``, ``agent_end``, ``client_disconnect``,
+            ``error``, ``shutdown`` — surfaced in the broadcast for telemetry.
+        """
+        # Fast path: no voice session ever started — nothing to tear down,
+        # no broadcasts, no state churn. Text-mode ``stop()`` calls land
+        # here and exit immediately.
+        if self._voice_state == VoiceLifecycle.IDLE:
+            return
+        # Already ended — second caller observes the terminal state.
+        if self._voice_state == VoiceLifecycle.ENDED:
+            return
+        # Piggy-back on an in-flight teardown without re-running it.
+        if self._voice_state == VoiceLifecycle.ENDING:
+            await self._voice_ended.wait()
+            return
+
+        async with self._voice_lock:
+            # Re-check under the lock.
+            if self._voice_state == VoiceLifecycle.ENDED:
+                return
+            if self._voice_state == VoiceLifecycle.ENDING:
+                # Released the lock to a concurrent caller mid-teardown;
+                # wait for it to finish outside the lock below.
+                pass
+            else:
+                self._voice_end_reason = reason
+                self._set_voice_state_unlocked(VoiceLifecycle.ENDING)
+
+        if self._voice_state != VoiceLifecycle.ENDING:
+            # Concurrent finalisation happened — just wait for it.
+            await self._voice_ended.wait()
+            return
+
+        await self._broadcast_voice_lifecycle("voice_ending", reason)
+
+        # 1. Best-effort graceful shutdown frames (provider-specific). The
+        #    relay does the actual send so it can pace through the provider's
+        #    normal write path. Bounded by _GRACEFUL_SHUTDOWN_TIMEOUT_S.
+        if self._voice_relay is not None and self._voice_provider is not None:
+            try:
+                frames = self._voice_provider.graceful_shutdown_frames()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "graceful_shutdown_frames raised for provider %s",
+                    self._voice_provider.provider_name,
+                )
+                frames = []
+            if frames:
+                try:
+                    await asyncio.wait_for(
+                        self._voice_relay.send_shutdown_frames(frames),
+                        timeout=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "graceful_shutdown_frames timed out after %.1fs for session %s",
+                        _GRACEFUL_SHUTDOWN_TIMEOUT_S, self._local_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "graceful_shutdown_frames send failed for session %s",
+                        self._local_id,
+                    )
+
+        # 2. Close the relay (cancels drain/keepalive, closes upstream WS).
+        try:
+            await self.stop_voice_relay()
+        except Exception:  # noqa: BLE001
+            logger.exception("stop_voice_relay raised during end_voice")
+
+        # 3. Release the audio recorder.
+        if self._audio_recorder is not None:
+            try:
+                self._audio_recorder.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("audio recorder stop raised during end_voice")
+            self._audio_recorder = None
+
+        # 4. Release the provider handle AND demote the session out of
+        #    voice mode. The OrchestratorSession itself stays in the
+        #    pool as a *resumable shell* — the tab is the durable thing,
+        #    the voice connection is one ephemeral mode of interacting
+        #    with it. A subsequent ``voice_start`` for the same local_id
+        #    re-arms voice via ``restart_voice()`` on this same session,
+        #    preserving JSONL / agent context / background tasks.
+        #
+        #    What we DO release here is anything that costs tokens or
+        #    holds a remote resource: the relay, the upstream WS, the
+        #    audio recorder, the provider handle. No zombie behaviour.
+        self._voice_provider = None
+        self._voice = False
+
+        async with self._voice_lock:
+            if self._voice_state == VoiceLifecycle.ENDING:
+                self._set_voice_state_unlocked(VoiceLifecycle.ENDED)
+        self._voice_ended.set()
+
+        await self._broadcast_voice_lifecycle("voice_ended", reason)
+
+        # Background pre-warm: the conversation just gained new turns,
+        # so the summary cache is now stat-stale. Kick off a refresh
+        # off the critical path so the NEXT voice_start (e.g. user says
+        # the wake word again) doesn't pay the 60-90s LLM cost
+        # synchronously. If the user fires the wake word before this
+        # finishes, the STALE-REUSE path in ``_build_history_for_prompt``
+        # uses the existing summary + the new turns as verbatim — also
+        # instant, no LLM call. Either way: no long freeze.
+        try:
+            asyncio.create_task(
+                self.refresh_summary_cache_if_stale(),
+                name=f"summary-refresh-end-voice-{self._local_id}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to schedule end_voice summary refresh for session %s",
+                self._local_id,
+            )
+
+    async def _broadcast_voice_lifecycle(self, event_type: str, reason: str) -> None:
+        """Push a ``voice_ending`` / ``voice_ended`` event to all subscribers.
+
+        For ``voice_ended`` also emit the legacy ``voice_stopped`` event
+        so older frontends (web, Android) keep flipping to Off until
+        they're upgraded to the new ``voice_ended`` handler. The legacy
+        alias will be removed once both clients ship the new event.
+
+        Swallow errors: the lifecycle must not depend on the broadcast
+        succeeding (subscribers may already be gone if the trigger was
+        ``client_disconnect``).
+        """
+        pool = self._context.get("pool")
+        if pool is None:
+            return
+        try:
+            await pool.broadcast_orchestrator({
+                "type": event_type,
+                "reason": reason,
+                "session_id": self._local_id,
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "broadcast of %s failed for session %s",
+                event_type, self._local_id,
+            )
+        if event_type == "voice_ended":
+            try:
+                await pool.broadcast_orchestrator({"type": "voice_stopped"})
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "legacy voice_stopped broadcast failed for session %s",
+                    self._local_id,
+                )
+
+    async def restart_voice(
+        self,
+        *,
+        voice_provider: str | None = None,
+        voice_model: str | None = None,
+        voice_name: str | None = None,
+        voice_transcription_language: str | None = None,
+        voice_endpoint: str | None = None,
+    ) -> None:
+        """Re-arm voice on this same OrchestratorSession after ``end_voice``.
+
+        Keeps the JSONL, agent context, background tasks, and pool slot
+        intact — only the voice connection (provider + relay + recorder)
+        is reconstructed. The caller then invokes ``start_voice_relay``
+        the same way it would for a fresh voice session.
+
+        State machine: ENDED → IDLE → (caller drives) → STARTING → ACTIVE.
+        Or, if voice was never armed at all (``IDLE``), this is a no-op
+        for the state machine and the provider is instantiated fresh
+        (which is the same path ``start()`` takes).
+
+        Any None-valued voice config arg means "keep what the session
+        already had" — supports the wake-word case where the Android
+        client may omit fields it doesn't care about.
+        """
+        # Update config (None = keep prior).
+        if voice_provider is not None:
+            self._voice_provider_id = voice_provider
+        if voice_model is not None:
+            self._voice_model_id = voice_model
+        if voice_name is not None:
+            self._voice_name = voice_name
+        if voice_transcription_language is not None:
+            self._voice_transcription_language = voice_transcription_language
+        if voice_endpoint is not None:
+            self._voice_endpoint = voice_endpoint
+
+        # Move state back to IDLE so start_voice_relay can drive the
+        # normal IDLE → STARTING → ACTIVE cycle. Only meaningful if
+        # we're coming from ENDED; from IDLE this is a no-op.
+        async with self._voice_lock:
+            if self._voice_state == VoiceLifecycle.ENDED:
+                self._set_voice_state_unlocked(VoiceLifecycle.IDLE)
+                # Fresh Event so the next end_voice can be awaited cleanly
+                # (an Event that's already set never blocks).
+                self._voice_ended = asyncio.Event()
+            elif self._voice_state != VoiceLifecycle.IDLE:
+                # ACTIVE / STARTING / ENDING → caller asked for restart on
+                # a session that isn't currently torn down. Refuse rather
+                # than corrupt state; the route handler should have either
+                # awaited end_voice first or detected the live relay and
+                # reused it.
+                raise RuntimeError(
+                    f"restart_voice called on session {self._local_id} "
+                    f"in state {self._voice_state.value}; expected ENDED or IDLE"
+                )
+
+        # Instantiate a fresh provider mirroring the start() path.
+        from orchestrator.providers.voice_registry import (
+            instantiate_provider,
+            resolve_voice_target,
+        )
+        provider_id, model_entry, voice_name_resolved, language = resolve_voice_target(
+            self._voice_provider_id,
+            self._voice_model_id,
+            self._voice_name,
+            self._voice_transcription_language,
+        )
+        self._voice_provider_id = provider_id
+        self._voice_model_id = model_entry["id"]
+        self._voice_name = voice_name_resolved
+        self._voice_transcription_language = language
+        self._voice_provider = instantiate_provider(
+            provider_id, model_entry["id"], voice_name_resolved, language,
+            endpoint=self._voice_endpoint,
+        )
+        self._voice = True
+
+        # Re-arm the audio recorder if recording is enabled.
+        if is_recording_enabled() and self._audio_recorder is None:
+            self._audio_recorder = AudioRecorder(
+                session_id=self._local_id,
+                provider=self._voice_provider_id or "",
+                model=self._voice_model_id or "",
+                voice=self._voice_name or "",
+            )
+            self._audio_recorder.start()
+            logger.info(
+                "Audio recorder re-armed for session %s on restart_voice",
+                self._local_id,
+            )
+
+        logger.info(
+            "voice rearm session=%s provider=%s model=%s",
+            self._local_id, provider_id, self._voice_model_id,
+        )
 
     async def send_voice_audio_in(self, pcm_b64: str) -> None:
         """Forward a frontend mic chunk upstream (WS providers only).
@@ -657,6 +1225,34 @@ class OrchestratorSession:
         if self._audio_recorder is not None and self._audio_recorder.is_recording:
             self._audio_recorder.write_assistant_audio(pcm_b64)
 
+    def _flush_pending_user_transcript(self, transcript: str) -> None:
+        """Write the buffered user transcript as a single JSONL entry.
+
+        Used by the Gemini Live event path where ``inputTranscription``
+        arrives as token-level deltas across many events. The buffer is
+        cleared after writing.
+        """
+        segment = None
+        if self._audio_recorder is not None and self._audio_recorder.is_recording:
+            segment = self._audio_recorder.mark_user_turn_end(transcript)
+        if segment:
+            content = (
+                f"[voice, recording: {self._local_id} "
+                f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+            )
+        else:
+            content = f"[voice] {transcript}"
+        entry: dict[str, Any] = {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "source": "voice_transcription",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if segment:
+            entry["audio_segment"] = segment
+        self._writer.append(entry)
+        self._pending_user_transcript = None
+
     @property
     def audio_recorder(self) -> AudioRecorder | None:
         """The audio recorder instance, if recording is active."""
@@ -688,13 +1284,19 @@ class OrchestratorSession:
         Transcript events (TextDelta, TextComplete) and interruptions
         (VoiceInterrupted) are persisted to JSONL here.
         """
-        if not self._voice or self._voice_provider is None:
+        # Capture a local reference: end_voice() may null
+        # ``self._voice_provider`` while this method is mid-await (the
+        # agent's end_voice_session tool produces exactly this race —
+        # the tool result arrives via the relay drain loop AFTER
+        # end_voice has run).
+        provider = self._voice_provider
+        if not self._voice or provider is None:
             return []
 
         commands: list[dict[str, Any]] = []
 
         if inject:
-            await self._voice_provider.inject_event(event)
+            await provider.inject_event(event)
 
         event_type = event.get("type", "")
 
@@ -705,45 +1307,47 @@ class OrchestratorSession:
         # turn-complete / interruption signals under ``serverContent``.
         # Translate to the same persistence behaviour the OpenAI / Qwen
         # branches below provide.
-        if not event_type and self._voice_provider.provider_name == "google":
+        if not event_type and provider.provider_name == "google":
             sc = event.get("serverContent") or {}
             input_t = sc.get("inputTranscription") if isinstance(sc, dict) else None
             output_t = sc.get("outputTranscription") if isinstance(sc, dict) else None
             tool_call = event.get("toolCall")
 
-            # User speech transcript — persist a [voice] JSONL entry.
+            # User speech transcript — Gemini Live streams inputTranscription
+            # as token-level deltas (one event per word/fragment). Buffer and
+            # persist a single JSONL entry on turn boundary, mirroring the
+            # assistant-side accumulation below. Without this every fragment
+            # became its own "[voice] my" / "[voice] friend" user turn,
+            # corrupting both UI and history.
             if isinstance(input_t, dict) and not self.is_injecting:
-                transcript = input_t.get("text", "")
-                if transcript:
-                    segment = None
-                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
-                        segment = self._audio_recorder.mark_user_turn_end(transcript)
-                    if segment:
-                        content = (
-                            f"[voice, recording: {self._local_id} "
-                            f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
-                        )
-                    else:
-                        content = f"[voice] {transcript}"
-                    entry: dict[str, Any] = {
-                        "type": "user",
-                        "message": {"role": "user", "content": content},
-                        "source": "voice_transcription",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                    if segment:
-                        entry["audio_segment"] = segment
-                    self._writer.append(entry)
+                delta = input_t.get("text", "")
+                if delta:
+                    staged = getattr(self, "_pending_user_transcript", None) or ""
+                    self._pending_user_transcript = staged + delta
 
             # Assistant transcript delta — accumulate; persist on turnComplete.
+            # Flushing the *user* transcript here too: when the model starts
+            # replying, the user's turn is by definition over, so the buffered
+            # user fragments form one coherent utterance.
             if isinstance(output_t, dict):
+                # Flush staged user transcript on the first output delta of
+                # this turn (model started speaking → user turn ended).
+                staged_user = getattr(self, "_pending_user_transcript", None)
+                if staged_user and not self.is_injecting:
+                    self._flush_pending_user_transcript(staged_user)
                 delta = output_t.get("text", "")
                 if delta:
                     staged = getattr(self, "_pending_assistant_transcript", None) or ""
                     self._pending_assistant_transcript = staged + delta
 
-            # Turn complete — persist staged assistant transcript.
+            # Turn complete — persist staged transcripts.
             if isinstance(sc, dict) and sc.get("turnComplete"):
+                # Failsafe flush of user transcript: covers turns where the
+                # model produced no text output (audio-only modality) so the
+                # outputTranscription branch above never fired.
+                staged_user = getattr(self, "_pending_user_transcript", None)
+                if staged_user and not self.is_injecting:
+                    self._flush_pending_user_transcript(staged_user)
                 staged = getattr(self, "_pending_assistant_transcript", None)
                 if staged:
                     segment = None
@@ -799,7 +1403,14 @@ class OrchestratorSession:
                         "source": "voice",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
-                    commands.extend(self._voice_provider.format_tool_result(call_id, result))
+                    # Background tool-execution tasks can land here after
+                    # end_voice() has already nulled the provider (the
+                    # agent's own end_voice_session tool produces exactly
+                    # this race). Skip the format step silently — the
+                    # frontend has nothing to display either way.
+                    provider = self._voice_provider
+                    if provider is not None:
+                        commands.extend(provider.format_tool_result(call_id, result))
 
             return commands
 
@@ -861,14 +1472,14 @@ class OrchestratorSession:
             name = event.get("name", "")
 
             # Get name from pending_calls if not in event
-            if not name and call_id in self._voice_provider.pending_calls:
-                name = self._voice_provider.pending_calls[call_id]
+            if not name and call_id in provider.pending_calls:
+                name = provider.pending_calls[call_id]
 
             # Prefer accumulated streaming args over the done event's arguments field
             # (OpenAI may send an empty/missing arguments in the done event when
             # the args were streamed incrementally via delta events)
             args_str = (
-                self._voice_provider._pending_args.get(call_id)
+                provider._pending_args.get(call_id)
                 or event.get("arguments", "")
                 or "{}"
             )
@@ -898,8 +1509,13 @@ class OrchestratorSession:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
                 # Provider-specific command sequence to ship the result back
-                # and ask for the next response.
-                commands.extend(self._voice_provider.format_tool_result(call_id, result))
+                # and ask for the next response. Re-fetch provider in case
+                # the registered tool itself ended the voice session (e.g.
+                # end_voice_session) — the captured local would still be
+                # valid object-wise, but we'd be acting on a dead provider.
+                current_provider = self._voice_provider
+                if current_provider is not None:
+                    commands.extend(current_provider.format_tool_result(call_id, result))
 
         # Assistant transcript complete — STAGE it; we only persist if the
         # turn ended in status="completed" (response.done below). Otherwise
@@ -1235,12 +1851,25 @@ class OrchestratorSession:
         tokens_after = estimate_tokens(self._agent.history)
         return {"tokens_before": tokens_before, "tokens_after": tokens_after}
 
-    async def stop(self) -> None:
+    async def stop(self, reason: str = "shutdown") -> None:
         """Clean up the session.
 
         Cancels every in-flight background-agent turn (with SDK interrupts so
         the bundled ``claude`` subprocesses actually stop) and unsubscribes
         the wake callback so notifications fired during shutdown go nowhere.
+
+        Voice teardown is delegated to :meth:`end_voice` so the canonical
+        lifecycle path runs (graceful shutdown frames, broadcasts, state
+        machine). Idempotent — calling ``stop`` after ``end_voice`` is fine.
+
+        Also kicks off a fire-and-forget history-summary refresh: the
+        conversation just ended, so this is the cheapest moment to pay
+        for the LLM call — by the time the user comes back to this
+        session, the cache will be warm and ``voice_start`` won't have
+        to block on summarisation.
+
+        :param reason: Forwarded to :meth:`end_voice` if voice is active.
+            Defaults to ``shutdown``; the pool override path uses ``user_stop``.
         """
         self._notifications.set_wake_callback(None)
         if self._runner is not None:
@@ -1248,10 +1877,22 @@ class OrchestratorSession:
                 await self._runner.cancel_all()
             except Exception:  # noqa: BLE001
                 logger.exception("BackgroundAgentRunner.cancel_all failed during stop")
-        try:
-            await self.stop_voice_relay()
-        except Exception:  # noqa: BLE001
-            logger.exception("stop_voice_relay failed during session stop")
+        # Funnel voice teardown through the canonical path so the state
+        # machine and broadcasts stay coherent. ``end_voice`` is idempotent
+        # and handles the no-voice case (state == IDLE) implicitly.
+        if self._voice:
+            try:
+                await self.end_voice(reason)
+            except Exception:  # noqa: BLE001
+                logger.exception("end_voice failed during session stop")
+        # Spawn the cache-refresh as a detached task. We don't await
+        # because the session is shutting down and the JSONL is already
+        # written; the refresh just makes the next reopen faster.
+        if self._jsonl_path is not None and self._jsonl_path.is_file():
+            asyncio.create_task(
+                self.refresh_summary_cache_if_stale(),
+                name=f"summary-refresh-{self._local_id}",
+            )
         # Cancel the injection watchdog if it's still scheduled
         if self._injection_watchdog is not None and not self._injection_watchdog.done():
             self._injection_watchdog.cancel()
@@ -1262,7 +1903,9 @@ class OrchestratorSession:
         self._injection_watchdog = None
         self._injection_active = False
         self._injection_until = 0.0
-        # Stop audio recorder
+        # Audio recorder + voice_provider were already released by end_voice
+        # for voice sessions; clear here for non-voice sessions too (no-op
+        # if end_voice already ran).
         if self._audio_recorder is not None:
             try:
                 self._audio_recorder.stop()
@@ -1282,30 +1925,36 @@ class OrchestratorSession:
     async def _summarize_history(
         self,
         messages: list[dict[str, Any]],
-        max_tokens: int = 2048,
+        target_words: tuple[int, int] | None = None,
     ) -> str:
-        """Summarize older conversation messages using the orchestrator's current model.
+        """Summarize older conversation messages into a rich digest.
 
-        Produces a structured digest so that when voice mode resumes the
-        orchestrator can pick up the thread coherently. ``max_tokens`` scales
-        with the prefix size (see ``scale_summary_max_tokens``).
+        The digest is what the voice agent reads at the start of a session to
+        remember the earlier conversation, so it must be both comprehensive
+        (every major arc) and faithful (every user utterance represented in
+        short form). The API call is *uncapped* — the model writes as much as
+        it needs.  ``target_words`` is a soft steering range (min, max)
+        injected into the system prompt to nudge the model toward an
+        appropriate length for this conversation size; the model is explicitly
+        told it may go over rather than drop information.
 
-        Routes through whichever provider the orchestrator is currently using
-        (Anthropic or OpenAI) so summarization works regardless of which API
-        keys are configured in the environment.
+        The summarizer model is configurable via ``summarizer_model`` in
+        ``assistant_config.json`` so a fast frontier model can compress the
+        transcript even when the active text/voice model is a realtime model
+        that can't reliably hold the role of summarizer.
         """
-        if not messages or max_tokens <= 0:
+        if not messages:
             return ""
 
-        # Build a transcript for the summarizer. Keep more per-message content
-        # than the old 300-char clip so long-form answers survive summarization.
+        # Build a transcript for the summarizer. Generous per-message clips
+        # so long-form turns survive into the digest input.
         lines: list[str] = []
         for msg in messages:
             role = msg.get("role", "?")
             content = msg.get("content", "")
-            label = "User" if role == "user" else "Assistant"
+            label = "USER" if role == "user" else "ASSISTANT"
             if isinstance(content, str):
-                lines.append(f"{label}: {content.strip()[:2000]}")
+                lines.append(f"{label}: {content.strip()[:4000]}")
             elif isinstance(content, list):
                 parts: list[str] = []
                 for block in content:
@@ -1313,7 +1962,7 @@ class OrchestratorSession:
                         continue
                     btype = block.get("type")
                     if btype == "text":
-                        parts.append(block.get("text", "").strip()[:1500])
+                        parts.append(block.get("text", "").strip()[:4000])
                     elif btype == "tool_use":
                         parts.append(f"[tool: {block.get('name', '?')}]")
                     elif btype == "tool_result":
@@ -1323,55 +1972,196 @@ class OrchestratorSession:
                                 b.get("text", "") for b in rc
                                 if isinstance(b, dict) and b.get("type") == "text"
                             )
-                        parts.append(f"[tool result: {str(rc)[:400]}]")
+                        parts.append(f"[tool result: {str(rc)[:1200]}]")
                 if parts:
                     lines.append(f"{label}: {' '.join(parts)}")
 
         transcript = "\n".join(lines)
 
-        instructions = (
-            "Summarize the conversation below into a structured digest the "
-            "assistant will read to resume the chat. Use these sections, in "
-            "order, and only include ones that apply:\n"
-            "- **Topics & goals**: what was being worked on, and why\n"
-            "- **Decisions made**: concrete choices, trade-offs accepted\n"
-            "- **Open threads**: unresolved questions, things the user wanted "
-            "to come back to, work in progress\n"
-            "- **Key entities**: files, sessions, projects, people, tools "
-            "mentioned that matter for continuity\n"
-            "- **User preferences/context expressed**: anything about how the "
-            "user wants the assistant to behave, tone, constraints\n"
-            "Be factual and specific — prefer concrete names over generic "
-            "summaries. Omit pleasantries and filler. Write in the same "
-            "language(s) the conversation used.\n\n"
-            f"Conversation:\n{transcript}"
+        if target_words is None:
+            # Fallback when called without a pre-computed range (e.g. the
+            # manual /compact path).  Compute on the fly from the transcript.
+            from orchestrator.token_budget import (
+                estimate_tokens as _est,
+                summary_target_word_range as _range,
+            )
+            target_words = _range(len(messages), _est(transcript))
+
+        min_words, max_words = target_words
+        length_hint = (
+            f"## Target length\n"
+            f"Aim for roughly **{min_words}–{max_words} words**. This is a "
+            f"steering range, not a hard limit — if covering every user "
+            f"message and every topic faithfully needs more space, USE MORE. "
+            f"Never drop content to fit a target. If the conversation is "
+            f"short and the range feels too long, write less.\n\n"
         )
 
-        model = self._config.model
-        provider = self._config.provider
+        system = (
+            "You are a conversation summarizer. You receive a transcript of a "
+            "past conversation between a user and an AI assistant, wrapped in "
+            "<transcript>...</transcript> tags, and you produce a structured "
+            "digest the assistant will read later to remember the conversation.\n\n"
+            "Hard rules:\n"
+            "- DO NOT continue the conversation.\n"
+            "- DO NOT roleplay as the assistant or address the user.\n"
+            "- DO NOT answer any questions in the transcript — they're history.\n"
+            "- DO NOT omit any user message or topic to save space — go over "
+            "the length target if you have to.\n"
+            "- Output only the digest, in the format below.\n\n"
+            + length_hint +
+            "Format — include every section that has any content, in this order:\n\n"
+            "## Conversation arc\n"
+            "A short narrative (3–8 sentences) describing how the conversation "
+            "unfolded chronologically — what was discussed first, how it "
+            "evolved, what the current focus is. Capture the *feel* of the "
+            "conversation (exploratory, debugging, deep technical dive, casual "
+            "catch-up, etc.).\n\n"
+            "## Topics covered\n"
+            "Every distinct topic that came up, in roughly chronological order. "
+            "One bullet per topic with a 1–2 sentence description of what was "
+            "discussed and any outcome. Don't merge unrelated topics.\n\n"
+            "## Every user message (short)\n"
+            "A faithful list of every user utterance from the transcript, in "
+            "order, in short form. One bullet per user line. Compress long "
+            "messages to their essential ask/statement (≤25 words) but DO NOT "
+            "drop any — even greetings, asides, and one-word replies. This "
+            "section is what lets the assistant reconstruct the conversation "
+            "beat-by-beat. Use the user's own wording when possible.\n\n"
+            "## Decisions & conclusions\n"
+            "Concrete choices made, trade-offs accepted, conclusions reached. "
+            "One bullet each, specific.\n\n"
+            "## Open threads\n"
+            "Unresolved questions, things the user wanted to come back to, "
+            "work in progress. One bullet each.\n\n"
+            "## Key entities\n"
+            "Files, sessions, projects, people, tools, URLs, model names, "
+            "etc. that matter for continuity. One bullet each with a brief "
+            "note on what role they played.\n\n"
+            "## User preferences & context\n"
+            "How the user wants the assistant to behave, tone, constraints, "
+            "stated preferences, personal context revealed.\n\n"
+            "Style:\n"
+            "- Be factual and specific. Use concrete names, not generic phrases.\n"
+            "- Omit filler but keep the user's voice.\n"
+            "- Write in the same language(s) the conversation used.\n"
+            "- If a section has no content, omit it entirely (don't write 'N/A').\n\n"
+            "## Handling voice transcription errors\n"
+            "Parts of the transcript come from voice ASR and may contain "
+            "mistranscriptions of technical terms — model names, product names, "
+            "library names, project names, code identifiers. Before reifying any "
+            "unfamiliar proper noun as a real entity:\n"
+            "1. **Try to recover the intended word from context** — earlier or "
+            "later in the same transcript the user often uses the correct term, "
+            "or a sibling term that makes the intent obvious (e.g. an "
+            "ASR-rendered 'Quanticore' near repeated mentions of 'Qwen' and "
+            "'local models' almost certainly means 'Qwen Code'). When you're "
+            "confident from context, use the corrected term and add a short "
+            "parenthetical note like `Qwen Code (ASR rendered as \"Quanticore\")`.\n"
+            "2. **If context doesn't resolve it**, flag the term with `(?ASR)` "
+            "rather than treating it as authoritative — e.g. "
+            "`Foobarinator (?ASR) — referenced as a local model runner`. Don't "
+            "invent a description for an entity you can't verify; say it was "
+            "mentioned and you couldn't recover the canonical name.\n"
+            "Do this in the Key entities section and anywhere else a malformed "
+            "term would otherwise propagate as fact."
+        )
+
+        user_msg = (
+            "Summarize the transcript below according to your instructions.\n\n"
+            f"<transcript>\n{transcript}\n</transcript>\n\n"
+            "Produce only the structured digest. Do not greet, do not reply, "
+            "do not continue the conversation. Cover every user message in the "
+            '"Every user message (short)" section — do not skip any. If you '
+            "need more than the target length to do that faithfully, use it."
+        )
+
+        model, provider = self._resolve_summarizer_model()
         try:
             if provider == Provider.OPENAI:
                 import openai
                 client = openai.AsyncOpenAI()
-                response = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": instructions}],
+                # GPT-5 family and reasoning models (o1/o3/o4) reject custom
+                # ``temperature``; everything else takes it.  Both
+                # ``max_tokens`` and ``max_completion_tokens`` are omitted on
+                # purpose so the model writes as much as the digest requires.
+                mid = model.lower()
+                is_reasoning = (
+                    mid.startswith("gpt-5")
+                    or mid.startswith("o1")
+                    or mid.startswith("o3")
+                    or mid.startswith("o4")
                 )
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_msg},
+                    ],
+                }
+                if not is_reasoning:
+                    kwargs["temperature"] = 0.3
+                response = await client.chat.completions.create(**kwargs)
                 choice = response.choices[0] if response.choices else None
-                return (choice.message.content or "") if choice else ""
+                text = (choice.message.content or "") if choice else ""
+                if choice and choice.finish_reason == "length":
+                    logger.warning(
+                        "Summarizer hit the model's own output ceiling "
+                        "(model=%s, completion_tokens=%s) — digest may be "
+                        "incomplete. Consider switching to a model with a "
+                        "larger output cap.",
+                        model,
+                        getattr(response.usage, "completion_tokens", "?"),
+                    )
+                return text
             else:
                 import anthropic
                 client = anthropic.AsyncAnthropic()
+                # Anthropic requires ``max_tokens``; pass the largest value
+                # the SDK will accept so it doesn't cap us short.  Sonnet 4.6
+                # supports up to 64k output tokens.
                 response = await client.messages.create(
                     model=model,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": instructions}],
+                    max_tokens=64_000,
+                    system=system,
+                    messages=[{"role": "user", "content": user_msg}],
                 )
+                if response.stop_reason == "max_tokens":
+                    logger.warning(
+                        "Summarizer hit Anthropic's max_tokens cap of 64k "
+                        "(model=%s) — digest may be incomplete.",
+                        model,
+                    )
                 return response.content[0].text if response.content else ""
         except Exception as e:
             logger.warning("Failed to summarize history with %s/%s: %s", provider.value, model, e)
             return ""
+
+    def _resolve_summarizer_model(self) -> tuple[str, Provider]:
+        """Return (model_id, provider) for the history summarizer.
+
+        Reads ``summarizer_model`` from ``assistant_config.json`` on every
+        call so the user can change it in the Config UI without restarting
+        the orchestrator. Falls back to ``DEFAULT_SUMMARIZER_MODEL`` when
+        unset, and ultimately to the active text-mode model when the chosen
+        summarizer model id can't be classified at all.
+        """
+        from orchestrator.config import _infer_model_info, get_model_info
+
+        # Prefer the dedicated summarizer model from the live config file.
+        configured: str | None = None
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            configured = (_load_app_config().get("summarizer_model") or "").strip() or None
+        except Exception:
+            configured = None
+
+        candidate = configured or DEFAULT_SUMMARIZER_MODEL
+        info = get_model_info(candidate) or _infer_model_info(candidate)
+        if info is not None:
+            return candidate, info.provider
+        # Last resort: reuse the orchestrator's active model.
+        return self._config.model, self._config.provider
 
     def _get_jsonl_path(self) -> Path:
         """Get the JSONL file path for this session.

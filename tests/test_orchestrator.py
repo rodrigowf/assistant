@@ -652,6 +652,71 @@ class TestPromptBuilder:
         assert "sess-1" in prompt
         assert "idle" in prompt
 
+    def test_provider_memory_loaded_for_voice_provider(self, tmp_path):
+        """When voice_provider_id is passed and a matching
+        ORCHESTRATOR_MEMORY_<provider>.md exists, its contents are appended."""
+        from orchestrator.prompt import build_system_prompt
+        from orchestrator.config import OrchestratorConfig
+
+        (tmp_path / "ORCHESTRATOR_MEMORY.md").write_text("# Neutral memory")
+        (tmp_path / "ORCHESTRATOR_MEMORY_qwen.md").write_text(
+            "# Qwen diary\nThis is the qwen-only alignment content."
+        )
+
+        config = OrchestratorConfig(
+            project_dir=str(tmp_path),
+            memory_path=str(tmp_path / "ORCHESTRATOR_MEMORY.md"),
+        )
+
+        prompt = build_system_prompt(
+            config,
+            context={"orchestrator_sessions": {}},
+            voice_provider_id="qwen",
+        )
+        assert "Qwen diary" in prompt
+        assert "qwen-only alignment content" in prompt
+        assert "Provider-Specific Memory" in prompt
+
+    def test_provider_memory_omitted_when_not_voice(self, tmp_path):
+        """In text/audio mode (no voice_provider_id), the provider file must
+        never be injected, even if it exists on disk."""
+        from orchestrator.prompt import build_system_prompt
+        from orchestrator.config import OrchestratorConfig
+
+        (tmp_path / "ORCHESTRATOR_MEMORY.md").write_text("# Neutral memory")
+        (tmp_path / "ORCHESTRATOR_MEMORY_qwen.md").write_text(
+            "# Qwen diary\nSecret qwen-only content."
+        )
+
+        config = OrchestratorConfig(
+            project_dir=str(tmp_path),
+            memory_path=str(tmp_path / "ORCHESTRATOR_MEMORY.md"),
+        )
+
+        prompt = build_system_prompt(config, context={"orchestrator_sessions": {}})
+        assert "Qwen diary" not in prompt
+        assert "Secret qwen-only content" not in prompt
+        assert "Provider-Specific Memory" not in prompt
+
+    def test_provider_memory_omitted_for_provider_without_file(self, tmp_path):
+        """Voice provider with no matching file → no provider section, no error."""
+        from orchestrator.prompt import build_system_prompt
+        from orchestrator.config import OrchestratorConfig
+
+        (tmp_path / "ORCHESTRATOR_MEMORY.md").write_text("# Neutral memory")
+
+        config = OrchestratorConfig(
+            project_dir=str(tmp_path),
+            memory_path=str(tmp_path / "ORCHESTRATOR_MEMORY.md"),
+        )
+
+        prompt = build_system_prompt(
+            config,
+            context={"orchestrator_sessions": {}},
+            voice_provider_id="openai",
+        )
+        assert "Provider-Specific Memory" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # Agent loop tests

@@ -111,16 +111,61 @@ def test_translate_input_transcription_nested_under_server_content():
     assert out.text == "hello there"
 
 
-def test_session_config_includes_activity_detection():
-    """Tuned VAD prevents an open mic from preempting subsequent replies."""
+def test_session_config_disables_server_vad_when_manual_vad_on():
+    """Default mode (GEMINI_MANUAL_VAD unset) is manual VAD: server
+    VAD must be disabled so the client controls turn boundaries."""
     p = _make_provider()
-    cfg = p.format_session_config(system="x", tools=[])
-    rt = cfg["setup"]["realtimeInputConfig"]
-    aad = rt["automaticActivityDetection"]
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GEMINI_MANUAL_VAD", None)
+        cfg = p.format_session_config(system="x", tools=[])
+    aad = cfg["setup"]["realtimeInputConfig"]["automaticActivityDetection"]
+    assert aad == {"disabled": True}
+
+
+def test_session_config_uses_server_vad_when_manual_off():
+    """GEMINI_MANUAL_VAD=0 falls back to server VAD, tuned as
+    conservatively as the Live API allows."""
+    p = _make_provider()
+    with patch.dict(os.environ, {"GEMINI_MANUAL_VAD": "0"}):
+        cfg = p.format_session_config(system="x", tools=[])
+    aad = cfg["setup"]["realtimeInputConfig"]["automaticActivityDetection"]
     assert aad["disabled"] is False
     assert aad["startOfSpeechSensitivity"] == "START_SENSITIVITY_LOW"
     assert aad["endOfSpeechSensitivity"] == "END_SENSITIVITY_LOW"
-    assert aad["silenceDurationMs"] == 1500
+    assert aad["silenceDurationMs"] == 2500
+
+
+def test_audio_in_sample_rate_declared_for_manual_vad():
+    """Gemini must declare its mic sample rate so the relay's manual-VAD
+    init gate (which requires non-None ``audio_in_sample_rate``) actually
+    fires. Without this, the relay disables server VAD via setup but
+    never sends ``activityStart`` — and Gemini sits silent on the audio."""
+    p = _make_provider()
+    assert p.audio_in_sample_rate == 16000
+
+
+def test_manual_vad_frames_match_live_api_activity_shape():
+    """Manual VAD: start/stop frames must use Live API's
+    ``realtimeInput.activityStart`` / ``activityEnd`` envelopes."""
+    p = _make_provider()
+    assert p.manual_vad_start_frames() == [
+        {"realtimeInput": {"activityStart": {}}},
+    ]
+    assert p.manual_vad_stop_frames() == [
+        {"realtimeInput": {"activityEnd": {}}},
+    ]
+    assert p.supports_manual_vad is True
+
+
+def test_manual_vad_safety_commit_is_disabled_for_gemini():
+    """Gemini Live's ``activityEnd`` triggers a reply unconditionally —
+    there's no Qwen-style separation of "commit" from "response.create".
+    So the safety-commit path is disabled (empty frames) and the relay's
+    safety watchdog becomes a no-op for Gemini sessions. See the
+    docstring on ``manual_vad_safety_commit_frames`` for the live
+    test that disproved the original assumption."""
+    p = _make_provider()
+    assert p.manual_vad_safety_commit_frames() == []
 
 
 def test_session_config_skips_system_when_empty():
@@ -323,6 +368,33 @@ def test_is_recoverable_error_default_false():
     p = _make_provider()
     assert p.is_recoverable_error(ConnectionError("InvalidParameter")) is False
     assert p.is_recoverable_error(RuntimeError("anything")) is False
+
+
+def test_is_recoverable_error_stale_handle_one_shot_recovery():
+    """1008 "session expired" with a captured handle but no prior goAway:
+    drop the (poisoned) handle and recover once. Replays of the same
+    failure after recovery are fatal."""
+    p = _make_provider()
+    p._resumption_handle = "stale-handle-from-previous-session"
+    exc = ConnectionError(
+        "received 1008 (policy violation) BidiGenerateContent session expired; "
+        "then sent 1008 (policy violation) BidiGenerateContent session expired"
+    )
+    # First time: recover.
+    assert p.is_recoverable_error(exc) is True
+    assert p._resumption_handle is None
+    assert p._stale_handle_recovery_used is True
+    # Second time without a setupComplete in between: fatal (no loop).
+    assert p.is_recoverable_error(exc) is False
+
+
+def test_is_recoverable_error_session_expired_without_handle_is_fatal():
+    """If we never had a handle, a 1008 isn't a stale-handle situation —
+    don't try to recover (could be a real quota / policy denial)."""
+    p = _make_provider()
+    assert p._resumption_handle is None
+    exc = ConnectionError("1008 BidiGenerateContent session expired")
+    assert p.is_recoverable_error(exc) is False
 
 
 def test_should_gate_event_default_false():
