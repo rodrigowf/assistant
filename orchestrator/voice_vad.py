@@ -107,7 +107,7 @@ class VoiceVAD:
     def __init__(
         self,
         input_sample_rate: int = 24000,
-        threshold: float = 0.35,
+        threshold: float = 0.28,
         min_silence_duration_ms: int = 2500,
         min_speech_duration_ms: int = 200,
     ) -> None:
