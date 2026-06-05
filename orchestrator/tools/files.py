@@ -29,7 +29,15 @@ def _resolve_path(base_dir: str, path: str) -> Path:
 
 @registry.register(
     name="read_file",
-    description="Read a file. Absolute paths read from anywhere on the host; relative paths resolve against the project directory.",
+    description=(
+        "Read a file. Absolute paths read from anywhere on the host; relative "
+        "paths resolve against the project directory. Optionally pass "
+        "start_line/end_line (1-indexed, inclusive) to read just a slice — "
+        "useful for large files. When the response gets truncated by the "
+        "byte limit you'll see a marker like '[truncated at line X of Y total "
+        "— call read_file again with start_line=X+1 to continue]' so you can "
+        "page through the rest."
+    ),
     input_schema={
         "type": "object",
         "properties": {
@@ -37,11 +45,26 @@ def _resolve_path(base_dir: str, path: str) -> Path:
                 "type": "string",
                 "description": "Absolute path (e.g. '/etc/hosts', '~/notes.txt') or path relative to the project root (e.g. 'CLAUDE.md', 'context/memory/MEMORY.md').",
             },
+            "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-indexed first line to return (inclusive). Default: 1 (start of file).",
+            },
+            "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-indexed last line to return (inclusive). Default: end of file. Clamped to total line count.",
+            },
         },
         "required": ["path"],
     },
 )
-async def read_file(context: dict[str, Any], path: str) -> str:
+async def read_file(
+    context: dict[str, Any],
+    path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
     project_dir = context.get("project_dir", "")
     if not project_dir:
         return json.dumps({"error": "Project directory not configured"})
@@ -52,12 +75,70 @@ async def read_file(context: dict[str, Any], path: str) -> str:
         return json.dumps({"error": f"File not found: {path}"})
 
     try:
-        content = target.read_text(encoding="utf-8")
-        if len(content) > MAX_FILE_SIZE:
-            content = content[:MAX_FILE_SIZE] + f"\n... (truncated at {MAX_FILE_SIZE} bytes)"
-        return json.dumps({"path": str(target), "content": content})
+        raw = target.read_text(encoding="utf-8")
     except Exception as e:
         return json.dumps({"error": f"Failed to read file: {e}"})
+
+    lines = raw.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    # Normalise the range. start_line defaults to 1; end_line defaults to EOF.
+    # Both are clamped to [1, total_lines]; an inverted range yields empty.
+    s = 1 if start_line is None else max(1, start_line)
+    e = total_lines if end_line is None else min(total_lines, max(1, end_line))
+
+    if total_lines == 0:
+        # Empty file — preserve original behaviour (return empty content).
+        return json.dumps({
+            "path": str(target),
+            "content": "",
+            "start_line": 1,
+            "end_line": 0,
+            "total_lines": 0,
+        })
+
+    if s > total_lines:
+        return json.dumps({
+            "error": (
+                f"start_line {s} is past end of file "
+                f"(total {total_lines} lines)"
+            ),
+            "path": str(target),
+            "total_lines": total_lines,
+        })
+
+    sliced = "".join(lines[s - 1:e])
+    returned_end = e
+
+    # Byte-size truncation — count whole lines so the marker can name a
+    # line number the model can resume from.
+    if len(sliced) > MAX_FILE_SIZE:
+        kept: list[str] = []
+        running = 0
+        last_idx = s - 1
+        for idx in range(s - 1, e):
+            chunk = lines[idx]
+            if running + len(chunk) > MAX_FILE_SIZE and kept:
+                break
+            kept.append(chunk)
+            running += len(chunk)
+            last_idx = idx
+        sliced = "".join(kept)
+        returned_end = last_idx + 1
+        next_line = returned_end + 1
+        marker = (
+            f"\n... [truncated at line {returned_end} of {total_lines} total "
+            f"— call read_file again with start_line={next_line} to continue]"
+        )
+        sliced += marker
+
+    return json.dumps({
+        "path": str(target),
+        "content": sliced,
+        "start_line": s,
+        "end_line": returned_end,
+        "total_lines": total_lines,
+    })
 
 
 @registry.register(

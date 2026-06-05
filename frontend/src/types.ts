@@ -96,7 +96,11 @@ export type ServerEvent =
   | { type: "voice_command"; command: Record<string, unknown> }
   | { type: "voice_event"; event: RealtimeEvent }
   | { type: "voice_audio_out"; audio: string }
-  | { type: "voice_stopped" };
+  | { type: "voice_ending"; reason?: string; session_id?: string }
+  | { type: "voice_ended"; reason?: string; session_id?: string }
+  | { type: "voice_stopped" }
+  | { type: "ping" }
+  | { type: "pong" };
 
 // OpenAI Realtime API event types (subset used by voice integration)
 export interface RealtimeEvent {
@@ -111,6 +115,7 @@ export type VoiceStatus =
   | "speaking"
   | "thinking"
   | "tool_use"
+  | "ending"
   | "error";
 
 // Chat state types

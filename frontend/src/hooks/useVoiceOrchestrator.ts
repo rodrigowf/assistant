@@ -131,6 +131,13 @@ export function useVoiceOrchestrator(
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Safety timeout for the "Ending..." → "Off" transition. The backend
+  // emits voice_ended once teardown completes; this fires only if the
+  // ack never arrives (server crash, WS drop, etc.) so the UI doesn't
+  // stay stuck on "Ending" forever.
+  const endingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ENDING_ACK_TIMEOUT_MS = 5000;
+
   const optsRef = useRef(options);
   optsRef.current = options;
 
@@ -483,6 +490,13 @@ export function useVoiceOrchestrator(
       vlog("recv", event.type, event.type === "voice_event" ? (event.event as RealtimeEvent).type : "");
     }
     switch (event.type) {
+      // Heartbeat from backend (every 15s) — keeps the connection
+      // warm against power-saving WiFi clients. No-op here; receiving
+      // the bytes is the entire purpose.
+      case "ping":
+      case "pong":
+        return;
+
       case "session_started": {
         optsRef.current.onSessionStarted?.(event.session_id);
         const info = event.voice_connection_info;
@@ -521,7 +535,28 @@ export function useVoiceOrchestrator(
         break;
       }
 
-      case "voice_stopped":
+      case "voice_ending":
+        // Backend has begun teardown. Reflect it in the UI so the user
+        // sees "Ending..." instead of a stuck "Active" until voice_ended
+        // arrives. Idempotent if we already set Ending in stopVoice().
+        if (endingTimeoutRef.current === null) {
+          endingTimeoutRef.current = setTimeout(() => {
+            console.warn("[voice-orchestrator] voice_ended ack timeout");
+            cleanup();
+            updateStatus("off");
+            optsRef.current.onAfterStop?.();
+            endingTimeoutRef.current = null;
+          }, ENDING_ACK_TIMEOUT_MS);
+        }
+        updateStatus("ending");
+        break;
+
+      case "voice_ended":
+      case "voice_stopped":  // legacy alias — remove after one release
+        if (endingTimeoutRef.current !== null) {
+          clearTimeout(endingTimeoutRef.current);
+          endingTimeoutRef.current = null;
+        }
         cleanup();
         updateStatus("off");
         optsRef.current.onAfterStop?.();
@@ -698,14 +733,46 @@ export function useVoiceOrchestrator(
   ]);
 
   const stopVoice = useCallback(() => {
-    if (wsRef.current) wsRef.current.send({ type: "stop" });
-    cleanup();
-    updateStatus("off");
-    optsRef.current.onAfterStop?.();
+    // Tell the backend to end ONLY the voice connection (keeping the
+    // orchestrator session alive in the pool for re-arm), then wait
+    // for the voice_ended ack before flipping to Off. Show "Ending..."
+    // in the meantime so the user gets feedback that the request is in
+    // flight. A safety timeout flips to Off after 5s in case the ack
+    // never arrives (server crash, dropped WS). The previous design
+    // sent {type:"stop"} which dropped the entire session — wrong: the
+    // tab should survive, voice is one mode of interacting with it.
+    if (wsRef.current) {
+      wsRef.current.send({ type: "voice_stop" });
+    } else {
+      // No socket → nothing to await. Tear down locally.
+      cleanup();
+      updateStatus("off");
+      optsRef.current.onAfterStop?.();
+      return;
+    }
+    updateStatus("ending");
+    if (endingTimeoutRef.current !== null) {
+      clearTimeout(endingTimeoutRef.current);
+    }
+    endingTimeoutRef.current = setTimeout(() => {
+      console.warn(
+        "[voice-orchestrator] voice_ended ack timeout — forcing local Off",
+      );
+      cleanup();
+      updateStatus("off");
+      optsRef.current.onAfterStop?.();
+      endingTimeoutRef.current = null;
+    }, ENDING_ACK_TIMEOUT_MS);
   }, [cleanup, updateStatus]);
 
   useEffect(() => {
-    return () => { cleanup(); };
+    return () => {
+      if (endingTimeoutRef.current !== null) {
+        clearTimeout(endingTimeoutRef.current);
+        endingTimeoutRef.current = null;
+      }
+      cleanup();
+    };
   }, [cleanup]);
 
   return {

@@ -110,6 +110,13 @@ class SessionPool:
         self._orchestrator_id: str | None = None
         self._orchestrator_subs: set[WebSocket] = set()
 
+        # Orchestrator session currently being torn down. Parked here for
+        # the duration of stop_orchestrator() so a concurrent voice_start
+        # for the same local_id can await it via await_orchestrator_stop
+        # instead of reconnecting into the husk. Cleared after stop() returns.
+        self._stopping_orchestrator: Any | None = None
+        self._stopping_orchestrator_id: str | None = None
+
         # Watchers: receive agent_session_opened / agent_session_closed events
         self._watchers: set[WebSocket] = set()
 
@@ -483,16 +490,80 @@ class SessionPool:
             self._orchestrator_subs.discard(ws)
 
     async def stop_orchestrator(self) -> None:
-        """Stop and clear the active orchestrator session."""
+        """Stop and clear the active orchestrator session.
+
+        Moves the session into ``_stopping_orchestrator`` for the
+        duration of ``session.stop()`` so a concurrent ``voice_start``
+        for the same ``local_id`` can await the stop instead of racing
+        a dying session (see :meth:`await_orchestrator_stop`). After
+        ``session.stop()`` returns, the stopping slot is cleared.
+        """
         session = self._orchestrator
+        local_id = self._orchestrator_id
         self._orchestrator = None
         self._orchestrator_id = None
         self._orchestrator_subs.clear()
-        if session is not None and hasattr(session, "stop"):
-            try:
-                await session.stop()
-            except Exception:
-                pass
+        if session is None or not hasattr(session, "stop"):
+            return
+        # Park the session in the stopping slot so a concurrent start
+        # for the same local_id can wait it out cleanly.
+        self._stopping_orchestrator = session
+        self._stopping_orchestrator_id = local_id
+        try:
+            await session.stop()
+        except Exception:
+            logger.exception("orchestrator session.stop() raised")
+        finally:
+            # Release the stopping slot only if it's still us — defensive
+            # against future code that might park multiple sessions.
+            if self._stopping_orchestrator is session:
+                self._stopping_orchestrator = None
+                self._stopping_orchestrator_id = None
+
+    async def await_orchestrator_stop(
+        self,
+        local_id: str,
+        timeout: float = 5.0,
+    ) -> bool:
+        """Wait for an in-flight teardown of ``local_id`` to finish.
+
+        Returns True if a teardown was in flight and completed (or there
+        was nothing to wait for). Returns False if it timed out — the
+        caller can choose to reject the new start with an error, since a
+        slot that won't release is a bug worth surfacing rather than
+        silently overwriting.
+
+        Used by ``_handle_start`` so that a ``voice_start`` arriving
+        during the ENDING window for the same ``local_id`` is held
+        until the prior session is fully gone, then served a fresh
+        session instead of reconnecting into the husk.
+        """
+        if self._stopping_orchestrator_id != local_id:
+            return True
+        session = self._stopping_orchestrator
+        if session is None:
+            return True
+        ended_event = getattr(session, "_voice_ended", None)
+        if ended_event is None:
+            # Pre-refactor session (no state machine) — fall back to a
+            # polling wait on the slot itself.
+            import time as _time
+            deadline = _time.monotonic() + timeout
+            while self._stopping_orchestrator_id == local_id:
+                if _time.monotonic() > deadline:
+                    return False
+                await asyncio.sleep(0.05)
+            return True
+        try:
+            await asyncio.wait_for(ended_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        # Give stop_orchestrator() the moment to clear the slot.
+        for _ in range(10):
+            if self._stopping_orchestrator_id != local_id:
+                return True
+            await asyncio.sleep(0.02)
+        return self._stopping_orchestrator_id != local_id
 
     async def close_all(self) -> None:
         """Stop every active session in the pool. Used at app shutdown so

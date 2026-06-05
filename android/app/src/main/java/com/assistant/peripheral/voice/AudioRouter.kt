@@ -252,17 +252,28 @@ class AudioRouter(private val context: Context) {
     private fun isHeadsetProfileConnected(): Boolean {
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
         if (!adapter.isEnabled) return false
-        @Suppress("DEPRECATION")
-        return adapter.getProfileConnectionState(BluetoothProfile.HEADSET) ==
-            BluetoothProfile.STATE_CONNECTED
+        return try {
+            @Suppress("DEPRECATION")
+            adapter.getProfileConnectionState(BluetoothProfile.HEADSET) ==
+                BluetoothProfile.STATE_CONNECTED
+        } catch (_: SecurityException) {
+            // Android 12+: requires BLUETOOTH_CONNECT at runtime. If the
+            // user hasn't granted it, the BT routing modes simply don't
+            // light up. MainActivity asks for it on launch.
+            false
+        }
     }
 
     private fun isA2dpProfileConnected(): Boolean {
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: return false
         if (!adapter.isEnabled) return false
-        @Suppress("DEPRECATION")
-        return adapter.getProfileConnectionState(BluetoothProfile.A2DP) ==
-            BluetoothProfile.STATE_CONNECTED
+        return try {
+            @Suppress("DEPRECATION")
+            adapter.getProfileConnectionState(BluetoothProfile.A2DP) ==
+                BluetoothProfile.STATE_CONNECTED
+        } catch (_: SecurityException) {
+            false
+        }
     }
 
     private fun isBluetoothType(type: Int): Boolean = when (type) {

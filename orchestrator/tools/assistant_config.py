@@ -30,13 +30,15 @@ logger = logging.getLogger(__name__)
 @registry.register(
     name="get_assistant_config",
     description=(
-        "Read the current global assistant configuration. Returns the same JSON "
-        "the Config page in the UI shows: active working directory (local or SSH "
-        "target), the full working_directory_history, harness provider + model, "
-        "enabled MCP servers, chrome extension flag, default voice provider/model, "
-        "and voice recording flag. Use this BEFORE calling open_agent_session "
-        "when you need to verify (or change) the settings the next session will "
-        "inherit — every field here flows into the spawned session automatically."
+        "Read the current global assistant configuration that shapes coding-agent "
+        "sessions: active working directory (local or SSH target), the full "
+        "working_directory_history, harness provider + per-provider model, "
+        "enabled MCP servers, and chrome_extension flag. Use this BEFORE "
+        "calling open_agent_session when you need to verify (or change via "
+        "update_assistant_config) the settings the next session will inherit. "
+        "Note: voice/orchestrator settings (default_voice_*, voice_recording_enabled, "
+        "default_model, summarizer_model) may also appear in the response but are "
+        "NOT editable from this tool — they belong to your own runtime."
     ),
     input_schema={
         "type": "object",
@@ -52,8 +54,14 @@ async def get_assistant_config(context: dict[str, Any]) -> str:
 @registry.register(
     name="update_assistant_config",
     description=(
-        "Update one or more fields of the global assistant configuration "
-        "(assistant_config.json) — the same path the Config page in the UI uses. "
+        "Update one or more CODING-AGENT fields of the global assistant "
+        "configuration (assistant_config.json) — the same path the Config "
+        "page in the UI uses for the coding-agent section. Scope is "
+        "deliberately limited: this tool only edits settings the next "
+        "open_agent_session will inherit (working directory, MCPs, "
+        "chrome flag, harness provider + model). Voice and orchestrator-runtime "
+        "settings are intentionally NOT exposed here — changing them mid-call "
+        "would disrupt your own session. "
         "All changes are validated server-side (working directory ids must exist "
         "in working_directory_history, harness provider must be registered, etc.) "
         "and take effect immediately for every subsequent open_agent_session call. "
@@ -106,32 +114,6 @@ async def get_assistant_config(context: dict[str, Any]) -> str:
                 ),
                 "additionalProperties": {"type": "string"},
             },
-            "default_voice_provider": {
-                "type": "string",
-                "description": "Default provider for voice sessions ('openai' | 'qwen' | 'google').",
-            },
-            "default_voice_model": {
-                "type": "string",
-                "description": "Default model for voice sessions, scoped to the chosen provider.",
-            },
-            "default_voice_name": {
-                "type": "string",
-                "description": "Default voice/speaker id for voice sessions.",
-            },
-            "default_voice_transcription_language": {
-                "type": "string",
-                "description": "Language hint for voice transcription. Empty string = auto-detect.",
-            },
-            "default_voice_endpoint": {
-                "type": "string",
-                "description": (
-                    "Backend for the 'google' voice provider only: 'vertex' or 'aistudio'."
-                ),
-            },
-            "voice_recording_enabled": {
-                "type": "boolean",
-                "description": "When true, voice sessions save raw audio to disk.",
-            },
         },
     },
 )
@@ -142,18 +124,17 @@ async def update_assistant_config(
     chrome_extension: bool | None = None,
     provider: str | None = None,
     harness_model: dict[str, str] | None = None,
-    default_voice_provider: str | None = None,
-    default_voice_model: str | None = None,
-    default_voice_name: str | None = None,
-    default_voice_transcription_language: str | None = None,
-    default_voice_endpoint: str | None = None,
-    voice_recording_enabled: bool | None = None,
 ) -> str:
     # Build a kwargs dict of only the fields the caller actually supplied
     # (i.e. everything that isn't None).  The signature must declare each
     # field explicitly because the registry executor filters call-site
     # kwargs by the handler's named parameters — ``**fields`` would
     # collapse to a single VAR_KEYWORD slot and lose them all.
+    #
+    # Coding-agent scope only: voice + orchestrator-runtime fields
+    # (default_voice_*, voice_recording_enabled, default_model,
+    # summarizer_model) are intentionally not in this signature so the
+    # orchestrator can't disrupt its own session mid-call.
     fields = {
         k: v for k, v in {
             "working_directory": working_directory,
@@ -161,12 +142,6 @@ async def update_assistant_config(
             "chrome_extension": chrome_extension,
             "provider": provider,
             "harness_model": harness_model,
-            "default_voice_provider": default_voice_provider,
-            "default_voice_model": default_voice_model,
-            "default_voice_name": default_voice_name,
-            "default_voice_transcription_language": default_voice_transcription_language,
-            "default_voice_endpoint": default_voice_endpoint,
-            "voice_recording_enabled": voice_recording_enabled,
         }.items() if v is not None
     }
     if not fields:

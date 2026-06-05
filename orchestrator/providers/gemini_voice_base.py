@@ -559,6 +559,22 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """
         return []
 
+    def graceful_shutdown_frames(self) -> list[dict[str, Any]]:
+        """Close any in-flight user turn before we tear the WS down.
+
+        Gemini's ``activityEnd`` ALSO triggers a model reply (see
+        :meth:`manual_vad_safety_commit_frames` for the long story).
+        That's normally a problem, but here it's harmless: the relay
+        closes the WS immediately after sending these frames, so the
+        reply — if any — never reaches us. What matters is that the
+        server-side activity gets a clean close instead of dangling
+        until the session age-out.
+
+        If no manual-VAD activity is open the frame is benign;
+        Gemini ignores ``activityEnd`` outside an active turn.
+        """
+        return [{"realtimeInput": {"activityEnd": {}}}]
+
     @classmethod
     def extract_audio_out(cls, raw_event: dict[str, Any]) -> str | None:
         """Pull base64-PCM from ``serverContent.modelTurn.parts[].inlineData.data``."""

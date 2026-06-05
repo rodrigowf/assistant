@@ -627,6 +627,16 @@ class QwenVoiceProvider(BaseVoiceProvider):
         """
         return [{"type": "input_audio_buffer.commit"}]
 
+    def graceful_shutdown_frames(self) -> list[dict[str, Any]]:
+        """Flush any buffered audio without provoking a reply, then close.
+
+        Mirrors the safety-commit shape — commit only, no
+        ``response.create`` — because the next thing the relay does is
+        close the WS. Sending ``response.create`` here would just race
+        the close and earn a confused server log line.
+        """
+        return [{"type": "input_audio_buffer.commit"}]
+
     # Client-mirrored events on the OpenAI-Realtime wire schema that
     # Qwen's DashScope endpoint actually understands.  Any other
     # ``type`` (in particular OpenAI-only diagnostics like
