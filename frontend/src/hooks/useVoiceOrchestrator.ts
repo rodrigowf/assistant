@@ -86,6 +86,12 @@ export interface VoiceOrchestratorResult {
   micLevel: number;
   speakerLevel: number;
   voiceError: string | null;
+  /** True when this device initiated the voice session (called startVoice).
+   *  False for passive viewers receiving voice events from another device. */
+  isLocalVoice: boolean;
+  /** Process a voice-related server event for passive viewing. Handles
+   *  voice_event (provider transcripts), voice_ending, and voice_ended. */
+  handlePassiveVoiceEvent: (event: ServerEvent) => void;
 }
 
 export function useVoiceOrchestrator(
@@ -93,6 +99,9 @@ export function useVoiceOrchestrator(
 ): VoiceOrchestratorResult {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  // True when this device called startVoice() — distinguishes the voice
+  // owner from passive viewers receiving events from another device.
+  const [isLocalVoice, setIsLocalVoice] = useState(false);
   const transportRef = useRef<AnyVoiceTransportHandles | null>(null);
   const wsRef = useRef<ChatSocket | null>(null);
 
@@ -189,6 +198,7 @@ export function useVoiceOrchestrator(
 
   const cleanup = useCallback(() => {
     vlog("cleanup (transport=", transportRef.current?.kind, ")");
+    setIsLocalVoice(false);
     // Stop audio recorder if active
     if (recorderRef.current) {
       recorderRef.current.stop();
@@ -602,6 +612,7 @@ export function useVoiceOrchestrator(
   const startVoice = useCallback(async () => {
     if (voiceStatus !== "off" && voiceStatus !== "error") return;
 
+    setIsLocalVoice(true);
     setVoiceError(null);
     updateStatus("connecting");
     dcReadyRef.current = false;
@@ -775,6 +786,25 @@ export function useVoiceOrchestrator(
     };
   }, [cleanup]);
 
+  // Handle voice-related server events for passive viewers (devices that
+  // didn't call startVoice but are subscribed to the same orchestrator).
+  // Routes provider events through handleProviderEvent for transcript
+  // rendering, and handles lifecycle events (ending/ended) for status.
+  const handlePassiveVoiceEvent = useCallback((event: ServerEvent) => {
+    switch (event.type) {
+      case "voice_event":
+        handleProviderEvent(event.event);
+        break;
+      case "voice_ending":
+        updateStatus("ending");
+        break;
+      case "voice_ended":
+      case "voice_stopped":
+        updateStatus("off");
+        break;
+    }
+  }, [handleProviderEvent, updateStatus]);
+
   return {
     voiceStatus,
     startVoice,
@@ -787,5 +817,7 @@ export function useVoiceOrchestrator(
     micLevel,
     speakerLevel,
     voiceError,
+    isLocalVoice,
+    handlePassiveVoiceEvent,
   };
 }

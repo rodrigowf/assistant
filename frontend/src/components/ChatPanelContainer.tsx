@@ -117,7 +117,7 @@ function OrchestratorChatPanel({
   onRewindMessage?: (dropLastN: number) => void;
   onForkMessage?: (dropLastN: number) => void;
 }) {
-  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel, voiceError } = useVoiceOrchestrator({
+  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel, voiceError, isLocalVoice, handlePassiveVoiceEvent } = useVoiceOrchestrator({
     localId: sessionId,
     resumeSdkId,
     onUserTranscript: (text) => {
@@ -142,6 +142,19 @@ function OrchestratorChatPanel({
       instance.restart();
     },
   });
+
+  // When this device is NOT the voice owner (passive viewer), register the
+  // passive handler so voice_event broadcasts from the text WebSocket are
+  // routed to handleProviderEvent for transcript rendering. When voice IS
+  // locally active, the voice orchestrator has its own WebSocket and handles
+  // events directly — no forwarding needed (would cause double-rendering).
+  useEffect(() => {
+    if (!isLocalVoice) {
+      instance.registerVoiceEventHandler(handlePassiveVoiceEvent);
+      return () => instance.registerVoiceEventHandler(null);
+    }
+    instance.registerVoiceEventHandler(null);
+  }, [isLocalVoice, instance.registerVoiceEventHandler, handlePassiveVoiceEvent]);
 
   return (
     <ChatPanel

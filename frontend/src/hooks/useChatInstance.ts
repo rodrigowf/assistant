@@ -505,6 +505,10 @@ export interface ChatInstance {
   dispatchToolUse: (toolUseId: string, toolName: string, toolInput: Record<string, unknown>) => void;
   /** Add a tool result to a pending tool use block (for voice mode tool results). */
   dispatchToolResult: (toolUseId: string, output: string, isError: boolean) => void;
+  /** Register a handler for voice-related server events (voice_event, voice_ending,
+   *  voice_ended). Used by passive devices to render voice transcripts from another
+   *  device's active voice session. Pass null to unregister. */
+  registerVoiceEventHandler: (handler: ((event: ServerEvent) => void) | null) => void;
 }
 
 interface UseChatInstanceOptions {
@@ -561,6 +565,12 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   onSessionClosedRef.current = onSessionClosed;
   const onSdkSessionAssignedRef = useRef(onSdkSessionAssigned);
   onSdkSessionAssignedRef.current = onSdkSessionAssigned;
+  // Registered by passive voice viewers (e.g. iPad watching Android's voice)
+  // to receive voice_event/voice_ending/voice_ended broadcasts.
+  const voiceEventHandlerRef = useRef<((event: ServerEvent) => void) | null>(null);
+  const registerVoiceEventHandler = useCallback((handler: ((event: ServerEvent) => void) | null) => {
+    voiceEventHandlerRef.current = handler;
+  }, []);
   const localIdRef = useRef(localId);
   localIdRef.current = localId;
   const resumeSdkIdRef = useRef(resumeSdkId);
@@ -689,6 +699,14 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "voice_command":
         onVoiceCommandRef.current?.(event.command);
+        break;
+      // Forward voice-related broadcasts to the registered passive handler
+      // so devices that didn't start voice can still render transcripts.
+      case "voice_event":
+      case "voice_ending":
+      case "voice_ended":
+      case "voice_stopped":
+        voiceEventHandlerRef.current?.(event);
         break;
     }
   }, []);
@@ -973,5 +991,6 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     voiceAssistantComplete,
     dispatchToolUse,
     dispatchToolResult,
+    registerVoiceEventHandler,
   };
 }

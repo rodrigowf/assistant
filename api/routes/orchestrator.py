@@ -81,6 +81,11 @@ async def orchestrator_ws(ws: WebSocket):
     # of the except handlers where ``was_voice`` is otherwise assigned.
     # Without this default we'd hit UnboundLocalError on any clean exit.
     was_voice = False
+    # True only if THIS WebSocket initiated the voice session (sent
+    # ``voice_start``). Passive subscribers (text-mode WebSockets that
+    # joined via ``start`` while voice was already active) must NOT tear
+    # down voice on disconnect — only the voice owner should.
+    voice_owner = False
 
     # Register as a watcher so this ws receives agent_session_opened/closed events
     pool.watch(ws)
@@ -110,6 +115,8 @@ async def orchestrator_ws(ws: WebSocket):
 
             elif msg_type == "voice_start":
                 session, subscribed = await _handle_start(ws, pool, msg, voice=True)
+                if session is not None:
+                    voice_owner = True
 
             elif msg_type == "send":
                 if session is None:
@@ -233,6 +240,7 @@ async def orchestrator_ws(ws: WebSocket):
                         await session.end_voice("user_stop")
                     except Exception:  # noqa: BLE001
                         logger.exception("end_voice failed during voice_stop")
+                voice_owner = False
                 # No session_stopped ack here — the voice_ended broadcast
                 # that end_voice fires is the ack the frontend waits for.
 
@@ -275,18 +283,16 @@ async def orchestrator_ws(ws: WebSocket):
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
-        # On client WS disconnect: tear down the voice connection
-        # (relay, upstream WS to Gemini/Qwen, audio recorder, provider
-        # handle) so we don't keep burning provider tokens with no
-        # client listening — but KEEP the OrchestratorSession alive in
-        # the pool. The tab survives like text mode does, and a
-        # subsequent ``voice_start`` re-arms voice on this same session
-        # via ``restart_voice`` (same JSONL, same agent context, no
-        # resume dance).
+        # On client WS disconnect: tear down the voice connection ONLY
+        # if this WebSocket is the voice owner (the one that sent
+        # ``voice_start``). Passive subscribers (text-mode WebSockets
+        # that joined via ``start`` while voice was active) must not
+        # kill the voice session when they disconnect — otherwise
+        # refreshing the iPad kills the Android's active voice call.
         #
         # ``end_voice`` is idempotent and handles non-voice sessions as
         # a fast no-op, so calling it unconditionally here is safe.
-        if was_voice and session is not None:
+        if was_voice and session is not None and voice_owner:
             try:
                 await session.end_voice("client_disconnect")
                 logger.info(
