@@ -639,11 +639,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // pendingResumeSessionId (the actual SDK/JSONL id) instead.
                 b.jsonlSessionId = b.pendingResumeSessionId.value ?: event.sessionId
 
-                // If this is a voice session, forward the session.update payload to OpenAI
-                // This sends the system prompt + tool definitions so the voice session
-                // has full context (matches web frontend's useVoiceOrchestrator)
-                event.voiceSessionUpdate?.let { update ->
-                    voiceManager?.handleBackendCommand(update)
+                // If this is a voice session AND we initiated it, forward
+                // the session.update payload to OpenAI (system prompt +
+                // tool definitions). When we are NOT the initiator (the
+                // session is voice because another client on the same
+                // orchestrator started it), skip the forward — we don't
+                // own a provider transport on this device, and queueing
+                // the update just leaks state for a future start the
+                // user may never trigger here.
+                if (event.voiceInitiator) {
+                    event.voiceSessionUpdate?.let { update ->
+                        voiceManager?.handleBackendCommand(update)
+                    }
                 }
 
                 // Load/refresh messages when reconnecting to an existing session.

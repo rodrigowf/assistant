@@ -134,7 +134,13 @@ sealed class WebSocketEvent {
     data class SessionStarted(
         val sessionId: String,
         val voice: Boolean = false,
-        val voiceSessionUpdate: Map<String, Any?>? = null  // session.update payload for OpenAI
+        val voiceSessionUpdate: Map<String, Any?>? = null,  // session.update payload for OpenAI
+        // True when this WS is the one that started/owns the voice
+        // session. False on reconnects where another client (a
+        // different device on the same orchestrator) is the actual
+        // initiator — we shouldn't spin up our own provider transport
+        // in that case, only mirror the voice UI state.
+        val voiceInitiator: Boolean = true
     ) : WebSocketEvent()
     object SessionStopped : WebSocketEvent()
     data class TurnComplete(val inputTokens: Int, val outputTokens: Int) : WebSocketEvent()

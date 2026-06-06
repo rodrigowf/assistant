@@ -598,8 +598,16 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
           sessionId: event.session_id,
           contextWindow: ctxWindow,
         });
-        // Voice mode: send session.update to OpenAI via voice bridge
-        if (event.voice_session_update) {
+        // Voice mode: send session.update to OpenAI via voice bridge,
+        // but ONLY if we initiated this voice session. When another
+        // client on the same orchestrator opened voice and we're just
+        // observing the broadcast, forwarding the update would push
+        // the session.update through this device's idle voice bridge
+        // and either fail (no transport) or wastefully open one.
+        // ``voice_initiator`` defaults to true so older backends keep
+        // working — they only sent session_started to the initiator.
+        const isInitiator = event.voice_initiator ?? true;
+        if (event.voice_session_update && isInitiator) {
           onVoiceCommandRef.current?.(event.voice_session_update as Record<string, unknown>);
         }
         break;

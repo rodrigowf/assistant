@@ -471,7 +471,10 @@ async def _handle_start(
                 "voice": True,
                 "model_info": session.get_model_info(),
             }
-            await _attach_voice_payload(reconnect_payload, session)
+            await _attach_voice_payload(
+                reconnect_payload, session,
+                initiator=True, initiator_ws=ws,
+            )
             await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
             logger.info(
                 "voice rearm complete session=%s — same orchestrator, fresh voice connection",
@@ -481,6 +484,10 @@ async def _handle_start(
         elif not voice and current_voice:
             # Text WS reconnecting while voice is active — subscribe without
             # disrupting the voice session (the text WS auto-connects on mount).
+            # Not the initiator: another client owns the live voice
+            # connection. Carry voice metadata so this client's UI can
+            # reflect that voice is active, but don't let it try to open
+            # its own provider transport.
             pool.subscribe_orchestrator(local_id, ws)
             reconnect_payload: dict = {
                 "type": "session_started",
@@ -488,7 +495,10 @@ async def _handle_start(
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
             }
-            await _attach_voice_payload(reconnect_payload, session)
+            await _attach_voice_payload(
+                reconnect_payload, session,
+                initiator=False, initiator_ws=None,
+            )
             await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
             return session, True
         else:
@@ -534,7 +544,10 @@ async def _handle_start(
                         "voice": current_voice,
                         "model_info": session.get_model_info(),
                     }
-                    await _attach_voice_payload(reconnect_payload, session)
+                    await _attach_voice_payload(
+                        reconnect_payload, session,
+                        initiator=True, initiator_ws=ws,
+                    )
                     await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
                     return session, True
             else:
@@ -696,7 +709,10 @@ async def _handle_start(
         "model_info": session.get_model_info(),
     }
     if voice:
-        await _attach_voice_payload(started_payload, session)
+        await _attach_voice_payload(
+            started_payload, session,
+            initiator=True, initiator_ws=ws,
+        )
         logger.info(
             "voice_start_timing local_id=%s step=attach_voice_payload dt_ms=%d",
             local_id, _ms_since(_t_payload),
@@ -755,10 +771,26 @@ def _voice_config_drift(
 async def _attach_voice_payload(
     payload: dict,
     session: OrchestratorSession,
+    *,
+    initiator: bool = True,
+    initiator_ws: WebSocket | None = None,
 ) -> None:
     """Mutate ``payload`` to include voice provider metadata and the
     provider-specific session.update + connection info, and start the
     backend relay for WebSocket providers if it isn't already running.
+
+    ``initiator`` flags whether the receiving WS is the client that
+    actually requested this voice attach (vs. a text client reconnecting
+    to an already-voice session). The payload carries this through as
+    ``voice_initiator`` so non-initiator clients can mirror the voice
+    UI without trying to spin up their own provider transport — which
+    would otherwise show duplicate "preparing" / "connecting" UI on
+    every device subscribed to the same orchestrator session.
+
+    ``initiator_ws`` is the WebSocket of the initiator, used to direct
+    pre-connect status events like ``voice_status: summarizing`` to
+    only the initiator instead of broadcasting them (which used to
+    flash the "summarizing" UI on every connected client).
 
     Errors fetching the ephemeral token or starting the relay are
     swallowed and reported back as ``voice_connection_error`` so the
@@ -768,6 +800,7 @@ async def _attach_voice_payload(
     payload["voice_model"] = session.voice_model_id
     payload["voice_name"] = session.voice_name_id
     payload["voice_transcription_language"] = session.voice_transcription_language
+    payload["voice_initiator"] = initiator
     # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
     payload["voice_recording_enabled"] = session.audio_recorder is not None
 
@@ -799,17 +832,28 @@ async def _attach_voice_payload(
         and session._jsonl_path.is_file()
         and not summary_cache.is_fresh(session._jsonl_path)
     )
-    if will_summarize and pool_for_status is not None:
+    if will_summarize:
+        summarizing_msg = orjson.dumps({
+            "type": "voice_event",
+            "event": {
+                "type": "voice_status",
+                "status": "summarizing",
+            },
+        })
+        # Directed send to the initiator only — broadcasting this used
+        # to flash a "Summarizing..." spinner on every other device
+        # subscribed to the same orchestrator session, making it look
+        # like both devices were trying to start a conversation. The
+        # initiator is the one waiting on the slow LLM round-trip; no
+        # other client needs to react. Falls back to broadcast if we
+        # don't have an initiator handle (e.g. server-initiated rearm).
         try:
-            await pool_for_status.broadcast_orchestrator({
-                "type": "voice_event",
-                "event": {
-                    "type": "voice_status",
-                    "status": "summarizing",
-                },
-            })
+            if initiator_ws is not None:
+                await _safe_send_bytes(initiator_ws, summarizing_msg)
+            elif pool_for_status is not None:
+                await pool_for_status.broadcast_orchestrator(orjson.loads(summarizing_msg))
         except Exception:  # noqa: BLE001
-            logger.exception("voice_status:summarizing broadcast failed")
+            logger.exception("voice_status:summarizing send failed")
 
     _t_su = time.monotonic()
     session_update = await session.get_session_update()

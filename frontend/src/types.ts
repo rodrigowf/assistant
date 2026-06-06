@@ -66,6 +66,12 @@ export type ServerEvent =
       voice_connection_info?: VoiceConnectionInfoPayload;
       voice_connection_error?: string;
       voice_recording_enabled?: boolean;
+      /** True when this WS is the initiator of the voice session.
+       * False for clients receiving session_started because another
+       * device on the same orchestrator opened voice. Non-initiators
+       * should mirror the voice UI state but not spin up their own
+       * provider transport. Defaults to true on older backends. */
+      voice_initiator?: boolean;
       /** Provider/model context window in tokens. Used by the compact-button %
        * counter. May be omitted when the backend has no opinion — frontend
        * falls back to a conservative default. */

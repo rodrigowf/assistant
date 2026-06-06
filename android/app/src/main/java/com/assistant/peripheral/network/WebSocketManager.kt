@@ -298,7 +298,11 @@ class WebSocketManager {
                     val sessionId = json.optString("session_id", "")
                     val voice = json.optBoolean("voice", false)
                     val voiceUpdate = json.optJSONObject("voice_session_update")?.let { jsonObjectToMap(it) }
-                    emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
+                    // Default to true for backward-compat with older
+                    // backends that don't send the flag — they only
+                    // emitted session_started for the initiator.
+                    val voiceInitiator = json.optBoolean("voice_initiator", true)
+                    emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate, voiceInitiator))
                 }
                 "session_stopped" -> emit(WebSocketEvent.SessionStopped)
 

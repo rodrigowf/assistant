@@ -515,7 +515,11 @@ export function useVoiceOrchestrator(
         recordingEnabledRef.current = event.voice_recording_enabled ?? false;
         // For WebRTC, the frontend forwards session.update via the data channel.
         // For WebSocket, the backend already sent it upstream — no-op for us.
-        if (event.voice_session_update && info?.connection_type === "webrtc") {
+        // Only forward if we initiated voice — non-initiators don't own
+        // a transport on this device. ``voice_initiator`` defaults to
+        // true for older backends.
+        const isInitiator = event.voice_initiator ?? true;
+        if (event.voice_session_update && info?.connection_type === "webrtc" && isInitiator) {
           sendProviderEvent(event.voice_session_update as RealtimeEvent);
         }
         if (event.voice_connection_error) {
