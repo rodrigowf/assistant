@@ -66,14 +66,6 @@ class WakeWordDetector(
 
         private const val CLIENT_ERROR_DELAY_MS = 1000L
 
-        // SpeechRecognizer can hang silently after onBeginningOfSpeech — no
-        // onResults/onError/onEndOfSpeech ever fires (observed 2026-06-06:
-        // 5-minute dead window with no recovery). Fire a watchdog timer on
-        // onBeginningOfSpeech and force-finish if nothing else arrives in
-        // time. 10s is generous for any real utterance (we cap input at
-        // ~6s via EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS).
-        private const val RECOGNIZER_HANG_TIMEOUT_MS = 10_000L
-
         /**
          * Generate phonetic variants for a wake word phrase.
          * SpeechRecognizer may mishear words (e.g. "hey assistant" → "a system", "resistant").
@@ -141,9 +133,6 @@ class WakeWordDetector(
 
     // Stage 2: speech recognizer always runs on Main
     private var speechRecognizer: SpeechRecognizer? = null
-    // Watchdog for the "Speech begun never returns" hang. See
-    // RECOGNIZER_HANG_TIMEOUT_MS for the rationale.
-    private var recognizerHangJob: Job? = null
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -169,10 +158,6 @@ class WakeWordDetector(
     fun start() {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Log.w(TAG, "Speech recognition not available on this device")
-            return
-        }
-        if (isActive && !isPaused) {
-            Log.d(TAG, "start() ignored — already active")
             return
         }
         Log.d(TAG, "Starting — wake variants: $wakeVariants")
@@ -430,7 +415,6 @@ class WakeWordDetector(
 
             override fun onBeginningOfSpeech() {
                 Log.d(TAG, "Speech begun")
-                armRecognizerHangWatchdog()
             }
 
             override fun onRmsChanged(rmsdB: Float) {}
@@ -440,7 +424,6 @@ class WakeWordDetector(
             override fun onError(error: Int) {
                 if (listenerFinished) return
                 listenerFinished = true
-                cancelRecognizerHangWatchdog()
                 Log.d(TAG, "Recognizer error: $error")
                 // ERROR_CLIENT (7): double-call or internal SDK error — use flat delay, no backoff.
                 // ERROR_NO_SPEECH (6): Google Recognition Service crash or audio routing issue —
@@ -456,7 +439,6 @@ class WakeWordDetector(
             override fun onResults(results: Bundle?) {
                 if (listenerFinished) return
                 listenerFinished = true
-                cancelRecognizerHangWatchdog()
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 Log.d(TAG, "Results: $matches")
                 val detected = matches != null && checkForWakeWord(matches)
@@ -471,7 +453,6 @@ class WakeWordDetector(
                     if (checkForWakeWord(partial)) {
                         // Early match on partial — stop immediately
                         listenerFinished = true
-                        cancelRecognizerHangWatchdog()
                         finishRecognition(wakeWordDetected = true)
                     }
                 }
@@ -484,11 +465,6 @@ class WakeWordDetector(
     }
 
     private fun finishRecognition(wakeWordDetected: Boolean, delay: Long = -1L) {
-        // Idempotent: if we've already finished (e.g. watchdog fired then a
-        // late onError arrived) don't schedule a second silence-monitor
-        // restart — that would launch two parallel monitors racing for the
-        // mic.
-        if (!isRecognizing && speechRecognizer == null) return
         isRecognizing = false
         destroyRecognizer()
         // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership.
@@ -521,7 +497,6 @@ class WakeWordDetector(
     }
 
     private fun destroyRecognizer() {
-        cancelRecognizerHangWatchdog()
         try {
             speechRecognizer?.cancel()
             speechRecognizer?.destroy()
@@ -529,21 +504,6 @@ class WakeWordDetector(
             Log.w(TAG, "Error destroying recognizer: ${e.message}")
         }
         speechRecognizer = null
-    }
-
-    private fun armRecognizerHangWatchdog() {
-        recognizerHangJob?.cancel()
-        recognizerHangJob = scope.launch {
-            kotlinx.coroutines.delay(RECOGNIZER_HANG_TIMEOUT_MS)
-            if (!isActive || !isRecognizing) return@launch
-            Log.w(TAG, "Recognizer hang detected after Speech begun — force-finishing")
-            finishRecognition(wakeWordDetected = false, delay = CLIENT_ERROR_DELAY_MS)
-        }
-    }
-
-    private fun cancelRecognizerHangWatchdog() {
-        recognizerHangJob?.cancel()
-        recognizerHangJob = null
     }
 
     // -------------------------------------------------------------------------

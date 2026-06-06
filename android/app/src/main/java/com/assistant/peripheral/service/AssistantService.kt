@@ -119,15 +119,6 @@ class AssistantService : Service() {
     private var wakeWordDetector: WakeWordDetector? = null
     private lateinit var prefs: SharedPreferences
 
-    // Tracks the last time startWakeWord ran with the same args, so
-    // duplicate onStartCommand deliveries (the framework sometimes
-    // redelivers an EXTRA_RESUME_WAKE_WORD intent within ~20ms) don't tear
-    // down and rebuild the detector twice. Observed 2026-06-06: two
-    // back-to-back "Service started" lines triggered two parallel
-    // WakeWordDetector instances briefly fighting for the mic.
-    private var lastStartWakeWordAtMs: Long = 0L
-    private var lastStartWakeWordArgs: String = ""
-
     // Recents long-press monitor (reads /dev/input/event2 directly)
     private var recentsMonitorThread: Thread? = null
     @Volatile private var recentsMonitorRunning = false
@@ -317,17 +308,6 @@ class AssistantService : Service() {
     }
 
     private fun startWakeWord(wakeWord: String, voiceWord: String, micGain: Float = lastWakeMicGain) {
-        val args = "$wakeWord|$voiceWord|$micGain"
-        val nowMs = System.currentTimeMillis()
-        val recent = wakeWordDetector?.isActive == true &&
-            args == lastStartWakeWordArgs &&
-            (nowMs - lastStartWakeWordAtMs) < 500L
-        if (recent) {
-            Log.d(TAG, "startWakeWord skipped — duplicate call within 500ms with same args")
-            return
-        }
-        lastStartWakeWordAtMs = nowMs
-        lastStartWakeWordArgs = args
         wakeWordDetector?.stop()
         wakeWordDetector = WakeWordDetector(this, wakeWord, voiceWord, micGain)
         wakeWordDetector?.start()
