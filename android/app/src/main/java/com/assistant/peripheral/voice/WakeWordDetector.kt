@@ -48,14 +48,11 @@ class WakeWordDetector(
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
 
-        // RMS threshold — 0..32767 scale. 100 catches normal speech in a
-        // quiet room on the A300M built-in mic. Lowered from 200 on
-        // 2026-06-06 after a DIAG mic probe showed typical voice RMS
-        // peaks around 60-100 at ~1m distance — the old 200 only fired
-        // when the speaker leaned in close. Ambient noise on the same
-        // mic stays below 25, so 100 keeps a comfortable margin from
-        // false triggers.
-        private const val RMS_THRESHOLD = 100.0
+        // RMS threshold — 0..32767 scale. ~200 catches normal speech in a quiet room.
+        // Lowered from 300 after device cleanup reduced background noise — fewer ambient
+        // processes means the mic is quieter at rest, so the old threshold was rarely
+        // breached, giving fewer recognition opportunities per minute.
+        private const val RMS_THRESHOLD = 200.0
 
         // How long audio must stay above threshold before we start recognizer (avoids clicks/pops)
         private const val ACTIVITY_HOLD_MS = 30L

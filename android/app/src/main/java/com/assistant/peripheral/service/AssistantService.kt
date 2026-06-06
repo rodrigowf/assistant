@@ -121,13 +121,10 @@ class AssistantService : Service() {
 
     // Tracks the last time startWakeWord ran with the same args, so
     // duplicate onStartCommand deliveries (the framework sometimes
-    // redelivers intents) don't tear down and rebuild the detector
-    // twice. Observed 2026-06-06: duplicate "Service started" lines
-    // arrived at +20ms AND at +1.3s after the first one — depending on
-    // whether MainActivity also kicked the service. 3000ms covers both;
-    // the first detector's silence monitor takes ~1.5s to come up, so
-    // legitimate user-driven restarts inside that window are extremely
-    // rare and would be a no-op anyway.
+    // redelivers an EXTRA_RESUME_WAKE_WORD intent within ~20ms) don't tear
+    // down and rebuild the detector twice. Observed 2026-06-06: two
+    // back-to-back "Service started" lines triggered two parallel
+    // WakeWordDetector instances briefly fighting for the mic.
     private var lastStartWakeWordAtMs: Long = 0L
     private var lastStartWakeWordArgs: String = ""
 
@@ -324,9 +321,9 @@ class AssistantService : Service() {
         val nowMs = System.currentTimeMillis()
         val recent = wakeWordDetector?.isActive == true &&
             args == lastStartWakeWordArgs &&
-            (nowMs - lastStartWakeWordAtMs) < 3000L
+            (nowMs - lastStartWakeWordAtMs) < 500L
         if (recent) {
-            Log.d(TAG, "startWakeWord skipped — duplicate call within 3s with same args")
+            Log.d(TAG, "startWakeWord skipped — duplicate call within 500ms with same args")
             return
         }
         lastStartWakeWordAtMs = nowMs
