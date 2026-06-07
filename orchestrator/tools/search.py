@@ -23,6 +23,12 @@ from orchestrator.tools import registry
 
 logger = logging.getLogger(__name__)
 
+# Paths (defined upfront so enrichment helpers below can reference them).
+_PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+_SEARCH_SERVER = _PROJECT_DIR / "default-scripts" / "search-server.py"
+_SEARCH_SCRIPT = _PROJECT_DIR / "default-scripts" / "search.py"
+_RUN_SH = _PROJECT_DIR / "context" / "scripts" / "run.sh"
+
 # Frontmatter parser — simple YAML subset (no nested structures except a list
 # under `references:`). Keeps the dependency surface zero.
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
@@ -252,12 +258,6 @@ def _enrich_history_results(results: list[dict[str, Any]]) -> None:
             }
             enrichment_cache[uuid] = data
         r.update(data)
-
-# Paths
-_PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-_SEARCH_SERVER = _PROJECT_DIR / "default-scripts" / "search-server.py"
-_SEARCH_SCRIPT = _PROJECT_DIR / "default-scripts" / "search.py"
-_RUN_SH = _PROJECT_DIR / "context" / "scripts" / "run.sh"
 
 # Singleton warm server process
 _server_proc: asyncio.subprocess.Process | None = None
