@@ -391,7 +391,7 @@ class QwenVoiceProvider(BaseVoiceProvider):
         # Voice-mode behavior tweaks. Qwen has no `speed`, `verbosity`, or
         # output-modality-routing parameters — every behavior we want has
         # to be requested in prose. The communication-style guidance below
-        # is distilled from `context/memory/communication_style_for_qwen.md`
+        # is distilled from `context/memory/assistant/identity/communication_style_for_qwen.md`
         # (full file is the canonical source; this is a compact runtime copy).
         voice_directives = (
             "\n\n# Voice Mode — Aligned Partnership\n"

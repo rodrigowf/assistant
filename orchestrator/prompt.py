@@ -365,7 +365,7 @@ Use this for orchestrator-specific state: active workflows, pending tasks, sessi
 
 ### Extended Memory Files
 
-For detailed notes, create separate files in `context/memory/<topic>.md`. These are automatically indexed for semantic search.
+For detailed notes, create separate files in the appropriate category folder under `context/memory/` (e.g. `assistant/architecture/`, `assistant/voice/`, `projects/content-creation/`, etc.). See the **Schema** section in `MEMORY.md` for the full folder ontology and frontmatter convention. New files are automatically indexed for semantic search.
 
 ### File Editing Rule
 

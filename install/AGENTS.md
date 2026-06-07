@@ -310,7 +310,7 @@ This is a fresh installation. Personalize this section as you learn about the us
 
 This section lists active projects with dedicated memory files. A fresh installation starts empty — add entries as projects are scoped.
 
-See `context/memory/personal_projects_index.md` (create this when you have multiple tracked projects) for full details.
+See `context/memory/projects/personal_projects_index.md` (create this when you have multiple tracked projects) for full details.
 
 ### Compact Instructions
 
