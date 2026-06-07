@@ -12,7 +12,7 @@ from utils.mcp_config import load_available_mcps
 
 # Limits for content injection
 MAX_MEMORY_CHARS = 12000
-MAX_MEMORY_INDEX_CHARS = 20000
+MAX_MEMORY_INDEX_CHARS = 40000
 
 # Shared memory index filename
 MEMORY_INDEX_FILENAME = "MEMORY.md"
@@ -90,7 +90,20 @@ def _load_memory_index(config: OrchestratorConfig) -> str:
     try:
         content = memory_index_path.read_text(encoding="utf-8")
         if len(content) > MAX_MEMORY_INDEX_CHARS:
-            content = content[:MAX_MEMORY_INDEX_CHARS] + "\n... (truncated)"
+            truncated = content[:MAX_MEMORY_INDEX_CHARS]
+            shown_lines = truncated.count("\n") + (0 if truncated.endswith("\n") else 1)
+            total_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+            # End cleanly on the last fully-shown line, then append the marker.
+            last_newline = truncated.rfind("\n")
+            if last_newline != -1:
+                truncated = truncated[: last_newline + 1]
+                shown_lines = truncated.count("\n")
+            next_line = shown_lines + 1
+            content = (
+                truncated
+                + f"\n[truncated — showing {shown_lines} of {total_lines} lines — "
+                f"read MEMORY.md starting at line {next_line} if you want to see the rest]\n"
+            )
         return content
     except Exception:
         return "(failed to read memory index)"
