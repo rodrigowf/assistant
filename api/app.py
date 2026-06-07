@@ -205,6 +205,35 @@ def create_app() -> FastAPI:
                 return FileResponse(candidate)
             raise HTTPException(status_code=404)
 
+    # Memory directory mount: /memory/<path> → context/memory/<path>.
+    # Exposes the structured memory wiki over the local network so a
+    # peripheral can fetch / render any memory file directly. Registered
+    # before the SPA catch-all so /memory never falls through.
+    context_memory = project_root / "context" / "memory"
+    context_memory_resolved = context_memory.resolve() if context_memory.exists() else None
+    if context_memory_resolved is not None:
+        @app.get("/memory")
+        @app.get("/memory/")
+        async def serve_memory_index():
+            candidate = context_memory / "MEMORY.md"
+            if candidate.is_file():
+                return FileResponse(candidate)
+            raise HTTPException(status_code=404)
+
+        @app.get("/memory/{full_path:path}")
+        async def serve_memory(full_path: str):
+            if not full_path:
+                raise HTTPException(status_code=404)
+            candidate = (context_memory / full_path).resolve()
+            if (
+                candidate.is_relative_to(context_memory_resolved)
+                and candidate.is_file()
+            ):
+                return FileResponse(candidate)
+            # Directory listing not supported — return 404. Use the index
+            # at /memory/ or fetch specific files.
+            raise HTTPException(status_code=404)
+
     # Serve the production frontend build if it exists
     frontend_dist = project_root / "frontend" / "dist"
     if frontend_dist.exists():
