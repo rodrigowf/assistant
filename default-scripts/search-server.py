@@ -346,8 +346,14 @@ def run_socket_loop(server: IndexServer, sock: socket.socket, sock_path: Path, s
     """Accept connections on a pre-bound socket."""
 
     def serve_conn(conn: socket.socket) -> None:
+        # Buffered I/O (default 8KB block). Unbuffered mode (`buffering=0`)
+        # made `readline()` fall back to single-byte recv() calls, which
+        # was both slow AND lost data on requests larger than ~200KB (the
+        # default Linux socket buffer) because partial reads weren't
+        # accumulated correctly. Buffered mode uses chunked recv() and
+        # accumulates until `\n`. Must explicitly flush() after each write.
         try:
-            f = conn.makefile("rwb", buffering=0)
+            f = conn.makefile("rwb")
             while not shutdown_flag.is_set():
                 line = f.readline()
                 if not line:
@@ -355,11 +361,16 @@ def run_socket_loop(server: IndexServer, sock: socket.socket, sock_path: Path, s
                 try:
                     request = json.loads(line.decode().strip())
                 except json.JSONDecodeError:
-                    f.write(json.dumps({"error": "Invalid JSON"}).encode() + b"\n")
+                    try:
+                        f.write(json.dumps({"error": "Invalid JSON"}).encode() + b"\n")
+                        f.flush()
+                    except BrokenPipeError:
+                        return
                     continue
                 reply = server.handle(request)
                 try:
                     f.write(json.dumps(reply).encode() + b"\n")
+                    f.flush()
                 except BrokenPipeError:
                     return
                 if request.get("command") == "shutdown":

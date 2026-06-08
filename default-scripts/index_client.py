@@ -80,7 +80,10 @@ class SocketClient:
         s.settimeout(self.timeout)
         s.connect(str(self.sock_path))
         self._sock = s
-        self._file = s.makefile("rwb", buffering=0)
+        # Buffered I/O (default 8KB block). Unbuffered mode lost data on
+        # writes larger than ~200KB because socket sends weren't accumulated
+        # correctly on slower hosts (Jetson). Must flush() after each write.
+        self._file = s.makefile("rwb")
 
     def close(self) -> None:
         try:
@@ -100,6 +103,7 @@ class SocketClient:
         if request_timeout is not None and self._sock is not None:
             self._sock.settimeout(request_timeout)
         self._file.write(json.dumps(request).encode() + b"\n")
+        self._file.flush()
         line = self._file.readline()
         if not line:
             raise ConnectionError("warm server closed the connection")

@@ -348,33 +348,32 @@ def _memory_section(
 
     section = f"""## Memory System
 
-The orchestrator uses a two-tier memory system: a **shared index** for reference information, and a **private memory** for orchestrator-specific state.
+`context/memory/` is a structured wiki — files live in semantic category folders, carry YAML frontmatter, and link to related files inline. `MEMORY.md` is the index: it documents the current folder ontology, the frontmatter schema, the cross-reference format, and lists every file with its location. Read MEMORY.md to discover what categories exist and what files already cover a topic — it is loaded below.
 
-### Shared Memory Index (`context/memory/MEMORY.md`)
+### Adding or updating memory
 
-This is the authoritative reference for skills, memory files, and project information. Both you and agent sessions rely on this index.
+1. **Reuse before creating.** Search the existing index for the closest file. If the new info extends or revises an existing topic, edit that file — do not create a new one for every fact.
+2. **Pick the category.** If no existing file fits, place the new file under the most specific matching folder from the ontology in MEMORY.md. If no folder fits, create a new subfolder — folders are cheap; misplaced files are expensive. Mirror new folders as new sections in MEMORY.md.
+3. **Fill all frontmatter fields.** Set `created` and `modified` to today. Set `source` to the originating session UUID + title when knowable; otherwise `curated (<short reason>)`. Compute `references` from the files you cite.
+4. **Cross-link.** Where prose mentions another memory file, link it inline with a relative markdown link `[name.md](../folder/name.md)`. Add the same path to the `references:` array. Then update those other files' `references:` arrays so the link is bidirectional.
+5. **Update MEMORY.md** in the same edit pass — add a one-line entry under the correct section header.
 
-**Your maintenance responsibilities:**
-- Update the Skills Reference table when skills are added, removed, or modified
-- Add reference lines for new memory files
-- Update project entries when their status changes
+### Editing rules
 
-### Your Private Memory (`{relative_path}`)
+- `write_file` is a full overwrite — read first, edit, then write the complete updated content. It creates parent directories automatically, so writing to `context/memory/<new-folder>/<file>.md` works without a separate mkdir.
+- When you change a file's content, bump its `modified` field to today.
+- When you move a file to a different category, update its `category` field and grep the memory tree for inbound references to the old path.
+- Never omit existing index entries unless they are clearly obsolete.
 
-Use this for orchestrator-specific state: active workflows, pending tasks, session notes.
+### Searching memory
 
-### Extended Memory Files
+- `search_memory` returns chunks enriched with the source file's `frontmatter` — use category and tags to triage before reading the full file.
+- `search_history` returns chunks enriched with `session_uuid`, `session_title`, `session_datetime`, and `linked_memories` — follow `linked_memories` to jump from a conversation back to relevant memory files.
+- For directed retrieval, prefer direct file lookup via MEMORY.md over semantic search. Search is a supplement.
 
-For detailed notes, create separate files in the appropriate category folder under `context/memory/` (e.g. `assistant/architecture/`, `assistant/voice/`, `projects/content-creation/`, etc.). See the **Schema** section in `MEMORY.md` for the full folder ontology and frontmatter convention. New files are automatically indexed for semantic search.
+### Your private memory (`{relative_path}`)
 
-### File Editing Rule
-
-**Critical: `write_file` performs a full overwrite.** Always:
-1. Read the file first
-2. Make your changes
-3. Write the complete updated content
-
-Never omit existing entries unless they are clearly obsolete."""
+For orchestrator-specific state: active workflows, pending tasks, session notes. Does NOT follow the frontmatter convention."""
 
     # Add shared memory index contents
     if memory_index:
