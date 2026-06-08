@@ -179,6 +179,26 @@ The user interacts with you through a multi-tab web interface. Each agent sessio
 - Maintain persistent memory for cross-session context"""
 
 
+def _self_reference_section(context: dict[str, Any]) -> str | None:
+    """Expose the orchestrator's own conversation JSONL path.
+
+    Lets the orchestrator delegate a digest of this conversation to an agent
+    session by handing over an exact file path, instead of describing the
+    conversation and asking the agent to find it.
+    """
+    session = context.get("session")
+    jsonl_path = getattr(session, "_jsonl_path", None) if session is not None else None
+    if jsonl_path is None:
+        return None
+    return (
+        "## This Conversation\n"
+        f"Your conversation JSONL: `{jsonl_path}`\n\n"
+        "Pass this path to an agent session when delegating a digest of this "
+        "conversation into memory. The append stream is owned by the live "
+        "session — treat the file as read-only from any delegated agent."
+    )
+
+
 def _active_sessions_section(context: dict[str, Any]) -> str:
     """Build the active sessions status section from the live pool.
 
@@ -581,6 +601,7 @@ def build_system_prompt(
     """
     sections = [
         _role_section(),
+        _self_reference_section(context),
         _active_sessions_section(context),
         _mcp_section(),
         _memory_section(config, voice_provider_id=voice_provider_id),
