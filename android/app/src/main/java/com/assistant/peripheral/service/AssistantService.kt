@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -48,6 +49,35 @@ class AssistantService : Service() {
 
         // Restart the detector periodically to recover from stale SpeechRecognizer state
         private const val WATCHDOG_INTERVAL_MS = 2 * 60 * 60 * 1000L // 2 hours
+
+        // Window inside which a second `startWakeWord` call with the same
+        // (wakeWord, voiceWord, micGain) tuple is treated as a duplicate
+        // (Android intent redelivery / sticky-restart races). 3 s covers
+        // both 20 ms and 1.3 s redelivery gaps observed in the field, and
+        // is short enough not to mask legitimate user toggles. See
+        // wakeword_subsystem_refactor_plan_2026_06_09.md §3 Inc 3.
+        private const val WAKE_START_DEDUPE_WINDOW_MS = 3000L
+
+        /**
+         * Pure predicate for the wake-word start dedupe (Increment 3).
+         * Returns true when a `startWakeWord(wakeWord, voiceWord, micGain)`
+         * call should short-circuit because it matches the previous call's
+         * key AND it lands within `WAKE_START_DEDUPE_WINDOW_MS` of the
+         * previous call.
+         *
+         * Strict `<` on the time window (not `<=`): a call exactly at the
+         * window boundary is allowed through, so a legitimate user toggle
+         * exactly 3 s after a redelivered intent isn't masked.
+         */
+        internal fun shouldDedupeWakeStart(
+            key: Triple<String, String, Float>,
+            nowMs: Long,
+            lastKey: Triple<String, String, Float>?,
+            lastAtMs: Long,
+        ): Boolean =
+            lastKey != null &&
+                key == lastKey &&
+                (nowMs - lastAtMs) < WAKE_START_DEDUPE_WINDOW_MS
 
         fun start(context: Context) {
             val intent = Intent(context, AssistantService::class.java)
@@ -154,6 +184,14 @@ class AssistantService : Service() {
     private var lastVoiceWord: String = ""
     private var lastEnabled: Boolean = false
     private var lastWakeMicGain: Float = 1.0f
+
+    // Inc 3 dedupe: last `startWakeWord` (key, monotonic-clock timestamp)
+    // — used by `shouldDedupeWakeStart` to suppress duplicate intents
+    // arriving inside `WAKE_START_DEDUPE_WINDOW_MS`. SystemClock.elapsedRealtime
+    // (monotonic, includes sleep) is preferred over System.currentTimeMillis
+    // (wall-clock, jumps with NTP / user changes).
+    private var lastStartKey: Triple<String, String, Float>? = null
+    private var lastStartAtMs: Long = 0L
 
     // Receiver for screen-on (ACTION_SCREEN_ON) and keyguard dismiss (ACTION_USER_PRESENT).
     // ACTION_SCREEN_ON fires immediately when the display turns on (even with lock screen).
@@ -312,6 +350,14 @@ class AssistantService : Service() {
     }
 
     private fun startWakeWord(wakeWord: String, voiceWord: String, micGain: Float = lastWakeMicGain) {
+        val key = Triple(wakeWord, voiceWord, micGain)
+        val nowMs = SystemClock.elapsedRealtime()
+        if (shouldDedupeWakeStart(key, nowMs, lastStartKey, lastStartAtMs)) {
+            Log.d(TAG, "startWakeWord() dedupe — same key within ${WAKE_START_DEDUPE_WINDOW_MS}ms")
+            return
+        }
+        lastStartKey = key
+        lastStartAtMs = nowMs
         wakeWordDetector?.stop()
         wakeWordDetector = WakeWordDetector(this, wakeWord, voiceWord, micGain)
         wakeWordDetector?.start()
@@ -321,6 +367,11 @@ class AssistantService : Service() {
     private fun stopWakeWord() {
         wakeWordDetector?.stop()
         wakeWordDetector = null
+        // Clear Inc 3 dedupe state so a subsequent enable-toggle with the
+        // same (wake, voice, gain) within 3 s is NOT mistaken for a
+        // duplicate intent. The user genuinely wants a restart here.
+        lastStartKey = null
+        lastStartAtMs = 0L
         Log.d(TAG, "Wake word detection stopped")
     }
 
