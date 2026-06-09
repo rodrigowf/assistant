@@ -45,10 +45,13 @@ class ButtonAccessibilityService : AccessibilityService() {
                     val enabled = getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
                         .getBoolean("button_trigger_enabled", false)
                     if (!enabled) return false
-                    Log.d(TAG, "Recents long-press (${held}ms) → starting voice session")
+                    Log.d(TAG, "Recents long-press (${held}ms) → starting realtime voice session")
                     AssistantService.bringToForeground(this)
+                    // Recents long-press triggers the same UX path as the realtime
+                    // wake word — fire ACTION_WAKE_WORD_DETECTED (post-Detour-3 naming:
+                    // wakeWord = realtime conversation).
                     LocalBroadcastManager.getInstance(this)
-                        .sendBroadcast(Intent(WakeWordDetector.ACTION_VOICE_WORD_DETECTED))
+                        .sendBroadcast(Intent(WakeWordDetector.ACTION_WAKE_WORD_DETECTED))
                     return true  // consume the event (suppress recents drawer)
                 }
             }

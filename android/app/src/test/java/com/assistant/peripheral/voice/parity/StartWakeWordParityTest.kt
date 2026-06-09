@@ -16,10 +16,11 @@ import org.junit.Test
  * 76ae6a6.
  *
  * Plan §3 Inc 3 spec: introduce dedupe keyed on
- * `(wakeWord, voiceWord, micGain)` with a 3 s window. If the same key
- * arrives within `DEDUPE_WINDOW_MS=3000`, short-circuit; otherwise update
- * the last-key/last-at fields and proceed with the existing
- * `startWakeWord` body.
+ * `(talkWord, wakeWord, micGain)` (post-Detour-3 naming, plan §0.5;
+ * pre-rename this was `(wakeWord, voiceWord, micGain)`) with a 3 s window.
+ * If the same key arrives within `DEDUPE_WINDOW_MS=3000`, short-circuit;
+ * otherwise update the last-key/last-at fields and proceed with the
+ * existing `startWakeWord` body.
  *
  * Same Option A+B pattern as Inc 1 and Inc 2: extract the dedupe
  * decision to a pure companion-object helper `shouldDedupeWakeStart`
@@ -29,10 +30,10 @@ import org.junit.Test
  * Behavior preserved (verified by reading `startWakeWord` at HEAD 76ae6a6)
  *   - First call still tears down the previous detector via
  *     `wakeWordDetector?.stop()`.
- *   - First call still constructs `WakeWordDetector(this, wakeWord,
- *     voiceWord, micGain)` and calls `.start()`.
- *   - First call still logs `Wake word detection started — wake: "$w",
- *     voice: "$v", gain=$g` at `Log.d`.
+ *   - First call still constructs `WakeWordDetector(this, talkWord,
+ *     wakeWord, micGain)` and calls `.start()`.
+ *   - First call still logs `Wake word detection started — talk: "$t",
+ *     wake: "$w", gain=$g` at `Log.d`.
  *   - All tuned constants untouched.
  *   - Detour 2's single-ingress behavior preserved — the dedupe is
  *     additive defense against the rare-race scenarios that survived
@@ -131,7 +132,7 @@ class StartWakeWordParityTest {
     @Test
     fun `dedupeDoesNotFireOnDifferentVoiceWord`() {
         assertFalse(
-            "Different voiceWord within 3 s must NOT dedupe — user changed config",
+            "Different wakeWord (realtime trigger) within 3 s must NOT dedupe — user changed config",
             AssistantService.shouldDedupeWakeStart(
                 key = Triple("my friend", "computer", 1.5f),
                 nowMs = 1_500L,

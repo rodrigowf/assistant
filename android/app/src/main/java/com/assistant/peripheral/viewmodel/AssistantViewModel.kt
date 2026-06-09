@@ -259,8 +259,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val SERVER_URL = stringPreferencesKey("server_url")
         val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
         val ENABLE_WAKE_WORD = booleanPreferencesKey("enable_wake_word")
-        val WAKE_WORD = stringPreferencesKey("wake_word")
-        val VOICE_WORD = stringPreferencesKey("voice_word")
+        // Detour 3 naming swap-rename (plan §0.5):
+        //   TALK_WORD → turn-based single voice message ("push-to-talk")
+        //   WAKE_WORD → realtime WebRTC voice conversation
+        // On-the-wire keys use fully-qualified forms ("turn_talk_word",
+        // "realtime_wake_word") so the persistence layer is self-describing.
+        val TALK_WORD = stringPreferencesKey("turn_talk_word")
+        val WAKE_WORD = stringPreferencesKey("realtime_wake_word")
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
         val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
@@ -314,8 +319,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     savedServers = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS]),
                     autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
                     enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
+                    talkWord = preferences[PreferenceKeys.TALK_WORD] ?: AppSettings().talkWord,
                     wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
-                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: AppSettings().voiceWord,
                     themeMode = try {
                         ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
                     } catch (e: Exception) {
@@ -1857,12 +1862,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     // Inline AssistantService.updateWakeWord calls intentionally removed from
-    // updateEnableWakeWord / updateWakeWord / updateVoiceWord — MainActivity's
-    // LaunchedEffect (keyed on enableWakeWord / wakeWord / voiceWord /
+    // updateEnableWakeWord / updateTalkWord / updateWakeWord — MainActivity's
+    // LaunchedEffect (keyed on enableWakeWord / talkWord / wakeWord /
     // wakeWordMicGainLevel) is the single ingress to the service. Each setting
     // change emits a DataStore update; the LaunchedEffect picks it up and fires
     // exactly one updateWakeWord intent, instead of the old double-intent
     // pattern (one inline, one from the effect — see commit d6181b1).
+    //
+    // Naming (Detour 3 / plan §0.5):
+    //   updateTalkWord  → turn-based single voice message phrase
+    //   updateWakeWord  → realtime WebRTC voice conversation phrase
 
     fun updateEnableWakeWord(enabled: Boolean) {
         viewModelScope.launch {
@@ -1872,18 +1881,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun updateWakeWord(word: String) {
+    fun updateTalkWord(word: String) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
-                preferences[PreferenceKeys.WAKE_WORD] = word
+                preferences[PreferenceKeys.TALK_WORD] = word
             }
         }
     }
 
-    fun updateVoiceWord(word: String) {
+    fun updateWakeWord(word: String) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
-                preferences[PreferenceKeys.VOICE_WORD] = word
+                preferences[PreferenceKeys.WAKE_WORD] = word
             }
         }
     }

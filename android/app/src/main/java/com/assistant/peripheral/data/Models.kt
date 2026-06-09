@@ -290,11 +290,14 @@ data class AppSettings(
     val savedServers: List<SavedServer> = emptyList(),
     val autoConnect: Boolean = true,
     val enableWakeWord: Boolean = true,
-    val wakeWord: String = "my friend",        // comma-separated, triggers turn-based voice input
-    val voiceWord: String = "wake up",         // comma-separated, triggers realtime WebRTC voice session
+    // Per Detour 3 naming convention (plan §0.5): `talkWord` triggers a single
+    // turn-based voice message ("push-to-talk"-style); `wakeWord` triggers a
+    // realtime WebRTC voice conversation ("wake up the assistant").
+    val talkWord: String = "my friend",        // comma-separated, triggers single turn-based voice message
+    val wakeWord: String = "wake up",          // comma-separated, triggers realtime WebRTC voice conversation
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,            // 0.0 to 1.5, where 1.0 is normal (voice session only)
-    val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for wake word detection
+    val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for the wake-word detector (umbrella, both phrase types)
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
     val audioOutput: AudioOutput = AudioOutput.AUTO,  // where voice session audio is routed; AUTO lets the OS pick

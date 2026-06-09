@@ -35,14 +35,17 @@ import kotlin.math.sqrt
  */
 class WakeWordDetector(
     private val context: Context,
-    private val wakeWord: String,       // triggers turn-based recording
-    private val voiceWord: String = "", // triggers realtime voice session (empty = disabled)
-    private val micGain: Float = 1.0f  // scales RMS threshold (independent of voice session gain)
+    // Per Detour 3 naming (plan §0.5):
+    //   talkWord = turn-based single voice message ("push-to-talk")
+    //   wakeWord = realtime WebRTC voice conversation ("wake up the assistant")
+    private val talkWord: String,
+    private val wakeWord: String = "", // empty = disabled
+    private val micGain: Float = 1.0f, // scales RMS threshold (independent of voice session gain)
 ) {
     companion object {
         private const val TAG = "WakeWordDetector"
-        const val ACTION_WAKE_WORD_DETECTED = "com.assistant.peripheral.WAKE_WORD_DETECTED"
-        const val ACTION_VOICE_WORD_DETECTED = "com.assistant.peripheral.VOICE_WORD_DETECTED"
+        const val ACTION_TALK_WORD_DETECTED = "com.assistant.peripheral.TURN_TALK_WORD_DETECTED"
+        const val ACTION_WAKE_WORD_DETECTED = "com.assistant.peripheral.REALTIME_WAKE_WORD_DETECTED"
 
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
@@ -157,12 +160,14 @@ class WakeWordDetector(
     private var consecutiveMisses = 0  // exponential backoff counter
 
     // Pre-computed phonetic variants for faster matching.
-    // wakeWord / voiceWord may be comma-separated lists of phrases.
-    private val wakeVariants = wakeWord.split(",")
+    // talkWord / wakeWord may be comma-separated lists of phrases.
+    //   talkVariants = phrases that trigger a single turn-based voice message
+    //   wakeVariants = phrases that trigger a realtime WebRTC conversation
+    private val talkVariants = talkWord.split(",")
         .map { it.trim() }.filter { it.isNotEmpty() }
         .flatMap { buildVariants(it) }.distinct()
-    private val voiceVariants = if (voiceWord.isNotEmpty())
-        voiceWord.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    private val wakeVariants = if (wakeWord.isNotEmpty())
+        wakeWord.split(",").map { it.trim() }.filter { it.isNotEmpty() }
             .flatMap { buildVariants(it) }.distinct()
     else emptyList()
 
@@ -210,8 +215,8 @@ class WakeWordDetector(
             Log.d(TAG, "start() ignored — already active")
             return
         }
-        Log.d(TAG, "Starting — wake variants: $wakeVariants")
-        if (voiceVariants.isNotEmpty()) Log.d(TAG, "Voice variants: $voiceVariants")
+        Log.d(TAG, "Starting — talk variants: $talkVariants")
+        if (wakeVariants.isNotEmpty()) Log.d(TAG, "Wake variants: $wakeVariants")
         isActive = true
         isPaused = false
         startSilenceMonitor()
@@ -629,21 +634,24 @@ class WakeWordDetector(
     private fun checkForWakeWord(results: List<String>): Boolean {
         for (result in results) {
             val lower = result.lowercase()
-            // Check voice word first (more specific / longer phrase wins if both match)
-            if (voiceVariants.isNotEmpty() && voiceVariants.any { lower.contains(it) }) {
-                Log.d(TAG, "Voice word detected in: \"$result\"")
-                // Bring app to foreground and unlock screen before broadcasting
-                AssistantService.bringToForeground(context)
-                LocalBroadcastManager.getInstance(context)
-                    .sendBroadcast(Intent(ACTION_VOICE_WORD_DETECTED))
-                return true
-            }
-            if (wakeVariants.any { lower.contains(it) }) {
-                Log.d(TAG, "Wake word detected in: \"$result\"")
+            // Check the realtime wake word FIRST — when a result contains both
+            // a wake-word match and a talk-word match, the realtime conversation
+            // takes precedence (more capable interaction). This preserves the
+            // pre-Detour-3 precedence ordering exactly.
+            if (wakeVariants.isNotEmpty() && wakeVariants.any { lower.contains(it) }) {
+                Log.d(TAG, "Wake word (realtime) detected in: \"$result\"")
                 // Bring app to foreground and unlock screen before broadcasting
                 AssistantService.bringToForeground(context)
                 LocalBroadcastManager.getInstance(context)
                     .sendBroadcast(Intent(ACTION_WAKE_WORD_DETECTED))
+                return true
+            }
+            if (talkVariants.any { lower.contains(it) }) {
+                Log.d(TAG, "Talk word (turn-based) detected in: \"$result\"")
+                // Bring app to foreground and unlock screen before broadcasting
+                AssistantService.bringToForeground(context)
+                LocalBroadcastManager.getInstance(context)
+                    .sendBroadcast(Intent(ACTION_TALK_WORD_DETECTED))
                 return true
             }
         }

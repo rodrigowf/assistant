@@ -46,8 +46,11 @@ fun SettingsScreen(
     isBluetoothAvailable: Boolean,
     isWiredHeadphoneAvailable: Boolean,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
+    // Per Detour 3 naming (plan §0.5):
+    //   onUpdateTalkWord = turn-based single voice message phrase
+    //   onUpdateWakeWord = realtime WebRTC voice conversation phrase
+    onUpdateTalkWord: (String) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
-    onUpdateVoiceWord: (String) -> Unit,
     onUpdateEnableButtonTrigger: (Boolean) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
@@ -106,8 +109,8 @@ fun SettingsScreen(
                 isBluetoothAvailable = isBluetoothAvailable,
                 isWiredHeadphoneAvailable = isWiredHeadphoneAvailable,
                 onUpdateEnableWakeWord = onUpdateEnableWakeWord,
+                onUpdateTalkWord = onUpdateTalkWord,
                 onUpdateWakeWord = onUpdateWakeWord,
-                onUpdateVoiceWord = onUpdateVoiceWord,
                 onUpdateEnableButtonTrigger = onUpdateEnableButtonTrigger,
                 onConnect = onConnect,
                 onDisconnect = onDisconnect,
@@ -148,8 +151,11 @@ private fun AppSettingsTabContent(
     isBluetoothAvailable: Boolean,
     isWiredHeadphoneAvailable: Boolean,
     onUpdateEnableWakeWord: (Boolean) -> Unit,
+    // Per Detour 3 naming (plan §0.5):
+    //   onUpdateTalkWord = turn-based single voice message phrase
+    //   onUpdateWakeWord = realtime WebRTC voice conversation phrase
+    onUpdateTalkWord: (String) -> Unit,
     onUpdateWakeWord: (String) -> Unit,
-    onUpdateVoiceWord: (String) -> Unit,
     onUpdateEnableButtonTrigger: (Boolean) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
@@ -160,8 +166,8 @@ private fun AppSettingsTabContent(
     onSelectSavedServer: (SavedServer) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var talkWordText by remember(settings.talkWord) { mutableStateOf(settings.talkWord) }
     var wakeWordText by remember(settings.wakeWord) { mutableStateOf(settings.wakeWord) }
-    var voiceWordText by remember(settings.voiceWord) { mutableStateOf(settings.voiceWord) }
 
     Column(
         modifier = modifier
@@ -437,22 +443,22 @@ private fun AppSettingsTabContent(
                     if (settings.enableWakeWord) {
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        // Turn-based voice input wake word
+                        // talkWord — turn-based single voice message trigger.
                         OutlinedTextField(
-                            value = wakeWordText,
-                            onValueChange = { wakeWordText = it },
-                            label = { Text("Voice Input Words") },
-                            placeholder = { Text("hey assistant, assistant") },
+                            value = talkWordText,
+                            onValueChange = { talkWordText = it },
+                            label = { Text("Single voice message / turn based") },
+                            placeholder = { Text("my friend, hey assistant") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            supportingText = { Text("Comma-separated phrases — any match starts turn-based recording") },
+                            supportingText = { Text("Comma-separated phrases — any match sends a single turn-based voice message") },
                             leadingIcon = {
                                 Icon(Icons.Default.Mic, contentDescription = null)
                             }
                         )
 
-                        if (wakeWordText != settings.wakeWord && wakeWordText.isNotBlank()) {
-                            TextButton(onClick = { onUpdateWakeWord(wakeWordText) }) {
+                        if (talkWordText != settings.talkWord && talkWordText.isNotBlank()) {
+                            TextButton(onClick = { onUpdateTalkWord(talkWordText) }) {
                                 Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("Save")
@@ -461,22 +467,22 @@ private fun AppSettingsTabContent(
 
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        // Realtime voice session wake word
+                        // wakeWord — realtime WebRTC voice conversation trigger.
                         OutlinedTextField(
-                            value = voiceWordText,
-                            onValueChange = { voiceWordText = it },
-                            label = { Text("Realtime Voice Words") },
-                            placeholder = { Text("hey realtime, realtime") },
+                            value = wakeWordText,
+                            onValueChange = { wakeWordText = it },
+                            label = { Text("Realtime voice conversation") },
+                            placeholder = { Text("wake up, hey realtime") },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            supportingText = { Text("Comma-separated phrases — any match starts realtime WebRTC conversation") },
+                            supportingText = { Text("Comma-separated phrases — any match starts a realtime WebRTC conversation") },
                             leadingIcon = {
                                 Icon(Icons.Default.RecordVoiceOver, contentDescription = null)
                             }
                         )
 
-                        if (voiceWordText != settings.voiceWord && voiceWordText.isNotBlank()) {
-                            TextButton(onClick = { onUpdateVoiceWord(voiceWordText) }) {
+                        if (wakeWordText != settings.wakeWord && wakeWordText.isNotBlank()) {
+                            TextButton(onClick = { onUpdateWakeWord(wakeWordText) }) {
                                 Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text("Save")
