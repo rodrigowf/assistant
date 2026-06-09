@@ -78,47 +78,16 @@ class WakeWordDetector(
         private const val RECOGNIZER_HANG_WATCHDOG_MS = 10_000L
 
         /**
-         * Generate phonetic variants for a wake word phrase.
-         * SpeechRecognizer may mishear words (e.g. "hey assistant" → "a system", "resistant").
-         * Only full-phrase substitutions are generated — no bare single words — to avoid
-         * matching every utterance that contains a common word.
+         * Normalize a wake-word phrase. Inc 5 dropped the phonetic `wordSubs`
+         * expansion table (plan §3 Inc 5): variants are now the configured
+         * phrases verbatim. Per-phrase output is a single-element list
+         * containing the lowercased + trimmed input. The split-by-comma
+         * fan-out lives at the call site (`talkVariants` / `wakeVariants`
+         * below) so a user can still configure multiple alternatives via
+         * comma separation.
          */
-        fun buildVariants(phrase: String): List<String> {
-            val normalized = phrase.lowercase().trim()
-            val variants = mutableListOf(normalized)
-
-            // Minimum length guard: don't generate variants shorter than the original phrase
-            // minus the longest word (prevents bare "wake up" from "hey wake up" when "hey"→"").
-            val minVariantLen = normalized.length - (normalized.split(" ").maxOfOrNull { it.length } ?: 0)
-
-            // Per-word substitutions for common mishearings.
-            // Each entry replaces the word in the full phrase (not added standalone).
-            val wordSubs = mapOf(
-                "hey" to listOf("a", "hay", "he", "hate", "8"),
-                "assistant" to listOf("system", "assist", "distance", "resistant",
-                    "existence", "insistent", "assistance"),
-                "realtime" to listOf("real time", "real-time", "realm time", "real tight",
-                    "reel time"),
-                "computer" to listOf("commuter", "computers"),
-                "jarvis" to listOf("jar vis", "jarvi"),
-            )
-
-            val phraseWords = normalized.split(" ")
-            for ((word, subs) in wordSubs) {
-                if (phraseWords.contains(word)) {
-                    for (sub in subs) {
-                        // Replace the word inside the full phrase context only
-                        val variant = normalized.replace(word, sub).trim()
-                        // Skip variants that are too short (would cause false positives)
-                        if (variant.length >= minVariantLen) {
-                            variants.add(variant)
-                        }
-                    }
-                }
-            }
-
-            return variants.distinct()
-        }
+        fun buildVariants(phrase: String): List<String> =
+            listOf(phrase.lowercase().trim())
 
         /**
          * Pure predicate for the `start()` idempotency guard (Increment 1).
