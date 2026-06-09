@@ -264,6 +264,43 @@ class AssistantService : Service() {
         }
     }
 
+    /**
+     * Inc 9: notification manager handle for re-issuing the foreground
+     * notification when the mic-unavailable state changes. Lazily fetched
+     * via `getSystemService`.
+     */
+    private val notificationManager: NotificationManager
+        get() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+    /**
+     * Inc 9: tracks whether the foreground notification is currently
+     * showing the "mic stalled" warning text. Toggled by the
+     * ACTION_MIC_UNAVAILABLE / ACTION_MIC_AVAILABLE receiver. The
+     * notification builder reads this to pick the contentText.
+     */
+    @Volatile private var micUnavailable: Boolean = false
+
+    private val micAvailabilityReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                WakeWordDetector.ACTION_MIC_UNAVAILABLE -> {
+                    if (!micUnavailable) {
+                        micUnavailable = true
+                        Log.w(TAG, "Mic unavailable — updating notification")
+                        notificationManager.notify(NOTIFICATION_ID, createNotification())
+                    }
+                }
+                WakeWordDetector.ACTION_MIC_AVAILABLE -> {
+                    if (micUnavailable) {
+                        micUnavailable = false
+                        Log.d(TAG, "Mic available again — clearing notification warning")
+                        notificationManager.notify(NOTIFICATION_ID, createNotification())
+                    }
+                }
+            }
+        }
+    }
+
     // In-memory cache of last-known config (authoritative copy is in SharedPreferences).
     // Naming (Detour 3 / plan §0.5):
     //   lastTalkWord = last turn-based phrase
@@ -363,6 +400,17 @@ class AssistantService : Service() {
             recognizerUnhealthyReceiver,
             IntentFilter(WakeWordDetector.ACTION_RECOGNIZER_UNHEALTHY),
         )
+        // Inc 9: register the mic-availability receiver. Toggles the foreground
+        // notification text between the steady-state and the "Wake word stalled"
+        // warning. Independent of the Inc 8 receiver — different signal, different
+        // remediation (notification vs detector rebuild).
+        LocalBroadcastManager.getInstance(this).registerReceiver(
+            micAvailabilityReceiver,
+            IntentFilter().apply {
+                addAction(WakeWordDetector.ACTION_MIC_UNAVAILABLE)
+                addAction(WakeWordDetector.ACTION_MIC_AVAILABLE)
+            },
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -460,6 +508,8 @@ class AssistantService : Service() {
         unregisterReceiver(screenReceiver)
         // Inc 8: unregister the NO_SPEECH health receiver.
         LocalBroadcastManager.getInstance(this).unregisterReceiver(recognizerUnhealthyReceiver)
+        // Inc 9: unregister the mic-availability receiver.
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(micAvailabilityReceiver)
         wakeWordDetector?.release()
         stopRecentsMonitor()
         Log.d(TAG, "Service destroyed")
@@ -587,9 +637,20 @@ class AssistantService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Inc 9: swap content text on mic-unavailable. The warning text is
+        // inlined here (rather than added to res/values/strings.xml) because
+        // the Inc 9 scope is observability-only — adding to strings.xml
+        // would invite localization work that's out of scope. If the
+        // notification ships in non-en locales the inline literal becomes
+        // a future cleanup.
+        val contentText = if (micUnavailable)
+            "Wake word stalled — mic held by another app"
+        else
+            getString(R.string.notification_text)
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(R.string.notification_text))
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pendingIntent)
             .setOngoing(true)

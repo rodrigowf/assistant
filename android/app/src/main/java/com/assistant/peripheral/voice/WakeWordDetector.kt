@@ -192,6 +192,41 @@ class WakeWordDetector(
         ): Boolean = consecutiveNoSpeechErrors >= NO_SPEECH_HEALTH_THRESHOLD
 
         internal fun noSpeechHealthThresholdForTest(): Int = NO_SPEECH_HEALTH_THRESHOLD
+
+        /**
+         * Inc 9: mic-acquisition retry warn threshold. After this many
+         * consecutive failed AudioRecord acquisitions in
+         * startSilenceMonitor's retry loop, fire ACTION_MIC_UNAVAILABLE
+         * so AssistantService can update the foreground notification.
+         * 8 per plan §9 decision 7 — 4 s of churn at 500 ms / attempt.
+         * 4 s is "something's wrong"; 8 s is too late.
+         */
+        private const val MIC_RETRY_WARN_THRESHOLD = 8
+
+        /**
+         * Inc 9: LocalBroadcast action fired when mic-acquisition has
+         * been failing for MIC_RETRY_WARN_THRESHOLD attempts in a row.
+         * AssistantService updates the notification text.
+         */
+        const val ACTION_MIC_UNAVAILABLE =
+            "com.assistant.peripheral.MIC_UNAVAILABLE"
+
+        /**
+         * Inc 9: LocalBroadcast action fired when the FIRST successful
+         * mic acquisition follows a stretch where ACTION_MIC_UNAVAILABLE
+         * had been broadcast. Clears the warning notification.
+         */
+        const val ACTION_MIC_AVAILABLE =
+            "com.assistant.peripheral.MIC_AVAILABLE"
+
+        /**
+         * Pure predicate for the Inc 9 mic-unavailable broadcast.
+         * Strict `>=` so we fire AT the threshold, not after.
+         */
+        internal fun shouldBroadcastMicUnavailable(failures: Int): Boolean =
+            failures >= MIC_RETRY_WARN_THRESHOLD
+
+        internal fun micRetryWarnThresholdForTest(): Int = MIC_RETRY_WARN_THRESHOLD
     }
 
     /**
@@ -388,7 +423,15 @@ class WakeWordDetector(
         silenceMonitorJob = scope.launch(Dispatchers.IO) {
             // Retry loop: mic may be held by AudioRecorder (turn-based recording) for a few seconds.
             // Keep trying until the mic is free or we're no longer active.
+            // Inc 9: count failed acquisitions and broadcast ACTION_MIC_UNAVAILABLE
+            // at threshold so AssistantService updates the notification text. The
+            // retry mechanism itself is preserved (per §1 non-goals) — only the
+            // silence is broken. `notifiedUnavailable` ensures the broadcast is
+            // emitted ONCE per stalled-stretch (idempotent at the receiver too,
+            // but cheaper to gate at the source).
             var recorder: AudioRecord? = null
+            var failures = 0
+            var notifiedUnavailable = false
             while (isActive && recorder == null) {
                 val candidate = try {
                     AudioRecord(
@@ -400,6 +443,13 @@ class WakeWordDetector(
                     )
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to create AudioRecord (will retry): ${e.message}")
+                    failures++
+                    if (!notifiedUnavailable && shouldBroadcastMicUnavailable(failures)) {
+                        Log.w(TAG, "Mic unavailable for $failures consecutive attempts — broadcasting warning")
+                        LocalBroadcastManager.getInstance(context)
+                            .sendBroadcast(Intent(ACTION_MIC_UNAVAILABLE))
+                        notifiedUnavailable = true
+                    }
                     kotlinx.coroutines.delay(500L)
                     continue
                 }
@@ -407,11 +457,27 @@ class WakeWordDetector(
                 if (candidate.state != AudioRecord.STATE_INITIALIZED) {
                     Log.w(TAG, "AudioRecord not initialized (mic busy, will retry)")
                     candidate.release()
+                    failures++
+                    if (!notifiedUnavailable && shouldBroadcastMicUnavailable(failures)) {
+                        Log.w(TAG, "Mic unavailable for $failures consecutive attempts — broadcasting warning")
+                        LocalBroadcastManager.getInstance(context)
+                            .sendBroadcast(Intent(ACTION_MIC_UNAVAILABLE))
+                        notifiedUnavailable = true
+                    }
                     kotlinx.coroutines.delay(500L)
                     continue
                 }
 
                 recorder = candidate
+            }
+            // Inc 9: clear any prior mic-unavailable warning now that
+            // acquisition succeeded. Only fire ACTION_MIC_AVAILABLE if we
+            // had previously fired ACTION_MIC_UNAVAILABLE — avoids spamming
+            // the notification on the steady-state happy path.
+            if (notifiedUnavailable) {
+                Log.d(TAG, "Mic acquired after $failures failures — broadcasting clear")
+                LocalBroadcastManager.getInstance(context)
+                    .sendBroadcast(Intent(ACTION_MIC_AVAILABLE))
             }
             if (recorder == null || !isActive) return@launch
 
