@@ -56,7 +56,10 @@ from typing import Any
 import websockets
 
 from orchestrator import voice_vad
-from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.providers.voice_base import (
+    BaseVoiceProvider,
+    ToolCallAccumulator,
+)
 from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from orchestrator.types import (
     ErrorEvent,
@@ -91,7 +94,7 @@ GEMINI_LIVE_VOICES = (
 )
 
 
-class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
+class GeminiVoiceProviderBase(BaseVoiceProvider, ToolCallAccumulator, abc.ABC):
     """Shared Gemini Live protocol logic.
 
     Subclasses provide the URL, auth, and model-qualification details:
@@ -115,6 +118,11 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         voice: str = GEMINI_VOICE_NAME,
         transcription_language: str = "",
     ) -> None:
+        # Mixin storage (id→name + id→args). Gemini Live emits
+        # ``toolCall.functionCalls[]`` with the full args inline, so we
+        # only ever populate the names half; the args half stays empty
+        # but is harmless overhead.
+        ToolCallAccumulator.__init__(self)
         if not model:
             model = self.DEFAULT_MODEL
         self._model = model
@@ -124,12 +132,6 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         # OpenAIVoiceProvider but is currently unused.
         self._transcription_language = transcription_language
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        # Tool-name lookup: Gemini Live emits ``toolCall.functionCalls[]``
-        # with ``id`` and ``name`` we need to remember, because the
-        # canonical ``format_tool_result(call_id, output)`` signature
-        # doesn't include the tool name but Gemini's ``toolResponse``
-        # demands it.
-        self._pending_call_names: dict[str, str] = {}
         # Running transcript for interruption events.
         self._current_transcript: str = ""
         # Session resumption — Gemini Live closes the upstream WS after
@@ -245,12 +247,10 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
                 return
 
             # Side effects: track tool-call names + transcript before translating.
+            # Increment E — delegated to ``ToolCallAccumulator``.
             tool_calls = event.get("toolCall", {}).get("functionCalls", [])
             for call in tool_calls:
-                cid = call.get("id", "")
-                name = call.get("name", "")
-                if cid and name:
-                    self._pending_call_names[cid] = name
+                self.register_call(call.get("id", ""), call.get("name", ""))
 
             server_content = event.get("serverContent", {})
             parts = server_content.get("modelTurn", {}).get("parts", [])
@@ -269,91 +269,175 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
             if event.get("type") == "error" or "error" in event:
                 return
 
+    # ----- _EVENT_TRANSLATORS dispatch (Increment E) -----
+    #
+    # Gemini Live wraps payloads in nested camelCase keys
+    # (``serverContent.inputTranscription``, ``toolCall``,
+    # ``setupComplete``, ``goAway``, ...). The translator table is
+    # ORDERED — Gemini frames frequently carry several payloads at
+    # once (e.g., a ``serverContent`` with both ``inputTranscription``
+    # and ``turnComplete``); the legacy if/elif chain returned at the
+    # first match, so the table preserves that priority via an ordered
+    # tuple of (probe-key, method-name) pairs.
+
+    def _translate_setup_complete(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        # Setup acknowledgement — nothing to surface.
+        return None
+
+    def _translate_interrupted(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        return VoiceInterrupted(partial_text=self._current_transcript)
+
+    def _translate_server_content_input_transcription(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        sc = raw_event.get("serverContent", {})
+        input_t = sc.get("inputTranscription")
+        if isinstance(input_t, dict):
+            txt = input_t.get("text", "")
+            if txt:
+                return TextDelta(text=txt)
+        return None
+
+    def _translate_server_content_output_transcription(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        sc = raw_event.get("serverContent", {})
+        output_t = sc.get("outputTranscription")
+        if output_t is not None:
+            txt = output_t.get("text", "")
+            if txt:
+                return TextDelta(text=txt)
+        return None
+
+    def _translate_server_content_model_turn_text(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        # parts[].text — rare with native-audio models but supported by
+        # the half-cascade Live preview. Returns the first non-empty
+        # text part (matches the legacy ``for…return`` loop).
+        sc = raw_event.get("serverContent", {})
+        parts = sc.get("modelTurn", {}).get("parts", [])
+        for p in parts:
+            txt = p.get("text")
+            if txt:
+                return TextDelta(text=txt)
+        return None
+
+    def _translate_turn_complete(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        sc = raw_event.get("serverContent", {})
+        # Some Gemini Live builds attach usage info to
+        # outputTokensDetails; try opportunistically.
+        usage = sc.get("usageMetadata", {})
+        return TurnComplete(
+            input_tokens=usage.get("promptTokenCount", 0),
+            output_tokens=usage.get("candidatesTokenCount", 0),
+        )
+
+    def _translate_top_level_input_transcription(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        # Older Live API shape — newer builds nest under serverContent;
+        # accepted both since the docs disagree across versions.
+        input_t = raw_event.get("inputTranscription")
+        if isinstance(input_t, dict):
+            txt = input_t.get("text", "")
+            if txt:
+                return TextDelta(text=txt)
+        return None
+
+    def _translate_tool_call(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        tool_call = raw_event.get("toolCall")
+        if tool_call is None:
+            return None
+        calls = tool_call.get("functionCalls", [])
+        first: ToolUseStart | None = None
+        for call in calls:
+            cid = call.get("id", "")
+            name = call.get("name", "")
+            args = call.get("args", {}) or {}
+            if cid and name:
+                self.register_call(cid, name)
+                if first is None:
+                    first = ToolUseStart(
+                        tool_call_id=cid,
+                        tool_name=name,
+                        tool_input=args,
+                    )
+        return first
+
+    def _translate_top_level_error(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        err = raw_event["error"]
+        if isinstance(err, dict):
+            return ErrorEvent(
+                error=err.get("code", "gemini_error") if isinstance(err.get("code"), str) else "gemini_error",
+                detail=err.get("message", str(err)),
+            )
+        return ErrorEvent(error="gemini_error", detail=str(err))
+
+    @staticmethod
+    def _has_server_content_key(
+        raw_event: dict[str, Any], key: str
+    ) -> bool:
+        sc = raw_event.get("serverContent")
+        return isinstance(sc, dict) and key in sc
+
     def translate_event(self, raw_event: dict[str, Any]) -> OrchestratorEvent | None:
         """Translate a Gemini Live event to a canonical orchestrator event.
 
         Pure-ish (no transcript bookkeeping — :meth:`create_message`
         accumulates that). Returns ``None`` for events that don't map to
         anything user-visible (e.g. ``setupComplete``).
+
+        Increment E — dispatch via an ordered probe table; first
+        matching key wins. Priority preserves the legacy if/elif chain.
         """
-        # Setup acknowledgement — nothing to surface.
-        if "setupComplete" in raw_event:
-            return None
-
-        server_content = raw_event.get("serverContent")
-        if server_content is not None:
-            # Interrupted mid-response (user spoke over the model).
-            if server_content.get("interrupted"):
-                return VoiceInterrupted(partial_text=self._current_transcript)
-
-            # Input ASR transcription — what the user said. Live API
-            # ships this either as ``serverContent.inputTranscription``
-            # (current docs) or at the top level (older docs); we
-            # accept both.
-            input_t = server_content.get("inputTranscription")
-            if isinstance(input_t, dict):
-                txt = input_t.get("text", "")
-                if txt:
-                    return TextDelta(text=txt)
-
-            # Output ASR transcription — the model's spoken reply as text.
-            # Surfaces in the chat as a streaming assistant message
-            # alongside the audio.
-            output_t = server_content.get("outputTranscription")
-            if output_t is not None:
-                txt = output_t.get("text", "")
-                if txt:
-                    return TextDelta(text=txt)
-
-            # Streaming text via parts[].text (rare with native-audio
-            # models but supported by the half-cascade Live preview).
-            parts = server_content.get("modelTurn", {}).get("parts", [])
-            for p in parts:
-                txt = p.get("text")
-                if txt:
-                    return TextDelta(text=txt)
-
-            # Turn complete — emit a TurnComplete (usage isn't included
-            # by the Live API in turnComplete; report zeros).
-            if server_content.get("turnComplete"):
-                # Some Gemini Live builds attach usage info to outputTokensDetails;
-                # try opportunistically.
-                usage = server_content.get("usageMetadata", {})
-                return TurnComplete(
-                    input_tokens=usage.get("promptTokenCount", 0),
-                    output_tokens=usage.get("candidatesTokenCount", 0),
-                )
-
-        # Top-level inputTranscription — older Live API shape.  Newer
-        # builds nest it under serverContent (handled above); we accept
-        # either since the docs disagree across versions.
-        input_t = raw_event.get("inputTranscription")
-        if isinstance(input_t, dict):
-            txt = input_t.get("text", "")
-            if txt:
-                return TextDelta(text=txt)
-
-        # Tool call: track id→name so format_tool_result can echo the
-        # name back (Gemini's toolResponse requires it; our canonical
-        # format_tool_result(call_id, output) signature doesn't pass it
-        # through). Then surface the first call as ToolUseStart.
-        tool_call = raw_event.get("toolCall")
-        if tool_call is not None:
-            calls = tool_call.get("functionCalls", [])
-            first: ToolUseStart | None = None
-            for call in calls:
-                cid = call.get("id", "")
-                name = call.get("name", "")
-                args = call.get("args", {}) or {}
-                if cid and name:
-                    self._pending_call_names[cid] = name
-                    if first is None:
-                        first = ToolUseStart(
-                            tool_call_id=cid,
-                            tool_name=name,
-                            tool_input=args,
-                        )
-            return first
+        # (probe-fn, method-name) — first match wins.
+        probes: tuple[tuple[Any, str], ...] = (
+            (lambda e: "setupComplete" in e,                                "_translate_setup_complete"),
+            (lambda e: self._has_server_content_key(e, "interrupted") and e["serverContent"]["interrupted"], "_translate_interrupted"),
+            (lambda e: self._has_server_content_key(e, "inputTranscription"),  "_translate_server_content_input_transcription"),
+            (lambda e: self._has_server_content_key(e, "outputTranscription"), "_translate_server_content_output_transcription"),
+            (lambda e: self._has_server_content_key(e, "modelTurn"),           "_translate_server_content_model_turn_text"),
+            (lambda e: self._has_server_content_key(e, "turnComplete") and e["serverContent"]["turnComplete"], "_translate_turn_complete"),
+            (lambda e: isinstance(e.get("inputTranscription"), dict),       "_translate_top_level_input_transcription"),
+            (lambda e: e.get("toolCall") is not None,                       "_translate_tool_call"),
+            (lambda e: "error" in e,                                        "_translate_top_level_error"),
+        )
+        for probe, method_name in probes:
+            if probe(raw_event):
+                result = getattr(self, method_name)(raw_event)
+                if result is not None:
+                    return result
+                # If the probe matched a "structural" key (e.g.
+                # setupComplete, toolCall) that resolves to None, we
+                # still return None to match the legacy
+                # short-circuit behavior. Probes for text-bearing
+                # nested keys (inputTranscription / outputTranscription
+                # / modelTurn.parts) DON'T short-circuit on empty text
+                # — they fall through to the next probe so a frame
+                # carrying an empty inputTranscription + a valid
+                # outputTranscription still surfaces the latter, just
+                # as the legacy if/elif did.
+                if method_name in (
+                    "_translate_setup_complete",
+                    "_translate_interrupted",
+                    "_translate_turn_complete",
+                    "_translate_tool_call",
+                    "_translate_top_level_error",
+                ):
+                    return None
+                # fall through to the next probe
+        return None
 
         # Top-level error.
         if "error" in raw_event:
@@ -378,9 +462,10 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
 
         The tool name is required by the protocol — we look it up from
         the per-session ``_pending_call_names`` map that ``translate_event``
-        populated when the ``toolCall`` arrived.
+        populated when the ``toolCall`` arrived. Increment E — backed by
+        the ``ToolCallAccumulator`` mixin's ``pop_name``.
         """
-        name = self._pending_call_names.pop(call_id, "")
+        name = self.pop_name(call_id)
         return [{
             "toolResponse": {
                 "functionResponses": [{
@@ -896,112 +981,12 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """Open the upstream WebSocket with backend-specific URL + auth."""
 
 
-# JSON Schema keywords Gemini's OpenAPI 3.0 Schema doesn't accept on
-# function-declaration parameters. Stripping rather than rejecting:
-# we want to send the best schema we can, not refuse to call the tool.
-_GEMINI_SCHEMA_STRIP_KEYS = frozenset({
-    "$schema",
-    "$id",
-    "$ref",
-    "$defs",
-    "definitions",
-    "additionalProperties",
-    "patternProperties",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "if",
-    "then",
-    "else",
-    "not",
-    "dependencies",
-    "dependentSchemas",
-    "dependentRequired",
-})
+# Increment E (plan §E) — schema sanitizer moved to
+# ``orchestrator/providers/schema_utils.py``. The leading underscore
+# stays so ``tests/test_gemini_voice.py`` (and any external caller
+# that grew to depend on this private path) keeps working.
+from orchestrator.providers.schema_utils import (
+    sanitize_schema_for_gemini as _sanitize_schema_for_gemini,
+)
 
 
-def _sanitize_schema_for_gemini(schema: dict[str, Any]) -> dict[str, Any]:
-    """Convert a JSON Schema to the subset Gemini's Live API accepts.
-
-    Gemini's ``functionDeclarations[].parameters`` follows OpenAPI 3.0
-    Schema, which is a strict subset of JSON Schema Draft 7.
-    Mismatches the orchestrator's tool schemas tend to hit:
-
-    - ``"type": ["X", "null"]`` (union types) → split into
-      ``"type": "X", "nullable": true``.
-    - ``anyOf`` / ``oneOf`` / ``allOf`` containing exactly one schema
-      and one ``{"type": "null"}`` (the OpenAPI pattern for optionals)
-      → flatten to the non-null branch + ``nullable: true``.
-    - ``additionalProperties``, ``$schema``, ``$ref``, etc. → strip.
-
-    Everything else (``type``, ``description``, ``properties``,
-    ``required``, ``items``, ``enum``, ``format``, ``minimum``,
-    ``maximum``, ``nullable``) passes through. Recurses into
-    ``properties``, ``items``, ``anyOf``/``oneOf``/``allOf``.
-
-    Returns a new dict — does not mutate the input.
-    """
-    if not isinstance(schema, dict):
-        return schema
-
-    out: dict[str, Any] = {}
-    nullable = False
-
-    # Handle anyOf/oneOf/allOf with a null branch (optional pattern).
-    for combinator in ("anyOf", "oneOf", "allOf"):
-        if combinator in schema:
-            branches = schema[combinator]
-            if isinstance(branches, list):
-                non_null = [b for b in branches if not (isinstance(b, dict) and b.get("type") == "null")]
-                has_null = len(non_null) < len(branches)
-                if has_null:
-                    nullable = True
-                if len(non_null) == 1:
-                    # Pattern: anyOf:[{...}, {type: null}] → merge the
-                    # single non-null branch directly into ``out`` and
-                    # drop the combinator (Gemini still rejects raw
-                    # anyOf even of length 1 in practice).
-                    out.update(_sanitize_schema_for_gemini(non_null[0]))
-                elif len(non_null) > 1:
-                    # Multi-branch union — keep as anyOf with each
-                    # branch sanitized. Gemini accepts anyOf in some
-                    # cases; if it still rejects, the caller will see
-                    # the error and refine.
-                    out[combinator] = [_sanitize_schema_for_gemini(b) for b in non_null]
-                # Mark this combinator handled.
-                # (Falls through — we don't break since multiple combinators
-                # are rare; we sanitize each.)
-
-    for k, v in schema.items():
-        if k in _GEMINI_SCHEMA_STRIP_KEYS:
-            continue
-        if k in ("anyOf", "oneOf", "allOf"):
-            # Already handled above.
-            continue
-        if k == "type":
-            if isinstance(v, list):
-                # ["X", "null"] → "X" + nullable=True; ["X", "Y"] →
-                # keep first non-null (best-effort — Gemini wants a
-                # scalar type).
-                non_null = [t for t in v if t != "null"]
-                nullable = nullable or ("null" in v)
-                out["type"] = non_null[0] if non_null else "string"
-            else:
-                out["type"] = v
-        elif k == "properties" and isinstance(v, dict):
-            out["properties"] = {
-                pname: _sanitize_schema_for_gemini(pschema)
-                for pname, pschema in v.items()
-            }
-        elif k == "items" and isinstance(v, dict):
-            out["items"] = _sanitize_schema_for_gemini(v)
-        elif k == "items" and isinstance(v, list):
-            # Tuple-form items — Gemini doesn't support; collapse to
-            # the first entry as a best-effort.
-            if v:
-                out["items"] = _sanitize_schema_for_gemini(v[0])
-        else:
-            out[k] = v
-
-    if nullable:
-        out["nullable"] = True
-    return out
