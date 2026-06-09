@@ -164,6 +164,13 @@ class VoiceVAD:
         self._debug_last_emit_at = 0
         self._debug_enabled = os.environ.get("VOICE_DEBUG_VAD") == "1"
 
+        # Increment B observability: most-recent per-window Silero
+        # probability. Read by the relay to include in the
+        # ``voice_vad_state`` broadcast so the UI can render a
+        # confidence indicator next to the VAD state. None until the
+        # first ``feed_pcm16`` call infers a window.
+        self._last_silero_prob: float | None = None
+
         # Cheap log so we can confirm initialisation in the per-session
         # voice log.
         logger.info(
@@ -273,7 +280,11 @@ class VoiceVAD:
         if self._needs_sr:
             feed["sr"] = self._sr_input
         out, self._state = self._sess.run(None, feed)
-        return float(out[0, 0])
+        prob = float(out[0, 0])
+        # Increment B observability: cache so the relay can include the
+        # last inference in its ``voice_vad_state`` broadcast.
+        self._last_silero_prob = prob
+        return prob
 
     def _update_state(self, prob: float) -> VADEvent | None:
         """Update the speech/silence state machine; return an event or None."""
@@ -306,6 +317,16 @@ class VoiceVAD:
         """Whether the VAD currently considers the user to be speaking."""
         return self._is_speech
 
+    @property
+    def last_silero_prob(self) -> float | None:
+        """Most-recent per-window Silero P(speech), or None pre-feed.
+
+        Read by the relay to populate the ``voice_vad_state`` broadcast
+        so the UI can render a confidence indicator alongside the VAD
+        state. Read-only — does NOT mutate the state machine.
+        """
+        return self._last_silero_prob
+
     def reset(self) -> None:
         """Re-zero all per-stream state — call after a long discontinuity.
 
@@ -324,6 +345,7 @@ class VoiceVAD:
         self._carry_input_pcm = b""
         self._bytes_consumed = 0
         self._debug_window_probs = []
+        self._last_silero_prob = None
         logger.info("VoiceVAD reset (Silero state + state machine cleared)")
 
 

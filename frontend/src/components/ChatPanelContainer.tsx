@@ -117,7 +117,7 @@ function OrchestratorChatPanel({
   onRewindMessage?: (dropLastN: number) => void;
   onForkMessage?: (dropLastN: number) => void;
 }) {
-  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel, voiceError, isLocalVoice, handlePassiveVoiceEvent } = useVoiceOrchestrator({
+  const { voiceStatus, startVoice, stopVoice, isMuted, toggleMute, isAssistantMuted, toggleAssistantMute, micLevel, speakerLevel, voiceError, vadState, vadDurationMs, isLocalVoice, handlePassiveVoiceEvent } = useVoiceOrchestrator({
     localId: sessionId,
     resumeSdkId,
     onUserTranscript: (text) => {
@@ -188,6 +188,8 @@ function OrchestratorChatPanel({
       micLevel={micLevel}
       speakerLevel={speakerLevel}
       voiceError={voiceError}
+      vadState={vadState}
+      vadDurationMs={vadDurationMs}
       supportsAudio={supportsAudio}
     />
   );

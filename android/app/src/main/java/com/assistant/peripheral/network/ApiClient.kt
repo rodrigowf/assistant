@@ -753,6 +753,12 @@ class ApiClient(private val baseUrl: String) {
                 }
                 patch.defaultVoiceEndpoint?.let { put("default_voice_endpoint", it) }
                 patch.voiceRecordingEnabled?.let { put("voice_recording_enabled", it) }
+                // Increment B (voice subsystem refactor) — VAD + mic
+                // tuning knobs. Backend validates ranges; on rejection
+                // the 400 detail surfaces via Result.failure above.
+                patch.voiceVadThreshold?.let { put("voice_vad_threshold", it) }
+                patch.voiceVadMinSilenceMs?.let { put("voice_vad_min_silence_ms", it) }
+                patch.voiceMicGain?.let { put("voice_mic_gain", it) }
             }
             val request = Request.Builder()
                 .url(url)
@@ -958,6 +964,13 @@ class ApiClient(private val baseUrl: String) {
                 defaultVoiceTranscriptionLanguage = json.optString("default_voice_transcription_language", ""),
                 defaultVoiceEndpoint = json.optString("default_voice_endpoint", "vertex"),
                 voiceRecordingEnabled = json.optBoolean("voice_recording_enabled", false),
+                // Increment B — defaults match documented Silero
+                // constants so a backend that hasn't been upgraded yet
+                // (older agentic-backend on the Jetson) doesn't surface
+                // arbitrary slider values to the user.
+                voiceVadThreshold = json.optDouble("voice_vad_threshold", 0.28),
+                voiceVadMinSilenceMs = json.optInt("voice_vad_min_silence_ms", 2500),
+                voiceMicGain = json.optDouble("voice_mic_gain", 1.0),
             )
         } catch (e: Exception) {
             Log.e(TAG, "parseAssistantConfig error: ${e.message}", e)

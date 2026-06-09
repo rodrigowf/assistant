@@ -195,6 +195,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isRecording by viewModel.isRecording.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val voiceState by viewModel.voiceState.collectAsState()
+    val vadState by viewModel.vadState.collectAsState()
+    val vadDurationMs by viewModel.vadDurationMs.collectAsState()
     val isMuted by viewModel.isMuted.collectAsState()
     val liveSessionIds by viewModel.liveSessionIds.collectAsState()
     val isOrchestratorSession by viewModel.isOrchestratorSession.collectAsState()
@@ -472,7 +474,9 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 isMuted = isMuted,
                 onToggleMute = viewModel::toggleMute,
                 onStop = viewModel::stopVoiceSession,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                vadState = vadState,
+                vadDurationMs = vadDurationMs,
             )
         }
 

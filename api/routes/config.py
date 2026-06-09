@@ -153,6 +153,13 @@ def _default_config() -> dict[str, Any]:
         # ignore this field.
         "default_voice_endpoint": _default_voice_endpoint(),
         "voice_recording_enabled": False,  # save raw audio from voice sessions
+        # Increment B (voice subsystem refactor): user-tunable VAD +
+        # mic-gain knobs. Defaults equal the historical hardcoded
+        # literals exactly — see ``voice_vad.py:107-112`` — so changing
+        # the API surface doesn't change out-of-the-box behaviour.
+        "voice_vad_threshold": 0.28,        # Silero on-threshold; off = on - 0.15
+        "voice_vad_min_silence_ms": 2500,   # ms below off-threshold before speech_stopped
+        "voice_mic_gain": 1.0,              # server-side mic-input gain (reserved)
     }
 
 
@@ -249,6 +256,11 @@ class ConfigUpdate(BaseModel):
     # ``None`` falls back to the env / module default.
     default_voice_endpoint: str | None = None
     voice_recording_enabled: bool | None = None  # save raw audio from voice sessions
+    # Increment B (voice subsystem refactor) — VAD + mic tuning knobs.
+    # Validated ranges per plan §B (e.g. threshold 0.15-0.50).
+    voice_vad_threshold: float | None = None
+    voice_vad_min_silence_ms: int | None = None
+    voice_mic_gain: float | None = None
 
 
 # -----------------------------------------------------------------------
@@ -709,6 +721,43 @@ async def update_config(body: ConfigUpdate) -> dict[str, Any]:
 
     if body.voice_recording_enabled is not None:
         config["voice_recording_enabled"] = body.voice_recording_enabled
+
+    # Increment B — VAD + mic tuning knobs. Ranges are deliberately
+    # tight so a malformed slider drag can't permanently break the
+    # user's VAD; defaults equal HEAD constants exactly (see
+    # tests/parity/test_vad_defaults_parity.py).
+    if body.voice_vad_threshold is not None:
+        if not (0.15 <= body.voice_vad_threshold <= 0.50):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "voice_vad_threshold must be in [0.15, 0.50] "
+                    f"(got {body.voice_vad_threshold})"
+                ),
+            )
+        config["voice_vad_threshold"] = float(body.voice_vad_threshold)
+
+    if body.voice_vad_min_silence_ms is not None:
+        if not (800 <= body.voice_vad_min_silence_ms <= 5000):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "voice_vad_min_silence_ms must be in [800, 5000] "
+                    f"(got {body.voice_vad_min_silence_ms})"
+                ),
+            )
+        config["voice_vad_min_silence_ms"] = int(body.voice_vad_min_silence_ms)
+
+    if body.voice_mic_gain is not None:
+        if not (0.5 <= body.voice_mic_gain <= 2.0):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "voice_mic_gain must be in [0.5, 2.0] "
+                    f"(got {body.voice_mic_gain})"
+                ),
+            )
+        config["voice_mic_gain"] = float(body.voice_mic_gain)
 
     _save_config(config)
     return config

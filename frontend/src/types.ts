@@ -55,6 +55,12 @@ export interface VoiceConnectionInfoPayload {
   audio_relay?: "backend";
 }
 
+/** Increment B (voice subsystem refactor): Silero VAD state surfaced
+ *  to the UI alongside the existing ``input_audio_buffer.speech_*``
+ *  events. ``listening`` = Silero in speech_started; ``thinking`` =
+ *  speech_stopped just fired; ``idle`` = no manual VAD active. */
+export type VadState = "idle" | "listening" | "thinking";
+
 /** Typed voice-provider error categories. Mirrors
  *  ``orchestrator.voice_errors.VoiceErrorCategory`` — string values are
  *  the wire contract; don't rename without coordinating the backend
@@ -131,6 +137,7 @@ export type ServerEvent =
   | { type: "status"; status: string }
   | { type: "error"; error: string; detail?: string }
   | { type: "voice_error"; error: VoiceErrorEnvelope }
+  | { type: "voice_vad_state"; state: VadState; duration_ms: number; silero_prob: number | null }
   | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }
   | { type: "agent_session_closed"; session_id: string }
   | { type: "user_message"; text: string; source?: string }

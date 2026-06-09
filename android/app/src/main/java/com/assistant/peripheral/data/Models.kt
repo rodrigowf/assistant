@@ -179,6 +179,22 @@ sealed class WebSocketEvent {
     data class VoiceAudioOut(val audioBase64: String) : WebSocketEvent()
 
     /**
+     * Increment B (voice subsystem refactor) — Silero VAD state surfaced
+     * from the backend ``voice_vad_state`` event. Additive to the
+     * existing ``VoiceProviderEvent`` envelope; UI components watch a
+     * ``VadState`` flow on the ViewModel to render a "listening Ns"
+     * duration indicator when the user is stuck in speech_started.
+     *
+     * String value of [state] mirrors orchestrator's
+     * ``VadState`` enum: "listening" | "thinking" | "idle".
+     */
+    data class VoiceVadState(
+        val state: String,
+        val durationMs: Long,
+        val sileroProb: Double? = null,
+    ) : WebSocketEvent()
+
+    /**
      * Typed upstream-provider error from the backend ``voice_error`` event.
      *
      * Replaces the opaque ``Error("voice_relay_failed", ...)`` rendering

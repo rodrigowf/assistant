@@ -27,6 +27,16 @@ import androidx.compose.ui.unit.dp
 import com.assistant.peripheral.data.VoiceState
 
 /**
+ * Increment B (voice subsystem refactor): show the VAD-listening
+ * duration ("Listening Ns") only once Silero has been in
+ * speech_started for at least this many ms. Below the reveal point
+ * every quick utterance would flash a "1s" indicator that just adds
+ * noise; above it the user gets a clear "you've been listening too
+ * long" signal that points them at the VAD threshold slider.
+ */
+private const val LISTENING_REVEAL_MS = 3000L
+
+/**
  * Voice button that shows the current voice state.
  * Matches the web frontend's VoiceButton and VoiceControls components.
  */
@@ -169,6 +179,13 @@ fun VoiceButton(
 
 /**
  * Voice controls panel shown when voice is active.
+ *
+ * Increment B (voice subsystem refactor): the optional [vadState] and
+ * [vadDurationMs] params surface the Silero state to the user. When
+ * [vadState] is ``"listening"`` for >= [LISTENING_REVEAL_MS], the
+ * status label shows the elapsed seconds so the user can see they
+ * need to wrap up / adjust the VAD threshold in Settings (the symptom
+ * of Bug 2 — the 203s freeze).
  */
 @Composable
 fun VoiceControls(
@@ -176,8 +193,14 @@ fun VoiceControls(
     isMuted: Boolean,
     onToggleMute: () -> Unit,
     onStop: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    vadState: String = "idle",
+    vadDurationMs: Long = 0L,
 ) {
+    val showVadDuration =
+        vadState == "listening" && vadDurationMs >= LISTENING_REVEAL_MS
+    val vadDurationSeconds = (vadDurationMs / 1000L).toInt()
+
     val isActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
 
     if (!isActive) return
@@ -200,8 +223,10 @@ fun VoiceControls(
                 text = when (voiceState) {
                     is VoiceState.Connecting -> "Connecting..."
                     is VoiceState.Summarizing -> "Preparing conversation..."
-                    is VoiceState.Active -> "Connected"
-                    is VoiceState.Listening -> "Listening..."
+                    is VoiceState.Active -> if (showVadDuration)
+                        "Listening ${vadDurationSeconds}s" else "Connected"
+                    is VoiceState.Listening -> if (showVadDuration)
+                        "Listening ${vadDurationSeconds}s" else "Listening..."
                     is VoiceState.Speaking -> "Speaking..."
                     is VoiceState.Thinking -> "Thinking..."
                     is VoiceState.ToolUse -> "Using tools..."

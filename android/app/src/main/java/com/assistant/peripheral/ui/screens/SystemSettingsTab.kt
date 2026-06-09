@@ -348,6 +348,94 @@ private fun OrchestratorCard(state: SystemConfigState, onUpdate: (ConfigPatch) -
                 enabled = !state.saving,
             )
         }
+
+        Divider(modifier = Modifier.padding(vertical = 12.dp))
+
+        // Voice tuning — Increment B (voice subsystem refactor).
+        // Three knobs that were previously hardcoded; defaults equal
+        // the documented Silero constants exactly.
+        Text("Voice tuning", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "Adjust the on-device VAD if the assistant misses your speech (raise threshold) " +
+                "or cuts you off mid-sentence (raise silence ms). Restart voice to apply.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        VoiceTuningSlider(
+            title = "VAD threshold",
+            valueText = "%.2f".format(cfg.voiceVadThreshold),
+            value = cfg.voiceVadThreshold.toFloat(),
+            valueRange = 0.15f..0.5f,
+            steps = 34,  // 0.01 increments across 0.35 range
+            enabled = !state.saving,
+            onCommit = { onUpdate(ConfigPatch(voiceVadThreshold = it.toDouble())) },
+            description = "Silero P(speech) needed to enter listening. Lower = more sensitive.",
+        )
+
+        VoiceTuningSlider(
+            title = "Min silence",
+            valueText = "${cfg.voiceVadMinSilenceMs} ms",
+            value = cfg.voiceVadMinSilenceMs.toFloat(),
+            valueRange = 800f..5000f,
+            steps = 41,  // 100ms increments across 4200ms range
+            enabled = !state.saving,
+            onCommit = {
+                onUpdate(ConfigPatch(voiceVadMinSilenceMs = it.toInt()))
+            },
+            description = "How long below threshold before end-of-turn. Raise if it cuts you off.",
+        )
+
+        VoiceTuningSlider(
+            title = "Mic gain",
+            valueText = "%.2f×".format(cfg.voiceMicGain),
+            value = cfg.voiceMicGain.toFloat(),
+            valueRange = 0.5f..2.0f,
+            steps = 29,  // 0.05 increments across 1.5 range
+            enabled = !state.saving,
+            onCommit = { onUpdate(ConfigPatch(voiceMicGain = it.toDouble())) },
+            description = "Server-side mic-input scale (reserved — wiring lands in a later increment).",
+        )
+    }
+}
+
+/**
+ * Increment B (voice subsystem refactor): minimal slider used by the
+ * Voice Tuning section. Commits the value on slider release rather
+ * than on every drag tick to avoid spamming PUT /api/config (each
+ * one validates server-side and writes assistant_config.json).
+ */
+@Composable
+private fun VoiceTuningSlider(
+    title: String,
+    valueText: String,
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    enabled: Boolean,
+    description: String,
+    onCommit: (Float) -> Unit,
+) {
+    var localValue by remember(value) { mutableStateOf(value) }
+
+    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            Text(valueText, style = MaterialTheme.typography.labelMedium)
+        }
+        Slider(
+            value = localValue,
+            onValueChange = { localValue = it },
+            onValueChangeFinished = { onCommit(localValue) },
+            valueRange = valueRange,
+            steps = steps,
+            enabled = enabled,
+        )
+        Text(
+            description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

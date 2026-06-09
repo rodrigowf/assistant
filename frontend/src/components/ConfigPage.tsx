@@ -512,6 +512,96 @@ export function ConfigPage({ isOpen, onClose }: Props) {
                   )}
                 </div>
 
+                {/* Voice tuning — Increment B (voice subsystem refactor).
+                    The three knobs surface the Silero VAD + mic-gain values
+                    that were previously hardcoded. Defaults equal the
+                    documented historical constants (parity-tested in
+                    tests/parity/test_vad_defaults_parity.py). */}
+                <div className="config-subsection">
+                  <h4 className="config-subsection-title">Voice tuning</h4>
+                  <p className="config-subsection-desc">
+                    Adjust the on-device VAD if the assistant misses your speech
+                    in noisy rooms (raise threshold) or cuts you off mid-sentence
+                    (raise silence ms). Defaults match Silero's tuned far-field
+                    values. Restart the voice session to apply.
+                  </p>
+                  <div className="config-item-list">
+                    <label className="config-item">
+                      <div className="config-item-info" style={{ flex: 1 }}>
+                        <span className="config-item-name">
+                          VAD threshold: {config.voice_vad_threshold.toFixed(2)}
+                        </span>
+                        <span className="config-item-detail">
+                          Silero P(speech) needed to enter ``listening``. Lower = more sensitive.
+                          Range 0.15–0.50. Default 0.28.
+                        </span>
+                        <input
+                          type="range"
+                          min={0.15}
+                          max={0.5}
+                          step={0.01}
+                          value={config.voice_vad_threshold}
+                          disabled={saving}
+                          onChange={(e) =>
+                            save({ voice_vad_threshold: parseFloat(e.target.value) })
+                              .catch(err => setError(String(err)))
+                          }
+                          style={{ width: "100%", marginTop: 6 }}
+                        />
+                      </div>
+                    </label>
+                    <label className="config-item">
+                      <div className="config-item-info" style={{ flex: 1 }}>
+                        <span className="config-item-name">
+                          Min silence: {config.voice_vad_min_silence_ms} ms
+                        </span>
+                        <span className="config-item-detail">
+                          How long the audio must stay below the off-threshold before the
+                          assistant treats it as end-of-turn. Lower = snappier; raise if it
+                          cuts you off mid-sentence. Range 800–5000 ms. Default 2500.
+                        </span>
+                        <input
+                          type="range"
+                          min={800}
+                          max={5000}
+                          step={100}
+                          value={config.voice_vad_min_silence_ms}
+                          disabled={saving}
+                          onChange={(e) =>
+                            save({ voice_vad_min_silence_ms: parseInt(e.target.value, 10) })
+                              .catch(err => setError(String(err)))
+                          }
+                          style={{ width: "100%", marginTop: 6 }}
+                        />
+                      </div>
+                    </label>
+                    <label className="config-item">
+                      <div className="config-item-info" style={{ flex: 1 }}>
+                        <span className="config-item-name">
+                          Mic gain: {config.voice_mic_gain.toFixed(2)}×
+                        </span>
+                        <span className="config-item-detail">
+                          Server-side mic-input scale (reserved — wiring lands in a later
+                          increment). Range 0.5–2.0. Default 1.0.
+                        </span>
+                        <input
+                          type="range"
+                          min={0.5}
+                          max={2.0}
+                          step={0.05}
+                          value={config.voice_mic_gain}
+                          disabled={saving}
+                          onChange={(e) =>
+                            save({ voice_mic_gain: parseFloat(e.target.value) })
+                              .catch(err => setError(String(err)))
+                          }
+                          style={{ width: "100%", marginTop: 6 }}
+                        />
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
                 {/* Voice recording */}
                 <div className="config-subsection">
                   <h4 className="config-subsection-title">Voice recording</h4>

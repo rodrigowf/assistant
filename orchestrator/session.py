@@ -810,12 +810,32 @@ class OrchestratorSession:
                 raise RuntimeError("rebuild_session_update returned None")
             return payload
 
+        # Increment B — read user-tunable VAD knobs from
+        # ``assistant_config.json``. Missing keys fall back to the
+        # VoiceVAD constructor defaults (which equal the documented
+        # HEAD constants — see tests/parity/test_vad_defaults_parity.py).
+        vad_threshold: float | None = None
+        vad_min_silence_ms: int | None = None
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            _app_cfg = _load_app_config()
+            vt = _app_cfg.get("voice_vad_threshold")
+            if isinstance(vt, (int, float)):
+                vad_threshold = float(vt)
+            vs = _app_cfg.get("voice_vad_min_silence_ms")
+            if isinstance(vs, int):
+                vad_min_silence_ms = vs
+        except Exception:
+            logger.exception("voice tuning config load failed; using VoiceVAD defaults")
+
         relay = VoiceRelay(
             self._voice_provider,
             on_audio_out=on_audio_out,
             on_event_for_frontend=on_event_for_frontend,
             session_id=self._local_id,
             rebuild_session_update=_rebuild_session_update,
+            vad_threshold=vad_threshold,
+            vad_min_silence_ms=vad_min_silence_ms,
         )
         try:
             await relay.start(session_update)

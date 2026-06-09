@@ -73,6 +73,15 @@ _KEEPALIVE_INTERVAL_S = 30.0
 # enough below the ceiling that wire jitter never trips it.
 _MANUAL_VAD_SAFETY_COMMIT_S = 50.0
 
+# Increment B observability: heartbeat cadence for the
+# ``voice_vad_state`` broadcast while the VAD is in ``listening``. The
+# UI clock reads ``duration_ms`` from the most recent frame; without a
+# heartbeat the clock would freeze between Silero transitions (which
+# can be seconds apart on far-field input). 1.0 s keeps the clock
+# responsive without flooding the WS — at 31 windows/s a heartbeat
+# every 31 windows adds <1% overhead.
+_VAD_STATE_HEARTBEAT_S = 1.0
+
 # Bound the goAway-driven reconnect: if the new upstream WS connect +
 # session.update handshake doesn't complete within this window, give
 # up and surface a clean error so the frontend can tear down. Observed
@@ -109,6 +118,12 @@ class VoiceRelay:
         session_id: str | None = None,
         rebuild_session_update: SessionUpdateBuilder | None = None,
         max_reconnects: int = 2,
+        # Increment B — VAD tuning. None means "use VoiceVAD defaults"
+        # which equal HEAD constants exactly (see
+        # tests/parity/test_voice_vad_parity.py). Threaded from
+        # ``assistant_config.json`` via ``OrchestratorSession``.
+        vad_threshold: float | None = None,
+        vad_min_silence_ms: int | None = None,
     ) -> None:
         if provider.connection_type != "websocket":
             raise ValueError(
@@ -206,9 +221,21 @@ class VoiceRelay:
         # (and a safety commit at _MANUAL_VAD_SAFETY_COMMIT_S seconds
         # of continuous speech).
         self._manual_vad: voice_vad.VoiceVAD | None = None
+        # Increment B — user-tunable VAD params threaded from
+        # ``assistant_config.json``. None falls back to the VoiceVAD
+        # constructor defaults (which equal the documented HEAD
+        # constants — parity test pins this).
+        self._vad_threshold = vad_threshold
+        self._vad_min_silence_ms = vad_min_silence_ms
         # Timestamp of the most recent speech_started event (monotonic).
         # Used by the safety-commit watchdog.
         self._manual_vad_speech_started_at: float | None = None
+        # Increment B observability: timestamp of the last
+        # ``voice_vad_state`` heartbeat broadcast. While ``is_speech``
+        # is True the relay emits a fresh ``state=listening`` frame
+        # every ~_VAD_STATE_HEARTBEAT_S so the UI's duration clock
+        # advances even if Silero never transitions.
+        self._last_vad_state_emit_at: float | None = None
 
         # ``VOICE_DEBUG_DUMP_MIC=1`` — write every received mic byte to
         # ``logs/voice/<ts>_<sid>.mic.wav`` (16-bit PCM, mono, at the
@@ -404,8 +431,17 @@ class VoiceRelay:
             and in_sr is not None
         ):
             try:
-                self._manual_vad = voice_vad.VoiceVAD(input_sample_rate=in_sr)
-                self._slog(f"manual_vad init: in_sr={in_sr}Hz")
+                vad_kwargs: dict[str, object] = {"input_sample_rate": in_sr}
+                if self._vad_threshold is not None:
+                    vad_kwargs["threshold"] = self._vad_threshold
+                if self._vad_min_silence_ms is not None:
+                    vad_kwargs["min_silence_duration_ms"] = self._vad_min_silence_ms
+                self._manual_vad = voice_vad.VoiceVAD(**vad_kwargs)  # type: ignore[arg-type]
+                self._slog(
+                    f"manual_vad init: in_sr={in_sr}Hz "
+                    f"threshold={self._vad_threshold} "
+                    f"min_silence_ms={self._vad_min_silence_ms}"
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("manual_vad init failed; falling back to server VAD")
                 self._manual_vad = None
@@ -695,6 +731,10 @@ class VoiceRelay:
         sends the provider's wire-specific manual-VAD frames upstream
         (see :meth:`BaseVoiceProvider.manual_vad_start_frames` /
         ``manual_vad_stop_frames`` / ``manual_vad_safety_commit_frames``).
+
+        Increment B adds a parallel ``voice_vad_state`` broadcast (see
+        :meth:`_emit_voice_vad_state`) — additive observability that
+        doesn't affect any existing event.
         """
         assert self._manual_vad is not None
         pcm = base64.b64decode(pcm_b64)
@@ -705,6 +745,9 @@ class VoiceRelay:
                 await self._on_event_for_frontend({
                     "type": "input_audio_buffer.speech_started",
                 })
+                # Increment B: broadcast the new typed VAD state so the
+                # UI can render a duration clock + confidence indicator.
+                await self._emit_voice_vad_state("listening")
                 for frame in self._provider.manual_vad_start_frames():
                     await self.send_event(frame)
             elif event.kind == "speech_stopped":
@@ -713,8 +756,20 @@ class VoiceRelay:
                 await self._on_event_for_frontend({
                     "type": "input_audio_buffer.speech_stopped",
                 })
+                await self._emit_voice_vad_state("thinking")
                 for frame in self._provider.manual_vad_stop_frames():
                     await self.send_event(frame)
+
+        # Increment B observability heartbeat: while the VAD is still
+        # in ``speech_started`` (no transition this chunk), re-emit
+        # ``voice_vad_state`` every ~1s so the UI duration clock
+        # advances. Driven from this method (no asyncio.Task) so we
+        # don't add an extra coroutine to the relay's lifecycle.
+        if self._manual_vad.is_speech and self._manual_vad_speech_started_at is not None:
+            now = time.monotonic()
+            last = self._last_vad_state_emit_at
+            if last is None or (now - last) >= _VAD_STATE_HEARTBEAT_S:
+                await self._emit_voice_vad_state("listening")
 
         # Safety commit: some upstreams cap continuous audio in manual
         # mode (DashScope: 60s; Gemini: no documented cap but we chunk
@@ -741,6 +796,42 @@ class VoiceRelay:
                 self._manual_vad_speech_started_at = time.monotonic()
                 for frame in safety_frames:
                     await self.send_event(frame)
+
+    async def _emit_voice_vad_state(self, state: str) -> None:
+        """Increment B: broadcast typed VAD state to the frontend.
+
+        Payload shape (wire contract — clients switch on these keys):
+
+            {
+              "type": "voice_vad_state",
+              "state": "listening" | "thinking" | "idle",
+              "duration_ms": int,    // since speech_started; 0 otherwise
+              "silero_prob": float | None,
+            }
+
+        Additive event — does NOT replace the existing
+        ``input_audio_buffer.speech_started/stopped`` broadcasts.
+
+        Called by :meth:`_run_manual_vad` on every state transition AND
+        every ``_VAD_STATE_HEARTBEAT_S`` while the VAD remains in
+        ``listening`` (so the UI clock advances even when Silero
+        doesn't transition for tens of seconds).
+        """
+        now = time.monotonic()
+        started_at = self._manual_vad_speech_started_at
+        duration_ms = 0
+        if started_at is not None:
+            duration_ms = int((now - started_at) * 1000)
+        prob: float | None = None
+        if self._manual_vad is not None:
+            prob = self._manual_vad.last_silero_prob
+        self._last_vad_state_emit_at = now
+        await self._on_event_for_frontend({
+            "type": "voice_vad_state",
+            "state": state,
+            "duration_ms": duration_ms,
+            "silero_prob": prob,
+        })
 
     async def stop(self) -> None:
         """Cancel the drain task and close the upstream WS."""

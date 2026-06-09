@@ -402,6 +402,19 @@ class WebSocketManager {
                 }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 
+                "voice_vad_state" -> {
+                    // Increment B (voice subsystem refactor) — typed VAD
+                    // state envelope. Additive to the existing
+                    // ``input_audio_buffer.speech_*`` events; the
+                    // ViewModel exposes a VadState flow that UI
+                    // components watch to render a duration indicator.
+                    val state = json.optString("state", "idle")
+                    val durationMs = json.optLong("duration_ms", 0L)
+                    val prob = if (json.isNull("silero_prob")) null
+                               else json.optDouble("silero_prob")
+                    emit(WebSocketEvent.VoiceVadState(state, durationMs, prob))
+                }
+
                 "voice_error" -> {
                     // Typed upstream-provider error envelope (Increment A
                     // of the voice subsystem refactor). The backend emits

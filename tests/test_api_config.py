@@ -337,3 +337,81 @@ def test_gemini_voice_models_caches_response(
     assert r2.status_code == 200
     assert r1.json() == r2.json()
     assert call_count["n"] == 1, "Second call inside TTL must hit cache, not upstream"
+
+
+# ---------------------------------------------------------------------------
+# Increment B — voice tuning knobs (voice_vad_threshold,
+# voice_vad_min_silence_ms, voice_mic_gain).
+#
+# Plan §B: surface these as user-settable settings via the config API.
+# Defaults equal HEAD constants exactly (parity tests in
+# tests/parity/test_vad_defaults_parity.py pin the numbers).
+# Validated ranges per plan §B.
+
+
+def test_get_config_returns_vad_defaults(client: TestClient) -> None:
+    """Fresh install: GET /api/config returns the three Increment B
+    voice-tuning knobs populated with their documented defaults."""
+    r = client.get("/api/config")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["voice_vad_threshold"] == pytest.approx(0.28)
+    assert body["voice_vad_min_silence_ms"] == 2500
+    assert body["voice_mic_gain"] == pytest.approx(1.0)
+
+
+def test_put_config_persists_voice_vad_threshold(client: TestClient) -> None:
+    r = client.put("/api/config", json={"voice_vad_threshold": 0.35})
+    assert r.status_code == 200
+    assert r.json()["voice_vad_threshold"] == pytest.approx(0.35)
+    # Re-read to confirm persistence.
+    assert client.get("/api/config").json()["voice_vad_threshold"] == pytest.approx(0.35)
+
+
+def test_put_config_persists_voice_vad_min_silence_ms(client: TestClient) -> None:
+    r = client.put("/api/config", json={"voice_vad_min_silence_ms": 3000})
+    assert r.status_code == 200
+    assert r.json()["voice_vad_min_silence_ms"] == 3000
+
+
+def test_put_config_persists_voice_mic_gain(client: TestClient) -> None:
+    r = client.put("/api/config", json={"voice_mic_gain": 1.5})
+    assert r.status_code == 200
+    assert r.json()["voice_mic_gain"] == pytest.approx(1.5)
+
+
+def test_put_config_rejects_vad_threshold_out_of_range(client: TestClient) -> None:
+    """Plan §B: voice_vad_threshold range 0.15–0.50. Out-of-range
+    values must be rejected with a 400 so a malformed slider drag
+    can't leave the user with a permanently broken VAD."""
+    r = client.put("/api/config", json={"voice_vad_threshold": 0.05})
+    assert r.status_code == 400
+    r = client.put("/api/config", json={"voice_vad_threshold": 0.95})
+    assert r.status_code == 400
+
+
+def test_put_config_rejects_min_silence_ms_out_of_range(client: TestClient) -> None:
+    """Plan §B: voice_vad_min_silence_ms range 800–5000."""
+    r = client.put("/api/config", json={"voice_vad_min_silence_ms": 100})
+    assert r.status_code == 400
+    r = client.put("/api/config", json={"voice_vad_min_silence_ms": 10_000})
+    assert r.status_code == 400
+
+
+def test_put_config_rejects_mic_gain_out_of_range(client: TestClient) -> None:
+    """Plan §B: voice_mic_gain range 0.5–2.0."""
+    r = client.put("/api/config", json={"voice_mic_gain": 0.1})
+    assert r.status_code == 400
+    r = client.put("/api/config", json={"voice_mic_gain": 5.0})
+    assert r.status_code == 400
+
+
+def test_put_config_each_knob_independent(client: TestClient) -> None:
+    """Changing one knob must not reset the others to defaults."""
+    client.put("/api/config", json={"voice_vad_threshold": 0.35})
+    client.put("/api/config", json={"voice_vad_min_silence_ms": 3000})
+    client.put("/api/config", json={"voice_mic_gain": 1.2})
+    body = client.get("/api/config").json()
+    assert body["voice_vad_threshold"] == pytest.approx(0.35)
+    assert body["voice_vad_min_silence_ms"] == 3000
+    assert body["voice_mic_gain"] == pytest.approx(1.2)

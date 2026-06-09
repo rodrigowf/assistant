@@ -182,6 +182,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _voiceState = MutableStateFlow<VoiceState>(VoiceState.Off)
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
 
+    // Increment B (voice subsystem refactor) — Silero VAD state from
+    // the backend ``voice_vad_state`` broadcast. ``idle`` until the
+    // manual-VAD pipeline transitions; ``listening``/``thinking``
+    // mirrors Silero. Composables observe this to render the
+    // "listening Ns" duration indicator.
+    private val _vadState = MutableStateFlow("idle")
+    val vadState: StateFlow<String> = _vadState.asStateFlow()
+    private val _vadDurationMs = MutableStateFlow(0L)
+    val vadDurationMs: StateFlow<Long> = _vadDurationMs.asStateFlow()
+
     /**
      * The voice config in use for the *current* voice session, or null if
      * voice isn't active. Captured at [startVoiceSession] time. We hold
@@ -839,6 +849,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     blocks = listOf(MessageBlock.Compact(event.summary))
                 )
                 b.messages.update { it + compactMessage }
+            }
+
+            is WebSocketEvent.VoiceVadState -> {
+                // Increment B (voice subsystem refactor) — mirror the
+                // backend's typed VAD state into observable flows so
+                // composables can render the "listening Ns" indicator
+                // when the user gets stuck in speech_started (the
+                // symptom of Bug 2 — 203s freeze).
+                _vadState.value = event.state
+                _vadDurationMs.value = event.durationMs
             }
 
             is WebSocketEvent.VoiceError -> {
@@ -1646,6 +1666,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         endingTimeoutJob?.cancel()
         endingTimeoutJob = null
         activeVoiceConfig = null  // voice over → no resume on reconnect
+        // Increment B: clear VAD observability so any stale
+        // "listening Ns" indicator disappears the moment the session
+        // ends.
+        _vadState.value = "idle"
+        _vadDurationMs.value = 0L
         viewModelScope.launch {
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off
