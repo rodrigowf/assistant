@@ -108,6 +108,16 @@ class WakeWordDetector(
 
             return variants.distinct()
         }
+
+        /**
+         * Pure predicate for the `start()` idempotency guard (Increment 1).
+         * Returns true when a redundant `start()` should short-circuit:
+         * detector already active AND not paused. A paused detector must
+         * still run the full `start()` body so it re-arms (see
+         * `WakeWordStartParityTest.guardDoesNotShortCircuitPausedDetector`).
+         */
+        internal fun shouldShortCircuitStart(isActive: Boolean, isPaused: Boolean): Boolean =
+            isActive && !isPaused
     }
 
     var isActive = false
@@ -158,6 +168,10 @@ class WakeWordDetector(
     fun start() {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Log.w(TAG, "Speech recognition not available on this device")
+            return
+        }
+        if (shouldShortCircuitStart(isActive, isPaused)) {
+            Log.d(TAG, "start() ignored — already active")
             return
         }
         Log.d(TAG, "Starting — wake variants: $wakeVariants")
