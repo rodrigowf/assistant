@@ -66,6 +66,14 @@ class WakeWordDetector(
 
         private const val CLIENT_ERROR_DELAY_MS = 1000L
 
+        // Inc 4: post-`onBeginningOfSpeech` watchdog timeout. The SpeechRecognizer
+        // sometimes hangs silently after `onBeginningOfSpeech` without ever
+        // delivering `onResults` or `onError` (Bug 3 in the structural analysis;
+        // reproduced live during Inc 2 device testing). 10 s is generous — wake
+        // words are short and EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS
+        // (1500 ms) already bounds normal completion well under this value.
+        private const val RECOGNIZER_HANG_WATCHDOG_MS = 10_000L
+
         /**
          * Generate phonetic variants for a wake word phrase.
          * SpeechRecognizer may mishear words (e.g. "hey assistant" → "a system", "resistant").
@@ -164,6 +172,13 @@ class WakeWordDetector(
 
     // Stage 2: speech recognizer always runs on Main
     private var speechRecognizer: SpeechRecognizer? = null
+
+    // Inc 4: post-`onBeginningOfSpeech` hang watchdog. Cancelled in `onResults`,
+    // `onError`, the partial-match early-finish branch, and `destroyRecognizer`.
+    // If the recognizer never calls back after `onBeginningOfSpeech`, this
+    // job fires after RECOGNIZER_HANG_WATCHDOG_MS and force-finishes the
+    // cycle so the silence monitor re-arms instead of staying stuck.
+    private var recognizerWatchdogJob: Job? = null
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -450,6 +465,22 @@ class WakeWordDetector(
 
             override fun onBeginningOfSpeech() {
                 Log.d(TAG, "Speech begun")
+                // Inc 4: launch the hang watchdog. If neither onResults nor
+                // onError fires within RECOGNIZER_HANG_WATCHDOG_MS, force-finish
+                // the cycle so the silence monitor re-arms. The listenerFinished
+                // guard ensures we don't race a real callback that arrives
+                // within ε of the watchdog firing — Inc 2's finishRecognition
+                // idempotency guard is the belt-and-suspenders on the
+                // finishRecognition body itself.
+                recognizerWatchdogJob?.cancel()
+                recognizerWatchdogJob = scope.launch {
+                    delay(RECOGNIZER_HANG_WATCHDOG_MS)
+                    if (!listenerFinished) {
+                        Log.w(TAG, "Recognizer watchdog fired — forcing finish after ${RECOGNIZER_HANG_WATCHDOG_MS}ms silence after onBeginningOfSpeech")
+                        listenerFinished = true
+                        finishRecognition(wakeWordDetected = false)
+                    }
+                }
             }
 
             override fun onRmsChanged(rmsdB: Float) {}
@@ -459,6 +490,7 @@ class WakeWordDetector(
             override fun onError(error: Int) {
                 if (listenerFinished) return
                 listenerFinished = true
+                recognizerWatchdogJob?.cancel()
                 Log.d(TAG, "Recognizer error: $error")
                 // ERROR_CLIENT (7): double-call or internal SDK error — use flat delay, no backoff.
                 // ERROR_NO_SPEECH (6): Google Recognition Service crash or audio routing issue —
@@ -474,6 +506,7 @@ class WakeWordDetector(
             override fun onResults(results: Bundle?) {
                 if (listenerFinished) return
                 listenerFinished = true
+                recognizerWatchdogJob?.cancel()
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 Log.d(TAG, "Results: $matches")
                 val detected = matches != null && checkForWakeWord(matches)
@@ -488,6 +521,7 @@ class WakeWordDetector(
                     if (checkForWakeWord(partial)) {
                         // Early match on partial — stop immediately
                         listenerFinished = true
+                        recognizerWatchdogJob?.cancel()
                         finishRecognition(wakeWordDetected = true)
                     }
                 }
@@ -536,6 +570,13 @@ class WakeWordDetector(
     }
 
     private fun destroyRecognizer() {
+        // Inc 4: cancel the hang watchdog defensively. Normal cycles cancel
+        // it inside the listener (onResults/onError/partial-match), but a
+        // teardown initiated from elsewhere (pause, stop) must also clear it
+        // so a stale watchdog can't fire 10 s later against a detector that's
+        // no longer holding a recognizer.
+        recognizerWatchdogJob?.cancel()
+        recognizerWatchdogJob = null
         try {
             speechRecognizer?.cancel()
             speechRecognizer?.destroy()
