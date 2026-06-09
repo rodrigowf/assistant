@@ -101,7 +101,11 @@ class AssistantService : Service() {
             context.startActivity(intent)
         }
 
-        fun updateWakeWord(context: Context, enabled: Boolean, wakeWord: String, voiceWord: String = "", wakeWordMicGain: Float = 1.0f) {
+        // wakeWordMicGain is REQUIRED — a silent default would let a forgetful caller
+        // clobber the user's slider value with 1.0f every time the service is told to
+        // re-apply config. Every caller already has the gain readily available from
+        // DataStore; pass it explicitly.
+        fun updateWakeWord(context: Context, enabled: Boolean, wakeWord: String, voiceWord: String, wakeWordMicGain: Float) {
             val intent = Intent(context, AssistantService::class.java).apply {
                 putExtra(EXTRA_ENABLE_WAKE_WORD, enabled)
                 putExtra(EXTRA_WAKE_WORD, wakeWord)

@@ -273,12 +273,21 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
 
     // Apply wake word setting whenever it changes (also fires when DataStore finishes
     // loading on first launch — LaunchedEffect(Unit) runs before DataStore is ready).
-    LaunchedEffect(settings.enableWakeWord, settings.wakeWord, settings.voiceWord) {
+    // Gain MUST be included in the key list and the call — without it, this effect
+    // silently overwrites the user's `wakeWordMicGainLevel` slider value with 1.0f on
+    // every recomposition triggered by an enable/wake/voice change.
+    LaunchedEffect(
+        settings.enableWakeWord,
+        settings.wakeWord,
+        settings.voiceWord,
+        settings.wakeWordMicGainLevel,
+    ) {
         AssistantService.updateWakeWord(
             activity,
             settings.enableWakeWord,
             settings.wakeWord,
-            settings.voiceWord
+            settings.voiceWord,
+            settings.wakeWordMicGainLevel,
         )
     }
 
