@@ -34,8 +34,16 @@ from orchestrator import summary_cache
 from orchestrator.config import OrchestratorConfig, get_available_models
 from orchestrator.providers.discovery import list_orchestrator_models
 from orchestrator.session import OrchestratorSession
+from orchestrator.voice_timeouts import VoiceTimeouts
 
 logger = logging.getLogger(__name__)
+
+# Increment F (plan §F) — central voice-pipeline timeouts. Route layer
+# has no per-session knob (the timeout fires before/after a session
+# may exist), so it reads from ``VoiceTimeouts.default()``. Per-
+# session overrides happen via ``OrchestratorSession(voice_timeouts=...)``
+# threaded down to ``VoiceRelay``.
+_VOICE_TIMEOUTS = VoiceTimeouts.default()
 router = APIRouter(tags=["orchestrator"])
 
 # Per-session locks serializing concurrent ``voice_start`` handlers for the
@@ -411,7 +419,7 @@ async def _handle_start(
     # restart" bug — a fresh voice_start would hit the reconnect branch
     # and reattach to a session whose relay was already dying.
     if local_id:
-        ok = await pool.await_orchestrator_stop(local_id, timeout=5.0)
+        ok = await pool.await_orchestrator_stop(local_id, timeout=_VOICE_TIMEOUTS.await_orchestrator_stop_s)
         if not ok:
             logger.warning(
                 "Timed out waiting for prior orchestrator %s to finish stopping",
@@ -445,7 +453,7 @@ async def _handle_start(
                 await pool.stop_orchestrator()
             except Exception:  # noqa: BLE001
                 logger.exception("stop_orchestrator during ENDING-drop failed")
-            await pool.await_orchestrator_stop(local_id, timeout=5.0)
+            await pool.await_orchestrator_stop(local_id, timeout=_VOICE_TIMEOUTS.await_orchestrator_stop_s)
             skip_reconnect = True
 
         if skip_reconnect:
@@ -550,7 +558,7 @@ async def _handle_start(
                         drift,
                     )
                     await pool.stop_orchestrator()
-                    await pool.await_orchestrator_stop(local_id, timeout=5.0)
+                    await pool.await_orchestrator_stop(local_id, timeout=_VOICE_TIMEOUTS.await_orchestrator_stop_s)
                     # Fall through to the new-session creation path below.
                 else:
                     pool.subscribe_orchestrator(local_id, ws)

@@ -33,6 +33,7 @@ from orchestrator.config import (
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.voice_timeouts import VoiceTimeouts
 from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 # Provider classes are imported lazily inside the methods that need them so
 # this module remains importable on machines where the corresponding SDK
@@ -113,10 +114,9 @@ _VALID_VOICE_TRANSITIONS: dict[VoiceLifecycle, set[VoiceLifecycle]] = {
     VoiceLifecycle.ENDED: {VoiceLifecycle.IDLE},
 }
 
-# Best-effort timeout for the provider's graceful_shutdown_frames send.
-# If the upstream WS is already wedged we don't want teardown to block
-# forever; the WS close that follows will free the resource anyway.
-_GRACEFUL_SHUTDOWN_TIMEOUT_S = 0.5
+# Increment F (plan §F) — voice-pipeline timeouts moved to
+# ``orchestrator.voice_timeouts.VoiceTimeouts``. Sessions read from
+# ``self._voice_timeouts``; tests can override per-instance.
 
 
 def _render_notifications(notes: list[Notification]) -> str:
@@ -203,9 +203,16 @@ class OrchestratorSession:
         voice_name: str | None = None,
         voice_transcription_language: str | None = None,
         voice_endpoint: str | None = None,
+        voice_timeouts: VoiceTimeouts | None = None,
     ) -> None:
         self._config = config
         self._context = context
+        # Increment F — central voice-pipeline timeouts. Default to the
+        # HEAD constants (parity test pins this); callers can override
+        # in tests via ``voice_timeouts=VoiceTimeouts(graceful_shutdown_s=0.01)``.
+        self._voice_timeouts: VoiceTimeouts = (
+            voice_timeouts if voice_timeouts is not None else VoiceTimeouts.default()
+        )
         self._resume_id = session_id  # Original session_id for JSONL continuity
         self._local_id = local_id or str(uuid.uuid4())
         self._agent: OrchestratorAgent | None = None
@@ -930,6 +937,8 @@ class OrchestratorSession:
             rebuild_session_update=_rebuild_session_update,
             vad_threshold=vad_threshold,
             vad_min_silence_ms=vad_min_silence_ms,
+            # Increment F — central timeouts thread through.
+            voice_timeouts=self._voice_timeouts,
         )
         try:
             await relay.start(session_update)
@@ -1051,7 +1060,7 @@ class OrchestratorSession:
 
         # 1. Best-effort graceful shutdown frames (provider-specific). The
         #    relay does the actual send so it can pace through the provider's
-        #    normal write path. Bounded by _GRACEFUL_SHUTDOWN_TIMEOUT_S.
+        #    normal write path. Bounded by ``voice_timeouts.graceful_shutdown_s``.
         if self._voice_relay is not None and self._voice_provider is not None:
             try:
                 frames = self._voice_provider.graceful_shutdown_frames()
@@ -1062,15 +1071,16 @@ class OrchestratorSession:
                 )
                 frames = []
             if frames:
+                shutdown_timeout_s = self._voice_timeouts.graceful_shutdown_s
                 try:
                     await asyncio.wait_for(
                         self._voice_relay.send_shutdown_frames(frames),
-                        timeout=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+                        timeout=shutdown_timeout_s,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "graceful_shutdown_frames timed out after %.1fs for session %s",
-                        _GRACEFUL_SHUTDOWN_TIMEOUT_S, self._local_id,
+                        shutdown_timeout_s, self._local_id,
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception(

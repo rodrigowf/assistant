@@ -41,6 +41,7 @@ from orchestrator.voice_reconnect import (
     ReconnectReason,
     policy_for,
 )
+from orchestrator.voice_timeouts import VoiceTimeouts
 from utils.paths import PROJECT_ROOT
 from weakref import WeakSet
 
@@ -67,36 +68,14 @@ _AUDIO_LOG_SAMPLE_EVERY = 50
 # alongside the api logs so /debug-app picks them up.
 _VOICE_LOG_DIR = PROJECT_ROOT / "logs" / "voice"
 
-# How often to send a tiny silent keepalive PCM chunk upstream when the
-# user is silent.  Qwen-Omni's transcription pipeline times out after a
-# few minutes of audio silence and crashes on the next real input with
-# a misleading "InvalidParameter" 400.  30s comfortably stays under
-# that threshold while keeping bandwidth negligible (~960B/30s).
-_KEEPALIVE_INTERVAL_S = 30.0
-
-# Manual-VAD mode: DashScope documents a 60-second cap on continuous
-# audio in non-VAD (manual) mode before you MUST commit. We force a
-# commit + response.create at 50s if the user is still speaking — far
-# enough below the ceiling that wire jitter never trips it.
-_MANUAL_VAD_SAFETY_COMMIT_S = 50.0
-
-# Increment B observability: heartbeat cadence for the
-# ``voice_vad_state`` broadcast while the VAD is in ``listening``. The
-# UI clock reads ``duration_ms`` from the most recent frame; without a
-# heartbeat the clock would freeze between Silero transitions (which
-# can be seconds apart on far-field input). 1.0 s keeps the clock
-# responsive without flooding the WS — at 31 windows/s a heartbeat
-# every 31 windows adds <1% overhead.
-_VAD_STATE_HEARTBEAT_S = 1.0
-
-# Bound the goAway-driven reconnect: if the new upstream WS connect +
-# session.update handshake doesn't complete within this window, give
-# up and surface a clean error so the frontend can tear down. Observed
-# 2026-06-04: a stuck ``websockets.connect`` left the relay silently
-# jammed for 40s+ with the audio_in queue draining into a void.
-# Generous so a slow Anthropic/Gemini handshake doesn't trigger it,
-# but tight enough that the user notices something is wrong.
-_RECONNECT_HANDSHAKE_TIMEOUT_S = 15.0
+# Increment F (plan §F) — the timeout constants previously declared
+# here are now ``VoiceTimeouts`` fields:
+#   _KEEPALIVE_INTERVAL_S         → voice_timeouts.keepalive_s
+#   _MANUAL_VAD_SAFETY_COMMIT_S   → voice_timeouts.manual_vad_safety_commit_s
+#   _VAD_STATE_HEARTBEAT_S        → voice_timeouts.vad_state_heartbeat_s
+#   _RECONNECT_HANDSHAKE_TIMEOUT_S → voice_timeouts.reconnect_handshake_s
+# Defaults equal the pre-Inc-F literals byte-for-byte
+# (tests/test_voice_timeouts.py::test_defaults_equal_head_constants).
 
 
 class VoiceRelay:
@@ -131,6 +110,10 @@ class VoiceRelay:
         # ``assistant_config.json`` via ``OrchestratorSession``.
         vad_threshold: float | None = None,
         vad_min_silence_ms: int | None = None,
+        # Increment F — central voice-pipeline timeouts. None means
+        # "use VoiceTimeouts.default()" which equals HEAD constants
+        # exactly (parity test pins this).
+        voice_timeouts: "VoiceTimeouts | None" = None,
     ) -> None:
         if provider.connection_type != "websocket":
             raise ValueError(
@@ -262,6 +245,11 @@ class VoiceRelay:
         # constants — parity test pins this).
         self._vad_threshold = vad_threshold
         self._vad_min_silence_ms = vad_min_silence_ms
+        # Increment F — central voice-pipeline timeouts. Default to
+        # HEAD constants exactly (parity-tested).
+        self._voice_timeouts: VoiceTimeouts = (
+            voice_timeouts if voice_timeouts is not None else VoiceTimeouts.default()
+        )
         # Timestamp of the most recent speech_started event (monotonic).
         # Used by the safety-commit watchdog.
         self._manual_vad_speech_started_at: float | None = None
@@ -837,7 +825,7 @@ class VoiceRelay:
         if self._manual_vad.is_speech and self._manual_vad_speech_started_at is not None:
             now = time.monotonic()
             last = self._last_vad_state_emit_at
-            if last is None or (now - last) >= _VAD_STATE_HEARTBEAT_S:
+            if last is None or (now - last) >= self._voice_timeouts.vad_state_heartbeat_s:
                 await self._emit_voice_vad_state("listening")
 
         # Safety commit: some upstreams cap continuous audio in manual
@@ -852,7 +840,7 @@ class VoiceRelay:
         started_at = self._manual_vad_speech_started_at
         if (
             started_at is not None
-            and (time.monotonic() - started_at) >= _MANUAL_VAD_SAFETY_COMMIT_S
+            and (time.monotonic() - started_at) >= self._voice_timeouts.manual_vad_safety_commit_s
         ):
             safety_frames = self._provider.manual_vad_safety_commit_frames()
             if safety_frames:
@@ -986,12 +974,13 @@ class VoiceRelay:
         assert self._ws is not None
         try:
             while not self._closed.is_set():
-                await asyncio.sleep(_KEEPALIVE_INTERVAL_S / 2)
+                keepalive_s = self._voice_timeouts.keepalive_s
+                await asyncio.sleep(keepalive_s / 2)
                 if self._closed.is_set() or self._ws is None:
                     break
                 # Skip if a real audio chunk went out within the interval.
                 idle = time.monotonic() - (self._last_audio_in_at or self._started_at)
-                if idle < _KEEPALIVE_INTERVAL_S:
+                if idle < keepalive_s:
                     continue
                 try:
                     chunk = self._provider.build_keepalive_chunk()
@@ -1596,19 +1585,20 @@ class VoiceRelay:
         # (observed 2026-06-04: ``websockets.connect`` hung for 40s+
         # on goAway #3 of a long session, never resolved) doesn't
         # leave the relay silently jammed.
+        reconnect_timeout_s = self._voice_timeouts.reconnect_handshake_s
         try:
             await asyncio.wait_for(
                 self._open_and_handshake(session_config),
-                timeout=_RECONNECT_HANDSHAKE_TIMEOUT_S,
+                timeout=reconnect_timeout_s,
             )
         except asyncio.TimeoutError:
             self._slog(
                 f"reconnect failed: open_and_handshake timed out after "
-                f"{_RECONNECT_HANDSHAKE_TIMEOUT_S}s"
+                f"{reconnect_timeout_s}s"
             )
             logger.warning(
                 "voice_relay reconnect timed out session_id=%s after %ds",
-                self._session_id, _RECONNECT_HANDSHAKE_TIMEOUT_S,
+                self._session_id, reconnect_timeout_s,
             )
             return False
         except Exception as e:  # noqa: BLE001

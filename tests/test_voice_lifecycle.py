@@ -248,6 +248,53 @@ class TestEndVoiceCanonical:
         assert s.voice_state is VoiceLifecycle.ENDED
 
     @pytest.mark.asyncio
+    async def test_end_voice_uses_per_session_graceful_shutdown_timeout(self):
+        """Increment F — ``voice_timeouts.graceful_shutdown_s`` override
+        flows from ``OrchestratorSession.__init__`` into the
+        ``send_shutdown_frames`` wait_for budget. A very short override
+        means even a 50ms-delayed relay tears down without waiting the
+        default 500ms.
+        """
+        from orchestrator.voice_timeouts import VoiceTimeouts
+
+        config = MagicMock()
+        config.summarizer_model = None
+        context = {"pool": MagicMock(), "store": MagicMock()}
+        from orchestrator.session import OrchestratorSession
+        s = OrchestratorSession(
+            config=config,
+            context=context,
+            voice=True,
+            local_id="t-timeout-override",
+            # Override graceful shutdown to 10ms so a 200ms-delayed
+            # relay forces the wait_for to trip.
+            voice_timeouts=VoiceTimeouts(graceful_shutdown_s=0.01),
+        )
+
+        provider = _stub_provider([{"type": "input_audio_buffer.commit"}])
+        relay = _stub_relay(send_shutdown_frames_delay=0.2)
+        s._voice_provider = provider
+        s._voice_relay = relay
+
+        async with s._voice_lock:
+            s._set_voice_state_unlocked(VoiceLifecycle.STARTING)
+            s._set_voice_state_unlocked(VoiceLifecycle.ACTIVE)
+
+        import time as _time
+        before = _time.monotonic()
+        await s.end_voice("test_override")
+        elapsed = _time.monotonic() - before
+
+        # The 200ms delay must NOT have blocked teardown — the 10ms
+        # override budget hit first. Allow some slack for scheduler
+        # noise (50ms is way under the legacy 500ms default).
+        assert elapsed < 0.15, (
+            f"end_voice took {elapsed:.3f}s — should have hit the 10ms "
+            "graceful_shutdown_s override and skipped the 200ms wait"
+        )
+        assert s.voice_state is VoiceLifecycle.ENDED
+
+    @pytest.mark.asyncio
     async def test_double_end_voice_is_idempotent(self):
         """Second call observes ENDED and returns without rerunning teardown."""
         pool = MagicMock()
