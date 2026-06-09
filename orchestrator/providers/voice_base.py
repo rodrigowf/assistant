@@ -31,6 +31,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from orchestrator.types import OrchestratorEvent
+from orchestrator.voice_errors import VoiceError
 
 
 class BaseVoiceProvider(ABC):
@@ -184,6 +185,31 @@ class BaseVoiceProvider(ABC):
         ``session.update``.
         """
         return False
+
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> VoiceError | None:
+        """Return a typed :class:`VoiceError` for this close, or None.
+
+        Providers override to map their wire-specific error patterns
+        (HTTP body shapes, close codes, reason strings) into the shared
+        :class:`VoiceErrorCategory` taxonomy. Returning None tells the
+        relay to fall back to a generic NETWORK envelope.
+
+        **Read-only contract.** Implementations MUST NOT mutate
+        provider state — only :meth:`is_recoverable_error` does that
+        (Gemini's stale-handle one-shot, etc.). The two methods are
+        kept separate in Increment A to preserve those existing state
+        machines verbatim. Wherever this method returns a
+        ``VoiceError``, its ``recoverable`` flag must match what
+        :meth:`is_recoverable_error` would return for the same
+        exception (parity test:
+        ``tests/parity/test_voice_error_recoverable_parity.py``).
+        """
+        return None
 
     def accepts_upstream_event(self, event: dict[str, Any]) -> bool:
         """Whether a client-mirrored event is safe to forward upstream.

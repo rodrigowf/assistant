@@ -402,6 +402,37 @@ class WebSocketManager {
                 }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
 
+                "voice_error" -> {
+                    // Typed upstream-provider error envelope (Increment A
+                    // of the voice subsystem refactor). The backend emits
+                    // this AHEAD of the legacy ``error`` event so up-to-date
+                    // clients can render categorised UI while older
+                    // clients still see the generic banner.
+                    val err = json.optJSONObject("error")
+                    if (err != null) {
+                        val rawCode = if (err.isNull("raw_close_code")) null
+                                      else err.optInt("raw_close_code")
+                        val rawReason = if (err.isNull("raw_close_reason")) null
+                                        else err.optString("raw_close_reason", null)
+                        val hint = if (err.isNull("recovery_hint")) null
+                                   else err.optString("recovery_hint", null)
+                        val doc = if (err.isNull("provider_doc_url")) null
+                                  else err.optString("provider_doc_url", null)
+                        emit(
+                            WebSocketEvent.VoiceError(
+                                category = err.optString("category", "unknown"),
+                                message = err.optString("message", ""),
+                                recoverable = err.optBoolean("recoverable", true),
+                                recoveryHint = hint,
+                                providerDocUrl = doc,
+                                rawCloseCode = rawCode,
+                                rawCloseReason = rawReason,
+                                provider = err.optString("provider", ""),
+                            )
+                        )
+                    }
+                }
+
                 // Compact
                 "compact_complete" -> emit(WebSocketEvent.CompactComplete(json.optString("summary", "")))
 

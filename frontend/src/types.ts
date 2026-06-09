@@ -55,6 +55,40 @@ export interface VoiceConnectionInfoPayload {
   audio_relay?: "backend";
 }
 
+/** Typed voice-provider error categories. Mirrors
+ *  ``orchestrator.voice_errors.VoiceErrorCategory`` — string values are
+ *  the wire contract; don't rename without coordinating the backend
+ *  classifier + Android parser. */
+export type VoiceErrorCategory =
+  | "quota_exceeded"
+  | "rate_limit"
+  | "auth"
+  | "model_unavailable"
+  | "context_full"
+  | "network"
+  | "provider_internal"
+  | "unknown";
+
+/** Payload of a backend ``voice_error`` event. Shape is the typed
+ *  envelope built by ``VoiceError.to_event()`` in
+ *  ``orchestrator/voice_errors.py``.
+ *
+ *  - ``recoverable=false`` means the backend already short-circuited
+ *    reconnect; clients should render a terminal banner.
+ *  - ``recoverable=true`` means a reconnect attempt is in flight; the
+ *    banner should auto-clear on ``session_started`` of the new
+ *    connection. */
+export interface VoiceErrorEnvelope {
+  category: VoiceErrorCategory;
+  message: string;
+  recoverable: boolean;
+  recovery_hint: string | null;
+  provider_doc_url: string | null;
+  raw_close_code: number | null;
+  raw_close_reason: string | null;
+  provider: string;
+}
+
 export type ServerEvent =
   | {
       type: "session_started";
@@ -96,6 +130,7 @@ export type ServerEvent =
   | { type: "permission_resolved"; request_id: string; decision: "allow" | "deny"; responder: string; message?: string | null }
   | { type: "status"; status: string }
   | { type: "error"; error: string; detail?: string }
+  | { type: "voice_error"; error: VoiceErrorEnvelope }
   | { type: "agent_session_opened"; session_id: string; sdk_session_id?: string }
   | { type: "agent_session_closed"; session_id: string }
   | { type: "user_message"; text: string; source?: string }

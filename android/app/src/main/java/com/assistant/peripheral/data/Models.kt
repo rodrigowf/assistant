@@ -178,6 +178,28 @@ sealed class WebSocketEvent {
     /** Speaker chunk from WS-path voice providers.  Base64-encoded PCM. */
     data class VoiceAudioOut(val audioBase64: String) : WebSocketEvent()
 
+    /**
+     * Typed upstream-provider error from the backend ``voice_error`` event.
+     *
+     * Replaces the opaque ``Error("voice_relay_failed", ...)`` rendering
+     * with a categorised envelope the UI can render with targeted
+     * affordances (billing-cap deep link, auth banner, etc.). The legacy
+     * ``Error`` event is still emitted alongside this for back-compat
+     * with the existing system-message error path.
+     *
+     * String values mirror ``orchestrator.voice_errors.VoiceErrorCategory``.
+     */
+    data class VoiceError(
+        val category: String,
+        val message: String,
+        val recoverable: Boolean,
+        val recoveryHint: String? = null,
+        val providerDocUrl: String? = null,
+        val rawCloseCode: Int? = null,
+        val rawCloseReason: String? = null,
+        val provider: String,
+    ) : WebSocketEvent()
+
     // Compaction
     data class CompactComplete(val summary: String) : WebSocketEvent()
 }

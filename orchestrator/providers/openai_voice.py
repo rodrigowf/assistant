@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 
 from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from orchestrator.types import (
     ErrorEvent,
     OrchestratorEvent,
@@ -345,3 +346,102 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
             "model": self._model,
             "voice": self._voice,
         }
+
+    # --- error classification ------------------------------------------
+
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> VoiceError | None:
+        """Map OpenAI Realtime error shapes onto VoiceError categories.
+
+        OpenAI uses WebRTC — the relay's drain-loop close path doesn't
+        fire here in Increment A. The classifier is still wired so:
+
+        - The ephemeral-token endpoint (``api/routes/voice.py``) can
+          route ``httpx.HTTPStatusError`` bodies through it in a future
+          increment.
+        - Data-channel mirrored ``error`` events that surface via
+          :meth:`inject_event` can be classified the same way.
+
+        Patterns (see plan §5):
+
+        - body contains ``insufficient_quota`` or "exceeded your current
+          quota" → QUOTA_EXCEEDED
+        - body contains ``rate_limit_exceeded`` or HTTP 429 → RATE_LIMIT
+        - body contains "Incorrect API key" or HTTP 401 → AUTH
+        - body contains ``model_not_found`` or "Unsupported model" →
+          MODEL_UNAVAILABLE
+        """
+        text = (close_reason or "") + " " + (str(exc) if exc is not None else "")
+        lower = text.lower()
+
+        if "insufficient_quota" in text or "exceeded your current quota" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.QUOTA_EXCEEDED,
+                message=(
+                    "Your OpenAI account has exhausted its credit "
+                    "(insufficient_quota)."
+                ),
+                recoverable=False,
+                recovery_hint=(
+                    "Top up at platform.openai.com/billing, then retry."
+                ),
+                provider_doc_url="https://platform.openai.com/billing",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        if "rate_limit_exceeded" in text or close_code == 429:
+            return VoiceError(
+                category=VoiceErrorCategory.RATE_LIMIT,
+                message="OpenAI Realtime rate limit reached.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        if (
+            "incorrect api key" in lower
+            or "invalid api key" in lower
+            or close_code == 401
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.AUTH,
+                message="OpenAI authentication failed (Incorrect API key).",
+                recoverable=False,
+                recovery_hint=(
+                    "Verify OPENAI_API_KEY in context/.env is current and "
+                    "the account is in good standing."
+                ),
+                provider_doc_url="https://platform.openai.com/api-keys",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        if "model_not_found" in text or "unsupported model" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.MODEL_UNAVAILABLE,
+                message=(
+                    "This OpenAI Realtime model isn't available on your "
+                    "account tier."
+                ),
+                recoverable=False,
+                recovery_hint=(
+                    "Switch to gpt-realtime or check your model access at "
+                    "platform.openai.com."
+                ),
+                provider_doc_url="https://platform.openai.com/docs/models",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        return None

@@ -841,6 +841,26 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 b.messages.update { it + compactMessage }
             }
 
+            is WebSocketEvent.VoiceError -> {
+                // Typed voice-provider error. Render a categorised
+                // system message; the legacy ``Error`` event still
+                // arrives behind this one (back-compat) but its detail
+                // is the same string the user just saw, so the
+                // duplicate display is acceptable in Increment A. A
+                // later cleanup can suppress the legacy event once all
+                // clients have migrated.
+                val hintLine = event.recoveryHint?.let { "\n$it" } ?: ""
+                val docLine = event.providerDocUrl?.let { "\n$it" } ?: ""
+                val errorMessage = ChatMessage(
+                    role = MessageRole.SYSTEM,
+                    content = "Voice error (${event.category}): ${event.message}$hintLine$docLine"
+                )
+                b.messages.update { it + errorMessage }
+                if (!event.recoverable) {
+                    b.sessionStatus.value = "error"
+                }
+            }
+
             is WebSocketEvent.Error -> {
                 val errorMessage = ChatMessage(
                     role = MessageRole.SYSTEM,

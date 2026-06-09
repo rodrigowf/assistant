@@ -36,6 +36,7 @@ import type {
   RealtimeEvent,
   ServerEvent,
   VoiceConnectionInfoPayload,
+  VoiceErrorEnvelope,
   VoiceStatus,
 } from "../types";
 
@@ -86,6 +87,13 @@ export interface VoiceOrchestratorResult {
   micLevel: number;
   speakerLevel: number;
   voiceError: string | null;
+  /** Typed voice-provider error envelope from the backend
+   *  ``voice_error`` event. Replaces ``voiceError: string`` in
+   *  components that want to render categorised UI (billing-cap
+   *  banner with deep link, auth banner with API-key hint, etc.).
+   *  Both fields update from the same source — components can pick
+   *  whichever shape they prefer. */
+  voiceErrorDetails: VoiceErrorEnvelope | null;
   /** True when this device initiated the voice session (called startVoice).
    *  False for passive viewers receiving voice events from another device. */
   isLocalVoice: boolean;
@@ -99,6 +107,11 @@ export function useVoiceOrchestrator(
 ): VoiceOrchestratorResult {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  // Typed voice-provider error envelope (from backend `voice_error`
+  // event). Components that want categorised UI render this; the
+  // legacy `voiceError` string stays in sync so older components keep
+  // working unchanged.
+  const [voiceErrorDetails, setVoiceErrorDetails] = useState<VoiceErrorEnvelope | null>(null);
   // True when this device called startVoice() — distinguishes the voice
   // owner from passive viewers receiving events from another device.
   const [isLocalVoice, setIsLocalVoice] = useState(false);
@@ -586,6 +599,27 @@ export function useVoiceOrchestrator(
         break;
       }
 
+      case "voice_error": {
+        // Typed upstream-provider error envelope. Surface the
+        // categorised payload so components can render targeted UI
+        // (billing-cap deep link, auth banner, etc.) and mirror the
+        // human-readable message into the legacy string state for
+        // components that haven't migrated yet.
+        const env = event.error;
+        console.error("[voice-orchestrator] voice_error:", env);
+        setVoiceErrorDetails(env);
+        setVoiceError(env.message);
+        if (!env.recoverable) {
+          cleanup();
+          updateStatus("error");
+          optsRef.current.onAfterStop?.();
+        }
+        // Recoverable variants leave the transport intact — the
+        // backend's reconnect path will deliver a fresh session_started
+        // on success (which clears the error in startVoice() below).
+        break;
+      }
+
       case "status":
         if ((event as { status?: string }).status === "disconnected" && transportRef.current) {
           setVoiceError((prev) => prev ?? "Server connection lost");
@@ -618,6 +652,7 @@ export function useVoiceOrchestrator(
 
     setIsLocalVoice(true);
     setVoiceError(null);
+    setVoiceErrorDetails(null);
     updateStatus("connecting");
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
@@ -821,6 +856,7 @@ export function useVoiceOrchestrator(
     micLevel,
     speakerLevel,
     voiceError,
+    voiceErrorDetails,
     isLocalVoice,
     handlePassiveVoiceEvent,
   };

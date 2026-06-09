@@ -603,6 +603,107 @@ class QwenVoiceProvider(BaseVoiceProvider):
         err_text = str(exc)
         return any(s in err_text for s in self._RECONNECTABLE_ERR_SUBSTRINGS)
 
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> "VoiceError | None":
+        """Map DashScope close reasons onto VoiceError categories.
+
+        Patterns (plan §5):
+
+        - "balance" / "insufficient" / "余额不足" → QUOTA_EXCEEDED
+        - "InvalidApiKey" → AUTH
+        - "Throttling" / "too many" → RATE_LIMIT (recoverable)
+        - "model not found" → MODEL_UNAVAILABLE
+        - Existing recoverable boilerplate ("InvalidParameter",
+          "response_idle_timeout") → NETWORK with recoverable=True
+          (mirrors :meth:`is_recoverable_error`)
+        """
+        from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
+
+        text = (close_reason or "") + " " + (str(exc) if exc is not None else "")
+        lower = text.lower()
+
+        # Quota — balance keyword in English or Chinese.
+        if (
+            "余额不足" in text
+            or ("balance" in lower and "insufficient" in lower)
+            or "balance insufficient" in lower
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.QUOTA_EXCEEDED,
+                message="Your DashScope account balance is depleted.",
+                recoverable=False,
+                recovery_hint=(
+                    "Top up at dashscope.console.aliyun.com, then retry."
+                ),
+                provider_doc_url="https://dashscope.console.aliyun.com/",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # AUTH.
+        if "InvalidApiKey" in text:
+            return VoiceError(
+                category=VoiceErrorCategory.AUTH,
+                message="DashScope authentication failed (InvalidApiKey).",
+                recoverable=False,
+                recovery_hint=(
+                    "Verify DASHSCOPE_API_KEY in context/.env is current."
+                ),
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # MODEL_UNAVAILABLE.
+        if "model not found" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.MODEL_UNAVAILABLE,
+                message="This Qwen-Omni model isn't available on DashScope.",
+                recoverable=False,
+                recovery_hint="Switch to a different Qwen model in settings.",
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # RATE_LIMIT.
+        if "throttling" in lower or "too many" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.RATE_LIMIT,
+                message="DashScope rate limit reached.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # Existing recoverable boilerplate — match `is_recoverable_error`
+        # so the parity contract holds.
+        if exc is not None and any(
+            s in str(exc) for s in self._RECONNECTABLE_ERR_SUBSTRINGS
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.NETWORK,
+                message="DashScope transient close; reconnecting.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        return None
+
     # --- manual-VAD upstream frames --------------------------------------
 
     def manual_vad_stop_frames(self) -> list[dict[str, Any]]:

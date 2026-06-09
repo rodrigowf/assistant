@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable
 
 from orchestrator.providers.voice_base import BaseVoiceProvider
 from orchestrator import voice_vad
+from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from utils.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
@@ -1040,6 +1041,17 @@ class VoiceRelay:
                 self._closed.set()
                 self._log_close_summary("clean close, reconnect refused")
                 self._close_session_log()
+                # Increment A — emit typed VoiceError envelope alongside
+                # the legacy ``error`` event. No exception object here
+                # (clean close), so the classifier sees None and falls
+                # through to the relay's generic NETWORK fallback.
+                await self._emit_voice_error_event(
+                    exc=None,
+                    fallback_message=(
+                        f"Upstream {self._provider.provider_name} "
+                        "reconnect refused after goAway"
+                    ),
+                )
                 await self._on_event_for_frontend({
                     "type": "error",
                     "error": {
@@ -1088,6 +1100,18 @@ class VoiceRelay:
                 )
                 self._slog(f"  recv[-{offset}] type={frame.get('type')} body={json.dumps(frame)[:500]}")
 
+            # Increment A — classify the close BEFORE the reconnect
+            # gate. If the classifier flags the close as
+            # ``recoverable=False`` (quota / auth / model_unavailable /
+            # context_full), short-circuit reconnect by zeroing
+            # ``_max_reconnects`` so :meth:`_try_reconnect` refuses on
+            # its first capacity check. This is authorised by plan §10
+            # (2026-06-09 user decision) — quota errors are never
+            # transient; retrying just delays the clear error message.
+            classified = self._classify_close(e)
+            if classified is not None and not classified.recoverable:
+                self._max_reconnects = 0
+
             # Try to recover transparently before giving up — DashScope's
             # "InvalidParameter" 400 mid-session is almost always salvageable
             # by reopening with a fresh session.update.
@@ -1107,6 +1131,18 @@ class VoiceRelay:
             self._log_close_summary(f"upstream drain failed: {e}")
             self._close_session_log()
 
+            # Emit the typed VoiceError envelope first so up-to-date
+            # clients render the categorised banner; the legacy
+            # ``voice_relay_failed`` ``error`` event follows for
+            # back-compat (older frontends + Android builds that haven't
+            # been updated yet still see the generic error).
+            await self._emit_voice_error_event(
+                exc=e,
+                fallback_message=(
+                    f"Upstream {self._provider.provider_name} WS closed: {e}"
+                ),
+                precomputed=classified,
+            )
             await self._on_event_for_frontend({
                 "type": "error",
                 "error": {
@@ -1114,6 +1150,86 @@ class VoiceRelay:
                     "message": f"Upstream {self._provider.provider_name} WS closed: {e}",
                 },
             })
+
+    def _classify_close(self, exc: BaseException | None) -> VoiceError | None:
+        """Run the provider's ``classify_close_reason`` if it exists.
+
+        Returns None when:
+        - The provider doesn't implement the classifier (older fakes /
+          providers that haven't been migrated yet).
+        - The classifier itself returns None (no semantic match).
+
+        Read-only contract: this never mutates provider state. Only
+        :meth:`is_recoverable_error` does that; the relay calls both
+        independently.
+        """
+        # ``hasattr`` check tolerates fake providers in existing tests
+        # that don't subclass BaseVoiceProvider. Real providers always
+        # have the method (default returns None) post-Increment-A.
+        classifier = getattr(self._provider, "classify_close_reason", None)
+        if classifier is None:
+            return None
+
+        ws_code: int | None = None
+        ws_reason: str | None = None
+        if self._ws is not None:
+            ws_code = getattr(self._ws, "close_code", None)
+            ws_reason = getattr(self._ws, "close_reason", None)
+
+        try:
+            return classifier(exc, ws_code, ws_reason)
+        except Exception:  # noqa: BLE001
+            # A classifier crash must not break the close path. Log and
+            # fall through to the relay's generic NETWORK envelope.
+            logger.exception(
+                "voice_relay classify_close_reason raised for %s",
+                self._provider.provider_name,
+            )
+            return None
+
+    async def _emit_voice_error_event(
+        self,
+        *,
+        exc: BaseException | None,
+        fallback_message: str,
+        precomputed: VoiceError | None = None,
+    ) -> None:
+        """Emit a typed ``voice_error`` event to the frontend.
+
+        If the provider classifier returns a :class:`VoiceError`, use
+        it. Otherwise synthesise a generic NETWORK envelope with
+        ``recoverable=True`` (matches today's reconnect behavior for
+        unclassified closes).
+
+        Increment A wires this alongside the legacy ``error`` event so
+        clients can opt into typed rendering incrementally.
+        """
+        err_obj = precomputed if precomputed is not None else self._classify_close(exc)
+
+        if err_obj is None:
+            ws_code: int | None = None
+            ws_reason: str | None = None
+            if self._ws is not None:
+                ws_code = getattr(self._ws, "close_code", None)
+                ws_reason = getattr(self._ws, "close_reason", None)
+            err_obj = VoiceError(
+                category=VoiceErrorCategory.NETWORK,
+                message=fallback_message,
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=ws_code,
+                raw_close_reason=ws_reason,
+                provider=self._provider.provider_name,
+            )
+
+        try:
+            await self._on_event_for_frontend(err_obj.to_event())
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "voice_relay failed to emit voice_error for %s",
+                self._provider.provider_name,
+            )
 
     async def _try_reconnect(
         self,

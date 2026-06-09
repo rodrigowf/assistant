@@ -57,6 +57,7 @@ import websockets
 
 from orchestrator import voice_vad
 from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from orchestrator.types import (
     ErrorEvent,
     OrchestratorEvent,
@@ -721,6 +722,124 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, abc.ABC):
         """
         msg = str(exc)
         return "1008" in msg and "session expired" in msg.lower()
+
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> VoiceError | None:
+        """Map Gemini Live close reasons onto :class:`VoiceErrorCategory`.
+
+        Pattern table (must stay aligned with plan §5):
+
+        - ``1011`` + "exceeded its monthly spending cap" → QUOTA_EXCEEDED
+        - ``1008`` + "session expired" → recoverable (existing
+          stale-handle path; mirrors :meth:`_is_session_expired_close`)
+        - ``1008`` + "denied access" → AUTH (non-recoverable)
+        - reason mentions "rate" → RATE_LIMIT (recoverable)
+        - "not available in your region" / "Model not found" /
+          "is not supported" → MODEL_UNAVAILABLE (non-recoverable)
+
+        Read-only contract: must NOT mutate ``_resumption_handle``,
+        ``_goaway_received``, or ``_stale_handle_recovery_used`` — only
+        :meth:`is_recoverable_error` does that.
+        """
+        text = (close_reason or "") + " " + (str(exc) if exc is not None else "")
+        lower = text.lower()
+
+        # Quota / billing — Bug 1 in the 2026-06-08 log inventory.
+        if "exceeded its monthly spending cap" in text or "Your project has" in text and "cap" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.QUOTA_EXCEEDED,
+                message=(
+                    "Your Google AI Studio project has exceeded its monthly "
+                    "spending cap."
+                ),
+                recoverable=False,
+                recovery_hint=(
+                    "Visit AI Studio at ai.studio/spend to raise the cap or "
+                    "wait for the cycle to reset."
+                ),
+                provider_doc_url="https://ai.studio/spend",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # Recoverable: stale-handle "session expired" 1008. Match the
+        # legacy gate (which mutates state); the classifier only reads.
+        if self._is_session_expired_close(exc) if exc is not None else False:
+            return VoiceError(
+                category=VoiceErrorCategory.NETWORK,
+                message="Gemini session resumption handle expired; reconnecting.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # AUTH — AI Studio denied access (separate 1008 reason, fatal).
+        if "denied access" in lower or "denied" in lower and "access" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.AUTH,
+                message=(
+                    "Your Google AI Studio project has been denied access to "
+                    "the Live API."
+                ),
+                recoverable=False,
+                recovery_hint=(
+                    "Verify your GEMINI_API_KEY is valid, the project is "
+                    "active, and the model is available on AI Studio. "
+                    "If AI Studio keeps refusing, switch the endpoint to "
+                    "Vertex AI."
+                ),
+                provider_doc_url="https://aistudio.google.com/apikey",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # MODEL_UNAVAILABLE — region or discontinued model.
+        if (
+            "not available in your region" in lower
+            or "model not found" in lower
+            or "is not supported" in lower
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.MODEL_UNAVAILABLE,
+                message="This Gemini model isn't available for your project.",
+                recoverable=False,
+                recovery_hint=(
+                    "Switch to a different Gemini Live model in voice "
+                    "settings, or change the endpoint to Vertex AI."
+                ),
+                provider_doc_url=(
+                    "https://ai.google.dev/gemini-api/docs/models/gemini"
+                ),
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # RATE_LIMIT — opaque but transient.
+        if "rate" in lower and ("limit" in lower or "throttl" in lower):
+            return VoiceError(
+                category=VoiceErrorCategory.RATE_LIMIT,
+                message="Google Live API rate limit reached.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # No semantic match — let the relay synthesise a generic NETWORK
+        # envelope.
+        return None
 
     # --- connection metadata ---------------------------------------------
 

@@ -322,3 +322,268 @@ async def test_no_reconnect_without_rebuild_callback():
     assert provider.opens == 1
     error_events = [e for e in frontend_events if e.get("type") == "error"]
     assert len(error_events) == 1
+
+
+# === Increment A — typed VoiceError surfacing ============================
+#
+# The relay emits a ``voice_error`` event (additive) ahead of the legacy
+# ``voice_relay_failed`` ``error`` event. When the classifier flags
+# ``recoverable=False`` (quota / auth / model_unavailable / context_full),
+# the relay short-circuits any further reconnect attempts.
+
+class _FakeProviderWithClassifier(_FakeProvider):
+    """Hand-rolled fake provider that also implements
+    ``classify_close_reason`` so we can test the new emission path
+    without spinning up a real Google/Qwen/OpenAI provider.
+    """
+
+    def __init__(self, ws_seq, classifier_response=None):
+        super().__init__(ws_seq)
+        self._classifier_response = classifier_response
+
+    def classify_close_reason(self, exc, code, reason):
+        return self._classifier_response
+
+
+@pytest.mark.asyncio
+async def test_voice_error_event_emitted_alongside_legacy_error():
+    """When a non-recoverable error closes the WS, the relay must emit
+    BOTH the new ``voice_error`` event AND the legacy
+    ``voice_relay_failed`` ``error`` event (back-compat with clients
+    that haven't been updated yet).
+    """
+    from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
+
+    classified = VoiceError(
+        category=VoiceErrorCategory.QUOTA_EXCEEDED,
+        message="Your project has exceeded its monthly spending cap.",
+        recoverable=False,
+        recovery_hint="Top up at ai.studio/spend",
+        provider_doc_url="https://ai.studio/spend",
+        raw_close_code=1011,
+        raw_close_reason="exceeded its monthly spending cap",
+        provider="google",
+    )
+
+    ws = _FakeWS(
+        frames=[json.dumps({"type": "session.created"})],
+        close_error=ConnectionError(
+            "received 1011 (internal error) Your project has exceeded its "
+            "monthly spending cap"
+        ),
+    )
+    provider = _FakeProviderWithClassifier([ws], classifier_response=classified)
+
+    frontend_events: list[dict[str, Any]] = []
+
+    async def on_audio(b64):
+        pass
+
+    async def on_event(ev):
+        frontend_events.append(ev)
+
+    relay = VoiceRelay(
+        provider,
+        on_audio_out=on_audio,
+        on_event_for_frontend=on_event,
+        session_id="t-quota",
+        rebuild_session_update=None,
+    )
+    await relay.start({"type": "session.update", "session": {"instructions": "initial"}})
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await relay.stop()
+
+    voice_errors = [e for e in frontend_events if e.get("type") == "voice_error"]
+    legacy_errors = [
+        e for e in frontend_events
+        if e.get("type") == "error"
+        and (e.get("error") or {}).get("code") == "voice_relay_failed"
+    ]
+    assert len(voice_errors) == 1, (
+        f"expected one voice_error event; got {voice_errors!r} "
+        f"(full event list: {frontend_events!r})"
+    )
+    payload = voice_errors[0]["error"]
+    assert payload["category"] == "quota_exceeded"
+    assert payload["recoverable"] is False
+    assert payload["provider"] == "google"
+    assert "spending cap" in payload["message"]
+    # Legacy event still emitted — back-compat.
+    assert len(legacy_errors) == 1
+    # voice_error must come BEFORE the legacy error so clients that
+    # listen to both see the typed envelope first and can decide whether
+    # to suppress the generic banner.
+    voice_error_idx = frontend_events.index(voice_errors[0])
+    legacy_idx = frontend_events.index(legacy_errors[0])
+    assert voice_error_idx < legacy_idx
+
+
+@pytest.mark.asyncio
+async def test_non_recoverable_voice_error_short_circuits_reconnect():
+    """When the classifier flags the close as ``recoverable=False``, the
+    relay must NOT consume reconnect attempts even if
+    ``rebuild_session_update`` is configured.
+
+    Authorised change per plan §10.2 (2026-06-09 user decision).
+    """
+    from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
+
+    classified = VoiceError(
+        category=VoiceErrorCategory.QUOTA_EXCEEDED,
+        message="Quota cap reached.",
+        recoverable=False,
+        recovery_hint=None,
+        provider_doc_url=None,
+        raw_close_code=1011,
+        raw_close_reason="quota cap",
+        provider="google",
+    )
+
+    ws = _FakeWS(
+        frames=[json.dumps({"type": "session.created"})],
+        close_error=ConnectionError("received 1011 (internal error) quota cap"),
+    )
+    provider = _FakeProviderWithClassifier([ws], classifier_response=classified)
+
+    frontend_events: list[dict[str, Any]] = []
+    rebuilt: list[bool] = []
+
+    async def on_audio(b64):
+        pass
+
+    async def on_event(ev):
+        frontend_events.append(ev)
+
+    async def rebuild():
+        rebuilt.append(True)
+        return {"type": "session.update", "session": {}}
+
+    relay = VoiceRelay(
+        provider,
+        on_audio_out=on_audio,
+        on_event_for_frontend=on_event,
+        session_id="t-shortcircuit",
+        rebuild_session_update=rebuild,
+        max_reconnects=5,
+    )
+    await relay.start({"type": "session.update", "session": {"instructions": "initial"}})
+
+    for _ in range(20):
+        await asyncio.sleep(0)
+    await relay.stop()
+
+    # Despite max_reconnects=5 + a rebuild callback, the
+    # recoverable=False classifier must keep the relay from retrying.
+    assert provider.opens == 1, (
+        f"expected exactly one open (no reconnects); got {provider.opens}. "
+        "Classifier said recoverable=False — relay must short-circuit."
+    )
+    assert rebuilt == [], (
+        "rebuild_session_update must not be called when the classifier "
+        "flagged the error as non-recoverable."
+    )
+
+
+@pytest.mark.asyncio
+async def test_recoverable_voice_error_does_not_short_circuit():
+    """When the classifier flags recoverable=True, the existing
+    reconnect path remains intact — the new code is fully back-compat.
+    """
+    from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
+
+    classified = VoiceError(
+        category=VoiceErrorCategory.NETWORK,
+        message="Transient transport close.",
+        recoverable=True,
+        recovery_hint=None,
+        provider_doc_url=None,
+        raw_close_code=1006,
+        raw_close_reason=None,
+        provider="qwen",
+    )
+
+    initial = _FakeWS(
+        frames=[json.dumps({"type": "session.created"})],
+        close_error=ConnectionError(
+            "received 1007 (invalid frame payload data) "
+            "InvalidParameter: The provided URL does not appear to be valid"
+        ),
+    )
+    reconnected = _FakeWS(frames=[json.dumps({"type": "session.created"})])
+    provider = _FakeProviderWithClassifier(
+        [initial, reconnected],
+        classifier_response=classified,
+    )
+
+    frontend_events: list[dict[str, Any]] = []
+
+    async def on_audio(b64):
+        pass
+
+    async def on_event(ev):
+        frontend_events.append(ev)
+
+    async def rebuild():
+        return {"type": "session.update", "session": {"instructions": "rebuilt"}}
+
+    relay = VoiceRelay(
+        provider,
+        on_audio_out=on_audio,
+        on_event_for_frontend=on_event,
+        session_id="t-recoverable",
+        rebuild_session_update=rebuild,
+        max_reconnects=2,
+    )
+    await relay.start({"type": "session.update", "session": {"instructions": "initial"}})
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await relay.stop()
+
+    assert provider.opens == 2, "recoverable classifier preserves reconnect path"
+
+
+@pytest.mark.asyncio
+async def test_no_classifier_falls_back_to_generic_voice_error():
+    """If the provider's classifier returns None, the relay synthesises a
+    generic NETWORK ``voice_error`` envelope (recoverable=True). The
+    relay's reconnect gate is then driven by ``is_recoverable_error``
+    exactly as before.
+    """
+    ws = _FakeWS(
+        frames=[json.dumps({"type": "session.created"})],
+        close_error=ConnectionError("some unrelated network error"),
+    )
+    # The default _FakeProvider has no classify_close_reason method.
+    provider = _FakeProvider([ws])
+
+    frontend_events: list[dict[str, Any]] = []
+
+    async def on_audio(b64):
+        pass
+
+    async def on_event(ev):
+        frontend_events.append(ev)
+
+    relay = VoiceRelay(
+        provider,
+        on_audio_out=on_audio,
+        on_event_for_frontend=on_event,
+        session_id="t-fallback",
+        rebuild_session_update=None,
+    )
+    await relay.start({"type": "session.update", "session": {"instructions": "initial"}})
+
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await relay.stop()
+
+    voice_errors = [e for e in frontend_events if e.get("type") == "voice_error"]
+    assert len(voice_errors) == 1
+    payload = voice_errors[0]["error"]
+    # No classifier output → relay uses the generic NETWORK fallback.
+    assert payload["category"] == "network"
+    assert payload["recoverable"] is True
+    assert payload["provider"] == "qwen-test"
