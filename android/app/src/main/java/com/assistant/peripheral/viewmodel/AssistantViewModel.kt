@@ -1800,11 +1800,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
             }
-            // Apply to wake word detector via AssistantService (restart with new gain)
-            val s = _settings.value
-            if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, s.voiceWord, level)
-            }
+            // No inline AssistantService.updateWakeWord call — MainActivity's
+            // LaunchedEffect keyed on settings.wakeWordMicGainLevel picks the
+            // change up off the settings StateFlow and applies it once.
         }
     }
 
@@ -1858,13 +1856,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Inline AssistantService.updateWakeWord calls intentionally removed from
+    // updateEnableWakeWord / updateWakeWord / updateVoiceWord — MainActivity's
+    // LaunchedEffect (keyed on enableWakeWord / wakeWord / voiceWord /
+    // wakeWordMicGainLevel) is the single ingress to the service. Each setting
+    // change emits a DataStore update; the LaunchedEffect picks it up and fires
+    // exactly one updateWakeWord intent, instead of the old double-intent
+    // pattern (one inline, one from the effect — see commit d6181b1).
+
     fun updateEnableWakeWord(enabled: Boolean) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.ENABLE_WAKE_WORD] = enabled
             }
-            val s = _settings.value
-            AssistantService.updateWakeWord(getApplication(), enabled, s.wakeWord, s.voiceWord, s.wakeWordMicGainLevel)
         }
     }
 
@@ -1873,10 +1877,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.WAKE_WORD] = word
             }
-            val s = _settings.value
-            if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, word, s.voiceWord, s.wakeWordMicGainLevel)
-            }
         }
     }
 
@@ -1884,10 +1884,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.VOICE_WORD] = word
-            }
-            val s = _settings.value
-            if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, word, s.wakeWordMicGainLevel)
             }
         }
     }
