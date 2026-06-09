@@ -21,6 +21,7 @@ import asyncio
 import base64
 import logging
 import time
+import weakref
 from pathlib import Path
 
 import orjson
@@ -48,10 +49,16 @@ router = APIRouter(tags=["orchestrator"])
 # spike of 400 BadRequest in AI Studio's dashboard (observed
 # 2026-06-04: three back-to-back opens, all reusing the same handle).
 #
-# Keyed on ``local_id``. The dict is intentionally never pruned — locks
-# are tiny (~100 bytes), local_ids are UUIDs, and a long-lived backend
-# accumulates O(distinct sessions/day) ≈ a handful, not enough to leak.
-_VOICE_START_LOCKS: dict[str, asyncio.Lock] = {}
+# Keyed on ``local_id``. Increment D (plan §D) switched this to a
+# ``WeakValueDictionary`` so locks for finished sessions get reaped
+# automatically — locks are tiny (~100 bytes) but a long-lived backend
+# that churns through thousands of distinct tab UUIDs would otherwise
+# accumulate them indefinitely. While a handler is mid-acquire it
+# holds a strong ref on its own stack frame, so the lock can't
+# disappear out from under it.
+_VOICE_START_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 
 
 def _voice_start_lock_for(local_id: str) -> asyncio.Lock:
@@ -101,16 +108,11 @@ async def orchestrator_ws(ws: WebSocket):
     pool: SessionPool = ws.app.state.pool
     session: OrchestratorSession | None = None
     subscribed = False  # True once this ws is registered in pool._orchestrator_subs
-    # Defensive init — the finally block reads ``was_voice``
-    # unconditionally, and not every loop-exit path runs through one
-    # of the except handlers where ``was_voice`` is otherwise assigned.
-    # Without this default we'd hit UnboundLocalError on any clean exit.
-    was_voice = False
-    # True only if THIS WebSocket initiated the voice session (sent
-    # ``voice_start``). Passive subscribers (text-mode WebSockets that
-    # joined via ``start`` while voice was already active) must NOT tear
-    # down voice on disconnect — only the voice owner should.
-    voice_owner = False
+    # Increment D (plan §D) — the route layer no longer carries
+    # ``voice_owner`` / ``was_voice`` flags. Ownership lives on the
+    # session: ``session.voice_owner_ws is ws`` answers "did this WS
+    # initiate voice?", and ``session.is_voice`` answers "is voice
+    # currently active?". The finally block reads those directly.
 
     # Register as a watcher so this ws receives agent_session_opened/closed events
     pool.watch(ws)
@@ -166,7 +168,10 @@ async def orchestrator_ws(ws: WebSocket):
                         ws, pool, msg, voice=True,
                     )
                 if session is not None:
-                    voice_owner = True
+                    # Increment D — record ownership on the session
+                    # itself instead of a route-local bool. Only this
+                    # WS is allowed to tear voice down on disconnect.
+                    session.register_voice_owner(ws)
 
             elif msg_type == "send":
                 if session is None:
@@ -290,7 +295,10 @@ async def orchestrator_ws(ws: WebSocket):
                         await session.end_voice("user_stop")
                     except Exception:  # noqa: BLE001
                         logger.exception("end_voice failed during voice_stop")
-                voice_owner = False
+                # Drop ownership on this WS so a later client disconnect
+                # doesn't trigger a redundant end_voice on the dead session.
+                if session is not None:
+                    session.clear_voice_owner_if(ws)
                 # No session_stopped ack here — the voice_ended broadcast
                 # that end_voice fires is the ack the frontend waits for.
 
@@ -320,16 +328,17 @@ async def orchestrator_ws(ws: WebSocket):
         # Note what state we were in — a voice-mode disconnect with no
         # `stop` command tends to indicate a frontend reconnect, which
         # has consequences (the session.update fires fresh next time).
-        was_voice = bool(session is not None and session.is_voice)
         logger.info(
             "Orchestrator WS disconnected (client closed) code=%s reason=%r voice_active=%s",
             getattr(e, "code", None),
             getattr(e, "reason", None),
-            was_voice,
+            bool(session is not None and session.is_voice),
         )
     except Exception:
-        was_voice = bool(session is not None and getattr(session, "is_voice", False))
-        logger.exception("Orchestrator WS error voice_active=%s", was_voice)
+        logger.exception(
+            "Orchestrator WS error voice_active=%s",
+            bool(session is not None and getattr(session, "is_voice", False)),
+        )
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
@@ -340,9 +349,16 @@ async def orchestrator_ws(ws: WebSocket):
         # kill the voice session when they disconnect — otherwise
         # refreshing the iPad kills the Android's active voice call.
         #
-        # ``end_voice`` is idempotent and handles non-voice sessions as
-        # a fast no-op, so calling it unconditionally here is safe.
-        if was_voice and session is not None and voice_owner:
+        # Increment D — ownership and end-of-life live on the session.
+        # Clear ownership FIRST (independent of end_voice succeeding)
+        # so a future raise inside end_voice can't leave the pointer
+        # dangling — this is the structural bug the Explore-agent
+        # flagged before §D.
+        if (
+            session is not None
+            and session.is_voice
+            and session.clear_voice_owner_if(ws)
+        ):
             try:
                 await session.end_voice("client_disconnect")
                 logger.info(
@@ -509,13 +525,13 @@ async def _handle_start(
             # honour mid-session changes. Block the swap while a turn is
             # in flight so we don't tear down upstream audio mid-reply.
             if voice and current_voice:
-                drift = _voice_config_drift(
-                    session,
-                    voice_provider_req,
-                    voice_model_req,
-                    voice_name_req,
-                    voice_lang_req,
-                    voice_endpoint_req,
+                # Increment D — drift logic moved onto the session.
+                drift = session.voice_config_drifts_from(
+                    provider=voice_provider_req,
+                    model=voice_model_req,
+                    voice_name=voice_name_req,
+                    language=voice_lang_req,
+                    endpoint=voice_endpoint_req,
                 )
                 if drift:
                     if session.is_busy:
@@ -727,45 +743,6 @@ async def _handle_start(
             _ms_since(_t0),
         )
     return session, True
-
-
-def _voice_config_drift(
-    session: OrchestratorSession,
-    provider: str | None,
-    model: str | None,
-    voice_name: str | None,
-    language: str | None,
-    endpoint: str | None,
-) -> str | None:
-    """Return a short description of which voice fields the client asked
-    to change vs. the live session, or ``None`` if they match.
-
-    Fields the client didn't send (``None``) are skipped — same-mode
-    reconnect WS messages frequently omit settings the client doesn't
-    care about. Endpoint comparison uses the live provider's classname
-    via ``endpoint_id`` for Gemini, falling back to ``_voice_endpoint``.
-    """
-    changed: list[str] = []
-    if provider is not None and provider != session.voice_provider_id:
-        changed.append(f"provider {session.voice_provider_id!r}→{provider!r}")
-    if model is not None and model != session.voice_model_id:
-        changed.append(f"model {session.voice_model_id!r}→{model!r}")
-    if voice_name is not None and voice_name != session.voice_name_id:
-        changed.append(f"voice {session.voice_name_id!r}→{voice_name!r}")
-    if language is not None and language != session.voice_transcription_language:
-        changed.append(
-            f"language {session.voice_transcription_language!r}→{language!r}"
-        )
-    if endpoint is not None:
-        live_endpoint: str | None = None
-        provider_obj = getattr(session, "_voice_provider", None)
-        if provider_obj is not None:
-            live_endpoint = getattr(provider_obj, "endpoint_id", None)
-        if live_endpoint is None:
-            live_endpoint = getattr(session, "_voice_endpoint", None)
-        if endpoint != live_endpoint:
-            changed.append(f"endpoint {live_endpoint!r}→{endpoint!r}")
-    return ", ".join(changed) if changed else None
 
 
 async def _attach_voice_payload(

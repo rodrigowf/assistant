@@ -263,6 +263,16 @@ class OrchestratorSession:
         # synthetic turn now or let the next user prompt drain notifications.
         self._busy_lock = asyncio.Lock()
 
+        # Increment D — voice-state hoist (plan §D). The "voice owner WS"
+        # is the WebSocket that sent ``voice_start``. Only the owner is
+        # allowed to tear voice down on disconnect; passive subscribers
+        # (text-mode WSes that joined via ``start`` while voice was
+        # active) leave the session running for the actual owner.
+        # ``Any`` rather than ``WebSocket`` to keep this module free of
+        # the api layer dep (the route layer hands us a Starlette WS
+        # but the session doesn't import starlette).
+        self._voice_owner_ws: Any | None = None
+
         # Injection window — set by the listen_recording tool while it's
         # pumping past audio into the live voice WS.  See the is_injecting
         # property for the full list of behaviours this gates.
@@ -349,6 +359,90 @@ class OrchestratorSession:
         notifications immediately or wait for the in-flight turn to finish.
         """
         return self._busy_lock.locked()
+
+    # --- Increment D — voice owner WS bookkeeping (plan §D) -------------
+
+    @property
+    def voice_owner_ws(self) -> Any | None:
+        """The WebSocket that sent ``voice_start`` for this session,
+        or None if no owner is registered.
+
+        The route layer's disconnect handler reads this to decide
+        whether to call :meth:`end_voice`: passive subscribers (which
+        joined via ``start`` while voice was already active) MUST NOT
+        tear voice down when they disconnect.
+        """
+        return self._voice_owner_ws
+
+    def register_voice_owner(self, ws: Any) -> None:
+        """Record ``ws`` as the voice owner. Called from the route
+        layer immediately after a successful ``voice_start``.
+        """
+        self._voice_owner_ws = ws
+
+    def clear_voice_owner_if(self, ws: Any) -> bool:
+        """Clear the owner pointer iff ``ws`` is the current owner.
+
+        Returns True if a clear happened, False otherwise. Idempotent:
+        a second call with the same ``ws`` returns False (already
+        cleared). The identity check prevents a passive subscriber's
+        disconnect from clobbering the active owner — that's the
+        load-bearing case for multi-device sessions (iPad refresh
+        while Android is talking).
+        """
+        if self._voice_owner_ws is ws:
+            self._voice_owner_ws = None
+            return True
+        return False
+
+    def voice_config_drifts_from(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        voice_name: str | None,
+        language: str | None,
+        endpoint: str | None,
+    ) -> str | None:
+        """Return a human-readable label of which voice fields the
+        client asked to change vs. the live session, or ``None`` if
+        they match.
+
+        Fields the client didn't send (``None``) are skipped — same-
+        mode reconnect WS messages frequently omit settings the client
+        doesn't care about. Endpoint comparison uses the live
+        provider's ``endpoint_id`` (Gemini), falling back to
+        ``_voice_endpoint``.
+
+        Moved from ``api/routes/orchestrator._voice_config_drift`` per
+        plan §D so the route layer stops carrying voice-state logic.
+        Behavior is byte-identical to the legacy helper.
+        """
+        changed: list[str] = []
+        if provider is not None and provider != self.voice_provider_id:
+            changed.append(
+                f"provider {self.voice_provider_id!r}→{provider!r}"
+            )
+        if model is not None and model != self.voice_model_id:
+            changed.append(f"model {self.voice_model_id!r}→{model!r}")
+        if voice_name is not None and voice_name != self.voice_name_id:
+            changed.append(
+                f"voice {self.voice_name_id!r}→{voice_name!r}"
+            )
+        if language is not None and language != self.voice_transcription_language:
+            changed.append(
+                f"language {self.voice_transcription_language!r}→{language!r}"
+            )
+        if endpoint is not None:
+            live_endpoint: str | None = None
+            provider_obj = getattr(self, "_voice_provider", None)
+            if provider_obj is not None:
+                live_endpoint = getattr(provider_obj, "endpoint_id", None)
+            if live_endpoint is None:
+                live_endpoint = getattr(self, "_voice_endpoint", None)
+            if endpoint != live_endpoint:
+                changed.append(f"endpoint {live_endpoint!r}→{endpoint!r}")
+        return ", ".join(changed) if changed else None
 
     @property
     def notifications(self) -> NotificationQueue:
