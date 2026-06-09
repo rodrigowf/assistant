@@ -118,6 +118,27 @@ class WakeWordDetector(
          */
         internal fun shouldShortCircuitStart(isActive: Boolean, isPaused: Boolean): Boolean =
             isActive && !isPaused
+
+        /**
+         * Pure predicate for the `finishRecognition` idempotency guard
+         * (Increment 2). Returns true when a redundant `finishRecognition`
+         * call should short-circuit: the listener path has already cleared
+         * `isRecognizing` AND `destroyRecognizer()` has nulled the recognizer.
+         *
+         * Both conditions are required: mid-teardown (one flag flipped but
+         * not the other) MUST still run the body to complete cleanup. See
+         * `FinishRecognitionParityTest.guardDoesNotShortCircuitMidTeardown`.
+         *
+         * This guard prevents a late `onResults` / `onError` racing a
+         * partial-match early-finish from launching a second silence-monitor
+         * coroutine. It is also a precondition for Increment 4's recognizer
+         * hang watchdog — the watchdog firing concurrently with a late
+         * callback is exactly the race this guard protects against.
+         */
+        internal fun shouldShortCircuitFinishRecognition(
+            isRecognizing: Boolean,
+            hasSpeechRecognizer: Boolean,
+        ): Boolean = !isRecognizing && !hasSpeechRecognizer
     }
 
     var isActive = false
@@ -479,6 +500,10 @@ class WakeWordDetector(
     }
 
     private fun finishRecognition(wakeWordDetected: Boolean, delay: Long = -1L) {
+        if (shouldShortCircuitFinishRecognition(isRecognizing, speechRecognizer != null)) {
+            Log.d(TAG, "finishRecognition() ignored — already finished")
+            return
+        }
         isRecognizing = false
         destroyRecognizer()
         // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership.
