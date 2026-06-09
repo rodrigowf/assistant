@@ -19,6 +19,26 @@ import kotlinx.coroutines.*
 import kotlin.math.sqrt
 
 /**
+ * Explicit lifecycle for the wake-word detector (plan §2.2, Inc 6).
+ * Replaces three implicit booleans (`isActive`, `isPaused`, `isRecognizing`)
+ * with a single sealed-class hierarchy so transitions are exhaustive and
+ * the rearm logic in `AssistantService.rearmWakeWord` can read genuine
+ * state instead of guessing from flag combinations.
+ *
+ * Lives top-level in this file (plan §9 decision 3 — no separate file).
+ */
+sealed class WakeWordState {
+    object Stopped : WakeWordState()
+    object Idle : WakeWordState()
+    object SilenceMonitor : WakeWordState()
+    data class Recognizing(
+        val startedAtMs: Long,
+        val beganSpeechAtMs: Long?,
+    ) : WakeWordState()
+    object Paused : WakeWordState()
+}
+
+/**
  * Wake word detector with two-stage pipeline:
  *
  * Stage 1 — Silence monitor (AudioRecord, lightweight):
@@ -119,13 +139,45 @@ class WakeWordDetector(
             isRecognizing: Boolean,
             hasSpeechRecognizer: Boolean,
         ): Boolean = !isRecognizing && !hasSpeechRecognizer
+
+        /**
+         * State→legacy-flag derived predicates (Inc 6). The three booleans
+         * `isActive`/`isPaused`/`isRecognizing` become functions of `state`
+         * so the public read-API (`AssistantService.rearmWakeWord` at
+         * `AssistantService.kt:173`, `MainActivity:276` LaunchedEffect, etc.)
+         * keeps working byte-compatibly. Exposed on the companion so
+         * `WakeWordFSMParityTest` can pin the mapping without instantiating
+         * the detector (which eagerly constructs a Main-dispatched scope).
+         */
+        internal fun derivedIsActive(state: WakeWordState): Boolean =
+            state !is WakeWordState.Stopped
+
+        internal fun derivedIsPaused(state: WakeWordState): Boolean =
+            state is WakeWordState.Paused
+
+        internal fun derivedIsRecognizing(state: WakeWordState): Boolean =
+            state is WakeWordState.Recognizing
     }
 
-    var isActive = false
-        private set
-    var isPaused = false
-        private set
-    private var isRecognizing = false
+    /**
+     * Single source of truth for the detector's lifecycle (Inc 6, plan §2.2).
+     * @Volatile because the silence-monitor IO coroutine reads it without
+     * a Main-dispatch round-trip on each iteration (see startSilenceMonitor
+     * inner loop). All WRITES happen on Main per the existing convention.
+     */
+    @Volatile
+    private var state: WakeWordState = WakeWordState.Stopped
+
+    /**
+     * Public read-API preserved byte-compatibly (plan §3 Inc 6). Downstream
+     * consumers (`AssistantService.rearmWakeWord`, `MainActivity:276`
+     * `LaunchedEffect`) keep reading `isActive` / `isPaused` as today.
+     * The `Idle` / `SilenceMonitor` distinction is internal to the FSM.
+     */
+    val isActive: Boolean get() = derivedIsActive(state)
+    val isPaused: Boolean get() = derivedIsPaused(state)
+    private val isRecognizing: Boolean get() = derivedIsRecognizing(state)
+
     private var consecutiveMisses = 0  // exponential backoff counter
 
     // Pre-computed phonetic variants for faster matching.
@@ -186,8 +238,9 @@ class WakeWordDetector(
         }
         Log.d(TAG, "Starting — talk variants: $talkVariants")
         if (wakeVariants.isNotEmpty()) Log.d(TAG, "Wake variants: $wakeVariants")
-        isActive = true
-        isPaused = false
+        // Transition Stopped → Idle. startSilenceMonitor then promotes
+        // Idle → SilenceMonitor once the mic is actually acquired.
+        state = WakeWordState.Idle
         startSilenceMonitor()
     }
 
@@ -198,13 +251,17 @@ class WakeWordDetector(
     fun pause() {
         if (!isActive || isPaused) return
         Log.d(TAG, "Pausing wake word detection")
-        isPaused = true
+        // Snapshot whether we were mid-recognition BEFORE the transition;
+        // the old code keyed the recognizer-teardown branch on the old
+        // `isRecognizing` value. The FSM derives the predicate from
+        // `state`, so we must capture it before assigning Paused.
+        val wasRecognizing = isRecognizing
+        state = WakeWordState.Paused
         // Stop mic + recognizer so they don't compete with voice session
         silenceMonitorJob?.cancel()
         silenceMonitorJob = null
         stopAudioRecord()
-        if (isRecognizing) {
-            isRecognizing = false
+        if (wasRecognizing) {
             scope.launch { destroyRecognizer(); unmuteBeep() }
         }
     }
@@ -215,15 +272,15 @@ class WakeWordDetector(
     fun resume() {
         if (!isActive || !isPaused) return
         Log.d(TAG, "Resuming wake word detection")
-        isPaused = false
+        // Paused → Idle. startSilenceMonitor promotes to SilenceMonitor
+        // once mic acquisition succeeds.
+        state = WakeWordState.Idle
         consecutiveMisses = 0
         startSilenceMonitor()
     }
 
     fun stop() {
-        isActive = false
-        isPaused = false
-        isRecognizing = false
+        state = WakeWordState.Stopped
         consecutiveMisses = 0
         revertAudioModeIfOurs()
         unmuteBeep()
@@ -324,6 +381,13 @@ class WakeWordDetector(
             }
             val effectiveThresholdLog = if (micGain > 0f) RMS_THRESHOLD / micGain else RMS_THRESHOLD
             Log.d(TAG, "Silence monitor started (threshold=$RMS_THRESHOLD, gain=$micGain, effective=${effectiveThresholdLog.toInt()})")
+            // Idle → SilenceMonitor. The mic is acquired and recording; the
+            // RMS read loop below is the SilenceMonitor stage. Only promote
+            // if we're still in Idle — a concurrent pause()/stop() may have
+            // transitioned away while we were waiting on AudioRecord.
+            withContext(Dispatchers.Main) {
+                if (state is WakeWordState.Idle) state = WakeWordState.SilenceMonitor
+            }
 
             val buffer = ShortArray(bufferSize / 2)
             var activityStartMs = 0L
@@ -393,7 +457,13 @@ class WakeWordDetector(
 
     private fun startRecognizer() {
         if (!isActive || isRecognizing) return
-        isRecognizing = true
+        // SilenceMonitor → Recognizing(startedAtMs=now, beganSpeechAtMs=null).
+        // `beganSpeechAtMs` is set later inside `onBeginningOfSpeech` by
+        // re-assigning state with the same `startedAtMs`.
+        state = WakeWordState.Recognizing(
+            startedAtMs = android.os.SystemClock.elapsedRealtime(),
+            beganSpeechAtMs = null,
+        )
 
         muteBeep()
         // Set communication mode to suppress system beep on older devices.
@@ -439,6 +509,14 @@ class WakeWordDetector(
 
             override fun onBeginningOfSpeech() {
                 Log.d(TAG, "Speech begun")
+                // Stamp beganSpeechAtMs on the Recognizing state for future
+                // watchdog/observability consumers (plan §2.3 transition row
+                // "Recognizing → Recognizing(startedAtMs, now)"). Idempotent
+                // if state has already moved off Recognizing (a late
+                // onBeginningOfSpeech racing a watchdog-fired finish).
+                (state as? WakeWordState.Recognizing)?.let {
+                    state = it.copy(beganSpeechAtMs = android.os.SystemClock.elapsedRealtime())
+                }
                 // Inc 4: launch the hang watchdog. If neither onResults nor
                 // onError fires within RECOGNIZER_HANG_WATCHDOG_MS, force-finish
                 // the cycle so the silence monitor re-arms. The listenerFinished
@@ -512,7 +590,14 @@ class WakeWordDetector(
             Log.d(TAG, "finishRecognition() ignored — already finished")
             return
         }
-        isRecognizing = false
+        // Recognizing → Idle. The deferred `startSilenceMonitor()` call at
+        // the bottom of this function (after `delay(restartDelay)`) will
+        // promote Idle → SilenceMonitor when it acquires the mic. Only
+        // transition off Recognizing — a concurrent pause()/stop() may
+        // have already moved us to Paused/Stopped, in which case the
+        // existing `if (isActive && !isPaused) startSilenceMonitor()`
+        // guard below correctly no-ops the rearm.
+        if (state is WakeWordState.Recognizing) state = WakeWordState.Idle
         destroyRecognizer()
         // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership.
         // Guarded: only revert if we set the mode ourselves (see revertAudioModeIfOurs).
