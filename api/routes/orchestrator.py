@@ -1255,10 +1255,17 @@ async def _handle_voice_tool_call(
         if not name and hasattr(session, "_voice_provider") and session._voice_provider:
             name = session._voice_provider.pending_calls.get(call_id, "")
 
-        # Prefer accumulated streaming args over the event's arguments field
+        # Prefer accumulated streaming args over the event's arguments field.
+        # Inc E renamed the attribute to ``_pending_call_args`` (mixin field);
+        # the legacy ``_pending_args`` name is kept here as a fall-through for
+        # any provider that hasn't migrated to the mixin yet (test fakes).
         pending_args = ""
         if hasattr(session, "_voice_provider") and session._voice_provider:
-            pending_args = session._voice_provider._pending_args.get(call_id, "")
+            prov = session._voice_provider
+            pending_args = (
+                getattr(prov, "_pending_call_args", {}).get(call_id, "")
+                or getattr(prov, "_pending_args", {}).get(call_id, "")
+            )
         try:
             tool_input = _json.loads(pending_args or event.get("arguments", "") or "{}")
         except Exception:
