@@ -96,8 +96,14 @@ class AssistantService : Service() {
         private const val PREF_WAKE_WORD = "realtime_wake_word"
         private const val PREF_WAKE_MIC_GAIN = "wake_word_mic_gain"
 
-        // Restart the detector periodically to recover from stale SpeechRecognizer state
-        private const val WATCHDOG_INTERVAL_MS = 2 * 60 * 60 * 1000L // 2 hours
+        // Inc 8 removed `WATCHDOG_INTERVAL_MS` (was `2 * 60 * 60 * 1000L`).
+        // The 2-hour periodic rebuild has been replaced by a NO_SPEECH-error-
+        // driven health check inside WakeWordDetector. When the count of
+        // consecutive ERROR_NO_SPEECH errors crosses
+        // `WakeWordDetector.NO_SPEECH_HEALTH_THRESHOLD` (8, plan §9
+        // decision 6), the detector broadcasts ACTION_RECOGNIZER_UNHEALTHY
+        // and this service rebuilds via `startWakeWord(...)`. Rebuild rate
+        // is capped at one per 3 s by Inc 3's dedupe.
 
         // Window inside which a second `startWakeWord` call with the same
         // (talkWord, wakeWord, micGain) tuple is treated as a duplicate
@@ -245,16 +251,16 @@ class AssistantService : Service() {
     private val rearmHandler = Handler(Looper.getMainLooper())
     private val rearmRunnable = Runnable { rearmWakeWord() }
 
-    // Periodic watchdog: restarts the WakeWordDetector every 2 hours to recover from
-    // stale SpeechRecognizer connections (Samsung Android 5.0 binder death after long uptime).
-    private val watchdogHandler = Handler(Looper.getMainLooper())
-    private val watchdogRunnable = object : Runnable {
-        override fun run() {
-            if (!voiceSessionActive && lastEnabled) {
-                Log.d(TAG, "Watchdog: periodic wake word restart to clear stale recognizer state")
-                startWakeWord(lastTalkWord, lastWakeWord)
-            }
-            watchdogHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
+    // Inc 8: NO_SPEECH-driven health receiver. WakeWordDetector broadcasts
+    // ACTION_RECOGNIZER_UNHEALTHY when consecutive NO_SPEECH errors cross
+    // the threshold; we rebuild via `startWakeWord(...)`. Funnels through
+    // Inc 3's dedupe so a flapping recognizer can't trigger a rebuild storm.
+    // Replaces the deleted 2-hour `watchdogRunnable`.
+    private val recognizerUnhealthyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (voiceSessionActive || !lastEnabled) return
+            Log.d(TAG, "Recognizer unhealthy broadcast received — rebuilding wake-word detector")
+            startWakeWord(lastTalkWord, lastWakeWord)
         }
     }
 
@@ -351,8 +357,12 @@ class AssistantService : Service() {
 
         startRecentsMonitor()
 
-        // Start the periodic watchdog to recover from stale SpeechRecognizer connections
-        watchdogHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
+        // Inc 8: register the NO_SPEECH-driven recognizer-unhealthy receiver.
+        // Replaces the deleted 2-hour periodic rebuild watchdog.
+        LocalBroadcastManager.getInstance(this).registerReceiver(
+            recognizerUnhealthyReceiver,
+            IntentFilter(WakeWordDetector.ACTION_RECOGNIZER_UNHEALTHY),
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -447,8 +457,9 @@ class AssistantService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         rearmHandler.removeCallbacks(rearmRunnable)
-        watchdogHandler.removeCallbacks(watchdogRunnable)
         unregisterReceiver(screenReceiver)
+        // Inc 8: unregister the NO_SPEECH health receiver.
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(recognizerUnhealthyReceiver)
         wakeWordDetector?.release()
         stopRecentsMonitor()
         Log.d(TAG, "Service destroyed")

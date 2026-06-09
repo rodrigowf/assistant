@@ -157,6 +157,41 @@ class WakeWordDetector(
 
         internal fun derivedIsRecognizing(state: WakeWordState): Boolean =
             state is WakeWordState.Recognizing
+
+        /**
+         * Inc 8: NO_SPEECH-error health threshold. After this many
+         * CONSECUTIVE `ERROR_NO_SPEECH` errors, the recognizer is
+         * declared unhealthy and a `ACTION_RECOGNIZER_UNHEALTHY`
+         * LocalBroadcast is fired so AssistantService can rebuild the
+         * detector. 8 per plan §9 decision 6 — roughly 30s+60s+... ≈
+         * 4–5 min of saturated backoff = clearly broken, not flaky.
+         *
+         * The rebuild is funnelled through Inc 3's dedupe so a flapping
+         * recognizer can't trigger a rebuild storm.
+         */
+        private const val NO_SPEECH_HEALTH_THRESHOLD = 8
+
+        /**
+         * Inc 8: LocalBroadcast action that fires when the consecutive
+         * NO_SPEECH-error count crosses NO_SPEECH_HEALTH_THRESHOLD.
+         * AssistantService listens for this and re-invokes
+         * `startWakeWord(lastTalkWord, lastWakeWord, lastWakeMicGain)`.
+         */
+        const val ACTION_RECOGNIZER_UNHEALTHY =
+            "com.assistant.peripheral.RECOGNIZER_UNHEALTHY"
+
+        /**
+         * Pure predicate for the Inc 8 health check. Returns true when
+         * the consecutive NO_SPEECH count has crossed
+         * NO_SPEECH_HEALTH_THRESHOLD and the recognizer should be
+         * declared unhealthy. Strict `>=` so we fire AT the threshold,
+         * not after.
+         */
+        internal fun shouldBroadcastRecognizerUnhealthy(
+            consecutiveNoSpeechErrors: Int,
+        ): Boolean = consecutiveNoSpeechErrors >= NO_SPEECH_HEALTH_THRESHOLD
+
+        internal fun noSpeechHealthThresholdForTest(): Int = NO_SPEECH_HEALTH_THRESHOLD
     }
 
     /**
@@ -179,6 +214,21 @@ class WakeWordDetector(
     private val isRecognizing: Boolean get() = derivedIsRecognizing(state)
 
     private var consecutiveMisses = 0  // exponential backoff counter
+
+    /**
+     * Inc 8: consecutive `ERROR_NO_SPEECH` count. Incremented in the
+     * recognizer listener when `onError(6)` fires; reset on `onResults`
+     * or any non-NO_SPEECH error. When it crosses
+     * `NO_SPEECH_HEALTH_THRESHOLD` we fire the
+     * `ACTION_RECOGNIZER_UNHEALTHY` broadcast so AssistantService can
+     * rebuild. Separate from `consecutiveMisses` — different semantic:
+     * `consecutiveMisses` drives the exponential backoff schedule (any
+     * non-detection counts); `consecutiveNoSpeechErrors` specifically
+     * detects the Samsung Lollipop binder-death symptom where the
+     * recognizer flaps with NO_SPEECH errors and never recovers without
+     * a rebuild.
+     */
+    private var consecutiveNoSpeechErrors = 0
 
     // Pre-computed phonetic variants for faster matching.
     // talkWord / wakeWord may be comma-separated lists of phrases.
@@ -544,6 +594,25 @@ class WakeWordDetector(
                 listenerFinished = true
                 recognizerWatchdogJob?.cancel()
                 Log.d(TAG, "Recognizer error: $error")
+                // Inc 8: track consecutive NO_SPEECH errors. Sustained flaps
+                // (8+ in a row, plan §9 decision 6) indicate the recognizer
+                // is wedged — Samsung Lollipop binder-death after long
+                // uptime is the canonical case. Reset on any non-NO_SPEECH
+                // error so a single bad cycle doesn't permanently mark the
+                // recognizer unhealthy. The broadcast fires AT the threshold
+                // (once) and on each subsequent NO_SPEECH; AssistantService
+                // funnels through Inc 3's dedupe so the rebuild rate is
+                // capped at one per 3 s regardless.
+                if (error == 6 /* ERROR_NO_SPEECH, added in API 23 */) {
+                    consecutiveNoSpeechErrors++
+                    if (shouldBroadcastRecognizerUnhealthy(consecutiveNoSpeechErrors)) {
+                        Log.w(TAG, "Recognizer unhealthy — $consecutiveNoSpeechErrors consecutive NO_SPEECH errors; broadcasting rebuild request")
+                        LocalBroadcastManager.getInstance(context)
+                            .sendBroadcast(Intent(ACTION_RECOGNIZER_UNHEALTHY))
+                    }
+                } else {
+                    consecutiveNoSpeechErrors = 0
+                }
                 // ERROR_CLIENT (7): double-call or internal SDK error — use flat delay, no backoff.
                 // ERROR_NO_SPEECH (6): Google Recognition Service crash or audio routing issue —
                 //   also use flat delay. Accumulating backoff here is wrong because the service
@@ -561,6 +630,10 @@ class WakeWordDetector(
                 recognizerWatchdogJob?.cancel()
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 Log.d(TAG, "Results: $matches")
+                // Inc 8: any successful onResults clears the NO_SPEECH health
+                // counter — the recognizer is alive even if the user didn't
+                // say the wake word.
+                consecutiveNoSpeechErrors = 0
                 val detected = matches != null && checkForWakeWord(matches)
                 finishRecognition(wakeWordDetected = detected)
             }
