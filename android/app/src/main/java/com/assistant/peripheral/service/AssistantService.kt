@@ -22,6 +22,9 @@ import java.io.DataInputStream
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
 
 /**
  * Foreground service that keeps the assistant running in the background.
@@ -45,6 +48,45 @@ class AssistantService : Service() {
         private const val EXTRA_PAUSE_WAKE_WORD = "pause_wake_word"
         private const val EXTRA_RESUME_WAKE_WORD = "resume_wake_word"
         const val EXTRA_WAKE_WORD_TRIGGERED = "wake_word_triggered"
+
+        // Inc 7: ack-token for the deferred hand-off contract. The caller
+        // stashes a CompletableDeferred<Unit> in `pendingAcks` keyed by a
+        // monotonic Long token, then passes the token through the Intent.
+        // onStartCommand completes the deferred after the pause/resume
+        // body has drained. Default value of -1L means "no caller is
+        // awaiting" (e.g. system-redelivered intents on sticky restart).
+        private const val EXTRA_ACK_TOKEN = "ack_token"
+        private const val ACK_TOKEN_NONE = -1L
+
+        /**
+         * Process-static registry for Inc 7 deferred-ack contracts. Lives
+         * on the companion (not on a Service instance) because the caller
+         * stashes BEFORE the service exists in cold-start cases. Cleared
+         * automatically by takeAck (one-shot) so completed deferreds
+         * don't accumulate.
+         */
+        private val pendingAcks: ConcurrentHashMap<Long, CompletableDeferred<Unit>> =
+            ConcurrentHashMap()
+        private val ackTokenGenerator = AtomicLong(0L)
+
+        private fun nextAckToken(): Long = ackTokenGenerator.incrementAndGet()
+        private fun stashAck(token: Long, ack: CompletableDeferred<Unit>) {
+            pendingAcks[token] = ack
+        }
+        private fun takeAck(token: Long): CompletableDeferred<Unit>? =
+            if (token == ACK_TOKEN_NONE) null else pendingAcks.remove(token)
+
+        // Test-only accessors so PauseResumeAckParityTest can exercise the
+        // registry contract without a Service runtime. Visibility is
+        // `internal` to keep them out of the public API surface.
+        internal fun nextAckTokenForTest(): Long = nextAckToken()
+        internal fun stashAckForTest(token: Long, ack: CompletableDeferred<Unit>) =
+            stashAck(token, ack)
+        internal fun takeAckForTest(token: Long): CompletableDeferred<Unit>? = takeAck(token)
+        internal fun clearPendingAcksForTest() {
+            pendingAcks.clear()
+            ackTokenGenerator.set(0L)
+        }
 
         // SharedPreferences keys — survive process death.
         // Same naming convention: TALK_WORD = turn-based, WAKE_WORD = realtime.
@@ -100,20 +142,46 @@ class AssistantService : Service() {
             context.stopService(intent)
         }
 
-        fun pauseWakeWord(context: Context) {
+        /**
+         * Inc 7: pauseWakeWord returns a CompletableDeferred<Unit> that
+         * completes when the service has drained the detector's pause
+         * path (silence-monitor cancelled, AudioRecord released, recognizer
+         * destroyed if running). Callers await the deferred with a 2 s
+         * timeout (plan §9 decision 5) before assuming the mic is free.
+         */
+        fun pauseWakeWord(context: Context): CompletableDeferred<Unit> {
+            val ack = CompletableDeferred<Unit>()
+            val token = nextAckToken()
+            stashAck(token, ack)
             val intent = Intent(context, AssistantService::class.java).apply {
                 putExtra(EXTRA_PAUSE_WAKE_WORD, true)
+                putExtra(EXTRA_ACK_TOKEN, token)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
+            return ack
         }
 
-        fun resumeWakeWord(context: Context) {
+        /**
+         * Inc 7: resumeWakeWord returns a CompletableDeferred<Unit> that
+         * completes when the service has fired the wake-word startup
+         * sequence (startWakeWord returned; the silence-monitor coroutine
+         * is launched on its IO dispatcher). The caller can await this to
+         * know the resume intent reached the service — and to prevent
+         * the duplicate-resume-intent race surfaced by Detour 3 (multiple
+         * finalizeVoiceStop call sites firing resumeWakeWord concurrently).
+         */
+        fun resumeWakeWord(context: Context): CompletableDeferred<Unit> {
+            val ack = CompletableDeferred<Unit>()
+            val token = nextAckToken()
+            stashAck(token, ack)
             val intent = Intent(context, AssistantService::class.java).apply {
                 putExtra(EXTRA_RESUME_WAKE_WORD, true)
+                putExtra(EXTRA_ACK_TOKEN, token)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
             else context.startService(intent)
+            return ack
         }
 
         fun bringToForeground(context: Context) {
@@ -292,11 +360,31 @@ class AssistantService : Service() {
         startForeground(NOTIFICATION_ID, createNotification())
 
         if (intent != null) {
+            // Inc 7: extract the deferred-ack token before the body. Completed
+            // unconditionally at the end of the pause/resume branch so the
+            // caller's withTimeoutOrNull(2000L) { ack.await() } unblocks even
+            // when the body short-circuited.
+            val ackToken = intent.getLongExtra(EXTRA_ACK_TOKEN, ACK_TOKEN_NONE)
             if (intent.getBooleanExtra(EXTRA_PAUSE_WAKE_WORD, false)) {
                 Log.d(TAG, "Pausing wake word detection for voice session")
                 voiceSessionActive = true
                 wakeWordDetector?.pause()
+                takeAck(ackToken)?.complete(Unit)
             } else if (intent.getBooleanExtra(EXTRA_RESUME_WAKE_WORD, false)) {
+                // Inc 7 + Detour-3 follow-up: idempotent at the service level.
+                // finalizeVoiceStop() in AssistantViewModel has three call sites
+                // (legacy bug from before voice_initiator landed) and a duplicate
+                // resume intent firing ~600-750 ms after the first one tore down
+                // the in-flight recognizer cycle ("AudioRecord.startRecording()
+                // failed — mic busy" log). voiceSessionActive==false means the
+                // service has already processed a resume for this session-end;
+                // short-circuit so the duplicate intent is harmless. The
+                // deferred is still completed so the caller's await() unblocks.
+                if (!voiceSessionActive) {
+                    Log.d(TAG, "Resume wake word intent ignored — already resumed for this session")
+                    takeAck(ackToken)?.complete(Unit)
+                    return START_STICKY
+                }
                 Log.d(TAG, "Resuming wake word detection after voice session")
                 voiceSessionActive = false
                 // Re-read enabled state from SharedPreferences — the user may have toggled
@@ -311,6 +399,7 @@ class AssistantService : Service() {
                 } else {
                     Log.d(TAG, "Wake word disabled — skipping restart after voice session")
                 }
+                takeAck(ackToken)?.complete(Unit)
             } else if (intent.hasExtra(EXTRA_ENABLE_WAKE_WORD)) {
                 val enableWakeWord = intent.getBooleanExtra(EXTRA_ENABLE_WAKE_WORD, false)
                 val talkWord = intent.getStringExtra(EXTRA_TALK_WORD) ?: "my friend"

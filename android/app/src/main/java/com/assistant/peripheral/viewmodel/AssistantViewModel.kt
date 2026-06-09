@@ -204,6 +204,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private var activeVoiceConfig: VoiceConfig? = null
 
     /**
+     * Inc 7: idempotency guard for [finalizeVoiceStop]. Set to true at the
+     * top of [finalizeVoiceStop] and cleared in [startVoiceSession]. Closes
+     * the duplicate-resume-intent race surfaced by Detour 3 testing —
+     * finalizeVoiceStop has three call sites (voice_ended ack timeout at
+     * voice_ending, WebSocketEvent.VoiceEnded/VoiceStopped handler, and
+     * stopVoiceSession's safety timeout); two can fire for the same
+     * session-end, sending two resumeWakeWord intents ~600-750 ms apart,
+     * the second tearing down the freshly-armed silence-monitor cycle.
+     *
+     * The structural fix is two-layer:
+     *  - This flag dedupes at the source (ViewModel).
+     *  - AssistantService.onStartCommand's EXTRA_RESUME_WAKE_WORD branch
+     *    short-circuits when voiceSessionActive is already false (defense
+     *    in depth against any other duplicate-intent paths).
+     */
+    private var voiceStopFinalized: Boolean = false
+
+    /**
      * One-shot transient message for the UI to display as a toast/snackbar.
      * Set to a non-null string when something noteworthy happens (e.g. the
      * audio router downgrades the user's requested output).  The UI consumes
@@ -1586,10 +1604,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
         // Pause wake word detection while voice session is active — the mic is owned
         // by WebRTC and we don't want keywords triggering extra recordings or new sessions.
-        AssistantService.pauseWakeWord(getApplication())
+        // Inc 7: capture the ack-deferred so the coroutine below can await
+        // it (with a 2 s timeout per plan §9 decision 5) before calling
+        // vm.start(cfg). This replaces the 200 ms HAL settle guess in
+        // WebSocketPcmProvider.connect with a true hand-off ack.
+        val pauseAck = AssistantService.pauseWakeWord(getApplication())
+        // Inc 7: reset the finalize-voice-stop idempotency flag for the
+        // new session. finalizeVoiceStop self-guards to short-circuit
+        // duplicate calls; this re-enables it for the new session.
+        voiceStopFinalized = false
 
         val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
         viewModelScope.launch {
+            // Inc 7: await the pause ack with a 2 s budget. On stalled
+            // service the timeout returns null and we proceed with the
+            // legacy fire-and-forget behavior (caller may still race the
+            // mic, but no worse than pre-Inc-7).
+            kotlinx.coroutines.withTimeoutOrNull(2_000L) { pauseAck.await() }
+                ?: Log.w(TAG, "pauseWakeWord ack timeout — proceeding without confirmed release")
             // Fetch the backend's configured voice defaults — provider,
             // model, voice, transcription language.  The Android app
             // doesn't carry its own preferences; the source of truth is
@@ -1668,6 +1700,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * Idempotent — safe to call after the session is already Off.
      */
     private fun finalizeVoiceStop() {
+        // Inc 7: idempotency guard. Multiple call sites
+        // (voice_ended ack timeout at voice_ending, VoiceEnded/VoiceStopped
+        // handler, stopVoiceSession's safety timeout) can fire for the same
+        // session-end. Without this guard, two resumeWakeWord intents fire
+        // ~600-750 ms apart and the second tears down the freshly-armed
+        // recognizer ("AudioRecord.startRecording() failed — mic busy" log).
+        // The flag is reset in startVoiceSession so a fresh session re-enables
+        // the path.
+        if (voiceStopFinalized) {
+            Log.d(TAG, "finalizeVoiceStop ignored — already finalized for this session")
+            return
+        }
+        voiceStopFinalized = true
         endingTimeoutJob?.cancel()
         endingTimeoutJob = null
         activeVoiceConfig = null  // voice over → no resume on reconnect
@@ -1684,8 +1729,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // Without this delay, AudioRecord fails 20+ times with "other input already
             // started" — the WebRTC AudioRecord is still held by the system even after
             // stop() returns, causing the wake word detector process to crash.
+            // The 1500 ms delay is empirically tuned; Inc 7's deferred ack is
+            // additive defense, not a replacement for the HAL settle wait.
             kotlinx.coroutines.delay(1500L)
-            AssistantService.resumeWakeWord(getApplication())
+            // Inc 7: capture the ack-deferred and await it with a 2 s budget
+            // (plan §9 decision 5). On timeout we log and continue — the
+            // resume intent fired regardless; the await just confirms the
+            // service drained the body.
+            val resumeAck = AssistantService.resumeWakeWord(getApplication())
+            kotlinx.coroutines.withTimeoutOrNull(2_000L) { resumeAck.await() }
+                ?: Log.w(TAG, "resumeWakeWord ack timeout — service may be slow or short-circuited")
         }
     }
 
