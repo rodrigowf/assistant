@@ -13,7 +13,6 @@ import com.assistant.peripheral.audio.AudioRecorder
 import com.assistant.peripheral.data.*
 import com.assistant.peripheral.network.ApiClient
 import com.assistant.peripheral.network.DiscoveredServer
-import com.assistant.peripheral.network.LiveSession
 import com.assistant.peripheral.network.NetworkScanner
 import com.assistant.peripheral.network.WebSocketEndpoint
 import com.assistant.peripheral.voice.VoiceConfig
@@ -27,8 +26,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 // DataStore I/O lives in SettingsRepository now (Increment 1 of the viewmodel
 // refactor — see ~/assistant/context/memory/assistant/plans/android_viewmodel_refactor_plan_2026_06_10.md).
@@ -42,9 +39,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         private const val TAG = "AssistantViewModel"
         private const val MAX_CACHED_SESSIONS = 5  // Keep at most 5 sessions in cache
         private const val MAX_CACHED_MESSAGES_PER_SESSION = 100  // Limit messages per cached session
-        // orchestrator_active recovery: 3 attempts at 0 / 500 / 2000 ms before
-        // giving up and surfacing the empty-state UI.
-        private const val MAX_RECOVERY_RETRIES = 3
     }
 
     private val settingsRepository = com.assistant.peripheral.settings.SettingsRepository.create(application)
@@ -57,14 +51,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // Voice manager for WebRTC (created lazily when apiClient is available)
     private var voiceManager: VoiceManager? = null
 
-    // Bounded, single-flight state for recoverFromOrchestratorActive. Without
-    // these guards the error handler re-fires every ~200 ms with the same stale
-    // local_id and the backend's rejection keeps re-triggering it.
-    private val recoveryInFlight = AtomicBoolean(false)
-    private val recoveryAttempt = AtomicInteger(0)
+    /**
+     * Orchestrator-side connection controller (Inc 2). Owns the recovery
+     * state machine, Connected-handler probe, scan-for-servers plumbing,
+     * and `noActiveOrchestrator` flag. The ViewModel still routes WS events
+     * for the orchestrator endpoint into this controller's hooks during
+     * Inc 2-3; once ChatController lands the WS event collector itself
+     * moves out of the ViewModel.
+     */
+    private val connectionController = com.assistant.peripheral.connection.OrchestratorConnectionController(
+        scope = viewModelScope,
+        settingsRepository = settingsRepository,
+        webSocketManager = webSocketManager,
+        getLivePool = { apiClient?.getLivePool() ?: emptyList() },
+        networkScan = { com.assistant.peripheral.network.NetworkScanner.scan(application) }
+    )
 
-    // Connection state
-    val connectionState: StateFlow<ConnectionState> = webSocketManager.connectionState
+    // Connection state — pass-through from the controller.
+    val connectionState: StateFlow<ConnectionState> = connectionController.connectionState
 
     // Per-endpoint chat state buckets — ensures events from the orchestrator
     // socket and the agent socket never write into each other's UI state.
@@ -263,8 +267,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // True when we're connected to the server but no orchestrator session is live.
     // The UI uses this to redirect from the Chat tab to History so the user can
     // pick or create a session — we no longer auto-spawn one on connect.
-    private val _noActiveOrchestrator = MutableStateFlow(false)
-    val noActiveOrchestrator: StateFlow<Boolean> = _noActiveOrchestrator.asStateFlow()
+    // Pass-through from the connection controller. The various local writes
+    // below were preserved for the existing call sites (newSession, loadSession,
+    // serverUrlChanged teardown) — they update the controller's state via
+    // `armNewSessionStart` / `onSessionStartedForOrchestrator` / direct sets
+    // when appropriate.
+    val noActiveOrchestrator: StateFlow<Boolean> = connectionController.noActiveOrchestrator
 
     // Settings — non-nullable view over the SettingsRepository's
     // `StateFlow<AppSettings?>`. Defaults to `AppSettings()` until the
@@ -274,12 +282,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _settings = MutableStateFlow(AppSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
-    // Network scan
-    private val _discoveredServers = MutableStateFlow<List<DiscoveredServer>>(emptyList())
-    val discoveredServers: StateFlow<List<DiscoveredServer>> = _discoveredServers.asStateFlow()
-
-    private val _isScanning = MutableStateFlow(false)
-    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
+    // Network scan — pass-through from the controller.
+    val discoveredServers: StateFlow<List<DiscoveredServer>> = connectionController.discoveredServers
+    val isScanning: StateFlow<Boolean> = connectionController.isScanning
 
     // System (backend) configuration — drives the System Settings tab.
     // Loaded on demand when the System tab is opened and refreshed after
@@ -381,6 +386,67 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch(Dispatchers.Default) {
             webSocketManager.events.collect { (endpoint, event) ->
                 handleWebSocketEvent(endpoint, event)
+            }
+        }
+
+        // Subscribe to OrchestratorConnectionController events. Inc 2 stops
+        // here — ChatController (Inc 3) and VoiceController (Inc 4) will
+        // subscribe directly to the same flow and absorb the bucket / voice
+        // glue that lives in this block.
+        viewModelScope.launch {
+            connectionController.events.collect { ev ->
+                handleConnectionEvent(ev)
+            }
+        }
+    }
+
+    private fun handleConnectionEvent(ev: com.assistant.peripheral.connection.ConnectionEvent) {
+        val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
+        when (ev) {
+            is com.assistant.peripheral.connection.ConnectionEvent.OrchestratorAdopted -> {
+                orchBucket.currentLocalId.value = ev.localId
+                orchBucket.pendingResumeSessionId.value = ev.sdkSessionId
+                _isOrchestratorSession.value = true
+            }
+            is com.assistant.peripheral.connection.ConnectionEvent.Reconnected -> {
+                // Voice continuity branch (moves to VoiceController at Inc 4).
+                val voiceCfg = activeVoiceConfig
+                if (voiceCfg != null) {
+                    Log.i(TAG, "WS reconnect during live voice — re-arming via voice_start")
+                    webSocketManager.send(
+                        WebSocketMessage.VoiceStart(
+                            localId = ev.localId,
+                            resumeSdkId = ev.sdkSessionId,
+                            voiceProvider = voiceCfg.provider,
+                            voiceModel = voiceCfg.model,
+                            voiceName = voiceCfg.voice,
+                            voiceTranscriptionLanguage = voiceCfg.transcriptionLanguage,
+                            voiceEndpoint = voiceCfg.endpoint.takeIf { it.isNotBlank() },
+                        ),
+                        endpoint = WebSocketEndpoint.ORCHESTRATOR
+                    )
+                } else {
+                    webSocketManager.send(
+                        WebSocketMessage.Start(localId = ev.localId, resumeSdkId = ev.sdkSessionId),
+                        endpoint = WebSocketEndpoint.ORCHESTRATOR
+                    )
+                }
+            }
+            is com.assistant.peripheral.connection.ConnectionEvent.NoOrchestratorFound -> {
+                orchBucket.pendingResumeSessionId.value = null
+                refreshSessions()
+            }
+            is com.assistant.peripheral.connection.ConnectionEvent.NewSessionAdopted -> {
+                _isOrchestratorSession.value = true
+                persistOrchestratorLocalId(orchBucket.currentLocalId.value)
+                webSocketManager.send(
+                    WebSocketMessage.Start(localId = orchBucket.currentLocalId.value),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                )
+            }
+            is com.assistant.peripheral.connection.ConnectionEvent.OrchestratorActiveCapHit -> {
+                // Informational — the controller has already flipped
+                // noActiveOrchestrator true, which routes the UI to History.
             }
         }
     }
@@ -540,86 +606,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     return
                 }
 
-                // Orchestrator socket below.
-                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-                // If newSession() armed a pending Start (because it had to connect first),
-                // honour it and skip the resume-existing lookup.
-                if (pendingNewSessionStart) {
-                    pendingNewSessionStart = false
-                    _noActiveOrchestrator.value = false
-                    _isOrchestratorSession.value = true
-                    persistOrchestratorLocalId(orchBucket.currentLocalId.value)
-                    webSocketManager.send(
-                        WebSocketMessage.Start(localId = orchBucket.currentLocalId.value),
-                        endpoint = WebSocketEndpoint.ORCHESTRATOR
-                    )
-                    return
-                }
-
-                // Check for an existing orchestrator on the server and reconnect to it.
-                // If there isn't one, do NOT auto-spawn one — the UI will route the
-                // user to History so they can pick or explicitly create a session.
-                //
-                // The pool lookup is retried once on miss because the backend can be
-                // slow to publish pool state on cold start; without the retry, a
-                // transient empty response would falsely trigger the empty-state UI.
-                viewModelScope.launch {
-                    suspend fun findOrchestrator(): LiveSession? =
-                        apiClient?.getLivePool()?.find { it.isOrchestrator }
-
-                    var existing = findOrchestrator()
-                    if (existing == null) {
-                        kotlinx.coroutines.delay(400L)
-                        existing = findOrchestrator()
-                    }
-
-                    if (existing != null) {
-                        // Reuse the existing orchestrator's local_id so the backend
-                        // recognises this as a reconnect (not a new/conflicting session)
-                        orchBucket.currentLocalId.value = existing.localId
-                        _isOrchestratorSession.value = true
-                        persistOrchestratorLocalId(existing.localId)
-                        // Also track the sdk session id so we can load history
-                        orchBucket.pendingResumeSessionId.value = existing.sdkSessionId
-                        _noActiveOrchestrator.value = false
-
-                        // If voice was active when the WS dropped, re-arm
-                        // voice on the new WS instead of falling back to
-                        // text mode. Without this, the local mic capture
-                        // loop kept pushing chunks at a voiceless socket
-                        // and the user-facing session appeared frozen.
-                        val voiceCfg = activeVoiceConfig
-                        if (voiceCfg != null) {
-                            Log.i(TAG, "WS reconnect during live voice — re-arming via voice_start")
-                            webSocketManager.send(
-                                WebSocketMessage.VoiceStart(
-                                    localId = existing.localId,
-                                    resumeSdkId = existing.sdkSessionId,
-                                    voiceProvider = voiceCfg.provider,
-                                    voiceModel = voiceCfg.model,
-                                    voiceName = voiceCfg.voice,
-                                    voiceTranscriptionLanguage = voiceCfg.transcriptionLanguage,
-                                    voiceEndpoint = voiceCfg.endpoint.takeIf { it.isNotBlank() },
-                                ),
-                                endpoint = WebSocketEndpoint.ORCHESTRATOR
-                            )
-                        } else {
-                            webSocketManager.send(
-                                WebSocketMessage.Start(
-                                    localId = existing.localId,
-                                    resumeSdkId = existing.sdkSessionId
-                                ),
-                                endpoint = WebSocketEndpoint.ORCHESTRATOR
-                            )
-                        }
-                    } else {
-                        // No live orchestrator. Stay idle — UI will switch to History.
-                        orchBucket.pendingResumeSessionId.value = null
-                        _noActiveOrchestrator.value = true
-                        // Make sure stale session list is loaded so History has something to show.
-                        refreshSessions()
-                    }
-                }
+                // Orchestrator socket — delegate to the controller. The probe
+                // runs there; this ViewModel subscribes to controller events
+                // in `init` and writes the bucket / voice plumbing as the
+                // events arrive (see the `connectionController.events.collect`
+                // block below).
+                connectionController.onWsConnected()
             }
 
             is WebSocketEvent.SessionStarted -> {
@@ -628,10 +620,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // Only clear noActiveOrchestrator if THIS is the orchestrator endpoint —
                 // an agent SessionStarted shouldn't change the orchestrator's empty-state flag.
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
-                    _noActiveOrchestrator.value = false
-                    // Recovery converged — reset the back-off so a later legitimate
-                    // reconnect doesn't carry over a partial counter and trip the cap.
-                    recoveryAttempt.set(0)
+                    // The controller clears its flag AND resets the recovery
+                    // counter so a later legitimate reconnect doesn't carry
+                    // over a partial counter and trip the cap.
+                    connectionController.onSessionStartedForOrchestrator()
                 }
 
                 // Track the true JSONL session ID for voice resume.
@@ -882,7 +874,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // is already active (stale local_id), recover by refreshing the live
                 // pool and re-Starting against the actual pool key.
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR && event.message == "orchestrator_active") {
-                    recoverFromOrchestratorActive()
+                    connectionController.onOrchestratorActiveError()
                 }
             }
 
@@ -983,98 +975,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    /**
-     * Backend rejected our orchestrator Start because the pool already has a
-     * different orchestrator. This happens when our local_id is stale (e.g.
-     * the live orchestrator was created from another client, or the WS and
-     * apiClient point at different servers during a cold-start race). Refresh
-     * the pool and re-Start with the live local_id.
-     *
-     * Three guards keep this from turning into a tight loop on the first
-     * orchestrator_active that doesn't resolve:
-     *   - single-flight: drop re-entrant calls while one is in flight,
-     *   - back-off: 0 / 500 / 2000 ms before each attempt,
-     *   - retry cap: surface noActiveOrchestrator after [MAX_RECOVERY_RETRIES]
-     *     so the UI routes the user to History (the proven workaround).
-     * The retry counter is reset in the [WebSocketEvent.SessionStarted]
-     * handler — a successful start means recovery converged.
-     *
-     * If the WS itself is stale (e.g. disconnected without onFailure firing),
-     * we trigger a reconnect instead of sending into a void: the existing
-     * Connected handler at L562+ already knows how to send Start after the
-     * new handshake.
-     */
-    private fun recoverFromOrchestratorActive() {
-        if (!recoveryInFlight.compareAndSet(false, true)) {
-            Log.d(TAG, "recoverFromOrchestratorActive already in flight; ignoring")
-            return
-        }
-        viewModelScope.launch {
-            try {
-                val attempt = recoveryAttempt.getAndIncrement()
-                if (attempt >= MAX_RECOVERY_RETRIES) {
-                    Log.w(TAG, "recoverFromOrchestratorActive hit retry cap ($MAX_RECOVERY_RETRIES); routing user to History")
-                    _noActiveOrchestrator.value = true
-                    return@launch
-                }
-                if (attempt > 0) {
-                    // 500ms after the first failure, 2000ms after the second.
-                    delay(500L shl (attempt - 1))
-                }
-                val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
-                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-                orchBucket.currentLocalId.value = live.localId
-                orchBucket.pendingResumeSessionId.value = live.sdkSessionId
-                persistOrchestratorLocalId(live.localId)
-                if (!webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
-                    // WS dropped silently — open a fresh one and let the Connected
-                    // handler resume the live orchestrator. Sending into a stale
-                    // socket would put us right back into this loop.
-                    Log.i(TAG, "WS not connected during recovery (attempt=$attempt); reconnecting")
-                    webSocketManager.connect(
-                        settingsRepository.awaitLoaded().serverUrl,
-                        live.localId,
-                        WebSocketEndpoint.ORCHESTRATOR
-                    )
-                    return@launch
-                }
-                webSocketManager.send(
-                    WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
-                    endpoint = WebSocketEndpoint.ORCHESTRATOR
-                )
-            } finally {
-                recoveryInFlight.set(false)
-            }
-        }
-    }
-
     fun connect() {
         viewModelScope.launch {
-            // Wait for the SettingsRepository to surface the persisted
-            // serverUrl. On cold start MainActivity.onResume() calls
-            // reconnectIfNeeded() before DataStore has emitted; without the
-            // await, the WS would open on the default Jetson URL while
-            // ApiClient got built ~1 s later against the persisted laptop
-            // URL — that mismatch is what put the recovery handler into an
-            // orchestrator_active loop. `awaitLoaded()` makes the gate
-            // structural (typed by `StateFlow<AppSettings?>`).
-            val loaded = settingsRepository.awaitLoaded()
-            webSocketManager.connect(
-                loaded.serverUrl,
-                bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value
-            )
+            connectionController.connect(bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value)
         }
     }
 
     fun disconnect() {
-        webSocketManager.disconnect()
+        connectionController.disconnect()
     }
 
-    /**
-     * Persist the orchestrator local_id so reopening the app reattaches to the same
-     * session instead of forking a new one. Called whenever we learn the current
-     * orchestrator id (from getLivePool() or a session_started event).
-     */
+    /** Wrapper kept so callers inside the ViewModel can stay synchronous. */
     private fun persistOrchestratorLocalId(localId: String) {
         viewModelScope.launch { settingsRepository.persistOrchestratorLocalId(localId) }
     }
@@ -1083,17 +994,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch { settingsRepository.clearOrchestratorLocalId() }
     }
 
-    /**
-     * Re-establish the WebSocket connection if currently disconnected.
-     * Call from MainActivity.onResume() so the app reconnects after screen lock/unlock
-     * or switching back from another app.
-     */
     fun reconnectIfNeeded() {
-        val state = connectionState.value
-        if (state is ConnectionState.Disconnected || state is ConnectionState.Error) {
-            Log.d(TAG, "Reconnecting WebSocket on foreground (was $state)")
-            connect()
-        }
+        connectionController.reconnectIfNeeded(
+            bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value
+        )
     }
 
     fun sendMessage(text: String) {
@@ -1239,7 +1143,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 b.messages.value = cached.messages
                 b.currentLocalId.value = localIdForStart
                 _isOrchestratorSession.value = cached.isOrchestrator
-                if (isOrchestrator) _noActiveOrchestrator.value = false
+                if (isOrchestrator) connectionController.setNoActiveOrchestrator(false)
 
                 openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
                 return@launch
@@ -1257,7 +1161,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 b.messages.value = paginated.messages
                 b.currentLocalId.value = localIdForStart
                 _isOrchestratorSession.value = isOrchestrator
-                if (isOrchestrator) _noActiveOrchestrator.value = false
+                if (isOrchestrator) connectionController.setNoActiveOrchestrator(false)
 
                 openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
             }
@@ -1376,7 +1280,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         b.currentSessionIdForPagination = null
         b.paginationStartIndex = 0
         b.hasMoreMessages.value = false
-        _noActiveOrchestrator.value = false
+        connectionController.setNoActiveOrchestrator(false)
 
         // Persist so a later reconnect finds this same session instead of forking.
         persistOrchestratorLocalId(b.currentLocalId.value)
@@ -1393,15 +1297,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 endpoint = WebSocketEndpoint.ORCHESTRATOR
             )
         } else {
-            // Not connected — connect, then send Start once Connected fires.
-            // We arm pendingNewSessionStart so the Connected handler picks it up.
-            pendingNewSessionStart = true
+            // Not connected — arm the controller's pending-start so its
+            // Connected handler skips the probe and emits NewSessionAdopted,
+            // which our connection-event handler turns into the Start frame.
+            connectionController.armNewSessionStart()
             connect()
         }
     }
-
-    // Set by newSession() when we need to (re)connect first; consumed in the Connected handler.
-    private var pendingNewSessionStart: Boolean = false
 
     // When loadSession() opens an agent session but the AGENT socket isn't connected yet,
     // we stash the resume sdk id here. The Connected(AGENT) handler picks it up and
@@ -1762,36 +1664,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         _isMuted.value = newMuteState
     }
 
-    // Network discovery
-    fun scanForServers() {
-        if (_isScanning.value) return
-        viewModelScope.launch {
-            _isScanning.value = true
-            _discoveredServers.value = emptyList()
-            try {
-                val servers = NetworkScanner.scan(getApplication())
-                _discoveredServers.value = servers
-                // Auto-connect to first discovered server only if using the default URL
-                // (don't overwrite a user-configured server URL). awaitLoaded() —
-                // scanForServers can fire before the settings observer has
-                // populated `_settings`, in which case reading `.value` would
-                // see the default and trigger a spurious auto-connect on top of
-                // whatever the user actually persisted.
-                val currentUrl = settingsRepository.awaitLoaded().serverUrl
-                val defaultUrl = AppSettings().serverUrl
-                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected && currentUrl == defaultUrl) {
-                    connectToDiscoveredServer(servers.first())
-                }
-            } finally {
-                _isScanning.value = false
-            }
-        }
-    }
+    // Network discovery — pass-throughs to the controller (Inc 2).
+    fun scanForServers() = connectionController.scanForServers()
 
-    fun connectToDiscoveredServer(server: DiscoveredServer) {
-        viewModelScope.launch { settingsRepository.updateServerUrl(server.wsUrl) }
-        // connect() is triggered by the settings observer on URL change.
-    }
+    fun connectToDiscoveredServer(server: DiscoveredServer) =
+        connectionController.connectToDiscoveredServer(server)
 
     // ─────────────────────────────────────────────────────────────────
     // Settings setters — every one delegates to SettingsRepository. Side
