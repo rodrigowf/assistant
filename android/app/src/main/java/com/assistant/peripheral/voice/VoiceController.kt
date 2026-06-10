@@ -135,9 +135,9 @@ class VoiceController(
 
     private val _toastMessage = MutableSharedFlow<String>(extraBufferCapacity = 8)
     /**
-     * Toast channel — voice events (routing fallback) emit here. The
-     * ViewModel mirrors this into its existing `_toastMessage` StateFlow
-     * during Inc 4; Inc 7 may consolidate.
+     * Toast channel — voice routing-fallback messages emit here. Inc 7
+     * merges this with ChatController's toast channel at the ViewModel
+     * level via `merge(...).shareIn(...)` — no intermediate StateFlow.
      */
     val toastMessages: SharedFlow<String> = _toastMessage.asSharedFlow()
 

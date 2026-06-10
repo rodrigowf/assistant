@@ -209,17 +209,13 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isScanning by viewModel.isScanning.collectAsState()
     val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
     val systemConfig by viewModel.systemConfig.collectAsState()
-    val toastMessage by viewModel.toastMessage.collectAsState()
-
     // Surface one-shot router messages (e.g. "BT speaker unsupported on
-    // OpenAI") as a system Toast.  Compose-side LaunchedEffect drains the
-    // state flow so each new message fires once.
+    // OpenAI") as a system Toast. Each emission on the SharedFlow is a
+    // discrete event — Compose collects directly, no "clear" needed.
     val toastContext = LocalContext.current
-    LaunchedEffect(toastMessage) {
-        val msg = toastMessage
-        if (msg != null) {
+    LaunchedEffect(Unit) {
+        viewModel.toastMessage.collect { msg ->
             android.widget.Toast.makeText(toastContext, msg, android.widget.Toast.LENGTH_LONG).show()
-            viewModel.clearToast()
         }
     }
 

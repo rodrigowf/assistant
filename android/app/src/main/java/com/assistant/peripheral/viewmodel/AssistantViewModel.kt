@@ -21,12 +21,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
-// DataStore I/O lives in SettingsRepository (Inc 1). Chat state + WS event
-// router lives in ChatController (Inc 3). Voice subsystem (state, lifecycle,
-// VoiceManager construction gate, reconnect-beep, push-to-talk recording)
-// lives in VoiceController (Inc 4).
-// The ViewModel now coordinates controllers, owns the System Config tab
-// (Inc 5 will absorb), and exposes a thin pass-through facade for Compose.
+// Post-refactor (Inc 7): a thin coordinator. State lives in five
+// controllers — SettingsRepository (Inc 1), OrchestratorConnectionController
+// (Inc 2), ChatController (Inc 3), VoiceController (Inc 4),
+// SystemConfigController (Inc 5). The ViewModel:
+//   - constructs and wires the controllers
+//   - exposes their flows to Compose (every public flow is a pass-through
+//     or a `stateIn`/`shareIn` projection — no mutable flow fields)
+//   - drives the WS event collector that fans out to chat + voice
+//   - handles two pieces of Android glue: SharedPreferences mirror for
+//     AssistantService's button-trigger flag, and the AudioTrack body
+//     for the reconnect beep (Compose-free Android API).
 
 class AssistantViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -86,7 +91,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         playBeep = { playReconnectBeep() }
     )
 
-    /** System Settings tab state + ops. Inc 5 extracted these from the VM. */
     private val systemConfigController = com.assistant.peripheral.system.SystemConfigController(
         scope = viewModelScope,
         getAssistantConfig = { apiClient?.getAssistantConfig() },
@@ -119,7 +123,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val sessionStatus: StateFlow<String> = chatController.sessionStatus
     val isLoadingMoreMessages: StateFlow<Boolean> = chatController.isLoadingMoreMessages
 
-    // Voice state — pass-throughs to VoiceController (Inc 4).
     val voiceState: StateFlow<VoiceState> = voiceController.voiceState
     val voiceReconnectBanner: StateFlow<String?> = voiceController.voiceReconnectBanner
     val vadState: StateFlow<String> = voiceController.vadState
@@ -127,37 +130,33 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val isMuted: StateFlow<Boolean> = voiceController.isMuted
     val isRecording: StateFlow<Boolean> = voiceController.isRecording
 
-    /** One-shot transient toast string for the UI. */
-    private val _toastMessage = MutableStateFlow<String?>(null)
-    val toastMessage: StateFlow<String?> = _toastMessage.asStateFlow()
-
-    fun clearToast() {
-        _toastMessage.value = null
-    }
+    /**
+     * One-shot transient toast strings for the UI. Merged from chat +
+     * voice controllers. Compose collects via LaunchedEffect — there is
+     * no "clear" because each emission is a new event, not a held state.
+     */
+    val toastMessage: SharedFlow<String> = merge(
+        chatController.toastMessages,
+        voiceController.toastMessages
+    ).shareIn(viewModelScope, SharingStarted.Eagerly, replay = 0)
 
     val noActiveOrchestrator: StateFlow<Boolean> = connectionController.noActiveOrchestrator
 
-    // Settings — non-nullable view over the SettingsRepository's
-    // `StateFlow<AppSettings?>`. Defaults to `AppSettings()` until the
-    // repository emits, matching the pre-refactor UI contract.
-    private val _settings = MutableStateFlow(AppSettings())
-    val settings: StateFlow<AppSettings> = _settings.asStateFlow()
+    /**
+     * Non-null view of the SettingsRepository's `StateFlow<AppSettings?>`.
+     * Defaults to `AppSettings()` until the repository emits, matching the
+     * pre-refactor UI contract. Compose treats `settings` as always present.
+     */
+    val settings: StateFlow<AppSettings> = settingsRepository.settings
+        .filterNotNull()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     val discoveredServers: StateFlow<List<DiscoveredServer>> = connectionController.discoveredServers
     val isScanning: StateFlow<Boolean> = connectionController.isScanning
 
-    // System (backend) configuration — pass-through to SystemConfigController (Inc 5).
     val systemConfig: StateFlow<SystemConfigState> = systemConfigController.systemConfig
 
     init {
-        // Mirror controller toast channels into the UI's _toastMessage flow.
-        viewModelScope.launch {
-            chatController.toastMessages.collect { _toastMessage.value = it }
-        }
-        viewModelScope.launch {
-            voiceController.toastMessages.collect { _toastMessage.value = it }
-        }
-
         // Observe settings. First emission restores the persisted orchestrator
         // local_id (so cold start reattaches instead of forking a new UUID)
         // and triggers `voiceController.onSettingsChanged` which builds the
@@ -180,7 +179,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
 
-                _settings.value = loaded
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
                     .edit().putBoolean("button_trigger_enabled", loaded.enableButtonTrigger).apply()
 
