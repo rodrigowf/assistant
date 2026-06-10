@@ -11,6 +11,7 @@ import com.assistant.peripheral.data.AudioOutput
 import com.assistant.peripheral.data.VoiceState
 import com.assistant.peripheral.network.ApiClient
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 
 /**
@@ -106,7 +107,19 @@ class VoiceManager(
     // provider is wired but before ``provider.connect`` opens the data
     // channel, so the provider's own ``pendingCommands`` queue receives
     // the update and flushes it on data-channel-open.
-    private val pendingBackendCommands = mutableListOf<Map<String, Any?>>()
+    //
+    // Increment H (Bug 7 fix): a Channel(UNLIMITED) replaces the prior
+    // unsynchronised mutableListOf. ``handleBackendCommand`` is called
+    // from the WebSocket dispatch coroutine (background) while
+    // ``start()`` reads the queue from a separate viewModelScope
+    // launch — concurrent producers on an ArrayList silently dropped
+    // or corrupted commands. UNLIMITED is safe here because the
+    // window between "WS message arrives" and "provider.connect
+    // returns" is at most a few hundred ms; the queue depth observed
+    // in practice is 1–3 commands. ``trySend`` is non-blocking on
+    // UNLIMITED and never returns failure modulo channel-closure.
+    private val pendingBackendCommands =
+        Channel<Map<String, Any?>>(capacity = Channel.UNLIMITED)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -276,9 +289,19 @@ class VoiceManager(
         // the HTTP fetch in step 1).  The provider has its own
         // pendingCommands queue keyed on the data channel state, so
         // these will sit there until DC_OPEN and flush atomically.
-        if (pendingBackendCommands.isNotEmpty()) {
-            val drained = pendingBackendCommands.toList()
-            pendingBackendCommands.clear()
+        // Drain the queue non-blockingly. Each tryReceive on an
+        // UNLIMITED channel either returns a value (success) or
+        // failure (empty / closed). We stop on the first failure —
+        // the channel is unbounded so isFailure means "no more
+        // queued commands", not backpressure.
+        val drained = buildList {
+            while (true) {
+                val r = pendingBackendCommands.tryReceive()
+                if (r.isFailure) break
+                r.getOrNull()?.let { add(it) }
+            }
+        }
+        if (drained.isNotEmpty()) {
             Log.i(TAG, "start: draining ${drained.size} pre-provider backend command(s)")
             for (cmd in drained) provider.handleBackendCommand(cmd)
         }
@@ -338,7 +361,13 @@ class VoiceManager(
         providerJob = null
         // Drop any backend commands queued for a provider that never
         // started — they belong to a session we just tore down.
-        pendingBackendCommands.clear()
+        // (Drain to empty; the channel itself stays open for the next
+        // session — closing would require recreating it on every
+        // start/stop cycle, which we don't want.)
+        while (true) {
+            val r = pendingBackendCommands.tryReceive()
+            if (r.isFailure) break
+        }
         releaseAudioFocus()
         _state.value = VoiceState.Off
     }
@@ -360,7 +389,14 @@ class VoiceManager(
             // Queue until start() wires the provider; drained below.
             val cmdType = command["type"] as? String ?: "?"
             Log.d(TAG, "handleBackendCommand: no provider yet, queueing type=$cmdType")
-            pendingBackendCommands.add(command)
+            // trySend on an UNLIMITED channel is non-blocking and
+            // always succeeds modulo channel-closure. We log a warning
+            // if the channel is closed (shouldn't happen — release()
+            // cancels the scope but doesn't close the channel).
+            val sendResult = pendingBackendCommands.trySend(command)
+            if (sendResult.isFailure) {
+                Log.w(TAG, "handleBackendCommand: trySend failed (channel closed?), dropping type=$cmdType")
+            }
         }
     }
 
