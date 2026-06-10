@@ -117,16 +117,25 @@ abstract class WebSocketPcmProvider(
     // This works the same way for both Gemini and Qwen WS providers — no
     // wire-format-specific event hooks needed.
     //
-    // When the user explicitly changes [setMicGain] / [setEchoDuckingGain]
-    // mid-duck, we update [gainBeforeSpeaking] (so the new value takes
-    // effect on restore) and apply the new ducking gain immediately —
-    // matching the user's expectation that the slider responds in real time.
-    private var micGainLevel: Float = 1.0f
-    private var echoDuckingGain: Float = 0.05f
-    @Volatile private var gainBeforeSpeaking: Float? = null
+    // Increment H: extracted to [EchoDuckController]. The controller owns
+    // micGainLevel, echoDuckingGain, gainBeforeSpeaking, and micRestoreJob.
+    // The remaining state below (agentSpeaking, lastSpeakerChunkAtMs,
+    // userMuted) is owned here because the capture/dispatch loops produce
+    // these signals; the controller observes them via the ducker's
+    // public API and callable accessors.
+    private val ducker: EchoDuckController by lazy {
+        EchoDuckController(
+            scope = scope,
+            getPlaybackHeadPosition = {
+                audioTrack?.takeIf { it.state == AudioTrack.STATE_INITIALIZED }
+                    ?.playbackHeadPosition?.toLong()
+            },
+            getTotalFramesWritten = { totalFramesWritten },
+            tag = tag,
+        )
+    }
     @Volatile private var agentSpeaking: Boolean = false
     @Volatile private var lastSpeakerChunkAtMs: Long = 0L
-    private var micRestoreJob: Job? = null
     private var userMuted: Boolean = false
 
     // Total frames written to the [AudioTrack] over this session, used
@@ -147,39 +156,9 @@ abstract class WebSocketPcmProvider(
         // chunk delivery without falsely ending mid-turn.
         private const val AGENT_SPEECH_STALE_MS = 800L
 
-        // After the speaker hardware buffer has finished draining, wait
-        // this long before restoring the mic.  This is a small safety
-        // margin to cover (a) BT/wired transducer latency past the
-        // AudioTrack's reported playback head, and (b) reverb / room
-        // tail that the mic could still pick up as the agent's voice.
-        private const val MIC_RESTORE_TAIL_MS = 600L
-
-        // Poll interval while waiting for the buffer to drain.
-        // The drain loop has no timeout: previous 4s and 20s caps
-        // panic-restored the mic mid-speech on legitimate long agent
-        // turns, leaking the speaker tail into the open mic and
-        // triggering Gemini's server-side VAD into a self-interrupt.
-        // The loop exits naturally on the real "done" conditions
-        // (writes quiet + head caught up, or writes quiet + head
-        // stuck after underrun) — both reliable.
-        //
-        // If we ever observe the drain loop genuinely wedged (e.g.
-        // AudioTrack truly hung): the cleanest next step is to wire
-        // Gemini's `serverContent.turnComplete: true` (and Qwen's
-        // `response.done`) as an explicit "agent's turn ended" signal
-        // into a new onAgentTurnComplete() hook in the providers, then
-        // force-restore on that. Both subclasses already parse those
-        // events for transcript flushing, so the plumbing is half there.
-        private const val MIC_RESTORE_DRAIN_POLL_MS = 80L
-
-        // How long [totalFramesWritten] must stay constant before we
-        // believe the playback loop is genuinely done writing.  Anything
-        // shorter risks declaring "done" during a tiny pause between
-        // bursts; the playback loop bursts ~24K frames/sec when active.
-        // 400ms (5 polls) ≈ 9600 frames of expected motion: any real
-        // playback exceeds this dramatically, any genuine quiescence
-        // produces zero motion.
-        private const val MIC_RESTORE_WRITES_QUIET_MS = 400L
+        // Drain-restore timing constants moved to [EchoDuckController]
+        // (Inc H). The controller owns the no-timeout drain loop and
+        // emits the canonical `[MIC_STATE] RESTORE_DRAIN(*)` log lines.
     }
 
     // --- Format (set in connect) ------------------------------------------
@@ -246,158 +225,17 @@ abstract class WebSocketPcmProvider(
         // Barge-in means the agent's audio is gone — restore mic right
         // away so the user can be heard without waiting out the stale
         // timeout.
-        restoreMicImmediately("flush")
-    }
-
-    // --- Echo ducking ------------------------------------------------------
-
-    private fun duckMicForAgentSpeech() {
-        if (gainBeforeSpeaking != null) return  // already ducked
-        gainBeforeSpeaking = micGainLevel
-        micGainLevel = echoDuckingGain
-        micRestoreJob?.cancel()
-        micRestoreJob = null
-        Log.i(tag, "[MIC_STATE] DUCK → gain: ${gainBeforeSpeaking}→$echoDuckingGain")
-    }
-
-    /**
-     * Schedule a mic restore once the speaker hardware buffer has
-     * fully drained.  Polls [AudioTrack.getPlaybackHeadPosition]
-     * against [totalFramesWritten] — the previous fixed-delay version
-     * could not account for the bursty/silent gaps inside a single
-     * agent turn: a 2s wait could fire while the AudioTrack was still
-     * playing the tail of a sentence (the 1.5s hardware buffer absorbs
-     * roughly the last second of audio after the last chunk was
-     * queued), the wired/BT speaker would feed that tail back into the
-     * mic, and Gemini Live's VAD would report it as a user barge-in.
-     *
-     * Restore policy:
-     *   1. Poll head position every [MIC_RESTORE_DRAIN_POLL_MS].
-     *   2. When `head == totalFramesWritten`, the DAC is idle.  Wait
-     *      [MIC_RESTORE_TAIL_MS] more (BT transducer latency + room
-     *      reverb tail) then restore.
-     *
-     * No timeout: the loop waits as long as playback takes. Earlier
-     * versions had a 4s and later 20s cap that fired on legitimate
-     * long agent turns and panic-restored the mic mid-speech — the
-     * residual speaker tail would then bleed into the open mic and
-     * trip the upstream VAD into a self-interrupt.
-     *
-     * If new speaker chunks arrive while we're polling, [pushSpeakerChunk]
-     * cancels this job — same as the previous behaviour.
-     */
-    /**
-     * Wait for the speaker pipeline to fully quiesce, then restore mic
-     * gain.  "Fully quiesced" means BOTH:
-     *
-     *   (a) `totalFramesWritten` has stopped growing for
-     *       [MIC_RESTORE_WRITES_QUIET_MS] — the playback loop has run
-     *       out of queued chunks AND no new chunks are arriving.
-     *   (b) `audioTrack.playbackHeadPosition` has reached
-     *       `totalFramesWritten` — the DAC has actually played
-     *       everything that was written, OR (fallback) the head has
-     *       gone stuck for the same quiet window (post-underrun case
-     *       where Lollipop's head pointer freezes).
-     *
-     * Why both conditions: the prior implementation only checked (b),
-     * which fired too early because the WS staleness detector schedules
-     * this restore as soon as no NEW chunks have arrived for 800ms,
-     * regardless of whether the local playback queue still has 5+
-     * seconds of buffered audio.  In that case `head` lags `written`
-     * by ~1s (the hardware buffer) and the strict `head >= written`
-     * check hit the 4s timeout while the speaker was still playing,
-     * panic-restored the mic, and the residual audio fed back into the
-     * mic — triggering server-side VAD self-interrupts mid-sentence.
-     *
-     * With (a) enforced first, we only start checking (b) once the
-     * playback loop is actually idle.  If [pushSpeakerChunk] receives
-     * new data at any point, it cancels this job — same as before.
-     */
-    private fun scheduleMicRestore(reason: String) {
-        if (gainBeforeSpeaking == null) return
-        micRestoreJob?.cancel()
-        val startedHead = (audioTrack?.playbackHeadPosition?.toLong() ?: 0L) and 0xFFFFFFFFL
-        Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) waiting; written=$totalFramesWritten head=$startedHead")
-        micRestoreJob = scope.launch {
-            val startMs = System.currentTimeMillis()
-            var lastWritten = totalFramesWritten
-            var lastWrittenAtMs = startMs
-            var lastHead = startedHead
-            var lastHeadAtMs = startMs
-            var writesQuietLoggedAt: Long = 0L
-            var pollCount = 0
-            while (true) {
-                val nowMs = System.currentTimeMillis()
-                val track = audioTrack
-                if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
-                    Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) AudioTrack gone; restoring")
-                    break
-                }
-
-                val written = totalFramesWritten
-                val head = (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
-                pollCount++
-
-                // Update "last changed" timestamps.
-                if (written != lastWritten) {
-                    lastWritten = written
-                    lastWrittenAtMs = nowMs
-                }
-                if (head != lastHead) {
-                    lastHead = head
-                    lastHeadAtMs = nowMs
-                }
-
-                if (pollCount % 10 == 0) {
-                    Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) poll=$pollCount head=$head written=$written remaining=${written - head} writesQuiet=${nowMs - lastWrittenAtMs}ms")
-                }
-
-                val writesQuietForMs = nowMs - lastWrittenAtMs
-                val writesAreQuiet = writesQuietForMs >= MIC_RESTORE_WRITES_QUIET_MS
-
-                if (writesAreQuiet && writesQuietLoggedAt == 0L) {
-                    writesQuietLoggedAt = nowMs
-                    Log.d(tag, "[MIC_STATE] RESTORE_DRAIN($reason) writes quiet at written=$written head=$head remaining=${written - head}")
-                }
-
-                // (a) AND (b)-primary: writes have stopped AND head caught up.
-                if (writesAreQuiet && head >= written) {
-                    Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) AudioTrack drained at head=$head poll=$pollCount; tail wait ${MIC_RESTORE_TAIL_MS}ms")
-                    delay(MIC_RESTORE_TAIL_MS)
-                    break
-                }
-
-                // (a) AND (b)-fallback: writes have stopped AND head has
-                // also been frozen for the same quiet window.  Covers
-                // Samsung Lollipop's post-underrun state where
-                // `playbackHeadPosition` never advances past the
-                // underrun frame, so the strict `head >= written` check
-                // would never be satisfied.  Safe because: if writes
-                // are quiet, the playback loop isn't going to push more
-                // frames, so whatever the DAC has is what it'll play —
-                // the small gap left in the hardware buffer is silence-
-                // equivalent (the underrun already happened, audibly).
-                if (writesAreQuiet && nowMs - lastHeadAtMs >= MIC_RESTORE_WRITES_QUIET_MS) {
-                    Log.i(tag, "[MIC_STATE] RESTORE_DRAIN($reason) head stuck at $head (written=$written) AND writes quiet; treating as drained; tail wait ${MIC_RESTORE_TAIL_MS}ms")
-                    delay(MIC_RESTORE_TAIL_MS)
-                    break
-                }
-
-                delay(MIC_RESTORE_DRAIN_POLL_MS)
-            }
-            restoreMicImmediately("drained:$reason")
-        }
-    }
-
-    private fun restoreMicImmediately(reason: String) {
-        micRestoreJob?.cancel()
-        micRestoreJob = null
-        val saved = gainBeforeSpeaking ?: return
-        micGainLevel = saved
-        gainBeforeSpeaking = null
         agentSpeaking = false
-        Log.i(tag, "[MIC_STATE] RESTORE_IMMEDIATE($reason) → gain: $echoDuckingGain→$micGainLevel")
+        ducker.restoreImmediately("flush")
     }
+
+    // --- Echo ducking -----------------------------------------------------
+    // Inc H: extracted to [EchoDuckController]. The capture loop reads
+    // ducker.currentMicGain for per-chunk gain application; the dispatch
+    // path calls ducker.duck()/cancelPendingRestore() on chunk arrival;
+    // the capture loop calls ducker.scheduleRestore("stale") when the
+    // staleness detector trips. Logging shape preserved verbatim — see
+    // EchoDuckController for the parity contract.
 
     // --- VoiceProvider implementation -------------------------------------
 
@@ -440,12 +278,10 @@ abstract class WebSocketPcmProvider(
         Log.i(tag, "Connecting $providerId voice: in=${inSampleRate}Hz out=${outSampleRate}Hz model=${info.model} voice=${info.voice}")
         _state.value = VoiceState.Connecting
         userMuted = false
-        gainBeforeSpeaking = null
         agentSpeaking = false
         lastSpeakerChunkAtMs = 0L
         totalFramesWritten = 0L
-        micRestoreJob?.cancel()
-        micRestoreJob = null
+        ducker.resetForNewSession()
 
         try {
             // Set `running` BEFORE startMic — the mic capture loop
@@ -585,11 +421,10 @@ abstract class WebSocketPcmProvider(
             // residual speaker burst trips Gemini's VAD into a
             // self-interrupt loop.
             lastSpeakerChunkAtMs = System.currentTimeMillis()
-            micRestoreJob?.cancel()
-            micRestoreJob = null
+            ducker.cancelPendingRestore()
             if (!agentSpeaking) {
                 agentSpeaking = true
-                duckMicForAgentSpeech()
+                ducker.duck()
             }
         } catch (e: Exception) {
             Log.w(tag, "Failed to decode speaker chunk: ${e.message}")
@@ -605,34 +440,13 @@ abstract class WebSocketPcmProvider(
     final override fun isMuted(): Boolean = userMuted
 
     final override fun setMicGain(level: Float) {
-        val clamped = level.coerceIn(0.0f, 2.0f)
-        // Mid-duck: update the saved "restore-to" value so the new gain
-        // takes effect when the agent stops speaking.  Do NOT touch
-        // [micGainLevel] (which is currently the ducking gain).
-        if (gainBeforeSpeaking != null) {
-            gainBeforeSpeaking = clamped
-            Log.d(tag, "Mic gain set to: $clamped (deferred — applies on restore)")
-        } else {
-            micGainLevel = clamped
-            Log.d(tag, "Mic gain set to: $clamped")
-        }
+        ducker.setMicGain(level)
     }
 
-    fun getMicGain(): Float = gainBeforeSpeaking ?: micGainLevel
+    fun getMicGain(): Float = ducker.getEffectiveMicGain()
 
     final override fun setEchoDuckingGain(gain: Float) {
-        val clamped = gain.coerceIn(0.0f, 1.0f)
-        echoDuckingGain = clamped
-        // Mid-duck: apply the new ducking gain immediately so the
-        // slider responds in real time (the previous bug: ducking
-        // was stored but never read by the capture loop, so changing
-        // it had no effect until session restart).
-        if (gainBeforeSpeaking != null) {
-            micGainLevel = clamped
-            Log.d(tag, "Echo ducking gain set to: $clamped (applied immediately, ducking active)")
-        } else {
-            Log.d(tag, "Echo ducking gain set to: $clamped")
-        }
+        ducker.setEchoDuckingGain(gain)
     }
 
     /**
@@ -927,9 +741,9 @@ abstract class WebSocketPcmProvider(
                 // avoids needing wire-format-specific event hooks.
                 if (agentSpeaking) {
                     val sinceLastChunk = System.currentTimeMillis() - lastSpeakerChunkAtMs
-                    if (sinceLastChunk > AGENT_SPEECH_STALE_MS && micRestoreJob == null) {
+                    if (sinceLastChunk > AGENT_SPEECH_STALE_MS && !ducker.isRestorePending) {
                         agentSpeaking = false
-                        scheduleMicRestore("stale")
+                        ducker.scheduleRestore("stale")
                     }
                 }
 
@@ -941,13 +755,13 @@ abstract class WebSocketPcmProvider(
                 probeChunks++
                 if (probeChunks >= 50) {
                     val avgRms = probeRmsAccum / probeChunks
-                    Log.i(tag, "[MIC_PROBE] rms_avg=${avgRms.toInt()} peak=$probePeak gain=$micGainLevel ducking=${agentSpeaking}")
+                    Log.i(tag, "[MIC_PROBE] rms_avg=${avgRms.toInt()} peak=$probePeak gain=${ducker.currentMicGain} ducking=${agentSpeaking}")
                     probeRmsAccum = 0.0
                     probeChunks = 0
                     probePeak = 0
                 }
 
-                val gain = micGainLevel
+                val gain = ducker.currentMicGain
                 if (gain != 1.0f) applyGainPcm16(buf, 0, read, gain)
 
                 val b64 = Base64.encodeToString(buf, 0, read, Base64.NO_WRAP)
@@ -1039,14 +853,10 @@ abstract class WebSocketPcmProvider(
         playbackJob?.cancel()
         playbackJob = null
 
-        micRestoreJob?.cancel()
-        micRestoreJob = null
-        // If we were mid-duck, restore the saved gain so a re-connect
-        // doesn't start with the attenuated value as the "real" one.
-        gainBeforeSpeaking?.let { saved ->
-            micGainLevel = saved
-            gainBeforeSpeaking = null
-        }
+        // If we were mid-duck, the controller restores the saved gain so
+        // a re-connect doesn't start with the attenuated value as the
+        // "real" one. Matches pre-Inc-H L1042–L1049.
+        ducker.cleanup()
         agentSpeaking = false
         totalFramesWritten = 0L
 
@@ -1076,7 +886,6 @@ abstract class WebSocketPcmProvider(
         }
         audioTrack = null
 
-        gainBeforeSpeaking = null
         sendMicChunk = null
     }
 }
