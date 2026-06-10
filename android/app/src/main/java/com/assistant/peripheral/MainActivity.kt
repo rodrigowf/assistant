@@ -209,17 +209,13 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isScanning by viewModel.isScanning.collectAsState()
     val noActiveOrchestrator by viewModel.noActiveOrchestrator.collectAsState()
     val systemConfig by viewModel.systemConfig.collectAsState()
-    val toastMessage by viewModel.toastMessage.collectAsState()
-
     // Surface one-shot router messages (e.g. "BT speaker unsupported on
-    // OpenAI") as a system Toast.  Compose-side LaunchedEffect drains the
-    // state flow so each new message fires once.
+    // OpenAI") as a system Toast. Each emission on the SharedFlow is a
+    // discrete event — Compose collects directly, no "clear" needed.
     val toastContext = LocalContext.current
-    LaunchedEffect(toastMessage) {
-        val msg = toastMessage
-        if (msg != null) {
+    LaunchedEffect(Unit) {
+        viewModel.toastMessage.collect { msg ->
             android.widget.Toast.makeText(toastContext, msg, android.widget.Toast.LENGTH_LONG).show()
-            viewModel.clearToast()
         }
     }
 
@@ -328,6 +324,20 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         }
     }
 
+    // Inc 3.5: navigate to Chat only when an orchestrator session is actually
+    // opened (the user's intent went through — either directly because there
+    // was no conflict, or after they resolved the dialog with OpenExisting /
+    // DiscardAndProceed). Cancel does NOT emit, so the user stays on History.
+    LaunchedEffect(Unit) {
+        viewModel.orchestratorOpenedToChat.collect {
+            navController.navigate(Screen.Chat.route) {
+                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                launchSingleTop = true
+                restoreState = true
+            }
+        }
+    }
+
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
     val isVoiceActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
@@ -374,12 +384,28 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         liveSessionIds = liveSessionIds,
                         isLoading = sessionsLoading,
                         onSessionClick = { sessionId, isOrchestrator, liveLocalId ->
-                            viewModel.loadSession(sessionId, isOrchestrator, liveLocalId)
-                            navController.navigate(Screen.Chat.route)
+                            if (isOrchestrator) {
+                                // Inc 3.5: orchestrator switches go through the
+                                // conflict mediator. We do NOT navigate to Chat
+                                // up-front because the conflict dialog must
+                                // overlay History (where the user tapped), not
+                                // a stale Chat view. Navigation happens via
+                                // the `orchestratorOpenedToChat` LaunchedEffect
+                                // below — fired only when the request actually
+                                // opens an orchestrator (directly or after
+                                // dialog resolution).
+                                viewModel.requestLoadOrchestratorSession(sessionId, liveLocalId)
+                            } else {
+                                // Agent sessions: parallel path stays as today.
+                                viewModel.loadSession(sessionId, false, liveLocalId)
+                                navController.navigate(Screen.Chat.route)
+                            }
                         },
                         onNewSession = {
-                            viewModel.newSession()
-                            navController.navigate(Screen.Chat.route)
+                            // Inc 3.5: same deferred-navigation pattern as
+                            // session click — the conflict dialog must overlay
+                            // History when a live orch exists.
+                            viewModel.requestNewOrchestratorSession()
                         },
                         onRenameSession = viewModel::renameSession,
                         onDeleteSession = { sid ->
@@ -603,6 +629,67 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             dismissButton = {
                 TextButton(onClick = { pendingMessageAction = null }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Inc 3.5 — orchestrator session conflict dialog. Surfaces when the user
+    // taps a non-live orchestrator in History (or the New Session FAB) while
+    // another orchestrator is already live in the pool. Three actions:
+    //   - Open the running one: load the live orch into the chat view.
+    //   - Close it and switch / start fresh: closePoolSession(live) then
+    //     proceed with the original intent.
+    //   - Cancel: clear the conflict, no further action.
+    val orchestratorConflict by viewModel.orchestratorConflict.collectAsState()
+    orchestratorConflict?.let { conflict ->
+        val (title, body, discardLabel) = when (conflict) {
+            is com.assistant.peripheral.chat.OrchestratorConflict.OnLoad -> Triple(
+                "Another orchestrator is running",
+                "There's already an active orchestrator session. " +
+                    "You can open the running one, or close it and switch to the one you tapped.",
+                "Close and switch"
+            )
+            is com.assistant.peripheral.chat.OrchestratorConflict.OnNew -> Triple(
+                "Another orchestrator is running",
+                "There's already an active orchestrator session. " +
+                    "You can open the running one, or close it and start a fresh session.",
+                "Close and start fresh"
+            )
+        }
+        AlertDialog(
+            onDismissRequest = {
+                viewModel.resolveOrchestratorConflict(
+                    com.assistant.peripheral.chat.OrchestratorConflictResolution.Cancel
+                )
+            },
+            title = { Text(title) },
+            text = { Text(body) },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.resolveOrchestratorConflict(
+                        com.assistant.peripheral.chat.OrchestratorConflictResolution.OpenExisting
+                    )
+                }) {
+                    Text("Open the running one")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        viewModel.resolveOrchestratorConflict(
+                            com.assistant.peripheral.chat.OrchestratorConflictResolution.DiscardAndProceed
+                        )
+                    }) {
+                        Text(discardLabel)
+                    }
+                    TextButton(onClick = {
+                        viewModel.resolveOrchestratorConflict(
+                            com.assistant.peripheral.chat.OrchestratorConflictResolution.Cancel
+                        )
+                    }) {
+                        Text("Cancel")
+                    }
                 }
             }
         )
