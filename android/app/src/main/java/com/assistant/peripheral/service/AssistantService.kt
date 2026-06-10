@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.assistant.peripheral.MainActivity
 import com.assistant.peripheral.R
+import com.assistant.peripheral.voice.VoskModelLoader
 import com.assistant.peripheral.voice.WakeWordDetector
 import java.io.DataInputStream
 import java.io.FileInputStream
@@ -25,6 +26,11 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * Foreground service that keeps the assistant running in the background.
@@ -238,6 +244,11 @@ class AssistantService : Service() {
     private var wakeWordDetector: WakeWordDetector? = null
     private lateinit var prefs: SharedPreferences
 
+    // V2: service-scoped CoroutineScope for fire-and-forget IO work
+    // (Vosk model pre-load). Cancelled in onDestroy. SupervisorJob so a
+    // single child failure doesn't propagate up and kill the scope.
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     // Recents long-press monitor (reads /dev/input/event2 directly)
     private var recentsMonitorThread: Thread? = null
     @Volatile private var recentsMonitorRunning = false
@@ -411,6 +422,15 @@ class AssistantService : Service() {
                 addAction(WakeWordDetector.ACTION_MIC_AVAILABLE)
             },
         )
+
+        // V2: kick off eager Vosk model load. Plan §5.5 chose eager — service
+        // start completes immediately; the load runs in IO and the model is
+        // ready by the time the first wake-word arm calls `getModel`. If the
+        // load races the arm, `getModel` is suspending and awaits the mutex.
+        // Logged outcome lets us measure cold-start latency on device.
+        serviceScope.launch {
+            VoskModelLoader.getModel(applicationContext)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -512,6 +532,10 @@ class AssistantService : Service() {
         LocalBroadcastManager.getInstance(this).unregisterReceiver(micAvailabilityReceiver)
         wakeWordDetector?.release()
         stopRecentsMonitor()
+        // V2: cancel any in-flight Vosk pre-load. Doesn't affect the cached
+        // Model — that lives on the VoskModelLoader singleton across service
+        // restarts within the same process.
+        serviceScope.cancel()
         Log.d(TAG, "Service destroyed")
     }
 

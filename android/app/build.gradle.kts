@@ -21,6 +21,25 @@ android {
         ndk {
             abiFilters += setOf("armeabi-v7a", "arm64-v8a")
         }
+        externalNativeBuild {
+            cmake {
+                // Vosk stderr/stdin/stdout polyfill for Lollipop (API 21–22).
+                // See app/src/main/cpp/vosk_stderr_shim.c. Loaded only when
+                // SDK_INT < 23 by VoskModelLoader.maybeLoadStderrShim.
+                arguments += listOf("-DANDROID_STL=c++_static")
+            }
+        }
+    }
+
+    // NDK 26 reintroduced Bionic compat stubs and links cleanly against
+    // the API 21 sysroot's __sF symbol — required by vosk-stderr-shim.
+    ndkVersion = "26.1.10909125"
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     androidResources {
