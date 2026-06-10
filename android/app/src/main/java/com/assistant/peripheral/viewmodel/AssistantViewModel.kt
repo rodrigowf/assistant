@@ -6,9 +6,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.*
-import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import android.util.Log
@@ -24,7 +21,6 @@ import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
 import com.assistant.peripheral.voice.VoiceManager
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -34,8 +30,11 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-// DataStore for app settings
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+// DataStore I/O lives in SettingsRepository now (Increment 1 of the viewmodel
+// refactor — see ~/assistant/context/memory/assistant/plans/android_viewmodel_refactor_plan_2026_06_10.md).
+// The repository declares the per-Application DataStore delegate; the ViewModel
+// no longer has direct DataStore access. The `name="settings"` file is unchanged
+// so the persisted preferences carry over from previous app versions verbatim.
 
 class AssistantViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -48,7 +47,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         private const val MAX_RECOVERY_RETRIES = 3
     }
 
-    private val dataStore = application.dataStore
+    private val settingsRepository = com.assistant.peripheral.settings.SettingsRepository.create(application)
     private val webSocketManager = WebSocketManager()
     private val audioRecorder = AudioRecorder(application.applicationContext)
 
@@ -57,13 +56,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Voice manager for WebRTC (created lazily when apiClient is available)
     private var voiceManager: VoiceManager? = null
-
-    // Completes on the first DataStore emission, after _settings.value has been
-    // populated from disk. connect() awaits this so the WS doesn't race the
-    // default Jetson URL against a persisted server URL — that mismatch put the
-    // app into a tight orchestrator_active loop (WS to one server, getLivePool
-    // to another, recovery hammering with the wrong local_id).
-    private val settingsLoaded = CompletableDeferred<Unit>()
 
     // Bounded, single-flight state for recoverFromOrchestratorActive. Without
     // these guards the error handler re-fires every ~200 ms with the same stale
@@ -274,7 +266,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _noActiveOrchestrator = MutableStateFlow(false)
     val noActiveOrchestrator: StateFlow<Boolean> = _noActiveOrchestrator.asStateFlow()
 
-    // Settings
+    // Settings — non-nullable view over the SettingsRepository's
+    // `StateFlow<AppSettings?>`. Defaults to `AppSettings()` until the
+    // repository emits, matching the pre-refactor UI contract. Internal
+    // call sites that need the URL DO NOT read this (they would race the
+    // first emission); they call `settingsRepository.awaitLoaded()` instead.
     private val _settings = MutableStateFlow(AppSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
@@ -292,120 +288,63 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val systemConfig: StateFlow<SystemConfigState> = _systemConfig.asStateFlow()
     private var savedFlashJob: kotlinx.coroutines.Job? = null
 
-    // Preference keys
-    private object PreferenceKeys {
-        val SERVER_URL = stringPreferencesKey("server_url")
-        val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
-        val ENABLE_WAKE_WORD = booleanPreferencesKey("enable_wake_word")
-        // Detour 3 naming swap-rename (plan §0.5):
-        //   TALK_WORD → turn-based single voice message ("push-to-talk")
-        //   WAKE_WORD → realtime WebRTC voice conversation
-        // On-the-wire keys use fully-qualified forms ("turn_talk_word",
-        // "realtime_wake_word") so the persistence layer is self-describing.
-        val TALK_WORD = stringPreferencesKey("turn_talk_word")
-        val WAKE_WORD = stringPreferencesKey("realtime_wake_word")
-        val THEME_MODE = stringPreferencesKey("theme_mode")
-        val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
-        val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
-        val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
-        val ECHO_DUCKING_GAIN = floatPreferencesKey("echo_ducking_gain")
-        val AUDIO_OUTPUT = stringPreferencesKey("audio_output")  // enum: EARPIECE / LOUDSPEAKER / BLUETOOTH
-        val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
-        val SAVED_SERVERS = stringPreferencesKey("saved_servers")
-        // Persisted across app restarts so we reattach to the same orchestrator
-        // session instead of forking a new one when getLivePool() races on launch.
-        val ORCHESTRATOR_LOCAL_ID = stringPreferencesKey("orchestrator_local_id")
-    }
-
-    // Saved servers are persisted as "label\turl|label\turl|..." — no quoting needed
-    // since labels/urls never contain tab or pipe in practice.
-    private fun encodeSavedServers(servers: List<SavedServer>): String =
-        servers.joinToString("|") { "${it.label}\t${it.url}" }
-
-    private fun decodeSavedServers(raw: String?): List<SavedServer> {
-        if (raw.isNullOrEmpty()) return emptyList()
-        return raw.split("|").mapNotNull { entry ->
-            val parts = entry.split("\t", limit = 2)
-            if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank())
-                SavedServer(parts[0], parts[1]) else null
-        }
-    }
-
     init {
-        // Load settings from DataStore
+        // Observe settings from the repository. The first emission restores
+        // the persisted orchestrator local_id (so cold start reattaches
+        // instead of forking a new UUID) and constructs the ApiClient +
+        // VoiceManager against the loaded serverUrl. Subsequent emissions
+        // refresh tunables; if the serverUrl changed we tear down session
+        // state and rebuild the voice manager. See the structural analysis
+        // §4 invariants #11, #13, #14 for the contract being preserved here.
         viewModelScope.launch {
             var previousServerUrl: String? = null
             var firstEmission = true
-            dataStore.data.collect { preferences ->
-                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: AppSettings().serverUrl
+            settingsRepository.settings.collect { loaded ->
+                if (loaded == null) return@collect
+                val newServerUrl = loaded.serverUrl
                 val serverUrlChanged = previousServerUrl != null && previousServerUrl != newServerUrl
                 previousServerUrl = newServerUrl
 
-                // On first emission, restore the persisted orchestrator local_id so
-                // we reattach to the same session across app restarts. Without this,
-                // each launch generates a fresh UUID and forks a new orchestrator
-                // when getLivePool() races (e.g. backend slow on cold start).
                 if (firstEmission) {
                     firstEmission = false
-                    preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID]?.takeIf { it.isNotBlank() }?.let {
+                    // Restore the persisted orchestrator local_id BEFORE any
+                    // WS opens. Without this, each launch generates a fresh
+                    // UUID and forks a new orchestrator when getLivePool()
+                    // races (e.g. backend slow on cold start).
+                    settingsRepository.persistedOrchestratorLocalId()?.let {
                         bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value = it
                     }
                 }
 
-                _settings.value = AppSettings(
-                    serverUrl = newServerUrl,
-                    savedServers = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS]),
-                    autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
-                    enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
-                    talkWord = preferences[PreferenceKeys.TALK_WORD] ?: AppSettings().talkWord,
-                    wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
-                    themeMode = try {
-                        ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
-                    } catch (e: Exception) {
-                        ThemeMode.SYSTEM
-                    },
-                    micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
-                    wakeWordMicGainLevel = preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] ?: 1.0f,
-                    speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
-                    echoDuckingGain = preferences[PreferenceKeys.ECHO_DUCKING_GAIN] ?: AppSettings().echoDuckingGain,
-                    audioOutput = AudioOutput.fromString(preferences[PreferenceKeys.AUDIO_OUTPUT]),
-                    enableButtonTrigger = preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] ?: false
-                )
-                // Sync button trigger setting to SharedPreferences so ButtonAccessibilityService can read it
+                _settings.value = loaded
+                // Sync button trigger flag through to SharedPreferences so
+                // ButtonAccessibilityService can read it without a Context ref.
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
-                    .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
-                // Release any connect() callers waiting on the persisted serverUrl.
-                // _settings.value is now the persisted (or default) value; without
-                // this gate the WS would open on the default Jetson URL one beat
-                // before the persisted URL lands, leaving apiClient and the WS
-                // pointing at different servers (root cause of the orchestrator_active loop).
-                if (!settingsLoaded.isCompleted) settingsLoaded.complete(Unit)
-                // Update API client when server URL changes
+                    .edit().putBoolean("button_trigger_enabled", loaded.enableButtonTrigger).apply()
+
+                // Update API client + voice manager when the server URL changes
+                // (or on first construction). Rebuilding on every emission
+                // produced phantom duplicate sessions when the wake word fired —
+                // see commit history of the voice subsystem refactor.
                 val needNewVoiceManager = voiceManager == null || serverUrlChanged
                 if (needNewVoiceManager) {
-                    apiClient = ApiClient(_settings.value.serverUrl)
+                    apiClient = ApiClient(loaded.serverUrl)
                     voiceManager?.release()
                     voiceManager = VoiceManager(getApplication(), apiClient!!).also {
-                        it.setMicGain(_settings.value.micGainLevel)
-                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                        it.setAudioOutput(_settings.value.audioOutput)
+                        it.setMicGain(loaded.micGainLevel)
+                        it.setEchoDuckingGain(loaded.echoDuckingGain)
+                        it.setAudioOutput(loaded.audioOutput)
                     }
                     setupVoiceManagerCallbacks()
                 } else {
-                    // Same server — just refresh tunables on the existing manager.
-                    // Rebuilding here on every DataStore emission was creating
-                    // overlapping VoiceManager instances + stale flow collectors,
-                    // which produced phantom duplicate sessions when the wake
-                    // word fired (two .start() calls slipping past the off-state
-                    // guard during the HTTP await).
                     voiceManager?.let {
-                        it.setMicGain(_settings.value.micGainLevel)
-                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                        it.setAudioOutput(_settings.value.audioOutput)
+                        it.setMicGain(loaded.micGainLevel)
+                        it.setEchoDuckingGain(loaded.echoDuckingGain)
+                        it.setAudioOutput(loaded.audioOutput)
                     }
                 }
 
-                // Clear all session state when switching servers
+                // Clear all session state when switching servers.
                 if (serverUrlChanged) {
                     webSocketManager.disconnect()
                     _sessions.value = emptyList()
@@ -415,7 +354,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     clearOrchestratorLocalId()
                     _isOrchestratorSession.value = false
                     sessionCache.clear()
-                    // Wipe both per-endpoint buckets.
                     for (b in buckets.values) {
                         b.messages.value = emptyList()
                         b.currentSessionId.value = null
@@ -1094,7 +1032,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     // socket would put us right back into this loop.
                     Log.i(TAG, "WS not connected during recovery (attempt=$attempt); reconnecting")
                     webSocketManager.connect(
-                        _settings.value.serverUrl,
+                        settingsRepository.awaitLoaded().serverUrl,
                         live.localId,
                         WebSocketEndpoint.ORCHESTRATOR
                     )
@@ -1112,17 +1050,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun connect() {
         viewModelScope.launch {
-            // Wait for DataStore to surface the persisted serverUrl. On a cold
-            // start MainActivity.onResume() calls reconnectIfNeeded() before
-            // DataStore has emitted, so _settings.value still holds the default
-            // (Jetson) URL — meanwhile apiClient gets built ~1s later from the
-            // persisted (laptop) URL. The mismatch puts the recovery handler in
-            // an orchestrator_active loop forever.
-            settingsLoaded.await()
-            // The implicit "connect" is for the orchestrator socket — the agent
-            // socket is opened lazily in loadSession when the user picks a Claude session.
+            // Wait for the SettingsRepository to surface the persisted
+            // serverUrl. On cold start MainActivity.onResume() calls
+            // reconnectIfNeeded() before DataStore has emitted; without the
+            // await, the WS would open on the default Jetson URL while
+            // ApiClient got built ~1 s later against the persisted laptop
+            // URL — that mismatch is what put the recovery handler into an
+            // orchestrator_active loop. `awaitLoaded()` makes the gate
+            // structural (typed by `StateFlow<AppSettings?>`).
+            val loaded = settingsRepository.awaitLoaded()
             webSocketManager.connect(
-                _settings.value.serverUrl,
+                loaded.serverUrl,
                 bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value
             )
         }
@@ -1138,19 +1076,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * orchestrator id (from getLivePool() or a session_started event).
      */
     private fun persistOrchestratorLocalId(localId: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID] = localId
-            }
-        }
+        viewModelScope.launch { settingsRepository.persistOrchestratorLocalId(localId) }
     }
 
     private fun clearOrchestratorLocalId() {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences.remove(PreferenceKeys.ORCHESTRATOR_LOCAL_ID)
-            }
-        }
+        viewModelScope.launch { settingsRepository.clearOrchestratorLocalId() }
     }
 
     /**
@@ -1346,7 +1276,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * (or the bucket's pendingResumeSessionId for orchestrator) and the
      * Connected handler sends it once the handshake completes.
      */
-    private fun openSessionOnEndpoint(
+    private suspend fun openSessionOnEndpoint(
         endpoint: WebSocketEndpoint,
         localId: String,
         resumeSdkId: String
@@ -1369,7 +1299,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 bucket(WebSocketEndpoint.ORCHESTRATOR).pendingResumeSessionId.value = resumeSdkId
             }
         }
-        webSocketManager.connect(_settings.value.serverUrl, localId, endpoint)
+        // Use awaitLoaded() — if the user taps a History session before
+        // DataStore has emitted (plausible on cold start before the
+        // settings observer fires), reading `_settings.value` would yield
+        // the default Jetson URL and route the WS to the wrong server.
+        webSocketManager.connect(settingsRepository.awaitLoaded().serverUrl, localId, endpoint)
     }
 
     /**
@@ -1838,8 +1772,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 val servers = NetworkScanner.scan(getApplication())
                 _discoveredServers.value = servers
                 // Auto-connect to first discovered server only if using the default URL
-                // (don't overwrite a user-configured server URL)
-                val currentUrl = _settings.value.serverUrl
+                // (don't overwrite a user-configured server URL). awaitLoaded() —
+                // scanForServers can fire before the settings observer has
+                // populated `_settings`, in which case reading `.value` would
+                // see the default and trigger a spurious auto-connect on top of
+                // whatever the user actually persisted.
+                val currentUrl = settingsRepository.awaitLoaded().serverUrl
                 val defaultUrl = AppSettings().serverUrl
                 if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected && currentUrl == defaultUrl) {
                     connectToDiscoveredServer(servers.first())
@@ -1851,106 +1789,66 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun connectToDiscoveredServer(server: DiscoveredServer) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SERVER_URL] = server.wsUrl
-            }
-            // connect() will be triggered by settings update via DataStore flow
-        }
+        viewModelScope.launch { settingsRepository.updateServerUrl(server.wsUrl) }
+        // connect() is triggered by the settings observer on URL change.
     }
 
-    // Settings
+    // ─────────────────────────────────────────────────────────────────
+    // Settings setters — every one delegates to SettingsRepository. Side
+    // effects beyond DataStore (voiceManager updates, system AudioManager,
+    // assistant_service_prefs mirror) stay here because they're ViewModel-
+    // scoped — the repository is pure persistence.
+    // ─────────────────────────────────────────────────────────────────
+
     fun updateServerUrl(url: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SERVER_URL] = url
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateServerUrl(url) }
     }
 
     fun addSavedServer(label: String, url: String) {
-        val cleanLabel = label.trim()
-        val cleanUrl = url.trim()
-        if (cleanLabel.isEmpty() || cleanUrl.isEmpty()) return
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                val existing = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS])
-                // Replace any entry with the same url, else append.
-                val updated = existing.filterNot { it.url == cleanUrl } + SavedServer(cleanLabel, cleanUrl)
-                preferences[PreferenceKeys.SAVED_SERVERS] = encodeSavedServers(updated)
-            }
-        }
+        viewModelScope.launch { settingsRepository.addSavedServer(label, url) }
     }
 
     fun removeSavedServer(url: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                val existing = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS])
-                val updated = existing.filterNot { it.url == url }
-                preferences[PreferenceKeys.SAVED_SERVERS] = encodeSavedServers(updated)
-            }
-        }
+        viewModelScope.launch { settingsRepository.removeSavedServer(url) }
     }
 
     fun selectSavedServer(server: SavedServer) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SERVER_URL] = server.url
-            }
-        }
+        viewModelScope.launch { settingsRepository.selectSavedServer(server) }
     }
 
     fun updateThemeMode(mode: ThemeMode) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.THEME_MODE] = mode.name
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateThemeMode(mode) }
     }
 
     fun updateAutoConnect(enabled: Boolean) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.AUTO_CONNECT] = enabled
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateAutoConnect(enabled) }
     }
 
     fun updateMicGainLevel(level: Float) {
         viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
-            }
+            settingsRepository.updateMicGainLevel(level)
             voiceManager?.setMicGain(level)
         }
     }
 
     fun updateEchoDuckingGain(gain: Float) {
         viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ECHO_DUCKING_GAIN] = gain.coerceIn(0.0f, 1.0f)
-            }
+            settingsRepository.updateEchoDuckingGain(gain)
             voiceManager?.setEchoDuckingGain(gain)
         }
     }
 
     fun updateWakeWordMicGainLevel(level: Float) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
-            }
-            // No inline AssistantService.updateWakeWord call — MainActivity's
-            // LaunchedEffect keyed on settings.wakeWordMicGainLevel picks the
-            // change up off the settings StateFlow and applies it once.
-        }
+        // No inline AssistantService.updateWakeWord call — MainActivity's
+        // LaunchedEffect keyed on settings.wakeWordMicGainLevel picks the
+        // change up off the settings StateFlow and applies it once.
+        viewModelScope.launch { settingsRepository.updateWakeWordMicGainLevel(level) }
     }
 
     fun updateAudioOutput(output: AudioOutput) {
         viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.AUDIO_OUTPUT] = output.name
-            }
-            // Apply immediately to VoiceManager so next session picks it up
+            settingsRepository.updateAudioOutput(output)
+            // Apply immediately to VoiceManager so next session picks it up.
             voiceManager?.setAudioOutput(output)
         }
     }
@@ -1971,28 +1869,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         voiceManager?.isWiredHeadphoneAvailable() == true
 
     fun updateSpeakerVolumeLevel(level: Float) {
-        viewModelScope.launch {
-            val clamped = level.coerceIn(0.0f, 1.5f)
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] = clamped
-            }
-            // Apply to system audio
-            val audioManager = getApplication<Application>().getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val newVolume = (clamped * maxVolume).toInt().coerceIn(0, maxVolume)
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
-        }
+        // Repository writes the persisted value AND applies it to the system
+        // AudioManager (preserved from HEAD — speaker volume is the only
+        // setter that touches a system service, so the repository owns both
+        // halves to keep them in lockstep).
+        viewModelScope.launch { settingsRepository.updateSpeakerVolumeLevel(level) }
     }
 
     fun updateEnableButtonTrigger(enabled: Boolean) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] = enabled
-            }
-            // Write to shared prefs so ButtonAccessibilityService can read it without a Context ref
-            getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
-                .edit().putBoolean("button_trigger_enabled", enabled).apply()
-        }
+        // Repository mirrors the flag to assistant_service_prefs (the side
+        // file that ButtonAccessibilityService reads without a Context ref).
+        viewModelScope.launch { settingsRepository.updateEnableButtonTrigger(enabled) }
     }
 
     // Inline AssistantService.updateWakeWord calls intentionally removed from
@@ -2008,27 +1895,15 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     //   updateWakeWord  → realtime WebRTC voice conversation phrase
 
     fun updateEnableWakeWord(enabled: Boolean) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ENABLE_WAKE_WORD] = enabled
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateEnableWakeWord(enabled) }
     }
 
     fun updateTalkWord(word: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.TALK_WORD] = word
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateTalkWord(word) }
     }
 
     fun updateWakeWord(word: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.WAKE_WORD] = word
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateWakeWord(word) }
     }
 
     // ─────────────────────────────────────────────────────────────────
