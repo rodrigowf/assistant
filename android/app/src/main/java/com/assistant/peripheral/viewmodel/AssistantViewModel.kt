@@ -18,7 +18,6 @@ import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceController
 import com.assistant.peripheral.voice.VoiceManager
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -87,6 +86,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         playBeep = { playReconnectBeep() }
     )
 
+    /** System Settings tab state + ops. Inc 5 extracted these from the VM. */
+    private val systemConfigController = com.assistant.peripheral.system.SystemConfigController(
+        scope = viewModelScope,
+        getAssistantConfig = { apiClient?.getAssistantConfig() },
+        listMcpServers = { apiClient?.listMcpServers() ?: emptyMap() },
+        listOrchestratorModels = { apiClient?.listOrchestratorModels() ?: emptyList() },
+        listVoiceModels = { apiClient?.listVoiceModels() ?: emptyMap() },
+        listQwenHarnessModels = { apiClient?.listQwenHarnessModels() ?: emptyList() },
+        listSessionProviders = { apiClient?.listSessionProviders() ?: emptyList() },
+        listGoogleVoiceModels = { endpoint -> apiClient?.listGoogleVoiceModels(endpoint) ?: emptyList() },
+        updateAssistantConfig = { patch ->
+            apiClient?.updateAssistantConfig(patch)
+                ?: Result.failure(IllegalStateException("Not connected to a server"))
+        },
+    )
+
     // ─────────────────────────────────────────────────────────────────
     // Public facade — pass-throughs to controllers.
     // ─────────────────────────────────────────────────────────────────
@@ -131,11 +146,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val discoveredServers: StateFlow<List<DiscoveredServer>> = connectionController.discoveredServers
     val isScanning: StateFlow<Boolean> = connectionController.isScanning
 
-    // System (backend) configuration — drives the System Settings tab.
-    // Stays on the ViewModel until Inc 5 (SystemConfigController).
-    private val _systemConfig = MutableStateFlow(SystemConfigState())
-    val systemConfig: StateFlow<SystemConfigState> = _systemConfig.asStateFlow()
-    private var savedFlashJob: kotlinx.coroutines.Job? = null
+    // System (backend) configuration — pass-through to SystemConfigController (Inc 5).
+    val systemConfig: StateFlow<SystemConfigState> = systemConfigController.systemConfig
 
     init {
         // Mirror controller toast channels into the UI's _toastMessage flow.
@@ -338,154 +350,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // System (backend) configuration — System Settings tab. Stays on the
-    // ViewModel until Inc 5 (SystemConfigController).
+    // System (backend) configuration — pass-throughs to SystemConfigController.
     // ─────────────────────────────────────────────────────────────────
 
-    fun loadSystemConfig() {
-        val client = apiClient
-        if (client == null) {
-            _systemConfig.value = _systemConfig.value.copy(
-                error = "Not connected to a server",
-                loading = false,
-            )
-            return
-        }
-        viewModelScope.launch {
-            _systemConfig.value = _systemConfig.value.copy(loading = true, error = null)
-            try {
-                val cfgDef = async(Dispatchers.IO) { client.getAssistantConfig() }
-                val mcpDef = async(Dispatchers.IO) { client.listMcpServers() }
-                val modelsDef = async(Dispatchers.IO) { client.listOrchestratorModels() }
-                val voiceDef = async(Dispatchers.IO) { client.listVoiceModels() }
-                val qwenDef = async(Dispatchers.IO) { client.listQwenHarnessModels() }
-                val providersDef = async(Dispatchers.IO) { client.listSessionProviders() }
-
-                val cfg = cfgDef.await()
-                if (cfg == null) {
-                    _systemConfig.value = _systemConfig.value.copy(
-                        loading = false,
-                        error = "Failed to load configuration",
-                    )
-                    return@launch
-                }
-                val googleVoice = client.listGoogleVoiceModels(cfg.defaultVoiceEndpoint)
-                val voiceProviders = voiceDef.await().toMutableMap()
-                if (googleVoice.isNotEmpty()) voiceProviders["google"] = googleVoice
-
-                val (correctedCfg, correction) = maybeAutoCorrectVoiceModel(
-                    client, cfg, googleVoice,
-                )
-
-                _systemConfig.value = SystemConfigState(
-                    config = correctedCfg,
-                    mcpServers = mcpDef.await(),
-                    models = modelsDef.await(),
-                    voiceProviders = voiceProviders,
-                    qwenHarnessModels = qwenDef.await(),
-                    sessionProviders = providersDef.await(),
-                    loading = false,
-                    voiceModelAutoCorrected = correction,
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "loadSystemConfig error: ${e.message}", e)
-                _systemConfig.value = _systemConfig.value.copy(
-                    loading = false,
-                    error = e.message ?: "Failed to load configuration",
-                )
-            }
-        }
-    }
-
-    fun updateSystemConfig(patch: ConfigPatch) {
-        val client = apiClient ?: return
-        viewModelScope.launch {
-            val prevEndpoint = _systemConfig.value.config?.defaultVoiceEndpoint
-            _systemConfig.value = _systemConfig.value.copy(saving = true, error = null)
-            val result = client.updateAssistantConfig(patch)
-            result.fold(
-                onSuccess = { newCfg ->
-                    var effectiveCfg = newCfg
-                    var correction: VoiceModelAutoCorrection? = _systemConfig.value.voiceModelAutoCorrected
-                    val voiceProviders = if (
-                        newCfg.defaultVoiceEndpoint != prevEndpoint
-                    ) {
-                        val googleVoice = client.listGoogleVoiceModels(newCfg.defaultVoiceEndpoint)
-                        val merged = _systemConfig.value.voiceProviders.toMutableMap()
-                        if (googleVoice.isNotEmpty()) {
-                            merged["google"] = googleVoice
-                            val (corrected, c) = maybeAutoCorrectVoiceModel(
-                                client, newCfg, googleVoice,
-                            )
-                            effectiveCfg = corrected
-                            if (c != null) correction = c
-                        }
-                        merged
-                    } else {
-                        _systemConfig.value.voiceProviders
-                    }
-                    _systemConfig.value = _systemConfig.value.copy(
-                        config = effectiveCfg,
-                        voiceProviders = voiceProviders,
-                        saving = false,
-                        savedFlash = true,
-                        voiceModelAutoCorrected = correction,
-                    )
-                    savedFlashJob?.cancel()
-                    savedFlashJob = viewModelScope.launch {
-                        kotlinx.coroutines.delay(2000)
-                        _systemConfig.value = _systemConfig.value.copy(savedFlash = false)
-                    }
-                },
-                onFailure = { e ->
-                    _systemConfig.value = _systemConfig.value.copy(
-                        saving = false,
-                        error = e.message ?: "Failed to save",
-                    )
-                },
-            )
-        }
-    }
-
-    fun dismissVoiceModelAutoCorrected() {
-        _systemConfig.value = _systemConfig.value.copy(voiceModelAutoCorrected = null)
-    }
-
-    private suspend fun maybeAutoCorrectVoiceModel(
-        client: ApiClient,
-        cfg: AssistantConfig,
-        discovered: List<VoiceModelEntry>,
-    ): Pair<AssistantConfig, VoiceModelAutoCorrection?> {
-        if (cfg.defaultVoiceProvider != "google") return cfg to null
-        if (discovered.isEmpty()) return cfg to null
-        if (discovered.any { it.id == cfg.defaultVoiceModel }) return cfg to null
-        val newDefault = discovered.firstOrNull { it.isDefault } ?: discovered.first()
-        val voiceListed = newDefault.voices.any { it.id == cfg.defaultVoiceName }
-        val patch = ConfigPatch(
-            defaultVoiceModel = newDefault.id,
-            defaultVoiceName = if (voiceListed) null else newDefault.voice,
-        )
-        val result = client.updateAssistantConfig(patch)
-        return result.fold(
-            onSuccess = { updated ->
-                updated to VoiceModelAutoCorrection(
-                    from = cfg.defaultVoiceModel,
-                    to = newDefault.id,
-                )
-            },
-            onFailure = { e ->
-                Log.w(TAG, "auto-correct voice model failed: ${e.message}")
-                cfg to null
-            },
-        )
-    }
-
-    fun toggleMcp(name: String) {
-        val cfg = _systemConfig.value.config ?: return
-        val next = cfg.enabledMcps.toMutableList()
-        if (next.contains(name)) next.remove(name) else next.add(name)
-        updateSystemConfig(ConfigPatch(enabledMcps = next))
-    }
+    fun loadSystemConfig() = systemConfigController.loadSystemConfig()
+    fun updateSystemConfig(patch: ConfigPatch) = systemConfigController.updateSystemConfig(patch)
+    fun dismissVoiceModelAutoCorrected() = systemConfigController.dismissVoiceModelAutoCorrected()
+    fun toggleMcp(name: String) = systemConfigController.toggleMcp(name)
 
     /**
      * Two-tone reconnect cue (~300ms) on STREAM_MUSIC so it's audible while
