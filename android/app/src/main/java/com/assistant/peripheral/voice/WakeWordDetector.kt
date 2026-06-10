@@ -118,6 +118,20 @@ class WakeWordDetector(
         // (1500 ms) already bounds normal completion well under this value.
         private const val RECOGNIZER_HANG_WATCHDOG_MS = 10_000L
 
+        // Detour 6: refresh the warm SpeechRecognizer after this many
+        // successful recognition cycles. Defense against long-term state
+        // accumulation (binder leaks, AGC drift, Google service connection
+        // staleness on long uptimes). 20 cycles ≈ 20 user wake-word
+        // triggers — far less frequent than the old 2-hour timer but still
+        // enough to keep the recognizer fresh in heavy use.
+        private const val RECOGNIZER_REFRESH_AFTER_N = 20
+
+        // Detour 6: refresh after this many consecutive NO_SPEECH errors
+        // within the LOCAL detector (separate from Inc 8's service-level
+        // rebuild threshold of 8). Lower bar because rebuilding the
+        // recognizer is cheap (~500ms-1s) vs full detector teardown.
+        private const val RECOGNIZER_REFRESH_NO_SPEECH_SPIKE = 2
+
         /**
          * Normalize a wake-word phrase. Inc 5 dropped the phonetic `wordSubs`
          * expansion table (plan §3 Inc 5): variants are now the configured
@@ -286,6 +300,34 @@ class WakeWordDetector(
      */
     private var consecutiveNoSpeechErrors = 0
 
+    /**
+     * Detour 6: counter for successful recognition cycles since the last
+     * SpeechRecognizer (re)construction. Used by the periodic-refresh
+     * safeguard (D). After RECOGNIZER_REFRESH_AFTER_N successful cycles,
+     * the recognizer is destroyed and recreated on the next silence-monitor
+     * arm — defends against long-term state accumulation (binder leaks,
+     * AGC drift, etc).
+     */
+    private var recognitionsSinceWarmedUp = 0
+
+    /**
+     * Detour 6: pre-built RecognizerIntent so `startListening` can be
+     * called with zero allocation. Reused across cycles. Constructed
+     * lazily on first use.
+     */
+    private val warmRecognizerIntent: Intent by lazy { buildRecognizerIntent() }
+
+    /**
+     * Detour 6: tells `startSilenceMonitor` that the next silence→recognizer
+     * transition should destroy the warm recognizer before listening.
+     * Set true on:
+     *  - watchdog fires (recognizer wedged)
+     *  - consecutive NO_SPEECH spike (safeguard B)
+     *  - pause/resume cycle (safeguard C)
+     * Cleared once `ensureRecognizerWarm` actually rebuilds.
+     */
+    @Volatile private var recognizerNeedsRefresh = true
+
     // Pre-computed phonetic variants for faster matching.
     // talkWord / wakeWord may be comma-separated lists of phrases.
     //   talkVariants = phrases that trigger a single turn-based voice message
@@ -367,9 +409,15 @@ class WakeWordDetector(
         silenceMonitorJob?.cancel()
         silenceMonitorJob = null
         stopAudioRecord()
-        if (wasRecognizing) {
-            scope.launch { destroyRecognizer(); unmuteBeep() }
+        // Detour 6 (Option A): full teardown of the warm recognizer on
+        // pause — voice session is taking the mic and may push the HAL
+        // through MODE_IN_COMMUNICATION; we don't want the warm recognizer
+        // hanging onto stale state. Safeguard C.
+        scope.launch {
+            destroyRecognizer()
+            if (wasRecognizing) unmuteBeep()
         }
+        recognizerNeedsRefresh = true
     }
 
     /**
@@ -379,9 +427,14 @@ class WakeWordDetector(
         if (!isActive || !isPaused) return
         Log.d(TAG, "Resuming wake word detection")
         // Paused → Idle. startSilenceMonitor promotes to SilenceMonitor
-        // once mic acquisition succeeds.
+        // once mic acquisition succeeds and pre-warms the recognizer.
         state = WakeWordState.Idle
         consecutiveMisses = 0
+        // Detour 6 safeguard C: force a fresh recognizer post-voice. The
+        // voice session may have left Google's recognizer service in an
+        // odd state; the warm recognizer on the next cycle should be brand
+        // new.
+        recognizerNeedsRefresh = true
         startSilenceMonitor()
     }
 
@@ -522,8 +575,14 @@ class WakeWordDetector(
             // RMS read loop below is the SilenceMonitor stage. Only promote
             // if we're still in Idle — a concurrent pause()/stop() may have
             // transitioned away while we were waiting on AudioRecord.
+            // Detour 6 (Option A): pre-warm the SpeechRecognizer NOW, in
+            // parallel with the RMS read loop. On Lollipop, construction
+            // takes 800ms-3s — running it during the silence-monitor stage
+            // means activity → startListening fires in ~50ms instead of
+            // burning the leading edge of the user's "wake up" on cold-start.
             withContext(Dispatchers.Main) {
                 if (state is WakeWordState.Idle) state = WakeWordState.SilenceMonitor
+                ensureRecognizerWarm()
             }
 
             val buffer = ShortArray(bufferSize / 2)
@@ -592,29 +651,15 @@ class WakeWordDetector(
     // Stage 2 — Speech recognizer
     // -------------------------------------------------------------------------
 
-    private fun startRecognizer() {
-        if (!isActive || isRecognizing) return
-        // SilenceMonitor → Recognizing(startedAtMs=now, beganSpeechAtMs=null).
-        // `beganSpeechAtMs` is set later inside `onBeginningOfSpeech` by
-        // re-assigning state with the same `startedAtMs`.
-        state = WakeWordState.Recognizing(
-            startedAtMs = android.os.SystemClock.elapsedRealtime(),
-            beganSpeechAtMs = null,
-        )
-
-        muteBeep()
-        // Set communication mode to suppress system beep on older devices.
-        // Track that the change is ours so we don't fight a concurrent
-        // voice session (which also sets MODE_IN_COMMUNICATION but for
-        // routing, not beep suppression).
-        try {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            weChangedAudioMode = true
-        } catch (_: Exception) {}
-        destroyRecognizer()
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+    /**
+     * Detour 6: pre-build the RecognizerIntent ONCE. The intent is
+     * stateless and reusable across recognition cycles — the constants
+     * inside (language, partial-results, timing extras) don't change
+     * between cycles. Moved out of startRecognizer to support the warm-
+     * recognizer pattern (Option A).
+     */
+    private fun buildRecognizerIntent(): Intent =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
@@ -636,113 +681,215 @@ class WakeWordDetector(
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
         }
 
-        // Guard against double finishRecognition calls (onPartialResults early-exit + onResults/onError)
-        var listenerFinished = false
-
-        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                Log.d(TAG, "Recognizer ready")
+    /**
+     * Detour 6 (Option A): ensure a SpeechRecognizer instance exists and
+     * is ready to accept `startListening()` with minimal latency.
+     *
+     * Called from `startSilenceMonitor` once the AudioRecord is acquired —
+     * this pre-warms the recognizer in parallel with the silence-monitor
+     * loop, so when activity is detected, `startListening` returns in ~50ms
+     * instead of the 800ms-3s cold-start observed on Lollipop.
+     *
+     * Honours `recognizerNeedsRefresh` (safeguards B, C, E) and the
+     * `RECOGNIZER_REFRESH_AFTER_N` counter (safeguard D). When either
+     * fires, destroy the existing instance before recreating.
+     *
+     * Must run on `Dispatchers.Main` — SpeechRecognizer construction
+     * is Main-thread-only on Lollipop.
+     */
+    private fun ensureRecognizerWarm() {
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) return
+        if (!isActive || isPaused) return
+        // Safeguard D: periodic refresh.
+        if (speechRecognizer != null && recognitionsSinceWarmedUp >= RECOGNIZER_REFRESH_AFTER_N) {
+            Log.d(TAG, "Recognizer refresh — $recognitionsSinceWarmedUp cycles since last warm")
+            recognizerNeedsRefresh = true
+        }
+        if (recognizerNeedsRefresh && speechRecognizer != null) {
+            try {
+                speechRecognizer?.cancel()
+                speechRecognizer?.destroy()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error destroying stale recognizer: ${e.message}")
             }
+            speechRecognizer = null
+        }
+        if (speechRecognizer == null) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+            speechRecognizer?.setRecognitionListener(recognitionListener)
+            recognizerNeedsRefresh = false
+            recognitionsSinceWarmedUp = 0
+            Log.d(TAG, "Recognizer warmed and ready (will respond to startListening immediately)")
+        }
+    }
 
-            override fun onBeginningOfSpeech() {
-                Log.d(TAG, "Speech begun")
-                // Stamp beganSpeechAtMs on the Recognizing state for future
-                // watchdog/observability consumers (plan §2.3 transition row
-                // "Recognizing → Recognizing(startedAtMs, now)"). Idempotent
-                // if state has already moved off Recognizing (a late
-                // onBeginningOfSpeech racing a watchdog-fired finish).
-                (state as? WakeWordState.Recognizing)?.let {
-                    state = it.copy(beganSpeechAtMs = android.os.SystemClock.elapsedRealtime())
-                }
-                // Inc 4: launch the hang watchdog. If neither onResults nor
-                // onError fires within RECOGNIZER_HANG_WATCHDOG_MS, force-finish
-                // the cycle so the silence monitor re-arms. The listenerFinished
-                // guard ensures we don't race a real callback that arrives
-                // within ε of the watchdog firing — Inc 2's finishRecognition
-                // idempotency guard is the belt-and-suspenders on the
-                // finishRecognition body itself.
-                recognizerWatchdogJob?.cancel()
-                recognizerWatchdogJob = scope.launch {
-                    delay(RECOGNIZER_HANG_WATCHDOG_MS)
-                    if (!listenerFinished) {
-                        Log.w(TAG, "Recognizer watchdog fired — forcing finish after ${RECOGNIZER_HANG_WATCHDOG_MS}ms silence after onBeginningOfSpeech")
-                        listenerFinished = true
-                        finishRecognition(wakeWordDetected = false)
-                    }
+    /**
+     * Detour 6: single reusable RecognitionListener instance. The
+     * `listenerFinished` per-cycle guard moved to an instance field
+     * (`listenerCycleFinished`) so the listener body can stay stateless.
+     */
+    private var listenerCycleFinished: Boolean = false
+
+    private val recognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {
+            Log.d(TAG, "Recognizer ready")
+        }
+
+        override fun onBeginningOfSpeech() {
+            Log.d(TAG, "Speech begun")
+            // Stamp beganSpeechAtMs on the Recognizing state for future
+            // watchdog/observability consumers (plan §2.3 transition row
+            // "Recognizing → Recognizing(startedAtMs, now)"). Idempotent
+            // if state has already moved off Recognizing (a late
+            // onBeginningOfSpeech racing a watchdog-fired finish).
+            (state as? WakeWordState.Recognizing)?.let {
+                state = it.copy(beganSpeechAtMs = android.os.SystemClock.elapsedRealtime())
+            }
+            // Inc 4: launch the hang watchdog. If neither onResults nor
+            // onError fires within RECOGNIZER_HANG_WATCHDOG_MS, force-finish
+            // the cycle so the silence monitor re-arms. The listenerCycleFinished
+            // guard ensures we don't race a real callback that arrives
+            // within ε of the watchdog firing — Inc 2's finishRecognition
+            // idempotency guard is the belt-and-suspenders on the
+            // finishRecognition body itself.
+            recognizerWatchdogJob?.cancel()
+            recognizerWatchdogJob = scope.launch {
+                delay(RECOGNIZER_HANG_WATCHDOG_MS)
+                if (!listenerCycleFinished) {
+                    Log.w(TAG, "Recognizer watchdog fired — forcing finish after ${RECOGNIZER_HANG_WATCHDOG_MS}ms silence after onBeginningOfSpeech")
+                    listenerCycleFinished = true
+                    // Detour 6 safeguard E: watchdog fire means the recognizer
+                    // is wedged. Force a refresh on the next cycle.
+                    recognizerNeedsRefresh = true
+                    finishRecognition(wakeWordDetected = false)
                 }
             }
+        }
 
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
 
-            override fun onError(error: Int) {
-                if (listenerFinished) return
-                listenerFinished = true
-                recognizerWatchdogJob?.cancel()
-                Log.d(TAG, "Recognizer error: $error")
-                // Inc 8: track consecutive NO_SPEECH errors. Sustained flaps
-                // (8+ in a row, plan §9 decision 6) indicate the recognizer
-                // is wedged — Samsung Lollipop binder-death after long
-                // uptime is the canonical case. Reset on any non-NO_SPEECH
-                // error so a single bad cycle doesn't permanently mark the
-                // recognizer unhealthy. The broadcast fires AT the threshold
-                // (once) and on each subsequent NO_SPEECH; AssistantService
-                // funnels through Inc 3's dedupe so the rebuild rate is
-                // capped at one per 3 s regardless.
-                if (error == 6 /* ERROR_NO_SPEECH, added in API 23 */) {
-                    consecutiveNoSpeechErrors++
-                    if (shouldBroadcastRecognizerUnhealthy(consecutiveNoSpeechErrors)) {
-                        Log.w(TAG, "Recognizer unhealthy — $consecutiveNoSpeechErrors consecutive NO_SPEECH errors; broadcasting rebuild request")
-                        LocalBroadcastManager.getInstance(context)
-                            .sendBroadcast(Intent(ACTION_RECOGNIZER_UNHEALTHY))
-                    }
-                } else {
-                    consecutiveNoSpeechErrors = 0
+        override fun onError(error: Int) {
+            if (listenerCycleFinished) return
+            listenerCycleFinished = true
+            recognizerWatchdogJob?.cancel()
+            Log.d(TAG, "Recognizer error: $error")
+            // Inc 8: track consecutive NO_SPEECH errors. Sustained flaps
+            // (8+ in a row, plan §9 decision 6) indicate the recognizer
+            // is wedged — Samsung Lollipop binder-death after long
+            // uptime is the canonical case. Reset on any non-NO_SPEECH
+            // error so a single bad cycle doesn't permanently mark the
+            // recognizer unhealthy. The broadcast fires AT the threshold
+            // (once) and on each subsequent NO_SPEECH; AssistantService
+            // funnels through Inc 3's dedupe so the rebuild rate is
+            // capped at one per 3 s regardless.
+            if (error == 6 /* ERROR_NO_SPEECH, added in API 23 */) {
+                consecutiveNoSpeechErrors++
+                // Detour 6 safeguard B: refresh the WARM recognizer locally
+                // after a smaller NO_SPEECH spike — cheaper than the service-
+                // level rebuild and addresses the "first wake-up clipped"
+                // pattern when the warm recognizer hasn't re-armed cleanly.
+                if (consecutiveNoSpeechErrors >= RECOGNIZER_REFRESH_NO_SPEECH_SPIKE) {
+                    Log.d(TAG, "Marking warm recognizer for refresh — $consecutiveNoSpeechErrors NO_SPEECH errors in a row")
+                    recognizerNeedsRefresh = true
                 }
-                // ERROR_CLIENT (7): double-call or internal SDK error — use flat delay, no backoff.
-                // ERROR_NO_SPEECH (6): Google Recognition Service crash or audio routing issue —
-                //   also use flat delay. Accumulating backoff here is wrong because the service
-                //   will recover in ~1s; we don't want to wait 2s/4s/8s/30s for something
-                //   that's not our fault and resolves quickly.
-                val delay = if (error == SpeechRecognizer.ERROR_CLIENT ||
-                                error == 6 /* ERROR_NO_SPEECH, added in API 23 */)
-                    CLIENT_ERROR_DELAY_MS else -1L
-                finishRecognition(wakeWordDetected = false, delay = delay)
-            }
-
-            override fun onResults(results: Bundle?) {
-                if (listenerFinished) return
-                listenerFinished = true
-                recognizerWatchdogJob?.cancel()
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                Log.d(TAG, "Results: $matches")
-                // Inc 8: any successful onResults clears the NO_SPEECH health
-                // counter — the recognizer is alive even if the user didn't
-                // say the wake word.
+                if (shouldBroadcastRecognizerUnhealthy(consecutiveNoSpeechErrors)) {
+                    Log.w(TAG, "Recognizer unhealthy — $consecutiveNoSpeechErrors consecutive NO_SPEECH errors; broadcasting rebuild request")
+                    LocalBroadcastManager.getInstance(context)
+                        .sendBroadcast(Intent(ACTION_RECOGNIZER_UNHEALTHY))
+                }
+            } else {
                 consecutiveNoSpeechErrors = 0
-                val detected = matches != null && checkForWakeWord(matches)
-                finishRecognition(wakeWordDetected = detected)
             }
+            // ERROR_CLIENT (7): double-call or internal SDK error — use flat delay, no backoff.
+            // ERROR_NO_SPEECH (6): Google Recognition Service crash or audio routing issue —
+            //   also use flat delay. Accumulating backoff here is wrong because the service
+            //   will recover in ~1s; we don't want to wait 2s/4s/8s/30s for something
+            //   that's not our fault and resolves quickly.
+            val delay = if (error == SpeechRecognizer.ERROR_CLIENT ||
+                            error == 6 /* ERROR_NO_SPEECH, added in API 23 */)
+                CLIENT_ERROR_DELAY_MS else -1L
+            finishRecognition(wakeWordDetected = false, delay = delay)
+        }
 
-            override fun onPartialResults(partialResults: Bundle?) {
-                if (listenerFinished) return
-                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!partial.isNullOrEmpty()) {
-                    Log.d(TAG, "Partial: $partial")
-                    if (checkForWakeWord(partial)) {
-                        // Early match on partial — stop immediately
-                        listenerFinished = true
-                        recognizerWatchdogJob?.cancel()
-                        finishRecognition(wakeWordDetected = true)
-                    }
+        override fun onResults(results: Bundle?) {
+            if (listenerCycleFinished) return
+            listenerCycleFinished = true
+            recognizerWatchdogJob?.cancel()
+            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            Log.d(TAG, "Results: $matches")
+            // Inc 8: any successful onResults clears the NO_SPEECH health
+            // counter — the recognizer is alive even if the user didn't
+            // say the wake word.
+            consecutiveNoSpeechErrors = 0
+            val detected = matches != null && checkForWakeWord(matches)
+            finishRecognition(wakeWordDetected = detected)
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            if (listenerCycleFinished) return
+            val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if (!partial.isNullOrEmpty()) {
+                Log.d(TAG, "Partial: $partial")
+                if (checkForWakeWord(partial)) {
+                    // Early match on partial — stop immediately
+                    listenerCycleFinished = true
+                    recognizerWatchdogJob?.cancel()
+                    finishRecognition(wakeWordDetected = true)
                 }
             }
+        }
 
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
 
-        speechRecognizer?.startListening(intent)
+    /**
+     * Detour 6 (Option A): start the recognizer using the WARM instance.
+     *
+     * The SpeechRecognizer was constructed during silence-monitor arming
+     * (`ensureRecognizerWarm`), so `startListening` returns in ~50 ms
+     * instead of the 800ms-3s observed with the cold-start path.
+     *
+     * If the warm recognizer is missing for any reason (shouldn't happen
+     * in normal flow but defends against init races), fall back to the
+     * cold-start path inline.
+     */
+    private fun startRecognizer() {
+        if (!isActive || isRecognizing) return
+        // SilenceMonitor → Recognizing(startedAtMs=now, beganSpeechAtMs=null).
+        // `beganSpeechAtMs` is set later inside `onBeginningOfSpeech` by
+        // re-assigning state with the same `startedAtMs`.
+        state = WakeWordState.Recognizing(
+            startedAtMs = android.os.SystemClock.elapsedRealtime(),
+            beganSpeechAtMs = null,
+        )
+
+        muteBeep()
+        // Set communication mode to suppress system beep on older devices.
+        // Track that the change is ours so we don't fight a concurrent
+        // voice session (which also sets MODE_IN_COMMUNICATION but for
+        // routing, not beep suppression).
+        try {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            weChangedAudioMode = true
+        } catch (_: Exception) {}
+
+        // Detour 6: reset the per-cycle listener guard before calling
+        // startListening — the listener instance is reused across cycles.
+        listenerCycleFinished = false
+
+        // Cold-start fallback: if the warm recognizer is missing (e.g. a
+        // race during init), construct one here and proceed. This restores
+        // the pre-Detour-6 behavior end-to-end as a defense in depth.
+        if (speechRecognizer == null) {
+            Log.w(TAG, "Recognizer not warm at startRecognizer — falling back to cold start")
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+            speechRecognizer?.setRecognitionListener(recognitionListener)
+            recognitionsSinceWarmedUp = 0
+        }
+
+        speechRecognizer?.startListening(warmRecognizerIntent)
     }
 
     private fun finishRecognition(wakeWordDetected: Boolean, delay: Long = -1L) {
@@ -758,7 +905,20 @@ class WakeWordDetector(
         // existing `if (isActive && !isPaused) startSilenceMonitor()`
         // guard below correctly no-ops the rearm.
         if (state is WakeWordState.Recognizing) state = WakeWordState.Idle
-        destroyRecognizer()
+        // Detour 6 (Option A): stop the warm recognizer's CURRENT listening
+        // session but KEEP THE INSTANCE alive for the next cycle. cancel()
+        // stops without delivering onResults/onError — appropriate here
+        // because we've already consumed the result. destroyRecognizer() is
+        // only invoked from full-teardown paths (stop/pause/release) or the
+        // refresh safeguards.
+        recognizerWatchdogJob?.cancel()
+        recognizerWatchdogJob = null
+        try {
+            speechRecognizer?.cancel()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error cancelling recognizer in finishRecognition: ${e.message}")
+        }
+        recognitionsSinceWarmedUp++
         // Only reset audio mode if no wake word — if detected, VoiceManager will take ownership.
         // Guarded: only revert if we set the mode ourselves (see revertAudioModeIfOurs).
         if (!wakeWordDetected) revertAudioModeIfOurs() else weChangedAudioMode = false
