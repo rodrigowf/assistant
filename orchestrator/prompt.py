@@ -12,7 +12,7 @@ from utils.mcp_config import load_available_mcps
 
 # Limits for content injection
 MAX_MEMORY_CHARS = 12000
-MAX_MEMORY_INDEX_CHARS = 20000
+MAX_MEMORY_INDEX_CHARS = 40000
 
 # Shared memory index filename
 MEMORY_INDEX_FILENAME = "MEMORY.md"
@@ -90,7 +90,20 @@ def _load_memory_index(config: OrchestratorConfig) -> str:
     try:
         content = memory_index_path.read_text(encoding="utf-8")
         if len(content) > MAX_MEMORY_INDEX_CHARS:
-            content = content[:MAX_MEMORY_INDEX_CHARS] + "\n... (truncated)"
+            truncated = content[:MAX_MEMORY_INDEX_CHARS]
+            shown_lines = truncated.count("\n") + (0 if truncated.endswith("\n") else 1)
+            total_lines = content.count("\n") + (0 if content.endswith("\n") else 1)
+            # End cleanly on the last fully-shown line, then append the marker.
+            last_newline = truncated.rfind("\n")
+            if last_newline != -1:
+                truncated = truncated[: last_newline + 1]
+                shown_lines = truncated.count("\n")
+            next_line = shown_lines + 1
+            content = (
+                truncated
+                + f"\n[truncated — showing {shown_lines} of {total_lines} lines — "
+                f"read MEMORY.md starting at line {next_line} if you want to see the rest]\n"
+            )
         return content
     except Exception:
         return "(failed to read memory index)"
@@ -164,6 +177,26 @@ The user interacts with you through a multi-tab web interface. Each agent sessio
 - Monitor their progress and collect results
 - Coordinate multi-step workflows across sessions
 - Maintain persistent memory for cross-session context"""
+
+
+def _self_reference_section(context: dict[str, Any]) -> str | None:
+    """Expose the orchestrator's own conversation JSONL path.
+
+    Lets the orchestrator delegate a digest of this conversation to an agent
+    session by handing over an exact file path, instead of describing the
+    conversation and asking the agent to find it.
+    """
+    session = context.get("session")
+    jsonl_path = getattr(session, "_jsonl_path", None) if session is not None else None
+    if jsonl_path is None:
+        return None
+    return (
+        "## This Conversation\n"
+        f"Your conversation JSONL: `{jsonl_path}`\n\n"
+        "Pass this path to an agent session when delegating a digest of this "
+        "conversation into memory. The append stream is owned by the live "
+        "session — treat the file as read-only from any delegated agent."
+    )
 
 
 def _active_sessions_section(context: dict[str, Any]) -> str:
@@ -335,33 +368,32 @@ def _memory_section(
 
     section = f"""## Memory System
 
-The orchestrator uses a two-tier memory system: a **shared index** for reference information, and a **private memory** for orchestrator-specific state.
+`context/memory/` is a structured wiki — files live in semantic category folders, carry YAML frontmatter, and link to related files inline. `MEMORY.md` is the index: it documents the current folder ontology, the frontmatter schema, the cross-reference format, and lists every file with its location. Read MEMORY.md to discover what categories exist and what files already cover a topic — it is loaded below.
 
-### Shared Memory Index (`context/memory/MEMORY.md`)
+### Adding or updating memory
 
-This is the authoritative reference for skills, memory files, and project information. Both you and agent sessions rely on this index.
+1. **Reuse before creating.** Search the existing index for the closest file. If the new info extends or revises an existing topic, edit that file — do not create a new one for every fact.
+2. **Pick the category.** If no existing file fits, place the new file under the most specific matching folder from the ontology in MEMORY.md. If no folder fits, create a new subfolder — folders are cheap; misplaced files are expensive. Mirror new folders as new sections in MEMORY.md.
+3. **Fill all frontmatter fields.** Set `created` and `modified` to today. Set `source` to the originating session UUID + title when knowable; otherwise `curated (<short reason>)`. Compute `references` from the files you cite.
+4. **Cross-link.** Where prose mentions another memory file, link it inline with a relative markdown link `[name.md](../folder/name.md)`. Add the same path to the `references:` array. Then update those other files' `references:` arrays so the link is bidirectional.
+5. **Update MEMORY.md** in the same edit pass — add a one-line entry under the correct section header.
 
-**Your maintenance responsibilities:**
-- Update the Skills Reference table when skills are added, removed, or modified
-- Add reference lines for new memory files
-- Update project entries when their status changes
+### Editing rules
 
-### Your Private Memory (`{relative_path}`)
+- `write_file` is a full overwrite — read first, edit, then write the complete updated content. It creates parent directories automatically, so writing to `context/memory/<new-folder>/<file>.md` works without a separate mkdir.
+- When you change a file's content, bump its `modified` field to today.
+- When you move a file to a different category, update its `category` field and grep the memory tree for inbound references to the old path.
+- Never omit existing index entries unless they are clearly obsolete.
 
-Use this for orchestrator-specific state: active workflows, pending tasks, session notes.
+### Searching memory
 
-### Extended Memory Files
+- `search_memory` returns chunks enriched with the source file's `frontmatter` — use category and tags to triage before reading the full file.
+- `search_history` returns chunks enriched with `session_uuid`, `session_title`, `session_datetime`, and `linked_memories` — follow `linked_memories` to jump from a conversation back to relevant memory files.
+- For directed retrieval, prefer direct file lookup via MEMORY.md over semantic search. Search is a supplement.
 
-For detailed notes, create separate files in `context/memory/<topic>.md`. These are automatically indexed for semantic search.
+### Your private memory (`{relative_path}`)
 
-### File Editing Rule
-
-**Critical: `write_file` performs a full overwrite.** Always:
-1. Read the file first
-2. Make your changes
-3. Write the complete updated content
-
-Never omit existing entries unless they are clearly obsolete."""
+For orchestrator-specific state: active workflows, pending tasks, session notes. Does NOT follow the frontmatter convention."""
 
     # Add shared memory index contents
     if memory_index:
@@ -569,6 +601,7 @@ def build_system_prompt(
     """
     sections = [
         _role_section(),
+        _self_reference_section(context),
         _active_sessions_section(context),
         _mcp_section(),
         _memory_section(config, voice_provider_id=voice_provider_id),

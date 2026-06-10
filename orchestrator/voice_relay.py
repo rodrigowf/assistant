@@ -34,7 +34,16 @@ from typing import Any, Awaitable, Callable
 
 from orchestrator.providers.voice_base import BaseVoiceProvider
 from orchestrator import voice_vad
+from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
+from orchestrator.voice_reconnect import (
+    HELD_OUTBOUND_CAP,
+    POLICIES,
+    ReconnectReason,
+    policy_for,
+)
+from orchestrator.voice_timeouts import VoiceTimeouts
 from utils.paths import PROJECT_ROOT
+from weakref import WeakSet
 
 logger = logging.getLogger(__name__)
 
@@ -59,27 +68,14 @@ _AUDIO_LOG_SAMPLE_EVERY = 50
 # alongside the api logs so /debug-app picks them up.
 _VOICE_LOG_DIR = PROJECT_ROOT / "logs" / "voice"
 
-# How often to send a tiny silent keepalive PCM chunk upstream when the
-# user is silent.  Qwen-Omni's transcription pipeline times out after a
-# few minutes of audio silence and crashes on the next real input with
-# a misleading "InvalidParameter" 400.  30s comfortably stays under
-# that threshold while keeping bandwidth negligible (~960B/30s).
-_KEEPALIVE_INTERVAL_S = 30.0
-
-# Manual-VAD mode: DashScope documents a 60-second cap on continuous
-# audio in non-VAD (manual) mode before you MUST commit. We force a
-# commit + response.create at 50s if the user is still speaking — far
-# enough below the ceiling that wire jitter never trips it.
-_MANUAL_VAD_SAFETY_COMMIT_S = 50.0
-
-# Bound the goAway-driven reconnect: if the new upstream WS connect +
-# session.update handshake doesn't complete within this window, give
-# up and surface a clean error so the frontend can tear down. Observed
-# 2026-06-04: a stuck ``websockets.connect`` left the relay silently
-# jammed for 40s+ with the audio_in queue draining into a void.
-# Generous so a slow Anthropic/Gemini handshake doesn't trigger it,
-# but tight enough that the user notices something is wrong.
-_RECONNECT_HANDSHAKE_TIMEOUT_S = 15.0
+# Increment F (plan §F) — the timeout constants previously declared
+# here are now ``VoiceTimeouts`` fields:
+#   _KEEPALIVE_INTERVAL_S         → voice_timeouts.keepalive_s
+#   _MANUAL_VAD_SAFETY_COMMIT_S   → voice_timeouts.manual_vad_safety_commit_s
+#   _VAD_STATE_HEARTBEAT_S        → voice_timeouts.vad_state_heartbeat_s
+#   _RECONNECT_HANDSHAKE_TIMEOUT_S → voice_timeouts.reconnect_handshake_s
+# Defaults equal the pre-Inc-F literals byte-for-byte
+# (tests/test_voice_timeouts.py::test_defaults_equal_head_constants).
 
 
 class VoiceRelay:
@@ -108,6 +104,16 @@ class VoiceRelay:
         session_id: str | None = None,
         rebuild_session_update: SessionUpdateBuilder | None = None,
         max_reconnects: int = 2,
+        # Increment B — VAD tuning. None means "use VoiceVAD defaults"
+        # which equal HEAD constants exactly (see
+        # tests/parity/test_voice_vad_parity.py). Threaded from
+        # ``assistant_config.json`` via ``OrchestratorSession``.
+        vad_threshold: float | None = None,
+        vad_min_silence_ms: int | None = None,
+        # Increment F — central voice-pipeline timeouts. None means
+        # "use VoiceTimeouts.default()" which equals HEAD constants
+        # exactly (parity test pins this).
+        voice_timeouts: "VoiceTimeouts | None" = None,
     ) -> None:
         if provider.connection_type != "websocket":
             raise ValueError(
@@ -176,6 +182,34 @@ class VoiceRelay:
         # drain loop sets it when ``setupComplete`` arrives.
         self._handshake_complete: asyncio.Event = asyncio.Event()
 
+        # --- Increment C: parameterised reconnect + held outbound queue ---
+        # Single lock around the entire close → rebuild → handshake
+        # sequence inside :meth:`_try_reconnect`. Concurrent callers
+        # coalesce: the first wins the lock, the rest wait and observe
+        # the outcome via ``_handshake_complete``. Closes the 2026-06-04
+        # 01:11 "duplicate setup frames on reconnect race" incident.
+        self._reconnect_lock: asyncio.Lock = asyncio.Lock()
+        # True while inside the locked section. ``send_event`` reads this
+        # to decide between "wait on handshake" (initial connect) and
+        # "queue into _held_outbound" (mid-reconnect).
+        self._in_reconnect: bool = False
+        # Monotonic counter of completed reconnect attempts (success OR
+        # fail). Used to coalesce concurrent ``_try_reconnect`` callers:
+        # if the counter advanced between a caller's entry and its lock
+        # acquisition, a prior caller already attempted, so this caller
+        # short-circuits. Distinct from ``_reconnect_count`` which only
+        # tracks recoverable-error successes against ``max_reconnects``.
+        self._reconnect_attempts_completed: int = 0
+        # Frames parked while mid-reconnect; flushed in order after the
+        # new upstream's setupComplete. Bounded by ``HELD_OUTBOUND_CAP``
+        # (drop-oldest) so a prolonged reconnect can't OOM the relay.
+        self._held_outbound: list[dict[str, Any]] = []
+        # Per-WS-instance idempotency guard — :meth:`_open_and_handshake`
+        # records the WS here after shipping the setup frame; a second
+        # call on the SAME instance raises. WeakSet so finished WSes
+        # don't pin in memory.
+        self._setup_sent_for_ws: WeakSet = WeakSet()
+
         # --- observability state ---
         self._started_at: float = 0.0  # set in start()
         self._first_audio_in_at: float | None = None
@@ -205,9 +239,26 @@ class VoiceRelay:
         # (and a safety commit at _MANUAL_VAD_SAFETY_COMMIT_S seconds
         # of continuous speech).
         self._manual_vad: voice_vad.VoiceVAD | None = None
+        # Increment B — user-tunable VAD params threaded from
+        # ``assistant_config.json``. None falls back to the VoiceVAD
+        # constructor defaults (which equal the documented HEAD
+        # constants — parity test pins this).
+        self._vad_threshold = vad_threshold
+        self._vad_min_silence_ms = vad_min_silence_ms
+        # Increment F — central voice-pipeline timeouts. Default to
+        # HEAD constants exactly (parity-tested).
+        self._voice_timeouts: VoiceTimeouts = (
+            voice_timeouts if voice_timeouts is not None else VoiceTimeouts.default()
+        )
         # Timestamp of the most recent speech_started event (monotonic).
         # Used by the safety-commit watchdog.
         self._manual_vad_speech_started_at: float | None = None
+        # Increment B observability: timestamp of the last
+        # ``voice_vad_state`` heartbeat broadcast. While ``is_speech``
+        # is True the relay emits a fresh ``state=listening`` frame
+        # every ~_VAD_STATE_HEARTBEAT_S so the UI's duration clock
+        # advances even if Silero never transitions.
+        self._last_vad_state_emit_at: float | None = None
 
         # ``VOICE_DEBUG_DUMP_MIC=1`` — write every received mic byte to
         # ``logs/voice/<ts>_<sid>.mic.wav`` (16-bit PCM, mono, at the
@@ -403,8 +454,17 @@ class VoiceRelay:
             and in_sr is not None
         ):
             try:
-                self._manual_vad = voice_vad.VoiceVAD(input_sample_rate=in_sr)
-                self._slog(f"manual_vad init: in_sr={in_sr}Hz")
+                vad_kwargs: dict[str, object] = {"input_sample_rate": in_sr}
+                if self._vad_threshold is not None:
+                    vad_kwargs["threshold"] = self._vad_threshold
+                if self._vad_min_silence_ms is not None:
+                    vad_kwargs["min_silence_duration_ms"] = self._vad_min_silence_ms
+                self._manual_vad = voice_vad.VoiceVAD(**vad_kwargs)  # type: ignore[arg-type]
+                self._slog(
+                    f"manual_vad init: in_sr={in_sr}Hz "
+                    f"threshold={self._vad_threshold} "
+                    f"min_silence_ms={self._vad_min_silence_ms}"
+                )
             except Exception:  # noqa: BLE001
                 logger.exception("manual_vad init failed; falling back to server VAD")
                 self._manual_vad = None
@@ -436,6 +496,21 @@ class VoiceRelay:
         """
         self._ws = await self._provider.open_upstream()
         self._slog("upstream connected")
+
+        # Increment C: idempotency guard. If we ever end up calling
+        # _open_and_handshake twice on the SAME ``_ws`` instance (the
+        # 2026-06-04 race that shipped two setup frames on one socket),
+        # raise before touching the wire. The single ``_reconnect_lock``
+        # in :meth:`_try_reconnect` already prevents the underlying race,
+        # but the guard stays as a defensive belt — cheap to check, and
+        # the test in tests/test_voice_reconnect_lock_and_queue.py pins
+        # that the guard fires loud rather than silently double-setup.
+        if self._ws in self._setup_sent_for_ws:
+            raise RuntimeError(
+                "setup_already_sent: refusing duplicate setup frame on "
+                f"WS instance for session {self._session_id}"
+            )
+        self._setup_sent_for_ws.add(self._ws)
 
         direction = getattr(self._provider, "handshake_direction", "server_first")
 
@@ -568,8 +643,27 @@ class VoiceRelay:
         gate has lifted (driven by upstream events through the drain
         loop).
         """
-        if self._ws is None or self._closed.is_set():
+        if self._closed.is_set():
             return  # Drop silently — caller already saw an error event.
+
+        # Increment C: if we're mid-reconnect (lock held by another
+        # coroutine, handshake gate closed), park the frame on
+        # ``_held_outbound`` instead of writing to a dead WS. The flush
+        # at the end of :meth:`_try_reconnect` replays the queue after
+        # the new ``setupComplete``.  Bounded at ``HELD_OUTBOUND_CAP``
+        # (drop-oldest) so a prolonged reconnect can't OOM the relay.
+        if self._in_reconnect and not self._handshake_complete.is_set():
+            if len(self._held_outbound) >= HELD_OUTBOUND_CAP:
+                dropped = self._held_outbound.pop(0)
+                self._slog(
+                    f"held_outbound drop-oldest type={dropped.get('type')} "
+                    f"queue_size={HELD_OUTBOUND_CAP}"
+                )
+            self._held_outbound.append(event)
+            return
+
+        if self._ws is None:
+            return
 
         # Wait for the upstream handshake to ack before forwarding
         # anything (see ``_handshake_complete`` for details). Bound the
@@ -694,6 +788,10 @@ class VoiceRelay:
         sends the provider's wire-specific manual-VAD frames upstream
         (see :meth:`BaseVoiceProvider.manual_vad_start_frames` /
         ``manual_vad_stop_frames`` / ``manual_vad_safety_commit_frames``).
+
+        Increment B adds a parallel ``voice_vad_state`` broadcast (see
+        :meth:`_emit_voice_vad_state`) — additive observability that
+        doesn't affect any existing event.
         """
         assert self._manual_vad is not None
         pcm = base64.b64decode(pcm_b64)
@@ -704,6 +802,9 @@ class VoiceRelay:
                 await self._on_event_for_frontend({
                     "type": "input_audio_buffer.speech_started",
                 })
+                # Increment B: broadcast the new typed VAD state so the
+                # UI can render a duration clock + confidence indicator.
+                await self._emit_voice_vad_state("listening")
                 for frame in self._provider.manual_vad_start_frames():
                     await self.send_event(frame)
             elif event.kind == "speech_stopped":
@@ -712,8 +813,20 @@ class VoiceRelay:
                 await self._on_event_for_frontend({
                     "type": "input_audio_buffer.speech_stopped",
                 })
+                await self._emit_voice_vad_state("thinking")
                 for frame in self._provider.manual_vad_stop_frames():
                     await self.send_event(frame)
+
+        # Increment B observability heartbeat: while the VAD is still
+        # in ``speech_started`` (no transition this chunk), re-emit
+        # ``voice_vad_state`` every ~1s so the UI duration clock
+        # advances. Driven from this method (no asyncio.Task) so we
+        # don't add an extra coroutine to the relay's lifecycle.
+        if self._manual_vad.is_speech and self._manual_vad_speech_started_at is not None:
+            now = time.monotonic()
+            last = self._last_vad_state_emit_at
+            if last is None or (now - last) >= self._voice_timeouts.vad_state_heartbeat_s:
+                await self._emit_voice_vad_state("listening")
 
         # Safety commit: some upstreams cap continuous audio in manual
         # mode (DashScope: 60s; Gemini: no documented cap but we chunk
@@ -727,7 +840,7 @@ class VoiceRelay:
         started_at = self._manual_vad_speech_started_at
         if (
             started_at is not None
-            and (time.monotonic() - started_at) >= _MANUAL_VAD_SAFETY_COMMIT_S
+            and (time.monotonic() - started_at) >= self._voice_timeouts.manual_vad_safety_commit_s
         ):
             safety_frames = self._provider.manual_vad_safety_commit_frames()
             if safety_frames:
@@ -740,6 +853,42 @@ class VoiceRelay:
                 self._manual_vad_speech_started_at = time.monotonic()
                 for frame in safety_frames:
                     await self.send_event(frame)
+
+    async def _emit_voice_vad_state(self, state: str) -> None:
+        """Increment B: broadcast typed VAD state to the frontend.
+
+        Payload shape (wire contract — clients switch on these keys):
+
+            {
+              "type": "voice_vad_state",
+              "state": "listening" | "thinking" | "idle",
+              "duration_ms": int,    // since speech_started; 0 otherwise
+              "silero_prob": float | None,
+            }
+
+        Additive event — does NOT replace the existing
+        ``input_audio_buffer.speech_started/stopped`` broadcasts.
+
+        Called by :meth:`_run_manual_vad` on every state transition AND
+        every ``_VAD_STATE_HEARTBEAT_S`` while the VAD remains in
+        ``listening`` (so the UI clock advances even when Silero
+        doesn't transition for tens of seconds).
+        """
+        now = time.monotonic()
+        started_at = self._manual_vad_speech_started_at
+        duration_ms = 0
+        if started_at is not None:
+            duration_ms = int((now - started_at) * 1000)
+        prob: float | None = None
+        if self._manual_vad is not None:
+            prob = self._manual_vad.last_silero_prob
+        self._last_vad_state_emit_at = now
+        await self._on_event_for_frontend({
+            "type": "voice_vad_state",
+            "state": state,
+            "duration_ms": duration_ms,
+            "silero_prob": prob,
+        })
 
     async def stop(self) -> None:
         """Cancel the drain task and close the upstream WS."""
@@ -825,12 +974,13 @@ class VoiceRelay:
         assert self._ws is not None
         try:
             while not self._closed.is_set():
-                await asyncio.sleep(_KEEPALIVE_INTERVAL_S / 2)
+                keepalive_s = self._voice_timeouts.keepalive_s
+                await asyncio.sleep(keepalive_s / 2)
                 if self._closed.is_set() or self._ws is None:
                     break
                 # Skip if a real audio chunk went out within the interval.
                 idle = time.monotonic() - (self._last_audio_in_at or self._started_at)
-                if idle < _KEEPALIVE_INTERVAL_S:
+                if idle < keepalive_s:
                     continue
                 try:
                     chunk = self._provider.build_keepalive_chunk()
@@ -1026,7 +1176,10 @@ class VoiceRelay:
                     "voice_relay drain exited cleanly with pending reconnect session_id=%s",
                     self._session_id,
                 )
-                reconnected = await self._try_reconnect(synthetic, is_goaway=True)
+                reconnected = await self._try_reconnect(
+                    synthetic,
+                    reason=ReconnectReason.PROVIDER_GOAWAY,
+                )
                 if reconnected:
                     self._drain_task = asyncio.create_task(
                         self._drain(),
@@ -1040,6 +1193,17 @@ class VoiceRelay:
                 self._closed.set()
                 self._log_close_summary("clean close, reconnect refused")
                 self._close_session_log()
+                # Increment A — emit typed VoiceError envelope alongside
+                # the legacy ``error`` event. No exception object here
+                # (clean close), so the classifier sees None and falls
+                # through to the relay's generic NETWORK fallback.
+                await self._emit_voice_error_event(
+                    exc=None,
+                    fallback_message=(
+                        f"Upstream {self._provider.provider_name} "
+                        "reconnect refused after goAway"
+                    ),
+                )
                 await self._on_event_for_frontend({
                     "type": "error",
                     "error": {
@@ -1088,10 +1252,41 @@ class VoiceRelay:
                 )
                 self._slog(f"  recv[-{offset}] type={frame.get('type')} body={json.dumps(frame)[:500]}")
 
+            # Increment A — classify the close BEFORE the reconnect
+            # gate. If the classifier flags the close as
+            # ``recoverable=False`` (quota / auth / model_unavailable /
+            # context_full), short-circuit reconnect by zeroing
+            # ``_max_reconnects`` so :meth:`_try_reconnect` refuses on
+            # its first capacity check. This is authorised by plan §10
+            # (2026-06-09 user decision) — quota errors are never
+            # transient; retrying just delays the clear error message.
+            classified = self._classify_close(e)
+            if classified is not None and not classified.recoverable:
+                self._max_reconnects = 0
+
             # Try to recover transparently before giving up — DashScope's
             # "InvalidParameter" 400 mid-session is almost always salvageable
             # by reopening with a fresh session.update.
-            reconnected = await self._try_reconnect(e)
+            # Increment C — choose a ReconnectReason from the close.
+            # Gemini's ``is_recoverable_error`` mutates state for the
+            # stale-handle one-shot; if it just dropped a handle, route
+            # via STALE_HANDLE policy (silent + handle already cleared).
+            # Detect by snapshotting the handle before/after the gate.
+            had_handle_before = getattr(self._provider, "_resumption_handle", None)
+            recoverable_now = self._provider.is_recoverable_error(e)
+            had_handle_after = getattr(self._provider, "_resumption_handle", None)
+            if not recoverable_now:
+                reconnected = False
+                self._slog("reconnect skipped: provider classifies error as fatal")
+            else:
+                if (
+                    had_handle_before is not None
+                    and had_handle_after is None
+                ):
+                    reconnect_reason = ReconnectReason.STALE_HANDLE
+                else:
+                    reconnect_reason = ReconnectReason.RECOVERABLE_ERROR
+                reconnected = await self._try_reconnect(e, reason=reconnect_reason)
             if reconnected:
                 # Drain task chains into itself after a successful reconnect:
                 # spin up a new drain so this one can return cleanly.  The
@@ -1107,6 +1302,18 @@ class VoiceRelay:
             self._log_close_summary(f"upstream drain failed: {e}")
             self._close_session_log()
 
+            # Emit the typed VoiceError envelope first so up-to-date
+            # clients render the categorised banner; the legacy
+            # ``voice_relay_failed`` ``error`` event follows for
+            # back-compat (older frontends + Android builds that haven't
+            # been updated yet still see the generic error).
+            await self._emit_voice_error_event(
+                exc=e,
+                fallback_message=(
+                    f"Upstream {self._provider.provider_name} WS closed: {e}"
+                ),
+                precomputed=classified,
+            )
             await self._on_event_for_frontend({
                 "type": "error",
                 "error": {
@@ -1115,48 +1322,197 @@ class VoiceRelay:
                 },
             })
 
+    def _classify_close(self, exc: BaseException | None) -> VoiceError | None:
+        """Run the provider's ``classify_close_reason`` if it exists.
+
+        Returns None when:
+        - The provider doesn't implement the classifier (older fakes /
+          providers that haven't been migrated yet).
+        - The classifier itself returns None (no semantic match).
+
+        Read-only contract: this never mutates provider state. Only
+        :meth:`is_recoverable_error` does that; the relay calls both
+        independently.
+        """
+        # ``hasattr`` check tolerates fake providers in existing tests
+        # that don't subclass BaseVoiceProvider. Real providers always
+        # have the method (default returns None) post-Increment-A.
+        classifier = getattr(self._provider, "classify_close_reason", None)
+        if classifier is None:
+            return None
+
+        ws_code: int | None = None
+        ws_reason: str | None = None
+        if self._ws is not None:
+            ws_code = getattr(self._ws, "close_code", None)
+            ws_reason = getattr(self._ws, "close_reason", None)
+
+        try:
+            return classifier(exc, ws_code, ws_reason)
+        except Exception:  # noqa: BLE001
+            # A classifier crash must not break the close path. Log and
+            # fall through to the relay's generic NETWORK envelope.
+            logger.exception(
+                "voice_relay classify_close_reason raised for %s",
+                self._provider.provider_name,
+            )
+            return None
+
+    async def _emit_voice_error_event(
+        self,
+        *,
+        exc: BaseException | None,
+        fallback_message: str,
+        precomputed: VoiceError | None = None,
+    ) -> None:
+        """Emit a typed ``voice_error`` event to the frontend.
+
+        If the provider classifier returns a :class:`VoiceError`, use
+        it. Otherwise synthesise a generic NETWORK envelope with
+        ``recoverable=True`` (matches today's reconnect behavior for
+        unclassified closes).
+
+        Increment A wires this alongside the legacy ``error`` event so
+        clients can opt into typed rendering incrementally.
+        """
+        err_obj = precomputed if precomputed is not None else self._classify_close(exc)
+
+        if err_obj is None:
+            ws_code: int | None = None
+            ws_reason: str | None = None
+            if self._ws is not None:
+                ws_code = getattr(self._ws, "close_code", None)
+                ws_reason = getattr(self._ws, "close_reason", None)
+            err_obj = VoiceError(
+                category=VoiceErrorCategory.NETWORK,
+                message=fallback_message,
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=ws_code,
+                raw_close_reason=ws_reason,
+                provider=self._provider.provider_name,
+            )
+
+        try:
+            await self._on_event_for_frontend(err_obj.to_event())
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "voice_relay failed to emit voice_error for %s",
+                self._provider.provider_name,
+            )
+
     async def _try_reconnect(
         self,
-        err: BaseException,
+        err: BaseException | None,
         *,
-        is_goaway: bool = False,
+        reason: ReconnectReason,
     ) -> bool:
         """Attempt to transparently reopen the upstream WS.
 
-        Only fires when the relay was constructed with a
-        ``rebuild_session_update`` callback.  Two reconnect classes:
+        Three reconnect reasons (see :class:`ReconnectReason`):
 
-        * **Provider-requested (``is_goaway=True``)**: Gemini Live (and
-          similar) emit a ``goAway`` lifecycle frame every ~10 minutes
-          and require the client to reopen with a resumption handle.
-          These are protocol-driven, NOT errors — refusing them caps
-          conversations at the upstream's session limit (~30 min for
-          ``max_reconnects=2``).  We do NOT cap these; the user can
-          talk for as long as they want.
-        * **Error-recoverable**: a transient network blip, transport
-          reset, etc., classified by
-          :meth:`BaseVoiceProvider.is_recoverable_error`.  These ARE
-          capped by :attr:`_max_reconnects` to prevent an infinite
-          reconnect storm on a broken upstream.
+        * ``PROVIDER_GOAWAY``: Gemini Live's ~10-min session limit
+          warning. Uncapped — protocol-driven, not an error.
+        * ``RECOVERABLE_ERROR``: transient transport close that
+          ``is_recoverable_error`` flagged. Capped by ``max_reconnects``.
+        * ``STALE_HANDLE``: 1008 "session expired" with a poisoned
+          handle. One-shot; the provider's own
+          ``_stale_handle_recovery_used`` flag guards the inner loop.
 
-        We deliberately do NOT mirror the upstream error frame to the
-        frontend on a successful reconnect — the user shouldn't see a
-        red banner that immediately heals.  If reconnect fails, the
-        normal error path resumes.
+        Concurrent callers coalesce on ``_reconnect_lock``: the first
+        wins the lock, the rest wait and observe the outcome via
+        ``_handshake_complete``. Closes the 2026-06-04 01:11 duplicate-
+        setup race (plan Bug 5).
+
+        Returns True iff the new upstream WS is up and the handshake
+        gate is open. On False the caller surfaces the error to the
+        frontend and tears down.
         """
         if self._rebuild_session_update is None:
             return False
-        if not is_goaway:
-            if self._reconnect_count >= self._max_reconnects:
+
+        # Snapshot the completed-attempts counter BEFORE queuing. If the
+        # counter advances between this entry and our lock acquisition,
+        # a prior caller already attempted a reconnect — we coalesce
+        # (their outcome is our outcome). Closes the 2026-06-04 01:11
+        # duplicate-setup race plus the more general "N concurrent
+        # callers per close event" stress case.
+        attempts_seen = self._reconnect_attempts_completed
+
+        # Coalesce-fast-path: another reconnect for this relay is in
+        # flight. Wait for it to release the lock, then report its
+        # outcome.
+        if self._reconnect_lock.locked():
+            self._slog(
+                f"reconnect coalesced: another attempt in flight (reason={reason.value})"
+            )
+            async with self._reconnect_lock:
+                return self._handshake_complete.is_set()
+
+        async with self._reconnect_lock:
+            # Re-check after acquiring: if the completed-attempts
+            # counter advanced while we were queued, a prior caller
+            # already attempted. Coalesce to their outcome instead of
+            # re-running.
+            if self._reconnect_attempts_completed > attempts_seen:
                 self._slog(
-                    f"reconnect skipped: hit max_reconnects={self._max_reconnects}"
+                    f"reconnect coalesced post-acquire: counter advanced "
+                    f"({attempts_seen} -> {self._reconnect_attempts_completed}, "
+                    f"reason={reason.value})"
+                )
+                return self._handshake_complete.is_set()
+            self._in_reconnect = True
+            try:
+                return await self._do_reconnect_locked(err, reason)
+            finally:
+                self._in_reconnect = False
+                # Bump AFTER the attempt completes (success OR fail) so
+                # concurrent callers see "an attempt has happened" and
+                # don't pile on. Done inside the lock so post-acquire
+                # re-check is correct.
+                self._reconnect_attempts_completed += 1
+                # Flush AFTER the handshake (inside the lock) so a
+                # second reconnect can't race the flush. ``_flush_held_outbound``
+                # is a no-op when the handshake gate stayed closed
+                # (failed reconnect).
+                await self._flush_held_outbound()
+
+    async def _do_reconnect_locked(
+        self,
+        err: BaseException | None,
+        reason: ReconnectReason,
+    ) -> bool:
+        """The actual reconnect body, executed under ``_reconnect_lock``.
+
+        Split out for readability — :meth:`_try_reconnect` handles
+        coalescing + lock ownership, this method does the work.
+        """
+        policy = policy_for(reason)
+
+        # Admission check: cap unless the policy says uncapped (0).
+        # The cap VALUE is the instance's ``_max_reconnects`` (user-
+        # configurable) — the policy only governs WHETHER to cap. This
+        # preserves the constructor-level override that existing tests
+        # rely on (``max_reconnects=1`` etc.).
+        # Callers are responsible for the provider's
+        # ``is_recoverable_error`` check before invoking this method
+        # (the gate may mutate provider state on Gemini's stale-handle
+        # path, so it must run exactly once per close).
+        if policy.max_attempts > 0:
+            cap = (
+                policy.max_attempts
+                if reason is ReconnectReason.STALE_HANDLE
+                else self._max_reconnects
+            )
+            if self._reconnect_count >= cap:
+                self._slog(
+                    f"reconnect skipped: hit cap={cap} (reason={reason.value})"
                 )
                 return False
-            if not self._provider.is_recoverable_error(err):
-                self._slog(f"reconnect skipped: provider classifies error as fatal")
-                return False
 
-        if is_goaway:
+        # Slog + counter bookkeeping per reason.
+        if reason is ReconnectReason.PROVIDER_GOAWAY:
             self._goaway_reconnect_count += 1
             self._slog(
                 f"reconnect attempt #{self._goaway_reconnect_count} (goAway, uncapped)"
@@ -1167,15 +1523,30 @@ class VoiceRelay:
             )
         else:
             self._reconnect_count += 1
+            slog_cap = (
+                policy.max_attempts
+                if reason is ReconnectReason.STALE_HANDLE
+                else self._max_reconnects
+            )
             self._slog(
-                f"reconnect attempt #{self._reconnect_count}/{self._max_reconnects}"
+                f"reconnect attempt #{self._reconnect_count}/{slog_cap} "
+                f"(reason={reason.value})"
             )
             logger.warning(
-                "voice_relay reconnect attempt %d/%d session_id=%s after: %s",
-                self._reconnect_count, self._max_reconnects, self._session_id, err,
+                "voice_relay reconnect attempt %d/%d session_id=%s reason=%s after: %s",
+                self._reconnect_count, slog_cap,
+                self._session_id, reason.value, err,
             )
 
-        # Tear down the old WS.  We do NOT cancel keepalive — it shares
+        # Drop the provider's resumption handle if the policy says so
+        # (STALE_HANDLE only). The provider's ``is_recoverable_error``
+        # already does this for the legacy gate; doing it explicitly
+        # here keeps the policy authoritative for non-legacy callers.
+        if policy.reset_handle and hasattr(self._provider, "_resumption_handle"):
+            self._provider._resumption_handle = None
+            self._slog(f"reconnect: dropped resumption handle (reason={reason.value})")
+
+        # Tear down the old WS. We do NOT cancel keepalive — it shares
         # the relay state and will resume on the new ``self._ws``.
         if self._ws is not None:
             try:
@@ -1185,24 +1556,23 @@ class VoiceRelay:
             self._ws = None
 
         # Relay-internal state: clear the deferred-event queue (those
-        # were tied to the old upstream context).  Provider-internal
+        # were tied to the old upstream context). Provider-internal
         # gating state resets itself naturally as the new session
         # delivers fresh events through :meth:`on_inbound_event`.
         self._deferred_events.clear()
         # Re-close the handshake gate so the new upstream gets a fresh
         # setup → setupComplete round trip before audio/events resume.
         self._handshake_complete.clear()
-        # Tell the frontend we're cutting over right now. Distinct from
-        # ``preparing`` (initial connect) so the Android UI can show the
-        # mid-call "pausing for a second to reconnect" banner instead
-        # of the initial "preparing" spinner.
-        try:
-            await self._on_event_for_frontend({
-                "type": "voice_status",
-                "status": "reconnecting",
-            })
-        except Exception:  # noqa: BLE001
-            pass
+        # Tell the frontend we're cutting over right now (unless the
+        # policy says this is a silent recovery — STALE_HANDLE).
+        if policy.surface_to_user:
+            try:
+                await self._on_event_for_frontend({
+                    "type": "voice_status",
+                    "status": "reconnecting",
+                })
+            except Exception:  # noqa: BLE001
+                pass
 
         try:
             session_config = await self._rebuild_session_update()
@@ -1214,22 +1584,21 @@ class VoiceRelay:
         # Bound the reconnect handshake so a stuck upstream connect
         # (observed 2026-06-04: ``websockets.connect`` hung for 40s+
         # on goAway #3 of a long session, never resolved) doesn't
-        # leave the relay silently jammed. Past this, surface as a
-        # failed reconnect so the frontend tears down cleanly and the
-        # user can wake-word a fresh session.
+        # leave the relay silently jammed.
+        reconnect_timeout_s = self._voice_timeouts.reconnect_handshake_s
         try:
             await asyncio.wait_for(
                 self._open_and_handshake(session_config),
-                timeout=_RECONNECT_HANDSHAKE_TIMEOUT_S,
+                timeout=reconnect_timeout_s,
             )
         except asyncio.TimeoutError:
             self._slog(
                 f"reconnect failed: open_and_handshake timed out after "
-                f"{_RECONNECT_HANDSHAKE_TIMEOUT_S}s"
+                f"{reconnect_timeout_s}s"
             )
             logger.warning(
                 "voice_relay reconnect timed out session_id=%s after %ds",
-                self._session_id, _RECONNECT_HANDSHAKE_TIMEOUT_S,
+                self._session_id, reconnect_timeout_s,
             )
             return False
         except Exception as e:  # noqa: BLE001
@@ -1240,36 +1609,77 @@ class VoiceRelay:
             )
             return False
 
-        self._slog(f"reconnect #{self._reconnect_count} succeeded")
+        self._slog(f"reconnect #{self._reconnect_count} succeeded (reason={reason.value})")
         logger.info(
-            "voice_relay reconnect #%d succeeded session_id=%s",
-            self._reconnect_count, self._session_id,
+            "voice_relay reconnect #%d succeeded session_id=%s reason=%s",
+            self._reconnect_count, self._session_id, reason.value,
         )
 
-        # Reset the local VAD's hidden state. The reconnect path drops
-        # mic chunks while the upstream WS is down (see WARN audio_in
-        # dropped above), and Silero's recurrent state doesn't
-        # gracefully recover from a multi-second discontinuity — the
-        # probability output stays flat for the rest of the session
-        # and speech_started never fires again. Resetting brings the
-        # model back to a blank slate so the post-reconnect audio is
-        # classified correctly.
-        if self._manual_vad is not None:
-            self._manual_vad.reset()
-            self._slog("manual_vad state reset after reconnect")
-
-        # Also clear the safety-commit watchdog timestamp. Otherwise it
-        # carries an N-seconds-ago timestamp from the pre-reconnect
-        # session and the post-reconnect path computes "speech ran
-        # 79.1s" and fires an immediate safety commit on the fresh
-        # upstream. Even with the safety frames now empty for Gemini,
-        # keeping this clean matters for Qwen and any future provider
-        # that does want the safety path.
-        if self._manual_vad_speech_started_at is not None:
-            self._manual_vad_speech_started_at = None
-            self._slog("manual_vad safety-commit watchdog reset after reconnect")
+        # Reset local VAD state per policy. The reconnect path drops
+        # mic chunks while the upstream WS is down, and Silero's
+        # recurrent state doesn't gracefully recover from a multi-
+        # second discontinuity — the probability output stays flat for
+        # the rest of the session and speech_started never fires again.
+        if policy.reset_vad_state:
+            if self._manual_vad is not None:
+                self._manual_vad.reset()
+                self._slog("manual_vad state reset after reconnect")
+            # Also clear the safety-commit watchdog timestamp. Otherwise
+            # it carries an N-seconds-ago timestamp from the pre-
+            # reconnect session and the post-reconnect path computes
+            # "speech ran 79.1s" and fires an immediate safety commit
+            # on the fresh upstream.
+            if self._manual_vad_speech_started_at is not None:
+                self._manual_vad_speech_started_at = None
+                self._slog("manual_vad safety-commit watchdog reset after reconnect")
 
         return True
+
+    async def _flush_held_outbound(self) -> None:
+        """Replay queued outbound frames on the new upstream.
+
+        Called from :meth:`_try_reconnect` AFTER the handshake completes
+        (inside the lock so a second reconnect can't race the flush).
+        Skips frames whose ``should_close_after_event`` would fire on
+        the new upstream — those referred to the dying connection's
+        lifecycle and would re-trigger a goAway loop.
+        """
+        if not self._held_outbound:
+            return
+        # If the new handshake didn't complete (failed reconnect), drop
+        # the queue — there's nothing to flush to and the relay is
+        # about to surface the error.
+        if not self._handshake_complete.is_set() or self._ws is None:
+            count = len(self._held_outbound)
+            self._held_outbound.clear()
+            self._slog(f"held_outbound dropped {count} frames (handshake never completed)")
+            return
+        frames = list(self._held_outbound)
+        self._held_outbound.clear()
+        flushed = 0
+        skipped = 0
+        for frame in frames:
+            if self._provider.should_close_after_event(frame):
+                skipped += 1
+                self._slog(
+                    f"held_outbound skip type={frame.get('type')} "
+                    "(would close new upstream)"
+                )
+                continue
+            try:
+                self._record_sent(frame)
+                async with self._send_lock:
+                    await self._ws.send(json.dumps(frame))
+                self._last_send_at = time.monotonic()
+                flushed += 1
+            except Exception as e:  # noqa: BLE001
+                self._slog(f"held_outbound flush failed: type={frame.get('type')} err={e}")
+                # Stop flushing — upstream is sick again.
+                break
+        self._slog(
+            f"held_outbound flushed={flushed} skipped={skipped} "
+            f"total={len(frames)}"
+        )
 
 
 def b64_to_pcm(b64: str) -> bytes:

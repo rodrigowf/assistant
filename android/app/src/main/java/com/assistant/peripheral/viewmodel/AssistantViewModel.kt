@@ -24,11 +24,15 @@ import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
 import com.assistant.peripheral.voice.VoiceManager
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 // DataStore for app settings
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
@@ -39,6 +43,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         private const val TAG = "AssistantViewModel"
         private const val MAX_CACHED_SESSIONS = 5  // Keep at most 5 sessions in cache
         private const val MAX_CACHED_MESSAGES_PER_SESSION = 100  // Limit messages per cached session
+        // orchestrator_active recovery: 3 attempts at 0 / 500 / 2000 ms before
+        // giving up and surfacing the empty-state UI.
+        private const val MAX_RECOVERY_RETRIES = 3
     }
 
     private val dataStore = application.dataStore
@@ -50,6 +57,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Voice manager for WebRTC (created lazily when apiClient is available)
     private var voiceManager: VoiceManager? = null
+
+    // Completes on the first DataStore emission, after _settings.value has been
+    // populated from disk. connect() awaits this so the WS doesn't race the
+    // default Jetson URL against a persisted server URL — that mismatch put the
+    // app into a tight orchestrator_active loop (WS to one server, getLivePool
+    // to another, recovery hammering with the wrong local_id).
+    private val settingsLoaded = CompletableDeferred<Unit>()
+
+    // Bounded, single-flight state for recoverFromOrchestratorActive. Without
+    // these guards the error handler re-fires every ~200 ms with the same stale
+    // local_id and the backend's rejection keeps re-triggering it.
+    private val recoveryInFlight = AtomicBoolean(false)
+    private val recoveryAttempt = AtomicInteger(0)
 
     // Connection state
     val connectionState: StateFlow<ConnectionState> = webSocketManager.connectionState
@@ -182,6 +202,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     private val _voiceState = MutableStateFlow<VoiceState>(VoiceState.Off)
     val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
 
+    // Increment B (voice subsystem refactor) — Silero VAD state from
+    // the backend ``voice_vad_state`` broadcast. ``idle`` until the
+    // manual-VAD pipeline transitions; ``listening``/``thinking``
+    // mirrors Silero. Composables observe this to render the
+    // "listening Ns" duration indicator.
+    private val _vadState = MutableStateFlow("idle")
+    val vadState: StateFlow<String> = _vadState.asStateFlow()
+    private val _vadDurationMs = MutableStateFlow(0L)
+    val vadDurationMs: StateFlow<Long> = _vadDurationMs.asStateFlow()
+
     /**
      * The voice config in use for the *current* voice session, or null if
      * voice isn't active. Captured at [startVoiceSession] time. We hold
@@ -192,6 +222,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * voiceless socket. Cleared in [finalizeVoiceStop].
      */
     private var activeVoiceConfig: VoiceConfig? = null
+
+    /**
+     * Inc 7: idempotency guard for [finalizeVoiceStop]. Set to true at the
+     * top of [finalizeVoiceStop] and cleared in [startVoiceSession]. Closes
+     * the duplicate-resume-intent race surfaced by Detour 3 testing —
+     * finalizeVoiceStop has three call sites (voice_ended ack timeout at
+     * voice_ending, WebSocketEvent.VoiceEnded/VoiceStopped handler, and
+     * stopVoiceSession's safety timeout); two can fire for the same
+     * session-end, sending two resumeWakeWord intents ~600-750 ms apart,
+     * the second tearing down the freshly-armed silence-monitor cycle.
+     *
+     * The structural fix is two-layer:
+     *  - This flag dedupes at the source (ViewModel).
+     *  - AssistantService.onStartCommand's EXTRA_RESUME_WAKE_WORD branch
+     *    short-circuits when voiceSessionActive is already false (defense
+     *    in depth against any other duplicate-intent paths).
+     */
+    private var voiceStopFinalized: Boolean = false
 
     /**
      * One-shot transient message for the UI to display as a toast/snackbar.
@@ -249,8 +297,13 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val SERVER_URL = stringPreferencesKey("server_url")
         val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
         val ENABLE_WAKE_WORD = booleanPreferencesKey("enable_wake_word")
-        val WAKE_WORD = stringPreferencesKey("wake_word")
-        val VOICE_WORD = stringPreferencesKey("voice_word")
+        // Detour 3 naming swap-rename (plan §0.5):
+        //   TALK_WORD → turn-based single voice message ("push-to-talk")
+        //   WAKE_WORD → realtime WebRTC voice conversation
+        // On-the-wire keys use fully-qualified forms ("turn_talk_word",
+        // "realtime_wake_word") so the persistence layer is self-describing.
+        val TALK_WORD = stringPreferencesKey("turn_talk_word")
+        val WAKE_WORD = stringPreferencesKey("realtime_wake_word")
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
         val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
@@ -304,8 +357,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     savedServers = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS]),
                     autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
                     enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
+                    talkWord = preferences[PreferenceKeys.TALK_WORD] ?: AppSettings().talkWord,
                     wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
-                    voiceWord = preferences[PreferenceKeys.VOICE_WORD] ?: AppSettings().voiceWord,
                     themeMode = try {
                         ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
                     } catch (e: Exception) {
@@ -321,6 +374,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // Sync button trigger setting to SharedPreferences so ButtonAccessibilityService can read it
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
                     .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
+                // Release any connect() callers waiting on the persisted serverUrl.
+                // _settings.value is now the persisted (or default) value; without
+                // this gate the WS would open on the default Jetson URL one beat
+                // before the persisted URL lands, leaving apiClient and the WS
+                // pointing at different servers (root cause of the orchestrator_active loop).
+                if (!settingsLoaded.isCompleted) settingsLoaded.complete(Unit)
                 // Update API client when server URL changes
                 val needNewVoiceManager = voiceManager == null || serverUrlChanged
                 if (needNewVoiceManager) {
@@ -632,6 +691,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // an agent SessionStarted shouldn't change the orchestrator's empty-state flag.
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
                     _noActiveOrchestrator.value = false
+                    // Recovery converged — reset the back-off so a later legitimate
+                    // reconnect doesn't carry over a partial counter and trip the cap.
+                    recoveryAttempt.set(0)
                 }
 
                 // Track the true JSONL session ID for voice resume.
@@ -639,11 +701,18 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // pendingResumeSessionId (the actual SDK/JSONL id) instead.
                 b.jsonlSessionId = b.pendingResumeSessionId.value ?: event.sessionId
 
-                // If this is a voice session, forward the session.update payload to OpenAI
-                // This sends the system prompt + tool definitions so the voice session
-                // has full context (matches web frontend's useVoiceOrchestrator)
-                event.voiceSessionUpdate?.let { update ->
-                    voiceManager?.handleBackendCommand(update)
+                // If this is a voice session AND we initiated it, forward
+                // the session.update payload to OpenAI (system prompt +
+                // tool definitions). When we are NOT the initiator (the
+                // session is voice because another client on the same
+                // orchestrator started it), skip the forward — we don't
+                // own a provider transport on this device, and queueing
+                // the update just leaks state for a future start the
+                // user may never trigger here.
+                if (event.voiceInitiator) {
+                    event.voiceSessionUpdate?.let { update ->
+                        voiceManager?.handleBackendCommand(update)
+                    }
                 }
 
                 // Load/refresh messages when reconnecting to an existing session.
@@ -834,6 +903,36 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 b.messages.update { it + compactMessage }
             }
 
+            is WebSocketEvent.VoiceVadState -> {
+                // Increment B (voice subsystem refactor) — mirror the
+                // backend's typed VAD state into observable flows so
+                // composables can render the "listening Ns" indicator
+                // when the user gets stuck in speech_started (the
+                // symptom of Bug 2 — 203s freeze).
+                _vadState.value = event.state
+                _vadDurationMs.value = event.durationMs
+            }
+
+            is WebSocketEvent.VoiceError -> {
+                // Typed voice-provider error. Render a categorised
+                // system message; the legacy ``Error`` event still
+                // arrives behind this one (back-compat) but its detail
+                // is the same string the user just saw, so the
+                // duplicate display is acceptable in Increment A. A
+                // later cleanup can suppress the legacy event once all
+                // clients have migrated.
+                val hintLine = event.recoveryHint?.let { "\n$it" } ?: ""
+                val docLine = event.providerDocUrl?.let { "\n$it" } ?: ""
+                val errorMessage = ChatMessage(
+                    role = MessageRole.SYSTEM,
+                    content = "Voice error (${event.category}): ${event.message}$hintLine$docLine"
+                )
+                b.messages.update { it + errorMessage }
+                if (!event.recoverable) {
+                    b.sessionStatus.value = "error"
+                }
+            }
+
             is WebSocketEvent.Error -> {
                 val errorMessage = ChatMessage(
                     role = MessageRole.SYSTEM,
@@ -949,25 +1048,77 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     /**
      * Backend rejected our orchestrator Start because the pool already has a
      * different orchestrator. This happens when our local_id is stale (e.g.
-     * the live orchestrator was created from another client). Refresh the
-     * pool and re-Start with the live local_id.
+     * the live orchestrator was created from another client, or the WS and
+     * apiClient point at different servers during a cold-start race). Refresh
+     * the pool and re-Start with the live local_id.
+     *
+     * Three guards keep this from turning into a tight loop on the first
+     * orchestrator_active that doesn't resolve:
+     *   - single-flight: drop re-entrant calls while one is in flight,
+     *   - back-off: 0 / 500 / 2000 ms before each attempt,
+     *   - retry cap: surface noActiveOrchestrator after [MAX_RECOVERY_RETRIES]
+     *     so the UI routes the user to History (the proven workaround).
+     * The retry counter is reset in the [WebSocketEvent.SessionStarted]
+     * handler — a successful start means recovery converged.
+     *
+     * If the WS itself is stale (e.g. disconnected without onFailure firing),
+     * we trigger a reconnect instead of sending into a void: the existing
+     * Connected handler at L562+ already knows how to send Start after the
+     * new handshake.
      */
     private fun recoverFromOrchestratorActive() {
+        if (!recoveryInFlight.compareAndSet(false, true)) {
+            Log.d(TAG, "recoverFromOrchestratorActive already in flight; ignoring")
+            return
+        }
         viewModelScope.launch {
-            val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
-            val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-            orchBucket.currentLocalId.value = live.localId
-            orchBucket.pendingResumeSessionId.value = live.sdkSessionId
-            persistOrchestratorLocalId(live.localId)
-            webSocketManager.send(
-                WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
-                endpoint = WebSocketEndpoint.ORCHESTRATOR
-            )
+            try {
+                val attempt = recoveryAttempt.getAndIncrement()
+                if (attempt >= MAX_RECOVERY_RETRIES) {
+                    Log.w(TAG, "recoverFromOrchestratorActive hit retry cap ($MAX_RECOVERY_RETRIES); routing user to History")
+                    _noActiveOrchestrator.value = true
+                    return@launch
+                }
+                if (attempt > 0) {
+                    // 500ms after the first failure, 2000ms after the second.
+                    delay(500L shl (attempt - 1))
+                }
+                val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
+                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
+                orchBucket.currentLocalId.value = live.localId
+                orchBucket.pendingResumeSessionId.value = live.sdkSessionId
+                persistOrchestratorLocalId(live.localId)
+                if (!webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
+                    // WS dropped silently — open a fresh one and let the Connected
+                    // handler resume the live orchestrator. Sending into a stale
+                    // socket would put us right back into this loop.
+                    Log.i(TAG, "WS not connected during recovery (attempt=$attempt); reconnecting")
+                    webSocketManager.connect(
+                        _settings.value.serverUrl,
+                        live.localId,
+                        WebSocketEndpoint.ORCHESTRATOR
+                    )
+                    return@launch
+                }
+                webSocketManager.send(
+                    WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                )
+            } finally {
+                recoveryInFlight.set(false)
+            }
         }
     }
 
     fun connect() {
         viewModelScope.launch {
+            // Wait for DataStore to surface the persisted serverUrl. On a cold
+            // start MainActivity.onResume() calls reconnectIfNeeded() before
+            // DataStore has emitted, so _settings.value still holds the default
+            // (Jetson) URL — meanwhile apiClient gets built ~1s later from the
+            // persisted (laptop) URL. The mismatch puts the recovery handler in
+            // an orchestrator_active loop forever.
+            settingsLoaded.await()
             // The implicit "connect" is for the orchestrator socket — the agent
             // socket is opened lazily in loadSession when the user picks a Claude session.
             webSocketManager.connect(
@@ -1534,10 +1685,24 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
         // Pause wake word detection while voice session is active — the mic is owned
         // by WebRTC and we don't want keywords triggering extra recordings or new sessions.
-        AssistantService.pauseWakeWord(getApplication())
+        // Inc 7: capture the ack-deferred so the coroutine below can await
+        // it (with a 2 s timeout per plan §9 decision 5) before calling
+        // vm.start(cfg). This replaces the 200 ms HAL settle guess in
+        // WebSocketPcmProvider.connect with a true hand-off ack.
+        val pauseAck = AssistantService.pauseWakeWord(getApplication())
+        // Inc 7: reset the finalize-voice-stop idempotency flag for the
+        // new session. finalizeVoiceStop self-guards to short-circuit
+        // duplicate calls; this re-enables it for the new session.
+        voiceStopFinalized = false
 
         val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
         viewModelScope.launch {
+            // Inc 7: await the pause ack with a 2 s budget. On stalled
+            // service the timeout returns null and we proceed with the
+            // legacy fire-and-forget behavior (caller may still race the
+            // mic, but no worse than pre-Inc-7).
+            kotlinx.coroutines.withTimeoutOrNull(2_000L) { pauseAck.await() }
+                ?: Log.w(TAG, "pauseWakeWord ack timeout — proceeding without confirmed release")
             // Fetch the backend's configured voice defaults — provider,
             // model, voice, transcription language.  The Android app
             // doesn't carry its own preferences; the source of truth is
@@ -1616,9 +1781,27 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
      * Idempotent — safe to call after the session is already Off.
      */
     private fun finalizeVoiceStop() {
+        // Inc 7: idempotency guard. Multiple call sites
+        // (voice_ended ack timeout at voice_ending, VoiceEnded/VoiceStopped
+        // handler, stopVoiceSession's safety timeout) can fire for the same
+        // session-end. Without this guard, two resumeWakeWord intents fire
+        // ~600-750 ms apart and the second tears down the freshly-armed
+        // recognizer ("AudioRecord.startRecording() failed — mic busy" log).
+        // The flag is reset in startVoiceSession so a fresh session re-enables
+        // the path.
+        if (voiceStopFinalized) {
+            Log.d(TAG, "finalizeVoiceStop ignored — already finalized for this session")
+            return
+        }
+        voiceStopFinalized = true
         endingTimeoutJob?.cancel()
         endingTimeoutJob = null
         activeVoiceConfig = null  // voice over → no resume on reconnect
+        // Increment B: clear VAD observability so any stale
+        // "listening Ns" indicator disappears the moment the session
+        // ends.
+        _vadState.value = "idle"
+        _vadDurationMs.value = 0L
         viewModelScope.launch {
             voiceManager?.stop()
             _voiceState.value = VoiceState.Off
@@ -1627,8 +1810,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             // Without this delay, AudioRecord fails 20+ times with "other input already
             // started" — the WebRTC AudioRecord is still held by the system even after
             // stop() returns, causing the wake word detector process to crash.
+            // The 1500 ms delay is empirically tuned; Inc 7's deferred ack is
+            // additive defense, not a replacement for the HAL settle wait.
             kotlinx.coroutines.delay(1500L)
-            AssistantService.resumeWakeWord(getApplication())
+            // Inc 7: capture the ack-deferred and await it with a 2 s budget
+            // (plan §9 decision 5). On timeout we log and continue — the
+            // resume intent fired regardless; the await just confirms the
+            // service drained the body.
+            val resumeAck = AssistantService.resumeWakeWord(getApplication())
+            kotlinx.coroutines.withTimeoutOrNull(2_000L) { resumeAck.await() }
+                ?: Log.w(TAG, "resumeWakeWord ack timeout — service may be slow or short-circuited")
         }
     }
 
@@ -1748,11 +1939,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
             }
-            // Apply to wake word detector via AssistantService (restart with new gain)
-            val s = _settings.value
-            if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, s.voiceWord, level)
-            }
+            // No inline AssistantService.updateWakeWord call — MainActivity's
+            // LaunchedEffect keyed on settings.wakeWordMicGainLevel picks the
+            // change up off the settings StateFlow and applies it once.
         }
     }
 
@@ -1806,13 +1995,31 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    // Inline AssistantService.updateWakeWord calls intentionally removed from
+    // updateEnableWakeWord / updateTalkWord / updateWakeWord — MainActivity's
+    // LaunchedEffect (keyed on enableWakeWord / talkWord / wakeWord /
+    // wakeWordMicGainLevel) is the single ingress to the service. Each setting
+    // change emits a DataStore update; the LaunchedEffect picks it up and fires
+    // exactly one updateWakeWord intent, instead of the old double-intent
+    // pattern (one inline, one from the effect — see commit d6181b1).
+    //
+    // Naming (Detour 3 / plan §0.5):
+    //   updateTalkWord  → turn-based single voice message phrase
+    //   updateWakeWord  → realtime WebRTC voice conversation phrase
+
     fun updateEnableWakeWord(enabled: Boolean) {
         viewModelScope.launch {
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.ENABLE_WAKE_WORD] = enabled
             }
-            val s = _settings.value
-            AssistantService.updateWakeWord(getApplication(), enabled, s.wakeWord, s.voiceWord, s.wakeWordMicGainLevel)
+        }
+    }
+
+    fun updateTalkWord(word: String) {
+        viewModelScope.launch {
+            dataStore.edit { preferences ->
+                preferences[PreferenceKeys.TALK_WORD] = word
+            }
         }
     }
 
@@ -1820,22 +2027,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             dataStore.edit { preferences ->
                 preferences[PreferenceKeys.WAKE_WORD] = word
-            }
-            val s = _settings.value
-            if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, word, s.voiceWord, s.wakeWordMicGainLevel)
-            }
-        }
-    }
-
-    fun updateVoiceWord(word: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.VOICE_WORD] = word
-            }
-            val s = _settings.value
-            if (s.enableWakeWord) {
-                AssistantService.updateWakeWord(getApplication(), true, s.wakeWord, word, s.wakeWordMicGainLevel)
             }
         }
     }

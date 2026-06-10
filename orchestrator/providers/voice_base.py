@@ -31,6 +31,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from orchestrator.types import OrchestratorEvent
+from orchestrator.voice_errors import VoiceError
 
 
 class BaseVoiceProvider(ABC):
@@ -184,6 +185,31 @@ class BaseVoiceProvider(ABC):
         ``session.update``.
         """
         return False
+
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> VoiceError | None:
+        """Return a typed :class:`VoiceError` for this close, or None.
+
+        Providers override to map their wire-specific error patterns
+        (HTTP body shapes, close codes, reason strings) into the shared
+        :class:`VoiceErrorCategory` taxonomy. Returning None tells the
+        relay to fall back to a generic NETWORK envelope.
+
+        **Read-only contract.** Implementations MUST NOT mutate
+        provider state — only :meth:`is_recoverable_error` does that
+        (Gemini's stale-handle one-shot, etc.). The two methods are
+        kept separate in Increment A to preserve those existing state
+        machines verbatim. Wherever this method returns a
+        ``VoiceError``, its ``recoverable`` flag must match what
+        :meth:`is_recoverable_error` would return for the same
+        exception (parity test:
+        ``tests/parity/test_voice_error_recoverable_parity.py``).
+        """
+        return None
 
     def accepts_upstream_event(self, event: dict[str, Any]) -> bool:
         """Whether a client-mirrored event is safe to forward upstream.
@@ -379,3 +405,88 @@ class BaseVoiceProvider(ABC):
           immediately and lets the drain loop handle the ack inline.
         """
         return "server_first"
+
+
+class ToolCallAccumulator:
+    """Mixin: tracks in-flight tool calls (id → name + accumulated args).
+
+    All three voice providers do the same bookkeeping pattern around
+    function-call events: stash the (call_id, name) when the call is
+    announced, accumulate the streamed JSON args delta-by-delta,
+    consume both when the args are finalised (OpenAI/Qwen) or when the
+    tool result is shipped back (Gemini's ``format_tool_result``).
+    Increment E (plan §E) consolidates that into one mixin.
+
+    Use:
+    - ``register_call(call_id, name)`` — when a new function-call is
+      announced (Gemini ``toolCall.functionCalls[*]``, OpenAI/Qwen
+      ``response.output_item.added`` of type ``function_call``).
+    - ``accumulate_args(call_id, delta)`` — when a delta frame arrives
+      (OpenAI/Qwen ``response.function_call_arguments.delta``). Silently
+      drops the delta if no call was registered (defensive — out-of-
+      order frames from a misbehaving provider don't crash the loop).
+    - ``pop_name(call_id) -> str`` — read AND remove the stored name.
+      Returns an empty string when not present (legacy contract).
+    - ``pop_args(call_id) -> str`` — read AND remove the accumulated
+      args JSON. Returns an empty string when not present.
+    - ``peek_name(call_id) -> str`` — non-consuming read; useful when
+      the same translator both reads the name AND keeps the call alive
+      for a later ``format_tool_result`` (Gemini pattern).
+    - ``clear_pending_calls()`` — drop everything (called on reconnect
+      teardown so a half-finished call can't bleed across sessions).
+
+    Subclasses pick up the storage via ``__init__`` calling
+    ``ToolCallAccumulator.__init__(self)``. The storage is two dicts;
+    the mixin never imports anything provider-specific.
+    """
+
+    def __init__(self) -> None:
+        # id → tool name (set on first announcement, popped at result).
+        self._pending_call_names: dict[str, str] = {}
+        # id → accumulated args JSON (populated by ``accumulate_args``).
+        self._pending_call_args: dict[str, str] = {}
+
+    def register_call(self, call_id: str, name: str) -> None:
+        """Record a newly-announced tool call. Re-registering with the
+        same ``call_id`` overwrites the prior entry; that matches the
+        legacy behavior of ``self._pending_calls[call_id] = name``.
+        """
+        if not call_id or not name:
+            return
+        self._pending_call_names[call_id] = name
+        # Reset args buffer for this call so a stale prior buffer can't
+        # leak forward (defensive — call_ids should be unique).
+        self._pending_call_args[call_id] = ""
+
+    def accumulate_args(self, call_id: str, delta: str) -> None:
+        """Append a streamed args-delta to the call's buffer.
+
+        Silently no-ops when the call_id wasn't registered — matches
+        the legacy ``if call_id in self._pending_args:`` guard which
+        kept the loop alive on out-of-order frames.
+        """
+        if call_id in self._pending_call_args:
+            self._pending_call_args[call_id] += delta
+
+    def pop_name(self, call_id: str) -> str:
+        """Read AND remove the tool name. Returns "" if absent."""
+        return self._pending_call_names.pop(call_id, "")
+
+    def pop_args(self, call_id: str) -> str:
+        """Read AND remove the accumulated args JSON. Returns "" if absent."""
+        return self._pending_call_args.pop(call_id, "")
+
+    def peek_name(self, call_id: str) -> str:
+        """Read the tool name WITHOUT removing it. Returns "" if absent."""
+        return self._pending_call_names.get(call_id, "")
+
+    def peek_args(self, call_id: str) -> str:
+        """Read the accumulated args WITHOUT removing it. Returns "" if absent."""
+        return self._pending_call_args.get(call_id, "")
+
+    def clear_pending_calls(self) -> None:
+        """Drop all in-flight call state. Call from reconnect / restart
+        paths so a half-finished call can't bleed across sessions.
+        """
+        self._pending_call_names.clear()
+        self._pending_call_args.clear()

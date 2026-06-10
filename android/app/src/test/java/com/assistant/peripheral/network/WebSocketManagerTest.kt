@@ -189,6 +189,47 @@ class WebSocketManagerTest {
     }
 
     @Test
+    fun `VoiceError event carries typed categorised payload`() {
+        // Increment A — typed voice-provider error envelope from
+        // backend `voice_error` events. String values for `category`
+        // mirror orchestrator.voice_errors.VoiceErrorCategory.
+        val event = WebSocketEvent.VoiceError(
+            category = "quota_exceeded",
+            message = "Your Google AI Studio project has exceeded its monthly spending cap.",
+            recoverable = false,
+            recoveryHint = "Visit ai.studio/spend",
+            providerDocUrl = "https://ai.studio/spend",
+            rawCloseCode = 1011,
+            rawCloseReason = "exceeded its monthly spending cap",
+            provider = "google",
+        )
+
+        assertEquals("quota_exceeded", event.category)
+        assertEquals("google", event.provider)
+        assertFalse(event.recoverable)
+        assertEquals(1011, event.rawCloseCode)
+        assertEquals("Visit ai.studio/spend", event.recoveryHint)
+    }
+
+    @Test
+    fun `VoiceError event accepts null optionals`() {
+        // Transient NETWORK-category envelopes carry no hint or doc URL.
+        val event = WebSocketEvent.VoiceError(
+            category = "network",
+            message = "Transient transport close",
+            recoverable = true,
+            provider = "qwen",
+        )
+
+        assertEquals("network", event.category)
+        assertTrue(event.recoverable)
+        assertNull(event.recoveryHint)
+        assertNull(event.providerDocUrl)
+        assertNull(event.rawCloseCode)
+        assertNull(event.rawCloseReason)
+    }
+
+    @Test
     fun `TurnComplete event has correct properties`() {
         val event = WebSocketEvent.TurnComplete(
             inputTokens = 100,

@@ -58,15 +58,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Callbacks set from AssistantApp composable
-    var onWakeWordDetected: (() -> Unit)? = null   // turn-based recording
-    var onVoiceWordDetected: (() -> Unit)? = null  // realtime WebRTC session
+    // Callbacks set from AssistantApp composable.
+    // Per Detour 3 naming (plan §0.5):
+    //   onTalkWordDetected → turn-based single voice message
+    //   onWakeWordDetected → realtime WebRTC voice conversation
+    var onTalkWordDetected: (() -> Unit)? = null
+    var onWakeWordDetected: (() -> Unit)? = null
 
     private val wakeWordReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
+                WakeWordDetector.ACTION_TALK_WORD_DETECTED -> onTalkWordDetected?.invoke()
                 WakeWordDetector.ACTION_WAKE_WORD_DETECTED -> onWakeWordDetected?.invoke()
-                WakeWordDetector.ACTION_VOICE_WORD_DETECTED -> onVoiceWordDetected?.invoke()
             }
         }
     }
@@ -76,10 +79,10 @@ class MainActivity : ComponentActivity() {
 
         requestRequiredPermissions()
 
-        // Register both wake word broadcast actions on the same receiver
+        // Register both wake-word-detector broadcast actions on the same receiver.
         val filter = IntentFilter().apply {
+            addAction(WakeWordDetector.ACTION_TALK_WORD_DETECTED)
             addAction(WakeWordDetector.ACTION_WAKE_WORD_DETECTED)
-            addAction(WakeWordDetector.ACTION_VOICE_WORD_DETECTED)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(wakeWordReceiver, filter)
 
@@ -195,6 +198,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val isRecording by viewModel.isRecording.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val voiceState by viewModel.voiceState.collectAsState()
+    val vadState by viewModel.vadState.collectAsState()
+    val vadDurationMs by viewModel.vadDurationMs.collectAsState()
     val isMuted by viewModel.isMuted.collectAsState()
     val liveSessionIds by viewModel.liveSessionIds.collectAsState()
     val isOrchestratorSession by viewModel.isOrchestratorSession.collectAsState()
@@ -218,10 +223,10 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         }
     }
 
-    // Wire wake word detection: start turn-based recording and navigate to chat
+    // Wire talk-word detection: start a single turn-based voice message recording.
     val coroutineScope = rememberCoroutineScope()
     DisposableEffect(Unit) {
-        activity.onWakeWordDetected = {
+        activity.onTalkWordDetected = {
             // Navigate to chat so the user sees the recording UI
             navController.navigate(Screen.Chat.route) {
                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
@@ -230,7 +235,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             }
             // Start recording — same as pressing the mic button
             viewModel.startRecording()
-            // Auto-stop after 5 seconds (user speaks their request after the wake word)
+            // Auto-stop after 5 seconds (user speaks their request after the trigger phrase)
             coroutineScope.launch {
                 kotlinx.coroutines.delay(5000L)
                 if (viewModel.isRecording.value) {
@@ -238,12 +243,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 }
             }
         }
-        onDispose { activity.onWakeWordDetected = null }
+        onDispose { activity.onTalkWordDetected = null }
     }
 
-    // Wire realtime voice word detection: start WebRTC voice session
+    // Wire wake-word detection: start a realtime WebRTC voice conversation.
     DisposableEffect(Unit) {
-        activity.onVoiceWordDetected = {
+        activity.onWakeWordDetected = {
             navController.navigate(Screen.Chat.route) {
                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
                 launchSingleTop = true
@@ -251,7 +256,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             }
             viewModel.startVoiceSession()
         }
-        onDispose { activity.onVoiceWordDetected = null }
+        onDispose { activity.onWakeWordDetected = null }
     }
 
     // Auto-connect or auto-scan on launch
@@ -269,14 +274,27 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         AssistantService.start(activity)
     }
 
-    // Apply wake word setting whenever it changes (also fires when DataStore finishes
-    // loading on first launch — LaunchedEffect(Unit) runs before DataStore is ready).
-    LaunchedEffect(settings.enableWakeWord, settings.wakeWord, settings.voiceWord) {
+    // Apply wake-word-detector config whenever it changes (also fires when DataStore
+    // finishes loading on first launch — LaunchedEffect(Unit) runs before DataStore
+    // is ready). Gain MUST be included in the key list and the call — without it,
+    // this effect silently overwrites the user's `wakeWordMicGainLevel` slider
+    // value with 1.0f on every recomposition.
+    //
+    // Per Detour 3 naming (plan §0.5):
+    //   settings.talkWord = turn-based single voice message trigger
+    //   settings.wakeWord = realtime WebRTC voice conversation trigger
+    LaunchedEffect(
+        settings.enableWakeWord,
+        settings.talkWord,
+        settings.wakeWord,
+        settings.wakeWordMicGainLevel,
+    ) {
         AssistantService.updateWakeWord(
             activity,
             settings.enableWakeWord,
+            settings.talkWord,
             settings.wakeWord,
-            settings.voiceWord
+            settings.wakeWordMicGainLevel,
         )
     }
 
@@ -396,8 +414,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         isBluetoothAvailable = viewModel.isBluetoothAudioAvailable(),
                         isWiredHeadphoneAvailable = viewModel.isWiredHeadphoneAvailable(),
                         onUpdateEnableWakeWord = viewModel::updateEnableWakeWord,
+                        onUpdateTalkWord = viewModel::updateTalkWord,
                         onUpdateWakeWord = viewModel::updateWakeWord,
-                        onUpdateVoiceWord = viewModel::updateVoiceWord,
                         onUpdateEnableButtonTrigger = viewModel::updateEnableButtonTrigger,
                         onConnect = viewModel::connect,
                         onDisconnect = viewModel::disconnect,
@@ -472,7 +490,9 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 isMuted = isMuted,
                 onToggleMute = viewModel::toggleMute,
                 onStop = viewModel::stopVoiceSession,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                vadState = vadState,
+                vadDurationMs = vadDurationMs,
             )
         }
 

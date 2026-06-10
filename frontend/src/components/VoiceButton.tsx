@@ -8,17 +8,31 @@
  *
  * Note: active, speaking, thinking, tool_use states are now handled by
  * VoiceControls component which shows the stop/mute buttons.
+ *
+ * Increment B (voice subsystem refactor): when the manual-VAD pipeline
+ * is stuck in ``listening`` for more than 3s — the symptom of Bug 2
+ * (203s freeze) — the button surfaces the duration so the user can
+ * see they need to wrap up / adjust the VAD threshold in settings.
  */
 
-import type { VoiceStatus } from "../types";
+import type { VadState, VoiceStatus } from "../types";
 
 interface Props {
   status: VoiceStatus;
   onStart: () => void;
   onStop: () => void;
+  /** Increment B — Silero VAD state from the backend ``voice_vad_state``
+   *  broadcast. Optional so older callers keep type-checking. */
+  vadState?: VadState;
+  /** Increment B — milliseconds since the most recent ``speech_started``
+   *  transition. Only rendered when ``vadState === "listening"`` and
+   *  ``vadDurationMs >= 3000``. */
+  vadDurationMs?: number;
 }
 
-export function VoiceButton({ status, onStart, onStop }: Props) {
+const _LISTENING_DURATION_REVEAL_MS = 3000;
+
+export function VoiceButton({ status, onStart, onStop, vadState, vadDurationMs }: Props) {
   const isOff = status === "off" || status === "error";
   const isConnecting = status === "connecting";
   // While Ending, swallow extra clicks — the backend is already
@@ -36,6 +50,17 @@ export function VoiceButton({ status, onStart, onStop }: Props) {
     error: "Retry",
   }[status];
 
+  // Increment B: surface "listening Ns" only when the VAD has stuck
+  // past the reveal threshold. Below that we keep the button quiet —
+  // every quick utterance would otherwise flash a "1s" indicator.
+  const showDuration =
+    vadState === "listening"
+    && typeof vadDurationMs === "number"
+    && vadDurationMs >= _LISTENING_DURATION_REVEAL_MS;
+  const durationText = showDuration
+    ? `${Math.floor((vadDurationMs ?? 0) / 1000)}s`
+    : null;
+
   return (
     <button
       className={`voice-start-btn voice-start-btn--${status}`}
@@ -48,6 +73,16 @@ export function VoiceButton({ status, onStart, onStop }: Props) {
       {(status === "connecting" || status === "ending") && <SpinnerIcon />}
       {status === "error" && <ErrorIcon />}
       <span className="voice-start-label">{label}</span>
+      {durationText !== null && (
+        <span
+          className="voice-vad-duration"
+          aria-label={`Listening for ${durationText}`}
+          title="Time since the assistant last detected your speech starting"
+          style={{ marginLeft: 6, fontVariantNumeric: "tabular-nums", opacity: 0.85 }}
+        >
+          {durationText}
+        </span>
+      )}
     </button>
   );
 }

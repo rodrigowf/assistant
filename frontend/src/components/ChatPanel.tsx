@@ -48,6 +48,11 @@ interface Props {
   speakerLevel?: number;
   /** Voice error message (e.g. session expired). */
   voiceError?: string | null;
+  /** Increment B (voice subsystem refactor) — Silero VAD state from
+   *  the backend ``voice_vad_state`` broadcast. Used by VoiceButton
+   *  to render a "listening Ns" duration indicator when stuck. */
+  vadState?: import("../types").VadState;
+  vadDurationMs?: number;
   /** Whether the current model supports audio input */
   supportsAudio?: boolean;
   /** Open session-specific config panel (non-orchestrator only) */
@@ -85,6 +90,8 @@ export function ChatPanel({
   micLevel,
   speakerLevel,
   voiceError,
+  vadState,
+  vadDurationMs,
   supportsAudio,
   onOpenSessionConfig,
 }: Props) {
@@ -149,6 +156,8 @@ export function ChatPanel({
             voiceStatus={isOrchestrator ? voiceStatus : undefined}
             onVoiceStart={isOrchestrator ? onVoiceStart : undefined}
             onVoiceStop={isOrchestrator ? onVoiceStop : undefined}
+            vadState={isOrchestrator ? vadState : undefined}
+            vadDurationMs={isOrchestrator ? vadDurationMs : undefined}
             onOpenConfig={!isOrchestrator ? onOpenSessionConfig : undefined}
           />
           {isOrchestrator && voiceStatus === "error" && voiceError && (

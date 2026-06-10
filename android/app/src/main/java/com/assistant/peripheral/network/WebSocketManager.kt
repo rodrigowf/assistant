@@ -298,7 +298,11 @@ class WebSocketManager {
                     val sessionId = json.optString("session_id", "")
                     val voice = json.optBoolean("voice", false)
                     val voiceUpdate = json.optJSONObject("voice_session_update")?.let { jsonObjectToMap(it) }
-                    emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate))
+                    // Default to true for backward-compat with older
+                    // backends that don't send the flag — they only
+                    // emitted session_started for the initiator.
+                    val voiceInitiator = json.optBoolean("voice_initiator", true)
+                    emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate, voiceInitiator))
                 }
                 "session_stopped" -> emit(WebSocketEvent.SessionStopped)
 
@@ -397,6 +401,50 @@ class WebSocketManager {
                     emit(WebSocketEvent.VoiceEnded(reason))
                 }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
+
+                "voice_vad_state" -> {
+                    // Increment B (voice subsystem refactor) — typed VAD
+                    // state envelope. Additive to the existing
+                    // ``input_audio_buffer.speech_*`` events; the
+                    // ViewModel exposes a VadState flow that UI
+                    // components watch to render a duration indicator.
+                    val state = json.optString("state", "idle")
+                    val durationMs = json.optLong("duration_ms", 0L)
+                    val prob = if (json.isNull("silero_prob")) null
+                               else json.optDouble("silero_prob")
+                    emit(WebSocketEvent.VoiceVadState(state, durationMs, prob))
+                }
+
+                "voice_error" -> {
+                    // Typed upstream-provider error envelope (Increment A
+                    // of the voice subsystem refactor). The backend emits
+                    // this AHEAD of the legacy ``error`` event so up-to-date
+                    // clients can render categorised UI while older
+                    // clients still see the generic banner.
+                    val err = json.optJSONObject("error")
+                    if (err != null) {
+                        val rawCode = if (err.isNull("raw_close_code")) null
+                                      else err.optInt("raw_close_code")
+                        val rawReason = if (err.isNull("raw_close_reason")) null
+                                        else err.optString("raw_close_reason", null)
+                        val hint = if (err.isNull("recovery_hint")) null
+                                   else err.optString("recovery_hint", null)
+                        val doc = if (err.isNull("provider_doc_url")) null
+                                  else err.optString("provider_doc_url", null)
+                        emit(
+                            WebSocketEvent.VoiceError(
+                                category = err.optString("category", "unknown"),
+                                message = err.optString("message", ""),
+                                recoverable = err.optBoolean("recoverable", true),
+                                recoveryHint = hint,
+                                providerDocUrl = doc,
+                                rawCloseCode = rawCode,
+                                rawCloseReason = rawReason,
+                                provider = err.optString("provider", ""),
+                            )
+                        )
+                    }
+                }
 
                 // Compact
                 "compact_complete" -> emit(WebSocketEvent.CompactComplete(json.optString("summary", "")))

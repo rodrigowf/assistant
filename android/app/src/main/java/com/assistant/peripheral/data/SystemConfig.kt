@@ -32,6 +32,11 @@ data class AssistantConfig(
     // Other providers ignore this field. Default is "vertex".
     val defaultVoiceEndpoint: String,
     val voiceRecordingEnabled: Boolean,
+    // Increment B (voice subsystem refactor) — VAD + mic tuning knobs.
+    // Defaults equal documented Silero constants exactly.
+    val voiceVadThreshold: Double = 0.28,
+    val voiceVadMinSilenceMs: Int = 2500,
+    val voiceMicGain: Double = 1.0,
 )
 
 data class McpServerConfig(
@@ -136,4 +141,10 @@ data class ConfigPatch(
     val defaultVoiceTranscriptionLanguage: String? = null,
     val defaultVoiceEndpoint: String? = null,
     val voiceRecordingEnabled: Boolean? = null,
+    // Increment B (voice subsystem refactor) — VAD + mic tuning.
+    // Validated server-side; defaults equal documented Silero
+    // constants exactly (see backend tests/parity/test_vad_defaults_parity.py).
+    val voiceVadThreshold: Double? = null,
+    val voiceVadMinSilenceMs: Int? = null,
+    val voiceMicGain: Double? = null,
 )

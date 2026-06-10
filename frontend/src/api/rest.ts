@@ -175,6 +175,11 @@ export interface AssistantConfig {
   default_voice_transcription_language: string;  // "" = auto-detect
   default_voice_endpoint: string;                // "vertex" | "aistudio" — google provider only
   voice_recording_enabled: boolean;              // save raw audio from voice sessions
+  // Increment B (voice subsystem refactor): user-tunable VAD knobs.
+  // Defaults equal documented Silero constants exactly.
+  voice_vad_threshold: number;                   // 0.15–0.50, default 0.28
+  voice_vad_min_silence_ms: number;              // 800–5000, default 2500
+  voice_mic_gain: number;                        // 0.5–2.0, default 1.0
 }
 
 export interface ConfigUpdate {
@@ -192,6 +197,9 @@ export interface ConfigUpdate {
   default_voice_transcription_language?: string;
   default_voice_endpoint?: string;
   voice_recording_enabled?: boolean;
+  voice_vad_threshold?: number;
+  voice_vad_min_silence_ms?: number;
+  voice_mic_gain?: number;
 }
 
 export function getConfig(): Promise<AssistantConfig> {

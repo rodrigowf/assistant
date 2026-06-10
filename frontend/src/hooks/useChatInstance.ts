@@ -505,6 +505,10 @@ export interface ChatInstance {
   dispatchToolUse: (toolUseId: string, toolName: string, toolInput: Record<string, unknown>) => void;
   /** Add a tool result to a pending tool use block (for voice mode tool results). */
   dispatchToolResult: (toolUseId: string, output: string, isError: boolean) => void;
+  /** Register a handler for voice-related server events (voice_event, voice_ending,
+   *  voice_ended). Used by passive devices to render voice transcripts from another
+   *  device's active voice session. Pass null to unregister. */
+  registerVoiceEventHandler: (handler: ((event: ServerEvent) => void) | null) => void;
 }
 
 interface UseChatInstanceOptions {
@@ -561,6 +565,12 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   onSessionClosedRef.current = onSessionClosed;
   const onSdkSessionAssignedRef = useRef(onSdkSessionAssigned);
   onSdkSessionAssignedRef.current = onSdkSessionAssigned;
+  // Registered by passive voice viewers (e.g. iPad watching Android's voice)
+  // to receive voice_event/voice_ending/voice_ended broadcasts.
+  const voiceEventHandlerRef = useRef<((event: ServerEvent) => void) | null>(null);
+  const registerVoiceEventHandler = useCallback((handler: ((event: ServerEvent) => void) | null) => {
+    voiceEventHandlerRef.current = handler;
+  }, []);
   const localIdRef = useRef(localId);
   localIdRef.current = localId;
   const resumeSdkIdRef = useRef(resumeSdkId);
@@ -588,8 +598,16 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
           sessionId: event.session_id,
           contextWindow: ctxWindow,
         });
-        // Voice mode: send session.update to OpenAI via voice bridge
-        if (event.voice_session_update) {
+        // Voice mode: send session.update to OpenAI via voice bridge,
+        // but ONLY if we initiated this voice session. When another
+        // client on the same orchestrator opened voice and we're just
+        // observing the broadcast, forwarding the update would push
+        // the session.update through this device's idle voice bridge
+        // and either fail (no transport) or wastefully open one.
+        // ``voice_initiator`` defaults to true so older backends keep
+        // working — they only sent session_started to the initiator.
+        const isInitiator = event.voice_initiator ?? true;
+        if (event.voice_session_update && isInitiator) {
           onVoiceCommandRef.current?.(event.voice_session_update as Record<string, unknown>);
         }
         break;
@@ -689,6 +707,14 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "voice_command":
         onVoiceCommandRef.current?.(event.command);
+        break;
+      // Forward voice-related broadcasts to the registered passive handler
+      // so devices that didn't start voice can still render transcripts.
+      case "voice_event":
+      case "voice_ending":
+      case "voice_ended":
+      case "voice_stopped":
+        voiceEventHandlerRef.current?.(event);
         break;
     }
   }, []);
@@ -973,5 +999,6 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     voiceAssistantComplete,
     dispatchToolUse,
     dispatchToolResult,
+    registerVoiceEventHandler,
   };
 }

@@ -7,3 +7,7 @@
 
 # Keep data classes
 -keep class com.assistant.peripheral.data.** { *; }
+
+# Vosk + Kaldi JNI types
+-keep class org.vosk.** { *; }
+-keep class org.kaldi.** { *; }

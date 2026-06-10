@@ -154,6 +154,12 @@ def create_app() -> FastAPI:
     app.include_router(agents.router)
     app.include_router(debug.router)
 
+    # index.html must never be cached — it's the bootstrap that points to
+    # the hashed bundle, so a cached copy traps the device on old code
+    # forever even after a deploy. Hashed assets under /assets/ and
+    # /compat/assets/ are already immutable, so caching them is fine.
+    _no_cache = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
     # Serve the compat frontend (React 18, for older devices) at /compat/
     compat_dist = Path(__file__).resolve().parent.parent / "frontend-compat" / "dist"
     if compat_dist.exists():
@@ -162,14 +168,14 @@ def create_app() -> FastAPI:
         @app.get("/compat")
         @app.get("/compat/")
         async def serve_compat_index():
-            return FileResponse(compat_dist / "index.html")
+            return FileResponse(compat_dist / "index.html", headers=_no_cache)
 
         @app.get("/compat/{full_path:path}")
         async def serve_compat_spa(full_path: str):
             file_path = compat_dist / full_path
             if file_path.exists() and file_path.is_file():
                 return FileResponse(file_path)
-            return FileResponse(compat_dist / "index.html")
+            return FileResponse(compat_dist / "index.html", headers=_no_cache)
 
     # Public files directory (context/public/ — synced across machines, served at URL root).
     # Anything placed under context/public/ is reachable at the matching URL path
@@ -199,14 +205,44 @@ def create_app() -> FastAPI:
                 return FileResponse(candidate)
             raise HTTPException(status_code=404)
 
+    # Memory directory mount: /memory/<path> → context/memory/<path>.
+    # Exposes the structured memory wiki over the local network so a
+    # peripheral can fetch / render any memory file directly. Registered
+    # before the SPA catch-all so /memory never falls through.
+    context_memory = project_root / "context" / "memory"
+    context_memory_resolved = context_memory.resolve() if context_memory.exists() else None
+    if context_memory_resolved is not None:
+        @app.get("/memory")
+        @app.get("/memory/")
+        async def serve_memory_index():
+            candidate = context_memory / "MEMORY.md"
+            if candidate.is_file():
+                return FileResponse(candidate)
+            raise HTTPException(status_code=404)
+
+        @app.get("/memory/{full_path:path}")
+        async def serve_memory(full_path: str):
+            if not full_path:
+                raise HTTPException(status_code=404)
+            candidate = (context_memory / full_path).resolve()
+            if (
+                candidate.is_relative_to(context_memory_resolved)
+                and candidate.is_file()
+            ):
+                return FileResponse(candidate)
+            # Directory listing not supported — return 404. Use the index
+            # at /memory/ or fetch specific files.
+            raise HTTPException(status_code=404)
+
     # Serve the production frontend build if it exists
     frontend_dist = project_root / "frontend" / "dist"
     if frontend_dist.exists():
         app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
 
+        # Same no-cache policy as the compat index — see comment above.
         @app.get("/")
         async def serve_index():
-            return FileResponse(frontend_dist / "index.html")
+            return FileResponse(frontend_dist / "index.html", headers=_no_cache)
 
         @app.get("/{full_path:path}")
         async def serve_spa(full_path: str):
@@ -227,6 +263,6 @@ def create_app() -> FastAPI:
                 return FileResponse(file_path)
 
             # 3) SPA fallback — serve index.html for client-side routing.
-            return FileResponse(frontend_dist / "index.html")
+            return FileResponse(frontend_dist / "index.html", headers=_no_cache)
 
     return app

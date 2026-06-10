@@ -12,9 +12,10 @@ import com.assistant.peripheral.voice.WakeWordDetector
 /**
  * Transparent trampoline activity launched from the home screen shortcut.
  *
- * Does exactly what the voice wake word does:
+ * Does exactly what the realtime wake word does:
  *   1. Acquires a wake lock to turn the screen on and dismiss the keyguard.
- *   2. Fires ACTION_VOICE_WORD_DETECTED so MainActivity navigates to Chat
+ *   2. Fires ACTION_WAKE_WORD_DETECTED (post-Detour-3 naming, plan §0.5:
+ *      wakeWord = realtime conversation) so MainActivity navigates to Chat
  *      and starts the realtime voice session.
  *   3. Finishes immediately so it leaves no back-stack entry.
  */
@@ -46,10 +47,10 @@ class VoiceShortcutActivity : ComponentActivity() {
         }
         startActivity(mainIntent)
 
-        // Fire the voice word broadcast — MainActivity's wakeWordReceiver picks this up
-        // and calls onVoiceWordDetected → navigate to Chat + startVoiceSession()
+        // Fire the realtime wake-word broadcast — MainActivity's wakeWordReceiver picks
+        // this up and calls onWakeWordDetected → navigate to Chat + startVoiceSession().
         LocalBroadcastManager.getInstance(this)
-            .sendBroadcast(Intent(WakeWordDetector.ACTION_VOICE_WORD_DETECTED))
+            .sendBroadcast(Intent(WakeWordDetector.ACTION_WAKE_WORD_DETECTED))
 
         finish()
     }

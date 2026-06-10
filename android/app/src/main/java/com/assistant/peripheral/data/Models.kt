@@ -134,7 +134,13 @@ sealed class WebSocketEvent {
     data class SessionStarted(
         val sessionId: String,
         val voice: Boolean = false,
-        val voiceSessionUpdate: Map<String, Any?>? = null  // session.update payload for OpenAI
+        val voiceSessionUpdate: Map<String, Any?>? = null,  // session.update payload for OpenAI
+        // True when this WS is the one that started/owns the voice
+        // session. False on reconnects where another client (a
+        // different device on the same orchestrator) is the actual
+        // initiator — we shouldn't spin up our own provider transport
+        // in that case, only mirror the voice UI state.
+        val voiceInitiator: Boolean = true
     ) : WebSocketEvent()
     object SessionStopped : WebSocketEvent()
     data class TurnComplete(val inputTokens: Int, val outputTokens: Int) : WebSocketEvent()
@@ -171,6 +177,44 @@ sealed class WebSocketEvent {
     data class VoiceProviderEvent(val event: Map<String, Any?>) : WebSocketEvent()
     /** Speaker chunk from WS-path voice providers.  Base64-encoded PCM. */
     data class VoiceAudioOut(val audioBase64: String) : WebSocketEvent()
+
+    /**
+     * Increment B (voice subsystem refactor) — Silero VAD state surfaced
+     * from the backend ``voice_vad_state`` event. Additive to the
+     * existing ``VoiceProviderEvent`` envelope; UI components watch a
+     * ``VadState`` flow on the ViewModel to render a "listening Ns"
+     * duration indicator when the user is stuck in speech_started.
+     *
+     * String value of [state] mirrors orchestrator's
+     * ``VadState`` enum: "listening" | "thinking" | "idle".
+     */
+    data class VoiceVadState(
+        val state: String,
+        val durationMs: Long,
+        val sileroProb: Double? = null,
+    ) : WebSocketEvent()
+
+    /**
+     * Typed upstream-provider error from the backend ``voice_error`` event.
+     *
+     * Replaces the opaque ``Error("voice_relay_failed", ...)`` rendering
+     * with a categorised envelope the UI can render with targeted
+     * affordances (billing-cap deep link, auth banner, etc.). The legacy
+     * ``Error`` event is still emitted alongside this for back-compat
+     * with the existing system-message error path.
+     *
+     * String values mirror ``orchestrator.voice_errors.VoiceErrorCategory``.
+     */
+    data class VoiceError(
+        val category: String,
+        val message: String,
+        val recoverable: Boolean,
+        val recoveryHint: String? = null,
+        val providerDocUrl: String? = null,
+        val rawCloseCode: Int? = null,
+        val rawCloseReason: String? = null,
+        val provider: String,
+    ) : WebSocketEvent()
 
     // Compaction
     data class CompactComplete(val summary: String) : WebSocketEvent()
@@ -246,11 +290,14 @@ data class AppSettings(
     val savedServers: List<SavedServer> = emptyList(),
     val autoConnect: Boolean = true,
     val enableWakeWord: Boolean = true,
-    val wakeWord: String = "my friend",        // comma-separated, triggers turn-based voice input
-    val voiceWord: String = "wake up",         // comma-separated, triggers realtime WebRTC voice session
+    // Per Detour 3 naming convention (plan §0.5): `talkWord` triggers a single
+    // turn-based voice message ("push-to-talk"-style); `wakeWord` triggers a
+    // realtime WebRTC voice conversation ("wake up the assistant").
+    val talkWord: String = "my friend",        // comma-separated, triggers single turn-based voice message
+    val wakeWord: String = "wake up",          // comma-separated, triggers realtime WebRTC voice conversation
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,            // 0.0 to 1.5, where 1.0 is normal (voice session only)
-    val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for wake word detection
+    val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for the wake-word detector (umbrella, both phrase types)
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
     val audioOutput: AudioOutput = AudioOutput.AUTO,  // where voice session audio is routed; AUTO lets the OS pick

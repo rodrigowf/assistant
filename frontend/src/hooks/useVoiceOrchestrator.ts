@@ -35,7 +35,9 @@ import type {
 import type {
   RealtimeEvent,
   ServerEvent,
+  VadState,
   VoiceConnectionInfoPayload,
+  VoiceErrorEnvelope,
   VoiceStatus,
 } from "../types";
 
@@ -86,6 +88,27 @@ export interface VoiceOrchestratorResult {
   micLevel: number;
   speakerLevel: number;
   voiceError: string | null;
+  /** Increment B (voice subsystem refactor): Silero VAD state from the
+   *  backend ``voice_vad_state`` broadcast. ``idle`` until the manual-
+   *  VAD pipeline starts firing. */
+  vadState: VadState;
+  /** Milliseconds since the most recent ``speech_started`` transition,
+   *  per the backend's monotonic clock. Updates every ~1s while
+   *  ``vadState`` is ``listening`` so the UI clock advances. */
+  vadDurationMs: number;
+  /** Typed voice-provider error envelope from the backend
+   *  ``voice_error`` event. Replaces ``voiceError: string`` in
+   *  components that want to render categorised UI (billing-cap
+   *  banner with deep link, auth banner with API-key hint, etc.).
+   *  Both fields update from the same source — components can pick
+   *  whichever shape they prefer. */
+  voiceErrorDetails: VoiceErrorEnvelope | null;
+  /** True when this device initiated the voice session (called startVoice).
+   *  False for passive viewers receiving voice events from another device. */
+  isLocalVoice: boolean;
+  /** Process a voice-related server event for passive viewing. Handles
+   *  voice_event (provider transcripts), voice_ending, and voice_ended. */
+  handlePassiveVoiceEvent: (event: ServerEvent) => void;
 }
 
 export function useVoiceOrchestrator(
@@ -93,6 +116,20 @@ export function useVoiceOrchestrator(
 ): VoiceOrchestratorResult {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("off");
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  // Typed voice-provider error envelope (from backend `voice_error`
+  // event). Components that want categorised UI render this; the
+  // legacy `voiceError` string stays in sync so older components keep
+  // working unchanged.
+  const [voiceErrorDetails, setVoiceErrorDetails] = useState<VoiceErrorEnvelope | null>(null);
+  // Increment B (voice subsystem refactor): Silero VAD state surfaced
+  // from the backend's ``voice_vad_state`` event. ``idle`` until the
+  // backend's manual-VAD pipeline emits its first transition. Resets
+  // to idle on stop / disconnect.
+  const [vadState, setVadState] = useState<VadState>("idle");
+  const [vadDurationMs, setVadDurationMs] = useState(0);
+  // True when this device called startVoice() — distinguishes the voice
+  // owner from passive viewers receiving events from another device.
+  const [isLocalVoice, setIsLocalVoice] = useState(false);
   const transportRef = useRef<AnyVoiceTransportHandles | null>(null);
   const wsRef = useRef<ChatSocket | null>(null);
 
@@ -189,6 +226,11 @@ export function useVoiceOrchestrator(
 
   const cleanup = useCallback(() => {
     vlog("cleanup (transport=", transportRef.current?.kind, ")");
+    setIsLocalVoice(false);
+    // Increment B: reset VAD state so any "listening Ns" duration UI
+    // disappears the instant the session tears down.
+    setVadState("idle");
+    setVadDurationMs(0);
     // Stop audio recorder if active
     if (recorderRef.current) {
       recorderRef.current.stop();
@@ -505,7 +547,11 @@ export function useVoiceOrchestrator(
         recordingEnabledRef.current = event.voice_recording_enabled ?? false;
         // For WebRTC, the frontend forwards session.update via the data channel.
         // For WebSocket, the backend already sent it upstream — no-op for us.
-        if (event.voice_session_update && info?.connection_type === "webrtc") {
+        // Only forward if we initiated voice — non-initiators don't own
+        // a transport on this device. ``voice_initiator`` defaults to
+        // true for older backends.
+        const isInitiator = event.voice_initiator ?? true;
+        if (event.voice_session_update && info?.connection_type === "webrtc" && isInitiator) {
           sendProviderEvent(event.voice_session_update as RealtimeEvent);
         }
         if (event.voice_connection_error) {
@@ -572,6 +618,39 @@ export function useVoiceOrchestrator(
         break;
       }
 
+      case "voice_vad_state": {
+        // Increment B (voice subsystem refactor) — typed VAD state
+        // event additive to the existing
+        // ``input_audio_buffer.speech_*`` events. UI components read
+        // ``vadState`` + ``vadDurationMs`` to render a duration clock
+        // when the user is stuck in ``listening``.
+        const evt = event as { state: VadState; duration_ms: number };
+        setVadState(evt.state);
+        setVadDurationMs(evt.duration_ms);
+        break;
+      }
+
+      case "voice_error": {
+        // Typed upstream-provider error envelope. Surface the
+        // categorised payload so components can render targeted UI
+        // (billing-cap deep link, auth banner, etc.) and mirror the
+        // human-readable message into the legacy string state for
+        // components that haven't migrated yet.
+        const env = event.error;
+        console.error("[voice-orchestrator] voice_error:", env);
+        setVoiceErrorDetails(env);
+        setVoiceError(env.message);
+        if (!env.recoverable) {
+          cleanup();
+          updateStatus("error");
+          optsRef.current.onAfterStop?.();
+        }
+        // Recoverable variants leave the transport intact — the
+        // backend's reconnect path will deliver a fresh session_started
+        // on success (which clears the error in startVoice() below).
+        break;
+      }
+
       case "status":
         if ((event as { status?: string }).status === "disconnected" && transportRef.current) {
           setVoiceError((prev) => prev ?? "Server connection lost");
@@ -602,7 +681,11 @@ export function useVoiceOrchestrator(
   const startVoice = useCallback(async () => {
     if (voiceStatus !== "off" && voiceStatus !== "error") return;
 
+    setIsLocalVoice(true);
     setVoiceError(null);
+    setVoiceErrorDetails(null);
+    setVadState("idle");
+    setVadDurationMs(0);
     updateStatus("connecting");
     dcReadyRef.current = false;
     pendingCommandsRef.current = [];
@@ -775,6 +858,25 @@ export function useVoiceOrchestrator(
     };
   }, [cleanup]);
 
+  // Handle voice-related server events for passive viewers (devices that
+  // didn't call startVoice but are subscribed to the same orchestrator).
+  // Routes provider events through handleProviderEvent for transcript
+  // rendering, and handles lifecycle events (ending/ended) for status.
+  const handlePassiveVoiceEvent = useCallback((event: ServerEvent) => {
+    switch (event.type) {
+      case "voice_event":
+        handleProviderEvent(event.event);
+        break;
+      case "voice_ending":
+        updateStatus("ending");
+        break;
+      case "voice_ended":
+      case "voice_stopped":
+        updateStatus("off");
+        break;
+    }
+  }, [handleProviderEvent, updateStatus]);
+
   return {
     voiceStatus,
     startVoice,
@@ -787,5 +889,10 @@ export function useVoiceOrchestrator(
     micLevel,
     speakerLevel,
     voiceError,
+    voiceErrorDetails,
+    vadState,
+    vadDurationMs,
+    isLocalVoice,
+    handlePassiveVoiceEvent,
   };
 }

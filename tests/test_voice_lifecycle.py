@@ -248,6 +248,53 @@ class TestEndVoiceCanonical:
         assert s.voice_state is VoiceLifecycle.ENDED
 
     @pytest.mark.asyncio
+    async def test_end_voice_uses_per_session_graceful_shutdown_timeout(self):
+        """Increment F — ``voice_timeouts.graceful_shutdown_s`` override
+        flows from ``OrchestratorSession.__init__`` into the
+        ``send_shutdown_frames`` wait_for budget. A very short override
+        means even a 50ms-delayed relay tears down without waiting the
+        default 500ms.
+        """
+        from orchestrator.voice_timeouts import VoiceTimeouts
+
+        config = MagicMock()
+        config.summarizer_model = None
+        context = {"pool": MagicMock(), "store": MagicMock()}
+        from orchestrator.session import OrchestratorSession
+        s = OrchestratorSession(
+            config=config,
+            context=context,
+            voice=True,
+            local_id="t-timeout-override",
+            # Override graceful shutdown to 10ms so a 200ms-delayed
+            # relay forces the wait_for to trip.
+            voice_timeouts=VoiceTimeouts(graceful_shutdown_s=0.01),
+        )
+
+        provider = _stub_provider([{"type": "input_audio_buffer.commit"}])
+        relay = _stub_relay(send_shutdown_frames_delay=0.2)
+        s._voice_provider = provider
+        s._voice_relay = relay
+
+        async with s._voice_lock:
+            s._set_voice_state_unlocked(VoiceLifecycle.STARTING)
+            s._set_voice_state_unlocked(VoiceLifecycle.ACTIVE)
+
+        import time as _time
+        before = _time.monotonic()
+        await s.end_voice("test_override")
+        elapsed = _time.monotonic() - before
+
+        # The 200ms delay must NOT have blocked teardown — the 10ms
+        # override budget hit first. Allow some slack for scheduler
+        # noise (50ms is way under the legacy 500ms default).
+        assert elapsed < 0.15, (
+            f"end_voice took {elapsed:.3f}s — should have hit the 10ms "
+            "graceful_shutdown_s override and skipped the 200ms wait"
+        )
+        assert s.voice_state is VoiceLifecycle.ENDED
+
+    @pytest.mark.asyncio
     async def test_double_end_voice_is_idempotent(self):
         """Second call observes ENDED and returns without rerunning teardown."""
         pool = MagicMock()
@@ -537,3 +584,58 @@ class TestProviderShutdownFrames:
         from orchestrator.providers.gemini_voice_base import GeminiVoiceProviderBase
         frames = GeminiVoiceProviderBase.graceful_shutdown_frames(MagicMock())
         assert frames == [{"realtimeInput": {"activityEnd": {}}}]
+
+
+class TestStopVoiceRelayClearsResumptionHandle:
+    """``stop_voice_relay`` must drop the Gemini sessionResumption handle.
+
+    Reusing a handle from a torn-down upstream WS makes Google accept the
+    next setup handshake and then 1008 it ~150s later ("operation
+    aborted"). Observed 2026-06-04: three back-to-back voice_start calls
+    after a relay died all reused the same dead handle and produced a
+    cluster of duplicate-handle aborts in AI Studio's dashboard.
+    """
+
+    @pytest.mark.asyncio
+    async def test_clears_handle_on_gemini_provider(self):
+        session = _make_session(voice=True)
+        # Stub a Gemini-shaped provider holding a captured handle.
+        provider = MagicMock()
+        provider._resumption_handle = "stale-handle-from-prev-ws"
+        session._voice_provider = provider
+        # Relay double whose stop() succeeds.
+        relay = MagicMock()
+        relay.stop = AsyncMock()
+        session._voice_relay = relay
+
+        await session.stop_voice_relay()
+
+        assert provider._resumption_handle is None
+        relay.stop.assert_awaited_once()
+        assert session._voice_relay is None
+
+    @pytest.mark.asyncio
+    async def test_no_op_on_provider_without_resumption(self):
+        """OpenAI / Qwen providers don't have ``_resumption_handle`` —
+        ``stop_voice_relay`` must not blow up trying to clear an
+        attribute that doesn't exist."""
+        session = _make_session(voice=True)
+        provider = MagicMock(spec=["provider_name"])  # no _resumption_handle
+        session._voice_provider = provider
+        relay = MagicMock()
+        relay.stop = AsyncMock()
+        session._voice_relay = relay
+
+        await session.stop_voice_relay()  # must not raise
+        relay.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_provider_unset(self):
+        session = _make_session(voice=True)
+        session._voice_provider = None
+        relay = MagicMock()
+        relay.stop = AsyncMock()
+        session._voice_relay = relay
+
+        await session.stop_voice_relay()  # must not raise
+        relay.stop.assert_awaited_once()

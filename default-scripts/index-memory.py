@@ -91,12 +91,12 @@ def index_memory(reset: bool = False) -> None:
         print("(This is normal if no memory files exist yet)")
         return
 
-    md_files = list(memory_dir.glob("*.md"))
+    md_files = list(memory_dir.rglob("*.md"))
     if not md_files:
         print("No memory files found, skipping")
         return
 
-    print(f"=== Indexing {len(md_files)} memory files ===")
+    print(f"=== Indexing {len(md_files)} memory files (recursive) ===")
     if reset:
         run_embed("reset", "--collection", "memory")
 

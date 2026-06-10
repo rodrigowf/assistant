@@ -23,7 +23,11 @@ from typing import Any
 
 import httpx
 
-from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.providers.voice_base import (
+    BaseVoiceProvider,
+    ToolCallAccumulator,
+)
+from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from orchestrator.types import (
     ErrorEvent,
     OrchestratorEvent,
@@ -55,7 +59,7 @@ DEFAULT_VAD = {
 }
 
 
-class OpenAIVoiceProvider(BaseVoiceProvider):
+class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
     """OpenAI Realtime voice provider (WebRTC).
 
     Usage::
@@ -72,6 +76,8 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
         voice: str = VOICE_NAME,
         transcription_language: str = "",
     ) -> None:
+        # Mixin storage (``_pending_call_names`` + ``_pending_call_args``).
+        ToolCallAccumulator.__init__(self)
         self._model = model
         self._voice = voice
         # OpenAI Realtime supports a `language` hint on whisper-1 transcription
@@ -81,8 +87,6 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
         self._transcription_language = transcription_language
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._current_transcript: str = ""
-        self._pending_calls: dict[str, str] = {}        # call_id → tool_name
-        self._pending_args: dict[str, str] = {}         # call_id → args_json (accumulated)
 
     # --- identity ---------------------------------------------------------
 
@@ -109,8 +113,13 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
 
     @property
     def pending_calls(self) -> dict[str, str]:
-        """Map of call_id → tool_name for calls awaiting results."""
-        return self._pending_calls
+        """Map of call_id → tool_name for calls awaiting results.
+
+        Increment E — backed by ``ToolCallAccumulator._pending_call_names``.
+        Returned by reference (legacy contract: callers occasionally
+        used it as a sanity-check dict).
+        """
+        return self._pending_call_names
 
     # --- ingestion --------------------------------------------------------
 
@@ -144,19 +153,20 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
 
             # Side-effects: track partial transcript for interruption context
             # and stash function-call metadata before translating.
+            # Increment E — both delegated to ``ToolCallAccumulator``.
             if event_type == "response.output_item.added":
                 item = event.get("item", {})
                 if item.get("type") == "function_call":
-                    call_id = item.get("call_id", "")
-                    name = item.get("name", "")
-                    if call_id and name:
-                        self._pending_calls[call_id] = name
-                        self._pending_args[call_id] = ""
+                    self.register_call(
+                        item.get("call_id", ""),
+                        item.get("name", ""),
+                    )
 
             elif event_type == "response.function_call_arguments.delta":
-                call_id = event.get("call_id", "")
-                if call_id in self._pending_args:
-                    self._pending_args[call_id] += event.get("delta", "")
+                self.accumulate_args(
+                    event.get("call_id", ""),
+                    event.get("delta", ""),
+                )
 
             elif event_type in (
                 "response.output_audio_transcript.delta",
@@ -174,65 +184,93 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
             if event_type == "error":
                 return
 
+    # ----- _EVENT_TRANSLATORS dispatch table (Increment E) -----
+    #
+    # Each translator is a method ``_translate_<name>(self, raw) → OrchestratorEvent | None``.
+    # Keyed on the top-level ``type`` field. GA gpt-realtime emits
+    # ``response.output_audio_transcript.*``; legacy beta
+    # gpt-4o-realtime-preview emits ``response.audio_transcript.*`` —
+    # both keys map to the same translator so the same provider class
+    # keeps working across model versions.
+
+    def _translate_text_delta(self, raw_event: dict[str, Any]) -> OrchestratorEvent | None:
+        text = raw_event.get("delta", "")
+        return TextDelta(text=text) if text else None
+
+    def _translate_text_complete(self, raw_event: dict[str, Any]) -> OrchestratorEvent | None:
+        return TextComplete(text=raw_event.get("transcript", ""))
+
+    def _translate_function_call_done(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        # Non-consuming peeks preserve the legacy ``.get()`` semantics
+        # of ``_pending_calls`` / ``_pending_args``; entries clear only
+        # via the mixin's ``clear_pending_calls`` (e.g., reconnect).
+        call_id = raw_event.get("call_id", "")
+        args_str = (
+            raw_event.get("arguments")
+            or self.peek_args(call_id)
+            or "{}"
+        )
+        name = self.peek_name(call_id) or raw_event.get("name", "")
+        try:
+            tool_input = json.loads(args_str) if args_str else {}
+        except Exception:
+            tool_input = {}
+        if call_id and name:
+            return ToolUseStart(
+                tool_call_id=call_id,
+                tool_name=name,
+                tool_input=tool_input,
+            )
+        return None
+
+    def _translate_response_done(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        usage = raw_event.get("response", {}).get("usage", {})
+        return TurnComplete(
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+
+    def _translate_speech_started(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        return VoiceInterrupted(partial_text=self._current_transcript)
+
+    def _translate_error(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        err = raw_event.get("error", {})
+        return ErrorEvent(
+            error=err.get("code", "openai_error"),
+            detail=err.get("message", str(err)),
+        )
+
+    # Dispatch table — keyed on the top-level ``type``. Order doesn't
+    # matter; missing keys fall through to ``translate_event`` returning
+    # ``None`` (the legacy behavior).
+    _EVENT_TRANSLATORS: dict[str, str] = {
+        "response.output_audio_transcript.delta": "_translate_text_delta",
+        "response.audio_transcript.delta":        "_translate_text_delta",
+        "response.output_audio_transcript.done":  "_translate_text_complete",
+        "response.audio_transcript.done":         "_translate_text_complete",
+        "response.function_call_arguments.done":  "_translate_function_call_done",
+        "response.done":                          "_translate_response_done",
+        "input_audio_buffer.speech_started":      "_translate_speech_started",
+        "error":                                  "_translate_error",
+    }
+
     def translate_event(self, raw_event: dict[str, Any]) -> OrchestratorEvent | None:
         """Translate a single OpenAI Realtime event to a canonical event.
 
         Pure (no side effects) — :meth:`create_message` does the bookkeeping.
         """
-        event_type = raw_event.get("type", "")
-
-        # GA gpt-realtime emits ``response.output_audio_transcript.*``;
-        # legacy beta gpt-4o-realtime-preview models still emit
-        # ``response.audio_transcript.*``.  Accept both so the same
-        # provider keeps working across model versions.
-        if event_type in (
-            "response.output_audio_transcript.delta",
-            "response.audio_transcript.delta",
-        ):
-            text = raw_event.get("delta", "")
-            return TextDelta(text=text) if text else None
-
-        if event_type in (
-            "response.output_audio_transcript.done",
-            "response.audio_transcript.done",
-        ):
-            return TextComplete(text=raw_event.get("transcript", ""))
-
-        if event_type == "response.function_call_arguments.done":
-            call_id = raw_event.get("call_id", "")
-            args_str = raw_event.get("arguments") or self._pending_args.get(call_id, "{}") or "{}"
-            name = self._pending_calls.get(call_id, raw_event.get("name", ""))
-            try:
-                tool_input = json.loads(args_str) if args_str else {}
-            except Exception:
-                tool_input = {}
-            if call_id and name:
-                return ToolUseStart(
-                    tool_call_id=call_id,
-                    tool_name=name,
-                    tool_input=tool_input,
-                )
+        method_name = self._EVENT_TRANSLATORS.get(raw_event.get("type", ""))
+        if method_name is None:
             return None
-
-        if event_type == "response.done":
-            usage = raw_event.get("response", {}).get("usage", {})
-            return TurnComplete(
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-            )
-
-        if event_type == "input_audio_buffer.speech_started":
-            partial = self._current_transcript
-            return VoiceInterrupted(partial_text=partial)
-
-        if event_type == "error":
-            err = raw_event.get("error", {})
-            return ErrorEvent(
-                error=err.get("code", "openai_error"),
-                detail=err.get("message", str(err)),
-            )
-
-        return None
+        return getattr(self, method_name)(raw_event)
 
     # --- command formatters ----------------------------------------------
 
@@ -345,3 +383,102 @@ class OpenAIVoiceProvider(BaseVoiceProvider):
             "model": self._model,
             "voice": self._voice,
         }
+
+    # --- error classification ------------------------------------------
+
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> VoiceError | None:
+        """Map OpenAI Realtime error shapes onto VoiceError categories.
+
+        OpenAI uses WebRTC — the relay's drain-loop close path doesn't
+        fire here in Increment A. The classifier is still wired so:
+
+        - The ephemeral-token endpoint (``api/routes/voice.py``) can
+          route ``httpx.HTTPStatusError`` bodies through it in a future
+          increment.
+        - Data-channel mirrored ``error`` events that surface via
+          :meth:`inject_event` can be classified the same way.
+
+        Patterns (see plan §5):
+
+        - body contains ``insufficient_quota`` or "exceeded your current
+          quota" → QUOTA_EXCEEDED
+        - body contains ``rate_limit_exceeded`` or HTTP 429 → RATE_LIMIT
+        - body contains "Incorrect API key" or HTTP 401 → AUTH
+        - body contains ``model_not_found`` or "Unsupported model" →
+          MODEL_UNAVAILABLE
+        """
+        text = (close_reason or "") + " " + (str(exc) if exc is not None else "")
+        lower = text.lower()
+
+        if "insufficient_quota" in text or "exceeded your current quota" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.QUOTA_EXCEEDED,
+                message=(
+                    "Your OpenAI account has exhausted its credit "
+                    "(insufficient_quota)."
+                ),
+                recoverable=False,
+                recovery_hint=(
+                    "Top up at platform.openai.com/billing, then retry."
+                ),
+                provider_doc_url="https://platform.openai.com/billing",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        if "rate_limit_exceeded" in text or close_code == 429:
+            return VoiceError(
+                category=VoiceErrorCategory.RATE_LIMIT,
+                message="OpenAI Realtime rate limit reached.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        if (
+            "incorrect api key" in lower
+            or "invalid api key" in lower
+            or close_code == 401
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.AUTH,
+                message="OpenAI authentication failed (Incorrect API key).",
+                recoverable=False,
+                recovery_hint=(
+                    "Verify OPENAI_API_KEY in context/.env is current and "
+                    "the account is in good standing."
+                ),
+                provider_doc_url="https://platform.openai.com/api-keys",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        if "model_not_found" in text or "unsupported model" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.MODEL_UNAVAILABLE,
+                message=(
+                    "This OpenAI Realtime model isn't available on your "
+                    "account tier."
+                ),
+                recoverable=False,
+                recovery_hint=(
+                    "Switch to gpt-realtime or check your model access at "
+                    "platform.openai.com."
+                ),
+                provider_doc_url="https://platform.openai.com/docs/models",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        return None

@@ -2,7 +2,7 @@ import { useRef, useCallback, type KeyboardEvent, type ChangeEvent } from "react
 import { VoiceRecordButton } from "./VoiceRecordButton";
 import { VoiceButton } from "./VoiceButton";
 import { useAudioRecorder } from "../hooks/useAudioRecorder";
-import type { VoiceStatus } from "../types";
+import type { VadState, VoiceStatus } from "../types";
 
 interface Props {
   onSend: (text: string) => void;
@@ -19,6 +19,11 @@ interface Props {
   voiceStatus?: VoiceStatus;
   onVoiceStart?: () => void;
   onVoiceStop?: () => void;
+  /** Increment B — Silero VAD state surfaced from the backend.
+   *  Forwarded to VoiceButton so the "listening Ns" indicator can
+   *  appear when the user is stuck in speech_started. */
+  vadState?: VadState;
+  vadDurationMs?: number;
   /** Open session-specific config panel (non-orchestrator only) */
   onOpenConfig?: () => void;
 }
@@ -35,6 +40,8 @@ export function ChatInput({
   voiceStatus,
   onVoiceStart,
   onVoiceStop,
+  vadState,
+  vadDurationMs,
   onOpenConfig,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -155,6 +162,8 @@ export function ChatInput({
           status={voiceStatus}
           onStart={onVoiceStart}
           onStop={onVoiceStop}
+          vadState={vadState}
+          vadDurationMs={vadDurationMs}
         />
       )}
       {onOpenConfig && (

@@ -35,7 +35,10 @@ from typing import Any
 
 import websockets
 
-from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.providers.voice_base import (
+    BaseVoiceProvider,
+    ToolCallAccumulator,
+)
 from orchestrator.types import (
     ErrorEvent,
     OrchestratorEvent,
@@ -62,37 +65,14 @@ QWEN_INTL_WS = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
 # contain bare hostnames, file paths, or `localhost:port` strings will
 # trigger it.  We rewrite those to a safe form before sending upstream.
 #
-# (See `_sanitize_for_qwen` below.)
-# Match scheme-less URL-shapes that DashScope's omni URL validator
-# misclassifies.  We wrap *strongly* URL-shaped tokens in backticks so
-# they look like markdown code spans (which the validator skips):
-#   - localhost optionally with :port and/or /path
-#   - dotted IPv4 optionally with :port and/or /path
-#   - hostname with explicit :port (e.g. example.com:8080)
-#   - absolute POSIX paths with at least 3 segments (/foo/bar/baz)
-# Plain dotted tokens like `file.txt` or `word.with.dots` are left alone:
-# the validator only fires on substrings the omni pipeline recognises as
-# URL-shaped, which (empirically) requires either a port, an IP, the
-# literal "localhost", or a multi-segment path.  Negative lookbehind
-# skips tokens already inside a well-formed `scheme://` URL or already
-# wrapped in a backtick.
-_URL_LIKE_RE = re.compile(
-    r"(?<![\w/:.\-`])"
-    r"(?:"
-    # localhost (optionally :port and/or /path)
-    r"localhost(?::\d+)?(?:/[^\s)\]\"'`]*)?"
-    # IPv4 (optionally :port and/or /path)
-    r"|\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:/[^\s)\]\"'`]*)?"
-    # hostname with explicit :port — at least one dot in the host
-    r"|(?:[a-zA-Z][\w\-]*\.)+[a-zA-Z]{2,}:\d+(?:/[^\s)\]\"'`]*)?"
-    # absolute POSIX path with 3+ segments (matches things like
-    # /home/rodrigo/Projects/... that DashScope's URL validator
-    # misclassifies as URL-shaped reference).  Stops at whitespace,
-    # quotes, brackets, or backticks.  Two-segment paths like /tmp/foo
-    # are intentionally left alone — short paths haven't tripped the
-    # validator empirically.
-    r"|/(?:[\w.\-]+/){2,}[\w.\-]+(?:/[\w.\-]*)*"
-    r")"
+# Increment E (plan §E) — the URL sanitizer + tool schema sanitizer
+# moved to ``orchestrator/providers/schema_utils.py``. The leading-
+# underscore names here are re-exports so existing call sites within
+# this module (and any external caller that depended on the private
+# path) keep working.
+from orchestrator.providers.schema_utils import (
+    sanitize_text_for_qwen as _sanitize_for_qwen,
+    sanitize_tool_for_qwen as _sanitize_tool_for_qwen,
 )
 
 DEFAULT_VAD = {
@@ -160,7 +140,7 @@ def _build_transcription_config(language: str) -> dict[str, Any]:
     return cfg
 
 
-class QwenVoiceProvider(BaseVoiceProvider):
+class QwenVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
     """Qwen-Omni realtime voice provider (WebSocket).
 
     Unlike :class:`OpenAIVoiceProvider`, the backend owns the WS connection
@@ -176,6 +156,8 @@ class QwenVoiceProvider(BaseVoiceProvider):
         voice: str = QWEN_VOICE_NAME,
         transcription_language: str = "",
     ) -> None:
+        # Mixin storage (``_pending_call_names`` + ``_pending_call_args``).
+        ToolCallAccumulator.__init__(self)
         self._model = model
         self._voice = voice
         # Empty string = auto-detect (no `language` field sent to Qwen).
@@ -183,8 +165,6 @@ class QwenVoiceProvider(BaseVoiceProvider):
         self._transcription_language = transcription_language
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._current_transcript: str = ""
-        self._pending_calls: dict[str, str] = {}
-        self._pending_args: dict[str, str] = {}
         # Tracks whether a ``response.created`` has fired without a
         # matching ``response.done``.  Sending ``response.create`` while
         # this is True triggers Qwen's "Conversation already has an
@@ -222,7 +202,8 @@ class QwenVoiceProvider(BaseVoiceProvider):
 
     @property
     def pending_calls(self) -> dict[str, str]:
-        return self._pending_calls
+        # Increment E — backed by ``ToolCallAccumulator``.
+        return self._pending_call_names
 
     # --- ingestion --------------------------------------------------------
 
@@ -265,18 +246,19 @@ class QwenVoiceProvider(BaseVoiceProvider):
             event_type = event.get("type", "")
 
             # Side effects (track tool-call metadata + transcript) before translation.
+            # Increment E — bookkeeping delegated to ``ToolCallAccumulator``.
             if event_type == "response.output_item.added":
                 item = event.get("item", {})
                 if item.get("type") == "function_call":
-                    call_id = item.get("call_id", "")
-                    name = item.get("name", "")
-                    if call_id and name:
-                        self._pending_calls[call_id] = name
-                        self._pending_args[call_id] = ""
+                    self.register_call(
+                        item.get("call_id", ""),
+                        item.get("name", ""),
+                    )
             elif event_type == "response.function_call_arguments.delta":
-                call_id = event.get("call_id", "")
-                if call_id in self._pending_args:
-                    self._pending_args[call_id] += event.get("delta", "")
+                self.accumulate_args(
+                    event.get("call_id", ""),
+                    event.get("delta", ""),
+                )
             elif event_type == "response.audio_transcript.delta":
                 self._current_transcript += event.get("delta", "")
 
@@ -290,62 +272,96 @@ class QwenVoiceProvider(BaseVoiceProvider):
             if event_type == "error":
                 return
 
+    # ----- _EVENT_TRANSLATORS dispatch table (Increment E) -----
+    #
+    # Qwen-Omni's event names mirror OpenAI's Realtime API by design.
+    # Two flavors emit text: ``response.audio_transcript.*`` (the
+    # spoken reply transcribed to text) and ``response.text.*`` (rare
+    # — only when the model emits raw text output). ``done`` payload
+    # field differs: ``transcript`` for audio, ``text`` for text-only.
+
+    def _translate_audio_transcript_delta(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        text = raw_event.get("delta", "")
+        return TextDelta(text=text) if text else None
+
+    def _translate_audio_transcript_done(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        return TextComplete(text=raw_event.get("transcript", ""))
+
+    def _translate_text_done(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        return TextComplete(text=raw_event.get("text", ""))
+
+    def _translate_function_call_done(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        # Non-consuming peeks preserve legacy ``.get()`` semantics.
+        call_id = raw_event.get("call_id", "")
+        args_str = (
+            raw_event.get("arguments")
+            or self.peek_args(call_id)
+            or "{}"
+        )
+        name = self.peek_name(call_id) or raw_event.get("name", "")
+        try:
+            tool_input = json.loads(args_str) if args_str else {}
+        except Exception:
+            tool_input = {}
+        if call_id and name:
+            return ToolUseStart(
+                tool_call_id=call_id,
+                tool_name=name,
+                tool_input=tool_input,
+            )
+        return None
+
+    def _translate_response_done(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        usage = raw_event.get("response", {}).get("usage", {})
+        return TurnComplete(
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+
+    def _translate_speech_started(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        return VoiceInterrupted(partial_text=self._current_transcript)
+
+    def _translate_error(
+        self, raw_event: dict[str, Any]
+    ) -> OrchestratorEvent | None:
+        err = raw_event.get("error", {})
+        return ErrorEvent(
+            error=err.get("code", "qwen_error"),
+            detail=err.get("message", str(err)),
+        )
+
+    _EVENT_TRANSLATORS: dict[str, str] = {
+        "response.audio_transcript.delta":       "_translate_audio_transcript_delta",
+        "response.text.delta":                   "_translate_audio_transcript_delta",
+        "response.audio_transcript.done":        "_translate_audio_transcript_done",
+        "response.text.done":                    "_translate_text_done",
+        "response.function_call_arguments.done": "_translate_function_call_done",
+        "response.done":                         "_translate_response_done",
+        "input_audio_buffer.speech_started":     "_translate_speech_started",
+        "error":                                 "_translate_error",
+    }
+
     def translate_event(self, raw_event: dict[str, Any]) -> OrchestratorEvent | None:
         """Translate a Qwen realtime event to a canonical event.
 
         Event names mirror OpenAI's Realtime API by design.
         """
-        event_type = raw_event.get("type", "")
-
-        if event_type == "response.audio_transcript.delta":
-            text = raw_event.get("delta", "")
-            return TextDelta(text=text) if text else None
-
-        if event_type == "response.audio_transcript.done":
-            return TextComplete(text=raw_event.get("transcript", ""))
-
-        if event_type == "response.text.delta":
-            text = raw_event.get("delta", "")
-            return TextDelta(text=text) if text else None
-
-        if event_type == "response.text.done":
-            return TextComplete(text=raw_event.get("text", ""))
-
-        if event_type == "response.function_call_arguments.done":
-            call_id = raw_event.get("call_id", "")
-            args_str = raw_event.get("arguments") or self._pending_args.get(call_id, "{}") or "{}"
-            name = self._pending_calls.get(call_id, raw_event.get("name", ""))
-            try:
-                tool_input = json.loads(args_str) if args_str else {}
-            except Exception:
-                tool_input = {}
-            if call_id and name:
-                return ToolUseStart(
-                    tool_call_id=call_id,
-                    tool_name=name,
-                    tool_input=tool_input,
-                )
+        method_name = self._EVENT_TRANSLATORS.get(raw_event.get("type", ""))
+        if method_name is None:
             return None
-
-        if event_type == "response.done":
-            usage = raw_event.get("response", {}).get("usage", {})
-            return TurnComplete(
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-            )
-
-        if event_type == "input_audio_buffer.speech_started":
-            partial = self._current_transcript
-            return VoiceInterrupted(partial_text=partial)
-
-        if event_type == "error":
-            err = raw_event.get("error", {})
-            return ErrorEvent(
-                error=err.get("code", "qwen_error"),
-                detail=err.get("message", str(err)),
-            )
-
-        return None
+        return getattr(self, method_name)(raw_event)
 
     # --- command formatters ----------------------------------------------
 
@@ -391,7 +407,7 @@ class QwenVoiceProvider(BaseVoiceProvider):
         # Voice-mode behavior tweaks. Qwen has no `speed`, `verbosity`, or
         # output-modality-routing parameters — every behavior we want has
         # to be requested in prose. The communication-style guidance below
-        # is distilled from `context/memory/communication_style_for_qwen.md`
+        # is distilled from `context/memory/assistant/identity/communication_style_for_qwen.md`
         # (full file is the canonical source; this is a compact runtime copy).
         voice_directives = (
             "\n\n# Voice Mode — Aligned Partnership\n"
@@ -603,6 +619,107 @@ class QwenVoiceProvider(BaseVoiceProvider):
         err_text = str(exc)
         return any(s in err_text for s in self._RECONNECTABLE_ERR_SUBSTRINGS)
 
+    def classify_close_reason(
+        self,
+        exc: BaseException | None,
+        close_code: int | None,
+        close_reason: str | None,
+    ) -> "VoiceError | None":
+        """Map DashScope close reasons onto VoiceError categories.
+
+        Patterns (plan §5):
+
+        - "balance" / "insufficient" / "余额不足" → QUOTA_EXCEEDED
+        - "InvalidApiKey" → AUTH
+        - "Throttling" / "too many" → RATE_LIMIT (recoverable)
+        - "model not found" → MODEL_UNAVAILABLE
+        - Existing recoverable boilerplate ("InvalidParameter",
+          "response_idle_timeout") → NETWORK with recoverable=True
+          (mirrors :meth:`is_recoverable_error`)
+        """
+        from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
+
+        text = (close_reason or "") + " " + (str(exc) if exc is not None else "")
+        lower = text.lower()
+
+        # Quota — balance keyword in English or Chinese.
+        if (
+            "余额不足" in text
+            or ("balance" in lower and "insufficient" in lower)
+            or "balance insufficient" in lower
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.QUOTA_EXCEEDED,
+                message="Your DashScope account balance is depleted.",
+                recoverable=False,
+                recovery_hint=(
+                    "Top up at dashscope.console.aliyun.com, then retry."
+                ),
+                provider_doc_url="https://dashscope.console.aliyun.com/",
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # AUTH.
+        if "InvalidApiKey" in text:
+            return VoiceError(
+                category=VoiceErrorCategory.AUTH,
+                message="DashScope authentication failed (InvalidApiKey).",
+                recoverable=False,
+                recovery_hint=(
+                    "Verify DASHSCOPE_API_KEY in context/.env is current."
+                ),
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # MODEL_UNAVAILABLE.
+        if "model not found" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.MODEL_UNAVAILABLE,
+                message="This Qwen-Omni model isn't available on DashScope.",
+                recoverable=False,
+                recovery_hint="Switch to a different Qwen model in settings.",
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # RATE_LIMIT.
+        if "throttling" in lower or "too many" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.RATE_LIMIT,
+                message="DashScope rate limit reached.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # Existing recoverable boilerplate — match `is_recoverable_error`
+        # so the parity contract holds.
+        if exc is not None and any(
+            s in str(exc) for s in self._RECONNECTABLE_ERR_SUBSTRINGS
+        ):
+            return VoiceError(
+                category=VoiceErrorCategory.NETWORK,
+                message="DashScope transient close; reconnecting.",
+                recoverable=True,
+                recovery_hint=None,
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        return None
+
     # --- manual-VAD upstream frames --------------------------------------
 
     def manual_vad_stop_frames(self) -> list[dict[str, Any]]:
@@ -743,60 +860,7 @@ class QwenVoiceProvider(BaseVoiceProvider):
         )
 
 
-def _sanitize_for_qwen(text: str) -> str:
-    """Neutralise URL-shaped substrings that DashScope's omni URL
-    validator rejects.
-
-    The validator only accepts URLs with one of ``http://``, ``https://``,
-    ``data:``, ``file://`` schemes; scheme-less URL-shapes (bare hosts,
-    ``localhost:port``, IPs, dotted names) are rejected with the same
-    misleading "URL does not appear to be valid" 400 used for malformed
-    multimodal inputs.  Wrapping the matches in backticks (markdown code
-    span) makes the validator skip them while keeping them legible to
-    the model.
-    """
-    def _wrap(m: re.Match[str]) -> str:
-        token = m.group(0)
-        # Already inside backticks?  Leave alone (the prior char check is
-        # cheap and avoids stacking quotes when the model echoes back).
-        return f"`{token}`"
-    return _URL_LIKE_RE.sub(_wrap, text)
-
-
-def _sanitize_tool_for_qwen(tool: dict[str, Any]) -> dict[str, Any]:
-    """Recursively scrub JSON Schema union types from a tool definition.
-
-    DashScope's ``session.update`` parser closes the WebSocket with
-    ``InternalError: Parse RealtimeEvent error: Common error!`` (1011)
-    when any parameter schema uses ``"type": ["X", "null"]``. This is
-    valid JSON Schema Draft 7 but unsupported here. We collapse the
-    union to its first non-null branch and drop the null option;
-    callers who relied on accepting null should mark the field
-    non-required instead.
-
-    Bisected 2026-05-15 — when this sanitiser is bypassed, the only
-    tool in our current registry that trips it is
-    ``read_agent_session`` via its ``max_messages: [integer, null]``
-    parameter.
-    """
-    if not isinstance(tool, dict):
-        return tool
-    return _scrub_union_types(tool)
-
-
-def _scrub_union_types(node: Any) -> Any:
-    """Recursively rewrite ``"type": [..., "null"]`` to a scalar type."""
-    if isinstance(node, dict):
-        out: dict[str, Any] = {}
-        for k, v in node.items():
-            if k == "type" and isinstance(v, list):
-                non_null = [t for t in v if t != "null"]
-                # Best-effort: keep the first non-null type, default to
-                # "string" if the union was purely null (unlikely).
-                out[k] = non_null[0] if non_null else "string"
-            else:
-                out[k] = _scrub_union_types(v)
-        return out
-    if isinstance(node, list):
-        return [_scrub_union_types(x) for x in node]
-    return node
+# Increment E — sanitizers moved to schema_utils.py. The
+# re-exports at the top of this file (line ~70) keep the
+# leading-underscore names callable from this module's body
+# (lines 353 / 424 / 433) without touching the call sites.

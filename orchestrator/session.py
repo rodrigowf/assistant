@@ -33,6 +33,8 @@ from orchestrator.config import (
 )
 from orchestrator.persistence import HistoryLoader, HistoryWriter
 from orchestrator.providers.voice_base import BaseVoiceProvider
+from orchestrator.voice_persister import VoicePersister
+from orchestrator.voice_timeouts import VoiceTimeouts
 from orchestrator.audio_recorder import AudioRecorder, is_recording_enabled
 # Provider classes are imported lazily inside the methods that need them so
 # this module remains importable on machines where the corresponding SDK
@@ -113,10 +115,9 @@ _VALID_VOICE_TRANSITIONS: dict[VoiceLifecycle, set[VoiceLifecycle]] = {
     VoiceLifecycle.ENDED: {VoiceLifecycle.IDLE},
 }
 
-# Best-effort timeout for the provider's graceful_shutdown_frames send.
-# If the upstream WS is already wedged we don't want teardown to block
-# forever; the WS close that follows will free the resource anyway.
-_GRACEFUL_SHUTDOWN_TIMEOUT_S = 0.5
+# Increment F (plan §F) — voice-pipeline timeouts moved to
+# ``orchestrator.voice_timeouts.VoiceTimeouts``. Sessions read from
+# ``self._voice_timeouts``; tests can override per-instance.
 
 
 def _render_notifications(notes: list[Notification]) -> str:
@@ -203,9 +204,16 @@ class OrchestratorSession:
         voice_name: str | None = None,
         voice_transcription_language: str | None = None,
         voice_endpoint: str | None = None,
+        voice_timeouts: VoiceTimeouts | None = None,
     ) -> None:
         self._config = config
         self._context = context
+        # Increment F — central voice-pipeline timeouts. Default to the
+        # HEAD constants (parity test pins this); callers can override
+        # in tests via ``voice_timeouts=VoiceTimeouts(graceful_shutdown_s=0.01)``.
+        self._voice_timeouts: VoiceTimeouts = (
+            voice_timeouts if voice_timeouts is not None else VoiceTimeouts.default()
+        )
         self._resume_id = session_id  # Original session_id for JSONL continuity
         self._local_id = local_id or str(uuid.uuid4())
         self._agent: OrchestratorAgent | None = None
@@ -262,6 +270,22 @@ class OrchestratorSession:
         # wake callback uses is_busy to decide whether to schedule a
         # synthetic turn now or let the next user prompt drain notifications.
         self._busy_lock = asyncio.Lock()
+
+        # Increment G — VoicePersister owns the voice-event → JSONL
+        # pipeline. Constructed lazily on first process_voice_event call
+        # so test fixtures that swap ``self._writer`` directly (rather
+        # than going through start()) still get a coherent persister.
+        self._voice_persister: VoicePersister | None = None
+
+        # Increment D — voice-state hoist (plan §D). The "voice owner WS"
+        # is the WebSocket that sent ``voice_start``. Only the owner is
+        # allowed to tear voice down on disconnect; passive subscribers
+        # (text-mode WSes that joined via ``start`` while voice was
+        # active) leave the session running for the actual owner.
+        # ``Any`` rather than ``WebSocket`` to keep this module free of
+        # the api layer dep (the route layer hands us a Starlette WS
+        # but the session doesn't import starlette).
+        self._voice_owner_ws: Any | None = None
 
         # Injection window — set by the listen_recording tool while it's
         # pumping past audio into the live voice WS.  See the is_injecting
@@ -349,6 +373,90 @@ class OrchestratorSession:
         notifications immediately or wait for the in-flight turn to finish.
         """
         return self._busy_lock.locked()
+
+    # --- Increment D — voice owner WS bookkeeping (plan §D) -------------
+
+    @property
+    def voice_owner_ws(self) -> Any | None:
+        """The WebSocket that sent ``voice_start`` for this session,
+        or None if no owner is registered.
+
+        The route layer's disconnect handler reads this to decide
+        whether to call :meth:`end_voice`: passive subscribers (which
+        joined via ``start`` while voice was already active) MUST NOT
+        tear voice down when they disconnect.
+        """
+        return self._voice_owner_ws
+
+    def register_voice_owner(self, ws: Any) -> None:
+        """Record ``ws`` as the voice owner. Called from the route
+        layer immediately after a successful ``voice_start``.
+        """
+        self._voice_owner_ws = ws
+
+    def clear_voice_owner_if(self, ws: Any) -> bool:
+        """Clear the owner pointer iff ``ws`` is the current owner.
+
+        Returns True if a clear happened, False otherwise. Idempotent:
+        a second call with the same ``ws`` returns False (already
+        cleared). The identity check prevents a passive subscriber's
+        disconnect from clobbering the active owner — that's the
+        load-bearing case for multi-device sessions (iPad refresh
+        while Android is talking).
+        """
+        if self._voice_owner_ws is ws:
+            self._voice_owner_ws = None
+            return True
+        return False
+
+    def voice_config_drifts_from(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        voice_name: str | None,
+        language: str | None,
+        endpoint: str | None,
+    ) -> str | None:
+        """Return a human-readable label of which voice fields the
+        client asked to change vs. the live session, or ``None`` if
+        they match.
+
+        Fields the client didn't send (``None``) are skipped — same-
+        mode reconnect WS messages frequently omit settings the client
+        doesn't care about. Endpoint comparison uses the live
+        provider's ``endpoint_id`` (Gemini), falling back to
+        ``_voice_endpoint``.
+
+        Moved from ``api/routes/orchestrator._voice_config_drift`` per
+        plan §D so the route layer stops carrying voice-state logic.
+        Behavior is byte-identical to the legacy helper.
+        """
+        changed: list[str] = []
+        if provider is not None and provider != self.voice_provider_id:
+            changed.append(
+                f"provider {self.voice_provider_id!r}→{provider!r}"
+            )
+        if model is not None and model != self.voice_model_id:
+            changed.append(f"model {self.voice_model_id!r}→{model!r}")
+        if voice_name is not None and voice_name != self.voice_name_id:
+            changed.append(
+                f"voice {self.voice_name_id!r}→{voice_name!r}"
+            )
+        if language is not None and language != self.voice_transcription_language:
+            changed.append(
+                f"language {self.voice_transcription_language!r}→{language!r}"
+            )
+        if endpoint is not None:
+            live_endpoint: str | None = None
+            provider_obj = getattr(self, "_voice_provider", None)
+            if provider_obj is not None:
+                live_endpoint = getattr(provider_obj, "endpoint_id", None)
+            if live_endpoint is None:
+                live_endpoint = getattr(self, "_voice_endpoint", None)
+            if endpoint != live_endpoint:
+                changed.append(f"endpoint {live_endpoint!r}→{endpoint!r}")
+        return ", ".join(changed) if changed else None
 
     @property
     def notifications(self) -> NotificationQueue:
@@ -810,12 +918,34 @@ class OrchestratorSession:
                 raise RuntimeError("rebuild_session_update returned None")
             return payload
 
+        # Increment B — read user-tunable VAD knobs from
+        # ``assistant_config.json``. Missing keys fall back to the
+        # VoiceVAD constructor defaults (which equal the documented
+        # HEAD constants — see tests/parity/test_vad_defaults_parity.py).
+        vad_threshold: float | None = None
+        vad_min_silence_ms: int | None = None
+        try:
+            from api.routes.config import _load_config as _load_app_config
+            _app_cfg = _load_app_config()
+            vt = _app_cfg.get("voice_vad_threshold")
+            if isinstance(vt, (int, float)):
+                vad_threshold = float(vt)
+            vs = _app_cfg.get("voice_vad_min_silence_ms")
+            if isinstance(vs, int):
+                vad_min_silence_ms = vs
+        except Exception:
+            logger.exception("voice tuning config load failed; using VoiceVAD defaults")
+
         relay = VoiceRelay(
             self._voice_provider,
             on_audio_out=on_audio_out,
             on_event_for_frontend=on_event_for_frontend,
             session_id=self._local_id,
             rebuild_session_update=_rebuild_session_update,
+            vad_threshold=vad_threshold,
+            vad_min_silence_ms=vad_min_silence_ms,
+            # Increment F — central timeouts thread through.
+            voice_timeouts=self._voice_timeouts,
         )
         try:
             await relay.start(session_update)
@@ -846,10 +976,22 @@ class OrchestratorSession:
 
         For the full session-level teardown — provider release, audio
         recorder stop, broadcast of ``voice_ended`` — call :meth:`end_voice`.
+
+        Also clears any Gemini ``sessionResumption`` handle the provider
+        was holding. The handle is bound to the upstream WS we just tore
+        down — Google invalidates it server-side on close, and reusing it
+        on the next setup makes Google accept the handshake and then 1008
+        the WS ~150s later ("operation aborted"). Observed 2026-06-04:
+        three back-to-back ``voice_start`` calls all reused the same dead
+        handle and got the duplicate-handle abort, surfacing as a spike
+        of 400 BadRequest in AI Studio's dashboard.
         """
         if self._voice_relay is not None:
             await self._voice_relay.stop()
             self._voice_relay = None
+        provider = self._voice_provider
+        if provider is not None and hasattr(provider, "_resumption_handle"):
+            provider._resumption_handle = None
 
     def _set_voice_state_unlocked(self, target: VoiceLifecycle) -> None:
         """Internal: transition state. Caller MUST hold ``_voice_lock``.
@@ -925,7 +1067,7 @@ class OrchestratorSession:
 
         # 1. Best-effort graceful shutdown frames (provider-specific). The
         #    relay does the actual send so it can pace through the provider's
-        #    normal write path. Bounded by _GRACEFUL_SHUTDOWN_TIMEOUT_S.
+        #    normal write path. Bounded by ``voice_timeouts.graceful_shutdown_s``.
         if self._voice_relay is not None and self._voice_provider is not None:
             try:
                 frames = self._voice_provider.graceful_shutdown_frames()
@@ -936,15 +1078,16 @@ class OrchestratorSession:
                 )
                 frames = []
             if frames:
+                shutdown_timeout_s = self._voice_timeouts.graceful_shutdown_s
                 try:
                     await asyncio.wait_for(
                         self._voice_relay.send_shutdown_frames(frames),
-                        timeout=_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+                        timeout=shutdown_timeout_s,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "graceful_shutdown_frames timed out after %.1fs for session %s",
-                        _GRACEFUL_SHUTDOWN_TIMEOUT_S, self._local_id,
+                        shutdown_timeout_s, self._local_id,
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception(
@@ -1225,33 +1368,60 @@ class OrchestratorSession:
         if self._audio_recorder is not None and self._audio_recorder.is_recording:
             self._audio_recorder.write_assistant_audio(pcm_b64)
 
-    def _flush_pending_user_transcript(self, transcript: str) -> None:
-        """Write the buffered user transcript as a single JSONL entry.
+    # Increment G — ``_flush_pending_user_transcript`` moved onto
+    # :class:`VoicePersister` (see ``orchestrator/voice_persister.py``).
+    # Inline staging state lives on the persister; the session exposes
+    # ``_pending_user_transcript`` / ``_pending_assistant_transcript``
+    # as proxy properties below so call sites (and tests) that read
+    # the buffers directly keep working.
 
-        Used by the Gemini Live event path where ``inputTranscription``
-        arrives as token-level deltas across many events. The buffer is
-        cleared after writing.
+    def _ensure_voice_persister(self) -> VoicePersister | None:
+        """Lazily build the persister on first voice-event call.
+
+        Returns None when ``self._writer`` isn't set yet (i.e., the
+        session hasn't started). Constructing on demand lets test
+        fixtures that swap ``self._writer = MagicMock()`` directly
+        still get a persister wired against that mock.
         """
-        segment = None
-        if self._audio_recorder is not None and self._audio_recorder.is_recording:
-            segment = self._audio_recorder.mark_user_turn_end(transcript)
-        if segment:
-            content = (
-                f"[voice, recording: {self._local_id} "
-                f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
+        if self._writer is None:
+            return None
+        if self._voice_persister is None:
+            self._voice_persister = VoicePersister(
+                writer=self._writer,
+                local_id=self._local_id,
+                get_audio_recorder=lambda: self._audio_recorder,
+                is_injecting=lambda: self.is_injecting,
             )
-        else:
-            content = f"[voice] {transcript}"
-        entry: dict[str, Any] = {
-            "type": "user",
-            "message": {"role": "user", "content": content},
-            "source": "voice_transcription",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if segment:
-            entry["audio_segment"] = segment
-        self._writer.append(entry)
-        self._pending_user_transcript = None
+        return self._voice_persister
+
+    @property
+    def _pending_user_transcript(self) -> str | None:
+        """Back-compat proxy — read the persister's staging buffer.
+
+        Setting via the property is supported; the legacy code did
+        ``self._pending_user_transcript = staged + delta`` and the
+        Gemini happy path / parity tests still read it. Persister
+        owns the storage; this proxy keeps the symbol pointing at it.
+        """
+        p = self._voice_persister
+        return p._pending_user_transcript if p is not None else None
+
+    @_pending_user_transcript.setter
+    def _pending_user_transcript(self, value: str | None) -> None:
+        p = self._ensure_voice_persister()
+        if p is not None:
+            p._pending_user_transcript = value
+
+    @property
+    def _pending_assistant_transcript(self) -> str | None:
+        p = self._voice_persister
+        return p._pending_assistant_transcript if p is not None else None
+
+    @_pending_assistant_transcript.setter
+    def _pending_assistant_transcript(self, value: str | None) -> None:
+        p = self._ensure_voice_persister()
+        if p is not None:
+            p._pending_assistant_transcript = value
 
     @property
     def audio_recorder(self) -> AudioRecorder | None:
@@ -1275,14 +1445,22 @@ class OrchestratorSession:
         *,
         inject: bool = True,
     ) -> list[dict[str, Any]]:
-        """Process a single mirrored OpenAI Realtime event.
+        """Process a single mirrored provider event.
 
-        Injects the event into the VoiceProvider queue, then processes any
-        ToolUseStart events synchronously. Returns a list of voice_command
-        dicts to send back to the frontend (tool results + response.create).
+        Increment G (plan §G) — the persistence dispatch moved onto
+        :class:`VoicePersister`. This method now:
 
-        Transcript events (TextDelta, TextComplete) and interruptions
-        (VoiceInterrupted) are persisted to JSONL here.
+        1. Captures a local reference to the provider (``end_voice``
+           can null it mid-await).
+        2. Injects the raw event into the provider's queue (so the
+           agent loop sees it via ``create_message``).
+        3. Delegates persistence to :class:`VoicePersister.handle_event`.
+        4. Handles the tool-execution paths inline — those touch
+           :class:`registry` + ``self._context`` and produce frontend
+           commands via the provider's ``format_tool_result``.
+
+        Returns voice_command dicts for the frontend (tool results +
+        response.create).
         """
         # Capture a local reference: end_voice() may null
         # ``self._voice_provider`` while this method is mid-await (the
@@ -1298,87 +1476,22 @@ class OrchestratorSession:
         if inject:
             await provider.inject_event(event)
 
+        # Delegate JSONL persistence to the per-session persister.
+        # The persister owns the staged transcript buffers and the
+        # ``is_injecting`` gating; the session only sees the result
+        # via the back-compat ``_pending_*_transcript`` properties.
+        persister = self._ensure_voice_persister()
+        if persister is not None:
+            persister.handle_event(event, provider.provider_name)
+
         event_type = event.get("type", "")
 
-        # --- Gemini Live event shape -----------------------------------
-        # Gemini Live doesn't carry a top-level ``type`` field — it uses
-        # camelCase top-level keys (``setupComplete``, ``serverContent``,
-        # ``toolCall``, ``toolResponse``) and nests transcription /
-        # turn-complete / interruption signals under ``serverContent``.
-        # Translate to the same persistence behaviour the OpenAI / Qwen
-        # branches below provide.
+        # --- Gemini Live tool calls (camelCase shape) ------------------
+        # Tool execution stays on the session because the registry needs
+        # ``self._context``; the persister provides the canonical
+        # ``persist_tool_use_and_result`` helper for the JSONL shape.
         if not event_type and provider.provider_name == "google":
-            sc = event.get("serverContent") or {}
-            input_t = sc.get("inputTranscription") if isinstance(sc, dict) else None
-            output_t = sc.get("outputTranscription") if isinstance(sc, dict) else None
             tool_call = event.get("toolCall")
-
-            # User speech transcript — Gemini Live streams inputTranscription
-            # as token-level deltas (one event per word/fragment). Buffer and
-            # persist a single JSONL entry on turn boundary, mirroring the
-            # assistant-side accumulation below. Without this every fragment
-            # became its own "[voice] my" / "[voice] friend" user turn,
-            # corrupting both UI and history.
-            if isinstance(input_t, dict) and not self.is_injecting:
-                delta = input_t.get("text", "")
-                if delta:
-                    staged = getattr(self, "_pending_user_transcript", None) or ""
-                    self._pending_user_transcript = staged + delta
-
-            # Assistant transcript delta — accumulate; persist on turnComplete.
-            # Flushing the *user* transcript here too: when the model starts
-            # replying, the user's turn is by definition over, so the buffered
-            # user fragments form one coherent utterance.
-            if isinstance(output_t, dict):
-                # Flush staged user transcript on the first output delta of
-                # this turn (model started speaking → user turn ended).
-                staged_user = getattr(self, "_pending_user_transcript", None)
-                if staged_user and not self.is_injecting:
-                    self._flush_pending_user_transcript(staged_user)
-                delta = output_t.get("text", "")
-                if delta:
-                    staged = getattr(self, "_pending_assistant_transcript", None) or ""
-                    self._pending_assistant_transcript = staged + delta
-
-            # Turn complete — persist staged transcripts.
-            if isinstance(sc, dict) and sc.get("turnComplete"):
-                # Failsafe flush of user transcript: covers turns where the
-                # model produced no text output (audio-only modality) so the
-                # outputTranscription branch above never fired.
-                staged_user = getattr(self, "_pending_user_transcript", None)
-                if staged_user and not self.is_injecting:
-                    self._flush_pending_user_transcript(staged_user)
-                staged = getattr(self, "_pending_assistant_transcript", None)
-                if staged:
-                    segment = None
-                    if self._audio_recorder is not None and self._audio_recorder.is_recording:
-                        segment = self._audio_recorder.mark_assistant_turn_end(staged)
-                    if segment:
-                        content = (
-                            f"[voice, recording: {self._local_id} "
-                            f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
-                        )
-                    else:
-                        content = staged
-                    entry = {
-                        "type": "assistant",
-                        "message": {"role": "assistant", "content": content},
-                        "source": "voice_response",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                    if segment:
-                        entry["audio_segment"] = segment
-                    self._writer.append(entry)
-                self._pending_assistant_transcript = None
-
-            # Interrupted — mark in JSONL like OpenAI's speech_started.
-            if isinstance(sc, dict) and sc.get("interrupted") and not self.is_injecting:
-                self._writer.append({
-                    "type": "voice_interrupted",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-
-            # Tool call — execute synchronously, ship the toolResponse back.
             if isinstance(tool_call, dict):
                 for call in tool_call.get("functionCalls", []):
                     call_id = call.get("id", "")
@@ -1387,99 +1500,44 @@ class OrchestratorSession:
                     if not (call_id and name):
                         continue
                     result = await registry.execute(name, args, self._context)
-                    self._writer.append({
-                        "type": "tool_use",
-                        "tool_call_id": call_id,
-                        "tool_name": name,
-                        "tool_input": args,
-                        "source": "voice",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    self._writer.append({
-                        "type": "tool_result",
-                        "tool_call_id": call_id,
-                        "output": result,
-                        "is_error": False,
-                        "source": "voice",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
+                    if persister is not None:
+                        persister.persist_tool_use_and_result(
+                            call_id=call_id,
+                            tool_name=name,
+                            tool_input=args,
+                            output=result,
+                        )
                     # Background tool-execution tasks can land here after
                     # end_voice() has already nulled the provider (the
                     # agent's own end_voice_session tool produces exactly
                     # this race). Skip the format step silently — the
                     # frontend has nothing to display either way.
-                    provider = self._voice_provider
-                    if provider is not None:
-                        commands.extend(provider.format_tool_result(call_id, result))
-
+                    current_provider = self._voice_provider
+                    if current_provider is not None:
+                        commands.extend(current_provider.format_tool_result(call_id, result))
             return commands
 
-        # --- OpenAI / Qwen event shape (uses top-level ``type``) -------
-
-        # User speech transcript — arrives when Whisper transcription completes.
-        # Skip while listen_recording is replaying past audio into the WS:
-        # the provider's ASR is transcribing those bytes and firing this
-        # event for each fragment, and persisting them as user turns would
-        # corrupt history with phantom messages that the user never spoke.
-        if (
-            event_type == "conversation.item.input_audio_transcription.completed"
-            and not self.is_injecting
-        ):
-            transcript = event.get("transcript", "")
-            if transcript:
-                # Build message content with optional audio segment reference
-                segment = None
-                if self._audio_recorder is not None and self._audio_recorder.is_recording:
-                    segment = self._audio_recorder.mark_user_turn_end(transcript)
-
-                if segment:
-                    # Include audio reference in the message text itself.
-                    # Wall-clock range — pass straight to listen_recording.
-                    content = (
-                        f"[voice, recording: {self._local_id} "
-                        f"{segment['start_ms']}-{segment['end_ms']}ms] {transcript}"
-                    )
-                else:
-                    content = f"[voice] {transcript}"
-
-                entry: dict[str, Any] = {
-                    "type": "user",
-                    "message": {"role": "user", "content": content},
-                    "source": "voice_transcription",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                if segment:
-                    entry["audio_segment"] = segment
-                self._writer.append(entry)
-
-        # User text input (typed messages in voice sessions, if applicable)
-        elif event_type == "conversation.item.created":
-            item = event.get("item", {})
-            if item.get("role") == "user":
-                for c in item.get("content", []):
-                    if c.get("type") == "input_text" and c.get("text"):
-                        self._writer.append({
-                            "type": "user",
-                            "message": {"role": "user", "content": c["text"]},
-                            "source": "voice_transcription",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        })
-                        break
-
-        # Tool call ready — execute and send result back
-        elif event_type == "response.function_call_arguments.done":
+        # --- OpenAI / Qwen tool calls (top-level type) -----------------
+        if event_type == "response.function_call_arguments.done":
             call_id = event.get("call_id", "")
             name = event.get("name", "")
 
-            # Get name from pending_calls if not in event
+            # Get name from pending_calls if not in event.
             if not name and call_id in provider.pending_calls:
                 name = provider.pending_calls[call_id]
 
-            # Prefer accumulated streaming args over the done event's arguments field
-            # (OpenAI may send an empty/missing arguments in the done event when
-            # the args were streamed incrementally via delta events)
+            # Prefer accumulated streaming args over the done event's
+            # ``arguments`` field (OpenAI may send empty/missing
+            # arguments when args were streamed incrementally via delta
+            # events).
+            # Inc E renamed the mixin attribute. Fall through to the
+            # legacy name for any provider not migrated yet (test fakes).
+            pending_args_dict = (
+                getattr(provider, "_pending_call_args", None)
+                or getattr(provider, "_pending_args", {})
+            )
             args_str = (
-                provider._pending_args.get(call_id)
+                pending_args_dict.get(call_id)
                 or event.get("arguments", "")
                 or "{}"
             )
@@ -1491,88 +1549,19 @@ class OrchestratorSession:
 
             if call_id and name:
                 result = await registry.execute(name, tool_input, self._context)
-                # Persist tool call + result to JSONL
-                self._writer.append({
-                    "type": "tool_use",
-                    "tool_call_id": call_id,
-                    "tool_name": name,
-                    "tool_input": tool_input,
-                    "source": "voice",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                self._writer.append({
-                    "type": "tool_result",
-                    "tool_call_id": call_id,
-                    "output": result,
-                    "is_error": False,
-                    "source": "voice",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                # Provider-specific command sequence to ship the result back
-                # and ask for the next response. Re-fetch provider in case
-                # the registered tool itself ended the voice session (e.g.
-                # end_voice_session) — the captured local would still be
-                # valid object-wise, but we'd be acting on a dead provider.
+                if persister is not None:
+                    persister.persist_tool_use_and_result(
+                        call_id=call_id,
+                        tool_name=name,
+                        tool_input=tool_input,
+                        output=result,
+                    )
+                # Provider-specific command sequence to ship the result
+                # back and ask for the next response. Re-fetch provider
+                # in case the tool itself ended the voice session.
                 current_provider = self._voice_provider
                 if current_provider is not None:
                     commands.extend(current_provider.format_tool_result(call_id, result))
-
-        # Assistant transcript complete — STAGE it; we only persist if the
-        # turn ended in status="completed" (response.done below). Otherwise
-        # the transcript is a fragment cut off by barge-in or response.cancel
-        # and would pollute history with sentences like "Yeah, I think".
-        # GA OpenAI gpt-realtime emits ``response.output_audio_transcript.done``;
-        # legacy beta models and Qwen still emit ``response.audio_transcript.done``.
-        elif event_type in (
-            "response.output_audio_transcript.done",
-            "response.audio_transcript.done",
-        ):
-            transcript = event.get("transcript", "")
-            if transcript:
-                self._pending_assistant_transcript = transcript
-
-        # Turn complete — decide whether to persist the staged transcript.
-        elif event_type == "response.done":
-            response = event.get("response", {})
-            status = response.get("status", "completed")
-            staged = getattr(self, "_pending_assistant_transcript", None)
-            if staged and status == "completed":
-                # Build message content with optional audio segment reference
-                segment = None
-                if self._audio_recorder is not None and self._audio_recorder.is_recording:
-                    segment = self._audio_recorder.mark_assistant_turn_end(staged)
-
-                if segment:
-                    # Include audio reference in the message text itself.
-                    # Wall-clock range — pass straight to listen_recording.
-                    content = (
-                        f"[voice, recording: {self._local_id} "
-                        f"{segment['start_ms']}-{segment['end_ms']}ms] {staged}"
-                    )
-                else:
-                    content = staged
-
-                entry: dict[str, Any] = {
-                    "type": "assistant",
-                    "message": {"role": "assistant", "content": content},
-                    "source": "voice_response",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                if segment:
-                    entry["audio_segment"] = segment
-                self._writer.append(entry)
-            self._pending_assistant_transcript = None
-
-        # Barge-in interruption — mark in JSONL.  While injecting past
-        # audio via listen_recording, the provider's VAD fires this event
-        # for every chunk it detects in the replay; those are not real
-        # interruptions and must not be persisted.
-        elif event_type == "input_audio_buffer.speech_started":
-            if not self.is_injecting:
-                self._writer.append({
-                    "type": "voice_interrupted",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
 
         return commands
 
