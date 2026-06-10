@@ -3,22 +3,13 @@ package com.assistant.peripheral.voice
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.AudioTrack
-import android.media.MediaRecorder
-import android.os.Build
 import android.util.Base64
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.assistant.peripheral.data.VoiceState
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
 
 /**
  * Abstract base for WebSocket-relayed PCM voice providers.
@@ -66,15 +57,17 @@ abstract class WebSocketPcmProvider(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // --- Audio I/O ---------------------------------------------------------
-    private var audioRecord: AudioRecord? = null
-    private var audioTrack: AudioTrack? = null
-    private var captureJob: Job? = null
-    private var playbackJob: Job? = null
+    // Inc H: AudioRecord/AudioTrack lifecycle extracted to MicCapture
+    // and PcmPlayback. This file holds only the orchestration and
+    // session-state surface; the helpers are constructed lazily once
+    // the in/out sample rates are known (after connect() reads them).
     private val running = AtomicBoolean(false)
+    private var mic: MicCapture? = null
+    private var playback: PcmPlayback? = null
 
     /**
-     * Current speaker-side audio plane.  Read by [startSpeaker] when
-     * building the [AudioTrack]; updated mid-session via
+     * Current speaker-side audio plane. Read when building the
+     * AudioTrack via PcmPlayback; updated mid-session via
      * [setSpeakerMode] when [VoiceManager]'s routing changes (e.g.
      * user plugs in / picks a BT speaker mid-call).
      *
@@ -86,24 +79,10 @@ abstract class WebSocketPcmProvider(
         AudioRouter.SpeakerMode.CALL
 
     /**
-     * Optional output endpoint to pin the [AudioTrack] to via
-     * [AudioTrack.setPreferredDevice].  When set, makes the route
-     * deterministic — critical when multiple A2DP devices are paired.
+     * Optional output endpoint to pin the AudioTrack to. Set
+     * mid-session by VoiceManager when device routing changes.
      */
     @Volatile private var preferredOutputDevice: android.media.AudioDeviceInfo? = null
-
-    /**
-     * Queue of decoded PCM speaker chunks waiting to be written to
-     * [AudioTrack].  Decoupling the WS receive thread from the
-     * AudioTrack.write() blocking call is critical: writing on the
-     * main thread (which the WS event dispatch runs on by default)
-     * caused 4,500-frame UI freezes mid-conversation.
-     *
-     * UNLIMITED capacity intentionally — a 200ms hiccup might queue
-     * ~10 chunks; we want to never drop audio at this layer (the
-     * upstream provider already controls our backpressure).
-     */
-    private val speakerQueue = Channel<ByteArray>(capacity = Channel.UNLIMITED)
 
     // --- Mic gain + ducking -----------------------------------------------
     //
@@ -126,11 +105,8 @@ abstract class WebSocketPcmProvider(
     private val ducker: EchoDuckController by lazy {
         EchoDuckController(
             scope = scope,
-            getPlaybackHeadPosition = {
-                audioTrack?.takeIf { it.state == AudioTrack.STATE_INITIALIZED }
-                    ?.playbackHeadPosition?.toLong()
-            },
-            getTotalFramesWritten = { totalFramesWritten },
+            getPlaybackHeadPosition = { playback?.getPlaybackHeadPosition() },
+            getTotalFramesWritten = { playback?.getTotalFramesWritten() ?: 0L },
             tag = tag,
         )
     }
@@ -138,35 +114,11 @@ abstract class WebSocketPcmProvider(
     @Volatile private var lastSpeakerChunkAtMs: Long = 0L
     private var userMuted: Boolean = false
 
-    // Total frames written to the [AudioTrack] over this session, used
-    // to compare against `audioTrack.playbackHeadPosition` to decide
-    // when the hardware buffer is truly empty (i.e. the speaker is
-    // really silent, not just "we stopped queueing").  Resets on
-    // [flushSpeakerOutput] since `flush()` resets the head position too.
-    @Volatile private var totalFramesWritten: Long = 0L
-
-    companion object {
-        // Mic chunk size: 20ms at 24kHz mono PCM16 = 480 frames = 960 bytes.
-        // Matches the web frontend's 20ms cadence.
-        private const val MIC_CHUNK_FRAMES = 480
-
-        // Agent-speaking → idle detection.  If no speaker chunk has been
-        // pushed in this many ms, treat the agent's turn as ended.
-        // 800ms covers the natural gaps between Gemini Live's bursty
-        // chunk delivery without falsely ending mid-turn.
-        private const val AGENT_SPEECH_STALE_MS = 800L
-
-        // Drain-restore timing constants moved to [EchoDuckController]
-        // (Inc H). The controller owns the no-timeout drain loop and
-        // emits the canonical `[MIC_STATE] RESTORE_DRAIN(*)` log lines.
-    }
-
     // --- Format (set in connect) ------------------------------------------
     private var inSampleRate: Int = 24000
     private var outSampleRate: Int = 24000
 
-    // --- Bridge to the backend WS (set in connect) ------------------------
-    private var sendMicChunk: ((String) -> Unit)? = null
+    // --- Bridge to the backend WS (passed into MicCapture in connect) -----
 
     // --- Subclass extension points ----------------------------------------
 
@@ -200,27 +152,7 @@ abstract class WebSocketPcmProvider(
      */
     protected fun flushSpeakerOutput() {
         if (!running.get()) return
-        var dropped = 0
-        while (true) {
-            val r = speakerQueue.tryReceive()
-            if (r.isFailure || r.isClosed) break
-            dropped++
-        }
-        try {
-            audioTrack?.let {
-                if (it.state == AudioTrack.STATE_INITIALIZED) {
-                    it.pause()
-                    it.flush()
-                    it.play()
-                    // flush() resets playbackHeadPosition to 0 — keep
-                    // our write counter in sync so the drain loop's
-                    // comparison stays valid.
-                    totalFramesWritten = 0L
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(tag, "AudioTrack flush failed: ${e.message}")
-        }
+        val dropped = playback?.flush() ?: 0
         if (dropped > 0) Log.d(tag, "Barge-in: dropped $dropped queued speaker chunks")
         // Barge-in means the agent's audio is gone — restore mic right
         // away so the user can be heard without waiting out the stale
@@ -271,17 +203,35 @@ abstract class WebSocketPcmProvider(
 
         inSampleRate = info.audioInSampleRate
         outSampleRate = info.audioOutSampleRate
-        sendMicChunk = sendMicChunkToBackend
         // mirrorEventToBackend is unused on the WS path (the backend
         // already sees its own upstream events directly).
+        // sendMicChunkToBackend is passed directly into MicCapture below.
 
         Log.i(tag, "Connecting $providerId voice: in=${inSampleRate}Hz out=${outSampleRate}Hz model=${info.model} voice=${info.voice}")
         _state.value = VoiceState.Connecting
         userMuted = false
         agentSpeaking = false
         lastSpeakerChunkAtMs = 0L
-        totalFramesWritten = 0L
         ducker.resetForNewSession()
+
+        // Build the helpers now that sample rates + callback are known.
+        playback = PcmPlayback(scope = scope, tag = tag, outSampleRate = outSampleRate)
+        mic = MicCapture(
+            scope = scope,
+            tag = tag,
+            inSampleRate = inSampleRate,
+            running = running,
+            isUserMuted = { userMuted },
+            getMicGain = { ducker.currentMicGain },
+            isAgentSpeaking = { agentSpeaking },
+            getLastSpeakerChunkAtMs = { lastSpeakerChunkAtMs },
+            isRestorePending = { ducker.isRestorePending },
+            onStalenessTriggered = {
+                agentSpeaking = false
+                ducker.scheduleRestore("stale")
+            },
+            sendMicChunk = sendMicChunkToBackend,
+        )
 
         try {
             // Set `running` BEFORE startMic — the mic capture loop
@@ -289,7 +239,7 @@ abstract class WebSocketPcmProvider(
             // the flag after the coroutine launches can race and
             // exit it immediately.
             running.set(true)
-            startSpeaker()
+            playback!!.start(speakerMode, preferredOutputDevice)
             // HAL settling delay between wake-word AudioRecord release
             // and the call's AudioRecord open. Observed 2026-06-04:
             // post-wake-word call mic came up with ~half the amplitude
@@ -299,7 +249,7 @@ abstract class WebSocketPcmProvider(
             // without a perceptible UX delay (the user already waited
             // for wake-word recognition + WS handshake).
             kotlinx.coroutines.delay(200L)
-            startMic()
+            mic!!.start()
             _state.value = VoiceState.Active
             _events.tryEmit(VoiceEvent.SessionCreated)
             Log.i(tag, "$providerId voice session ready")
@@ -395,19 +345,16 @@ abstract class WebSocketPcmProvider(
 
     final override fun pushSpeakerChunk(audioB64: String) {
         // Fast path: decode here (cheap), then hand off to the
-        // playback coroutine.  AudioTrack.write() blocks when the
+        // playback coroutine. AudioTrack.write() blocks when the
         // buffer is full — calling it on the WS dispatch thread
         // (which is Main by default in viewModelScope) freezes the
-        // UI.  The playback coroutine on Dispatchers.IO writes
+        // UI. The playback coroutine on Dispatchers.IO writes
         // without affecting frame timing.
         if (!running.get()) return
+        val pb = playback ?: return
         try {
             val pcm = Base64.decode(audioB64, Base64.NO_WRAP)
-            val result = speakerQueue.trySend(pcm)
-            if (result.isFailure) {
-                Log.w(tag, "speakerQueue full or closed; dropping chunk (${pcm.size}B)")
-                return
-            }
+            if (!pb.enqueue(pcm)) return  // queue closed or full (logs inside)
             // Agent-speaking signal: every chunk arrival refreshes the
             // staleness timer and, on the rising edge, ducks the mic.
             // The capture loop polls the staleness timeout to decide
@@ -468,311 +415,14 @@ abstract class WebSocketPcmProvider(
         speakerMode = mode
         preferredOutputDevice = preferredDevice
         if (!modeChanged && !deviceChanged) return
-        // If we're not yet playing, the staged values will take effect
-        // when startSpeaker() runs.
-        if (audioTrack == null) return
-        // Mid-session rebuild: tear down the current track and start
-        // fresh.  The playback queue is preserved — the playback
-        // coroutine will pick up the next chunk against the new
-        // AudioTrack on its next loop iteration.
-        Log.i(tag, "setSpeakerMode → $mode (rebuilding AudioTrack)")
-        stopSpeakerOnly()
-        try {
-            startSpeaker()
-        } catch (e: Exception) {
-            Log.e(tag, "AudioTrack rebuild failed: ${e.message}", e)
-        }
-    }
-
-    /**
-     * Tear down the current speaker [AudioTrack] without touching
-     * the playback queue or coroutine.  The next [startSpeaker] call
-     * brings up a new track and the playback loop seamlessly resumes.
-     */
-    private fun stopSpeakerOnly() {
-        val t = audioTrack ?: return
-        audioTrack = null
-        try {
-            if (t.playState == AudioTrack.PLAYSTATE_PLAYING) t.stop()
-            t.release()
-        } catch (e: Exception) {
-            Log.w(tag, "stopSpeakerOnly failed: ${e.message}")
-        }
+        // PcmPlayback.setSpeakerMode is a no-op if no AudioTrack is
+        // open yet (the staged values take effect on next start()).
+        playback?.setSpeakerMode(mode, preferredDevice)
     }
 
     fun release() {
         runBlocking { disconnect() }
         scope.cancel()
-    }
-
-    // --- AudioTrack (speaker) ---------------------------------------------
-
-    /**
-     * Build an [AudioTrack] for the current [speakerMode].
-     *
-     *  - CALL  → ``USAGE_VOICE_COMMUNICATION`` / ``CONTENT_TYPE_SPEECH``
-     *            (legacy: ``STREAM_VOICE_CALL``).  Routes through the
-     *            communication-audio plane; cooperates with AEC.
-     *  - MEDIA → ``USAGE_MEDIA`` / ``CONTENT_TYPE_MUSIC`` (legacy:
-     *            ``STREAM_MUSIC``).  Routes through the media-audio
-     *            plane — reaches A2DP sinks that the call plane can't.
-     */
-    private fun buildAudioTrack(
-        bufSize: Int,
-        mode: AudioRouter.SpeakerMode,
-    ): AudioTrack {
-        val track = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val attrs = when (mode) {
-                AudioRouter.SpeakerMode.CALL -> AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-                AudioRouter.SpeakerMode.MEDIA -> AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            }
-            AudioTrack.Builder()
-                .setAudioAttributes(attrs)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setSampleRate(outSampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .build()
-                )
-                .setBufferSizeInBytes(bufSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-        } else {
-            @Suppress("DEPRECATION")
-            val legacyStream = when (mode) {
-                AudioRouter.SpeakerMode.CALL -> AudioManager.STREAM_VOICE_CALL
-                AudioRouter.SpeakerMode.MEDIA -> AudioManager.STREAM_MUSIC
-            }
-            @Suppress("DEPRECATION")
-            AudioTrack(
-                legacyStream,
-                outSampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufSize,
-                AudioTrack.MODE_STREAM,
-            )
-        }
-        if (track.state != AudioTrack.STATE_INITIALIZED) {
-            track.release()
-            throw IllegalStateException("AudioTrack failed to initialize (state=${track.state})")
-        }
-        return track
-    }
-
-    private fun startSpeaker() {
-        val minBuf = AudioTrack.getMinBufferSize(
-            outSampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        // 1.5s hardware buffer — gives plenty of jitter headroom for
-        // the bursty upstream delivery pattern.  Combined with the
-        // non-blocking write loop below, the buffer absorbs short
-        // bursts naturally; barge-in flush() clears it instantly.
-        val bytesPerSecond = outSampleRate * 2  // mono PCM16
-        val bufSize = max(minBuf * 4, (bytesPerSecond * 1.5).toInt())
-
-        val track = buildAudioTrack(bufSize, speakerMode)
-        // Pin the output endpoint when the router gave us a specific
-        // device (e.g. the JBL).  Without this Android's default
-        // routing may snap the stream to the wrong sink the moment a
-        // new device connects.  ``setPreferredDevice`` is API 23+.
-        val pinned = preferredOutputDevice
-        if (pinned != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            try {
-                val ok = track.setPreferredDevice(pinned)
-                Log.d(tag, "AudioTrack pinned to ${pinned.productName} (type=${pinned.type}) → $ok")
-            } catch (e: Exception) {
-                Log.w(tag, "AudioTrack.setPreferredDevice failed: ${e.message}")
-            }
-        }
-        track.play()
-        audioTrack = track
-        Log.d(tag, "Speaker started: rate=${outSampleRate}Hz bufSize=$bufSize mode=$speakerMode")
-
-        // Drain the speaker queue on a dedicated IO coroutine.  This
-        // is the only thread that calls AudioTrack.write() — keeping
-        // it off Main/WS threads is what prevents UI freezes during
-        // playback.
-        //
-        // The hardware buffer (1.5s, see above) plus the unbounded
-        // Channel act as the queue.  WRITE_NON_BLOCKING means a full
-        // hardware buffer doesn't stall this coroutine — we park the
-        // leftover and try again on the next loop tick after the
-        // AudioTrack drains a bit.  On API 21/22 the 4-arg overload
-        // doesn't exist; we fall back to the blocking 3-arg write,
-        // which returns total bytes (never partial 0), so the parking
-        // branch is unreachable on those versions.
-        playbackJob = scope.launch {
-            var pending: ByteArray? = null
-            try {
-                while (isActive) {
-                    val t = audioTrack ?: break
-                    if (t.state != AudioTrack.STATE_INITIALIZED) break
-
-                    val data: ByteArray = if (pending != null) {
-                        pending.also { pending = null }
-                    } else {
-                        val r = speakerQueue.receiveCatching()
-                        if (r.isClosed) break
-                        r.getOrNull() ?: continue
-                    }
-
-                    var offset = 0
-                    while (offset < data.size) {
-                        // 4-arg write with WRITE_NON_BLOCKING is API
-                        // 23+. On API 21/22 the method doesn't exist
-                        // and a direct call throws NoSuchMethodError
-                        // (a Throwable, NOT an Exception) — naive
-                        // ``catch (Exception)`` lets it kill the
-                        // process. Branch on SDK_INT and catch
-                        // Throwable defensively.
-                        val written = try {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                t.write(
-                                    data,
-                                    offset,
-                                    data.size - offset,
-                                    AudioTrack.WRITE_NON_BLOCKING,
-                                )
-                            } else {
-                                t.write(data, offset, data.size - offset)
-                            }
-                        } catch (e: Throwable) {
-                            Log.w(tag, "AudioTrack.write failed: ${e.message}")
-                            -1
-                        }
-                        if (written < 0) {
-                            // Permanent error — drop the rest of this
-                            // chunk; next chunk may still play.
-                            break
-                        }
-                        if (written == 0) {
-                            // Hardware buffer is full.  Park the rest
-                            // and yield; the delay lets the buffer
-                            // drain a bit before we retry.
-                            pending = data.copyOfRange(offset, data.size)
-                            delay(10)
-                            break
-                        }
-                        offset += written
-                        // PCM16 mono → 2 bytes per frame.  Track
-                        // cumulative frames so the restore loop can
-                        // compare against playbackHeadPosition.
-                        totalFramesWritten += (written / 2).toLong()
-                    }
-                }
-            } catch (e: CancellationException) {
-                // Normal shutdown
-            } catch (e: Exception) {
-                Log.w(tag, "Playback loop ended with: ${e.message}")
-            }
-            Log.d(tag, "Playback loop exited")
-        }
-    }
-
-    // --- AudioRecord (mic) -------------------------------------------------
-
-    private fun startMic() {
-        val minBuf = AudioRecord.getMinBufferSize(
-            inSampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        // 4x min for headroom against scheduling jitter.
-        val bufSize = max(minBuf * 4, inSampleRate * 2 / 5)
-
-        // VOICE_RECOGNITION on Lollipop (API < 24) — Samsung's HAL
-        // routes VOICE_COMMUNICATION through aggressive processing
-        // that silences audio.  Same compatibility note as
-        // OpenAIVoiceProvider.
-        val source = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N)
-            MediaRecorder.AudioSource.VOICE_RECOGNITION
-        else
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION
-
-        val record = AudioRecord(
-            source,
-            inSampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufSize,
-        )
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            record.release()
-            throw IllegalStateException("AudioRecord failed to initialize (state=${record.state})")
-        }
-        record.startRecording()
-        audioRecord = record
-        Log.d(tag, "Mic started: rate=${inSampleRate}Hz source=$source bufSize=$bufSize")
-
-        captureJob = scope.launch {
-            val chunkBytes = MIC_CHUNK_FRAMES * 2  // 16-bit samples
-            val buf = ByteArray(chunkBytes)
-            // Per-second RMS probe: accumulate over ~50 chunks (1s at 20ms each)
-            // then emit one line. Lets us see ground-truth mic amplitude
-            // without spamming the log. Pre-gain so it reflects the raw
-            // signal from AudioRecord, not what ducking did to it.
-            var probeRmsAccum = 0.0
-            var probeChunks = 0
-            var probePeak = 0
-            while (isActive && running.get()) {
-                val read = record.read(buf, 0, chunkBytes)
-                if (read <= 0) {
-                    if (read == AudioRecord.ERROR_INVALID_OPERATION ||
-                        read == AudioRecord.ERROR_BAD_VALUE) {
-                        Log.w(tag, "AudioRecord.read error: $read — ending capture loop")
-                        break
-                    }
-                    continue
-                }
-                if (userMuted) continue  // drop chunks while muted
-
-                // Detect agent-speech-ended via staleness of the
-                // speaker queue.  Cheap to evaluate per-chunk and
-                // avoids needing wire-format-specific event hooks.
-                if (agentSpeaking) {
-                    val sinceLastChunk = System.currentTimeMillis() - lastSpeakerChunkAtMs
-                    if (sinceLastChunk > AGENT_SPEECH_STALE_MS && !ducker.isRestorePending) {
-                        agentSpeaking = false
-                        ducker.scheduleRestore("stale")
-                    }
-                }
-
-                // Pre-gain RMS probe. We compute over the raw bytes so
-                // duck attenuation doesn't distort the diagnostic.
-                val chunkStats = computeRmsAndPeakPcm16(buf, 0, read)
-                probeRmsAccum += chunkStats.first
-                probePeak = maxOf(probePeak, chunkStats.second)
-                probeChunks++
-                if (probeChunks >= 50) {
-                    val avgRms = probeRmsAccum / probeChunks
-                    Log.i(tag, "[MIC_PROBE] rms_avg=${avgRms.toInt()} peak=$probePeak gain=${ducker.currentMicGain} ducking=${agentSpeaking}")
-                    probeRmsAccum = 0.0
-                    probeChunks = 0
-                    probePeak = 0
-                }
-
-                val gain = ducker.currentMicGain
-                if (gain != 1.0f) applyGainPcm16(buf, 0, read, gain)
-
-                val b64 = Base64.encodeToString(buf, 0, read, Base64.NO_WRAP)
-                try {
-                    sendMicChunk?.invoke(b64)
-                } catch (e: Exception) {
-                    Log.w(tag, "sendMicChunk failed: ${e.message}")
-                }
-            }
-            Log.d(tag, "Mic capture loop exited")
-        }
     }
 
     /** Parse a Go-style duration string ("50s", "30m0s", "1h30m0s",
@@ -806,86 +456,18 @@ abstract class WebSocketPcmProvider(
         return total.toInt()
     }
 
-    /** Returns (rms, peak) of a PCM16 little-endian buffer slice.
-     *  RMS is the diagnostic for "is there signal here at all"; peak
-     *  catches transients that average away. Both in raw int16 units. */
-    private fun computeRmsAndPeakPcm16(buf: ByteArray, offset: Int, length: Int): Pair<Double, Int> {
-        var i = offset
-        val end = offset + length
-        var sumSq = 0.0
-        var peak = 0
-        var n = 0
-        while (i < end - 1) {
-            val lo = buf[i].toInt() and 0xff
-            val hi = buf[i + 1].toInt()
-            val sample = ((hi shl 8) or lo).toShort().toInt()
-            sumSq += (sample * sample).toDouble()
-            val abs = if (sample < 0) -sample else sample
-            if (abs > peak) peak = abs
-            n++
-            i += 2
-        }
-        val rms = if (n > 0) kotlin.math.sqrt(sumSq / n) else 0.0
-        return Pair(rms, peak)
-    }
-
-    private fun applyGainPcm16(buf: ByteArray, offset: Int, length: Int, gain: Float) {
-        var i = offset
-        val end = offset + length
-        while (i < end - 1) {
-            val lo = buf[i].toInt() and 0xff
-            val hi = buf[i + 1].toInt()
-            val sample = ((hi shl 8) or lo).toShort().toInt()
-            val amplified = (sample * gain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-            buf[i] = (amplified and 0xff).toByte()
-            buf[i + 1] = ((amplified shr 8) and 0xff).toByte()
-            i += 2
-        }
-    }
-
     // --- Cleanup -----------------------------------------------------------
 
     private fun cleanup() {
         running.set(false)
-        captureJob?.cancel()
-        captureJob = null
-
-        playbackJob?.cancel()
-        playbackJob = null
-
+        mic?.cleanup()
+        mic = null
+        playback?.cleanup()
+        playback = null
         // If we were mid-duck, the controller restores the saved gain so
         // a re-connect doesn't start with the attenuated value as the
-        // "real" one. Matches pre-Inc-H L1042–L1049.
+        // "real" one.
         ducker.cleanup()
         agentSpeaking = false
-        totalFramesWritten = 0L
-
-        // Drain anything still queued so we don't leak buffers.
-        while (true) {
-            val r = speakerQueue.tryReceive()
-            if (r.isFailure || r.isClosed) break
-        }
-
-        try {
-            audioRecord?.let {
-                if (it.recordingState == AudioRecord.RECORDSTATE_RECORDING) it.stop()
-                it.release()
-            }
-        } catch (e: Exception) {
-            Log.w(tag, "Error stopping AudioRecord: ${e.message}")
-        }
-        audioRecord = null
-
-        try {
-            audioTrack?.let {
-                if (it.playState == AudioTrack.PLAYSTATE_PLAYING) it.stop()
-                it.release()
-            }
-        } catch (e: Exception) {
-            Log.w(tag, "Error stopping AudioTrack: ${e.message}")
-        }
-        audioTrack = null
-
-        sendMicChunk = null
     }
 }
