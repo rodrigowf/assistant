@@ -189,6 +189,51 @@ class ChatController(
     internal val pendingAgentResumeForTest: PendingAgentResume? get() = pendingAgentResume
 
     // ─────────────────────────────────────────────────────────────────
+    // Inc 3.5 — orchestrator session conflict mediation
+    // ─────────────────────────────────────────────────────────────────
+
+    private val _orchestratorConflict = MutableStateFlow<OrchestratorConflict?>(null)
+    /**
+     * Non-null when a user-initiated orchestrator switch (`requestLoadOrchestratorSession`
+     * / `requestNewOrchestratorSession`) needs the user to decide between the
+     * live orchestrator and their request. UI observes this and shows a
+     * dialog; resolve via [resolveOrchestratorConflict].
+     */
+    val orchestratorConflict: StateFlow<OrchestratorConflict?> = _orchestratorConflict.asStateFlow()
+
+    private val _orchestratorOpenedToChat = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+    /**
+     * One-shot signal emitted when an orchestrator session was actually opened
+     * (the user's intent went through — directly or after resolving a
+     * conflict). MainActivity observes this and navigates to Chat; we
+     * deliberately do NOT navigate up-front because that would show the
+     * existing live orchestrator's chat behind the conflict dialog, which
+     * confuses the user (the dialog should overlay where they tapped, i.e.
+     * History).
+     */
+    val orchestratorOpenedToChat: SharedFlow<Unit> = _orchestratorOpenedToChat.asSharedFlow()
+
+    /**
+     * Captures the local_id the user *intended* to operate on. Set when a
+     * `request*` entry point proceeds past the probe; cleared on the matching
+     * orchestrator `session_started`. The WS-error router consults this when
+     * `orchestrator_active` arrives: with intent set we surface a conflict
+     * (mid-tap race), without intent we let the existing recovery path fire
+     * (cold-start / reconnect).
+     */
+    private val intendedOrchestratorLocalId =
+        java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+    /** The original tap that prompted a conflict. Used by [resolveOrchestratorConflict]. */
+    private var pendingConflictAction: PendingConflictAction? = null
+
+    private sealed class PendingConflictAction {
+        data class Load(val sessionId: String, val liveLocalId: String?, val onNeedsConnect: () -> Unit) :
+            PendingConflictAction()
+        data class New(val onNeedsConnect: () -> Unit) : PendingConflictAction()
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Toast / refresh debounce
     // ─────────────────────────────────────────────────────────────────
 
@@ -294,6 +339,11 @@ class ChatController(
                 b.sessionStatus.value = "idle"
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
                     connectionController.onSessionStartedForOrchestrator()
+                    // Inc 3.5: user-initiated switch converged — clear the
+                    // intent flag so a later cold-start / reconnect
+                    // `orchestrator_active` falls through to the recovery
+                    // path instead of opening a stale conflict dialog.
+                    intendedOrchestratorLocalId.set(null)
                 }
 
                 // Track the true JSONL session ID for voice resume. On
@@ -502,7 +552,15 @@ class ChatController(
                 b.messages.update { it + errorMessage }
                 b.sessionStatus.value = "error"
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR && event.message == "orchestrator_active") {
-                    connectionController.onOrchestratorActiveError()
+                    // Inc 3.5: with a user-initiated intent in flight, route to
+                    // the conflict mediator instead of silently resyncing via
+                    // recovery. The mediator probes the live pool and emits an
+                    // OnLoad conflict; if no intent is set, fall through to
+                    // the legacy recovery path (cold-start / reconnect).
+                    scope.launch {
+                        val routed = maybeRouteOrchestratorActiveToConflict()
+                        if (!routed) connectionController.onOrchestratorActiveError()
+                    }
                 }
             }
 
@@ -802,6 +860,170 @@ class ChatController(
     /** Pick the WebSocket endpoint that owns the currently-displayed session. */
     private fun currentEndpoint(): WebSocketEndpoint =
         if (_isOrchestratorSession.value) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
+
+    // ─────────────────────────────────────────────────────────────────
+    // Inc 3.5 — conflict-mediated orchestrator entry points
+    // ─────────────────────────────────────────────────────────────────
+
+    /**
+     * User intent: open an orchestrator session from History. Probes the live
+     * pool first, then either proceeds directly (same orch / no live orch) or
+     * emits an [OrchestratorConflict.OnLoad] for the UI to resolve.
+     */
+    fun requestLoadOrchestratorSession(
+        sessionId: String,
+        liveLocalId: String?,
+        onNeedsConnect: () -> Unit
+    ) {
+        scope.launch {
+            val live = getLivePool().firstOrNull { it.isOrchestrator }
+            when {
+                live == null -> {
+                    // No live orchestrator — proceed directly with the user's intent.
+                    intendedOrchestratorLocalId.set(liveLocalId)
+                    loadSession(sessionId, isOrchestrator = true, liveLocalId = liveLocalId)
+                    _orchestratorOpenedToChat.tryEmit(Unit)
+                }
+                live.sdkSessionId == sessionId -> {
+                    // Tapped the same orchestrator that's already live — proceed.
+                    intendedOrchestratorLocalId.set(live.localId)
+                    loadSession(sessionId, isOrchestrator = true, liveLocalId = live.localId)
+                    _orchestratorOpenedToChat.tryEmit(Unit)
+                }
+                else -> {
+                    pendingConflictAction = PendingConflictAction.Load(
+                        sessionId = sessionId,
+                        liveLocalId = liveLocalId,
+                        onNeedsConnect = onNeedsConnect,
+                    )
+                    _orchestratorConflict.value = OrchestratorConflict.OnLoad(
+                        targetSessionId = sessionId,
+                        targetLiveLocalId = liveLocalId,
+                        liveSdkSessionId = live.sdkSessionId,
+                        liveLocalId = live.localId,
+                    )
+                    // No navigation — dialog must overlay History (where the
+                    // user tapped). MainActivity navigates only after the
+                    // user resolves the conflict to a proceed action.
+                }
+            }
+        }
+    }
+
+    /**
+     * User intent: create a fresh orchestrator session. Probes the live pool
+     * first, then either proceeds directly or emits an
+     * [OrchestratorConflict.OnNew] for the UI to resolve.
+     */
+    fun requestNewOrchestratorSession(onNeedsConnect: () -> Unit) {
+        scope.launch {
+            val live = getLivePool().firstOrNull { it.isOrchestrator }
+            if (live == null) {
+                intendedOrchestratorLocalId.set(null) // newSession mints its own
+                newSession(onNeedsConnect)
+                _orchestratorOpenedToChat.tryEmit(Unit)
+            } else {
+                pendingConflictAction = PendingConflictAction.New(onNeedsConnect)
+                _orchestratorConflict.value = OrchestratorConflict.OnNew(
+                    liveSdkSessionId = live.sdkSessionId,
+                    liveLocalId = live.localId,
+                )
+                // No navigation — dialog must overlay where the user tapped.
+            }
+        }
+    }
+
+    /**
+     * Resolve a pending [orchestratorConflict]. The exact semantics depend on
+     * which conflict variant was emitted and the chosen resolution; see
+     * [OrchestratorConflictResolution] for the contract.
+     */
+    fun resolveOrchestratorConflict(decision: OrchestratorConflictResolution) {
+        val conflict = _orchestratorConflict.value ?: return
+        val action = pendingConflictAction
+        // Clear up front so subsequent ops don't see stale state.
+        _orchestratorConflict.value = null
+        pendingConflictAction = null
+
+        when (decision) {
+            OrchestratorConflictResolution.Cancel -> {
+                // No-op beyond clearing the conflict + action.
+                Log.d(TAG, "Orchestrator conflict cancelled by user")
+            }
+            OrchestratorConflictResolution.OpenExisting -> {
+                // Load the LIVE orchestrator's history into the orchestrator
+                // bucket — irrespective of which variant of conflict fired.
+                intendedOrchestratorLocalId.set(conflict.liveLocalId)
+                loadSession(
+                    sessionId = conflict.liveSdkSessionId,
+                    isOrchestrator = true,
+                    liveLocalId = conflict.liveLocalId,
+                )
+                _orchestratorOpenedToChat.tryEmit(Unit)
+            }
+            OrchestratorConflictResolution.DiscardAndProceed -> {
+                scope.launch {
+                    val ok = closePoolSession(conflict.liveLocalId)
+                    if (!ok) {
+                        Log.w(TAG, "Discard-and-proceed: closePoolSession rejected ${conflict.liveLocalId}")
+                        _toastMessage.tryEmit("Couldn't close the active session.")
+                        return@launch
+                    }
+                    // Mirror the optimistic UI update closeSession does so a
+                    // stale entry doesn't linger in the live-id map.
+                    _liveSessionIds.update { it - conflict.liveSdkSessionId }
+                    _sdkToLocalId.update { it - conflict.liveSdkSessionId }
+                    when (action) {
+                        is PendingConflictAction.Load -> {
+                            intendedOrchestratorLocalId.set(action.liveLocalId)
+                            loadSession(
+                                sessionId = action.sessionId,
+                                isOrchestrator = true,
+                                liveLocalId = action.liveLocalId,
+                            )
+                            _orchestratorOpenedToChat.tryEmit(Unit)
+                        }
+                        is PendingConflictAction.New -> {
+                            intendedOrchestratorLocalId.set(null)
+                            newSession(action.onNeedsConnect)
+                            _orchestratorOpenedToChat.tryEmit(Unit)
+                        }
+                        null -> {
+                            Log.w(TAG, "Discard-and-proceed: pendingConflictAction was null")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Called by the WS-error router when `orchestrator_active` arrives. With a
+     * user intent in flight, surface a conflict (mid-tap race). Without it,
+     * fall through to the existing recovery path.
+     *
+     * Returns true if the conflict path consumed the event (caller should NOT
+     * call recovery), false if the caller should proceed with recovery.
+     */
+    private suspend fun maybeRouteOrchestratorActiveToConflict(): Boolean {
+        if (intendedOrchestratorLocalId.get() == null) return false
+        val live = getLivePool().firstOrNull { it.isOrchestrator } ?: return false
+        // Build a conflict from the live orch + whatever the user originally
+        // intended. We don't always have the target sessionId at this point
+        // (recovery fires from within loadSession's openSessionOnEndpoint),
+        // so default to OnLoad with a synthetic empty target — the dialog
+        // text reads the live side anyway.
+        val intendedLocal = intendedOrchestratorLocalId.get()
+        _orchestratorConflict.value = OrchestratorConflict.OnLoad(
+            targetSessionId = bucket(WebSocketEndpoint.ORCHESTRATOR).currentSessionIdForPagination
+                ?: bucket(WebSocketEndpoint.ORCHESTRATOR).currentSessionId.value
+                ?: "",
+            targetLiveLocalId = intendedLocal,
+            liveSdkSessionId = live.sdkSessionId,
+            liveLocalId = live.localId,
+        )
+        return true
+    }
 
     // ─────────────────────────────────────────────────────────────────
     // History operations

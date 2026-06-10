@@ -224,6 +224,22 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         chatController.loadSession(sessionId, isOrchestrator, liveLocalId)
     fun loadMoreMessages() = chatController.loadMoreMessages()
     fun newSession() = chatController.newSession(onNeedsConnect = { connect() })
+
+    // Inc 3.5 — conflict-mediated orchestrator entry points.
+    val orchestratorConflict: StateFlow<com.assistant.peripheral.chat.OrchestratorConflict?> =
+        chatController.orchestratorConflict
+
+    /** One-shot signal: an orchestrator session was actually opened — navigate to Chat. */
+    val orchestratorOpenedToChat: SharedFlow<Unit> = chatController.orchestratorOpenedToChat
+
+    fun requestLoadOrchestratorSession(sessionId: String, liveLocalId: String?) =
+        chatController.requestLoadOrchestratorSession(sessionId, liveLocalId, onNeedsConnect = { connect() })
+
+    fun requestNewOrchestratorSession() =
+        chatController.requestNewOrchestratorSession(onNeedsConnect = { connect() })
+
+    fun resolveOrchestratorConflict(decision: com.assistant.peripheral.chat.OrchestratorConflictResolution) =
+        chatController.resolveOrchestratorConflict(decision)
     fun deleteSession(sessionId: String) = chatController.deleteSessionById(sessionId)
     fun renameSession(sessionId: String, title: String) = chatController.renameSessionById(sessionId, title)
     fun duplicateSession(sessionId: String) = chatController.duplicateSessionById(sessionId)
