@@ -18,6 +18,13 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        ndk {
+            abiFilters += setOf("armeabi-v7a", "arm64-v8a")
+        }
+    }
+
+    androidResources {
+        noCompress += "vosk-model-small-en-us-0.15"
     }
 
     buildTypes {
@@ -91,6 +98,9 @@ dependencies {
 
     // WebRTC for voice mode
     implementation("io.getstream:stream-webrtc-android:1.1.1")
+
+    // Vosk on-device STT (wake-word recognition)
+    implementation("com.alphacephei:vosk-android:0.3.47")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
