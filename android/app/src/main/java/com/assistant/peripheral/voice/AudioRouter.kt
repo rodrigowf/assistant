@@ -114,7 +114,15 @@ class AudioRouter(private val context: Context) {
         /** Which speaker mode the provider's AudioTrack should use. */
         val speakerMode: SpeakerMode
             get() = when (this) {
-                is BluetoothMedia, is SystemDefault -> SpeakerMode.MEDIA
+                is BluetoothMedia -> SpeakerMode.MEDIA
+                // SystemDefault hands routing to the OS (MODE_NORMAL, no
+                // pinning) but the AudioTrack itself is still tagged
+                // CALL — USAGE_VOICE_COMMUNICATION on M+, STREAM_VOICE_CALL
+                // on Lollipop. Samsung's MSM8916 audio policy keys the
+                // tfa9895 amp's volume gate off the active output's stream
+                // type: STREAM_MUSIC + mPhoneState=NORMAL + isVoIpActive=0
+                // → TFA_SETVOLUME=0 (silent amp). Tagging as CALL skips
+                // that gate while still letting the OS pick the device.
                 else -> SpeakerMode.CALL
             }
 

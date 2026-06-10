@@ -239,17 +239,21 @@ abstract class WebSocketPcmProvider(
             // the flag after the coroutine launches can race and
             // exit it immediately.
             running.set(true)
-            playback!!.start(speakerMode, preferredOutputDevice)
             // HAL settling delay between wake-word AudioRecord release
-            // and the call's AudioRecord open. Observed 2026-06-04:
-            // post-wake-word call mic came up with ~half the amplitude
-            // of a cold-start call until ~30s into the session. Symptom
-            // matches the Samsung HAL re-initialising AGC state between
-            // sources too quickly. 200ms is enough to let the HAL settle
-            // without a perceptible UX delay (the user already waited
-            // for wake-word recognition + WS handshake).
+            // (in WakeWordDetector.pause()) and the call's AudioRecord
+            // open. Observed 2026-06-04: post-wake-word call mic came
+            // up with ~half the amplitude of a cold-start call until
+            // ~30s into the session. Symptom matches the Samsung HAL
+            // re-initialising AGC state between sources too quickly.
+            // 200ms is enough to let the HAL settle without a
+            // perceptible UX delay (the user already waited for
+            // wake-word recognition + WS handshake).
             kotlinx.coroutines.delay(200L)
+            // Mic before speaker: the capture path is hot before the
+            // amp comes up, so the first speaker chunk can't echo into
+            // a mic that hadn't started yet.
             mic!!.start()
+            playback!!.start(speakerMode, preferredOutputDevice)
             _state.value = VoiceState.Active
             _events.tryEmit(VoiceEvent.SessionCreated)
             Log.i(tag, "$providerId voice session ready")
