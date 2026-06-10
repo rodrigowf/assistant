@@ -71,11 +71,32 @@ class WakeWordDetector(
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
 
-        // RMS threshold — 0..32767 scale. ~200 catches normal speech in a quiet room.
-        // Lowered from 300 after device cleanup reduced background noise — fewer ambient
-        // processes means the mic is quieter at rest, so the old threshold was rarely
-        // breached, giving fewer recognition opportunities per minute.
-        private const val RMS_THRESHOLD = 200.0
+        // RMS threshold — 0..32767 scale.
+        //
+        // Empirically retuned 2026-06-09 from 200 to 70 (Detour 5).
+        //
+        // Field observation: on the A300M with the post-Inc-9 detector, normal
+        // conversational "wake up" at arm's-length produced winMaxRms values of
+        // 35–82 across many test windows (gain=1.5, effective=133 with the old
+        // threshold). The recognizer only fired once across an 18-minute test
+        // session — the threshold was structurally too high for this device's
+        // mic at any practical gain. Background floor sits at RMS 4–11 with
+        // occasional spikes to 30–50 from ambient noise.
+        //
+        // New value of 70:
+        //  - At 100% gain (default), effective=70 — catches raised speech.
+        //  - At 130% gain, effective=54 — normal speech reliably crosses.
+        //  - At 150% gain, effective=47 — conversational speech crosses.
+        // The slider now provides a useful range from "raised voice only" to
+        // "conversational" instead of bottoming out at "still requires leaning
+        // in" as it did at threshold=200.
+        //
+        // Plan §7 originally forbade this change (cited the reverted 200→100
+        // commit). That ban was a guardrail against speculative tuning during
+        // the refactor. Empirical logcat capture during Detour 5's investigation
+        // justified lifting it — the change is grounded in measured device data,
+        // not theory.
+        private const val RMS_THRESHOLD = 70.0
 
         // How long audio must stay above threshold before we start recognizer (avoids clicks/pops)
         private const val ACTIVITY_HOLD_MS = 30L
