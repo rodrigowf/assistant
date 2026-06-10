@@ -24,11 +24,15 @@ import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
 import com.assistant.peripheral.voice.VoiceEvent
 import com.assistant.peripheral.voice.VoiceManager
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 // DataStore for app settings
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
@@ -39,6 +43,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         private const val TAG = "AssistantViewModel"
         private const val MAX_CACHED_SESSIONS = 5  // Keep at most 5 sessions in cache
         private const val MAX_CACHED_MESSAGES_PER_SESSION = 100  // Limit messages per cached session
+        // orchestrator_active recovery: 3 attempts at 0 / 500 / 2000 ms before
+        // giving up and surfacing the empty-state UI.
+        private const val MAX_RECOVERY_RETRIES = 3
     }
 
     private val dataStore = application.dataStore
@@ -50,6 +57,19 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     // Voice manager for WebRTC (created lazily when apiClient is available)
     private var voiceManager: VoiceManager? = null
+
+    // Completes on the first DataStore emission, after _settings.value has been
+    // populated from disk. connect() awaits this so the WS doesn't race the
+    // default Jetson URL against a persisted server URL — that mismatch put the
+    // app into a tight orchestrator_active loop (WS to one server, getLivePool
+    // to another, recovery hammering with the wrong local_id).
+    private val settingsLoaded = CompletableDeferred<Unit>()
+
+    // Bounded, single-flight state for recoverFromOrchestratorActive. Without
+    // these guards the error handler re-fires every ~200 ms with the same stale
+    // local_id and the backend's rejection keeps re-triggering it.
+    private val recoveryInFlight = AtomicBoolean(false)
+    private val recoveryAttempt = AtomicInteger(0)
 
     // Connection state
     val connectionState: StateFlow<ConnectionState> = webSocketManager.connectionState
@@ -354,6 +374,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // Sync button trigger setting to SharedPreferences so ButtonAccessibilityService can read it
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
                     .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
+                // Release any connect() callers waiting on the persisted serverUrl.
+                // _settings.value is now the persisted (or default) value; without
+                // this gate the WS would open on the default Jetson URL one beat
+                // before the persisted URL lands, leaving apiClient and the WS
+                // pointing at different servers (root cause of the orchestrator_active loop).
+                if (!settingsLoaded.isCompleted) settingsLoaded.complete(Unit)
                 // Update API client when server URL changes
                 val needNewVoiceManager = voiceManager == null || serverUrlChanged
                 if (needNewVoiceManager) {
@@ -665,6 +691,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 // an agent SessionStarted shouldn't change the orchestrator's empty-state flag.
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
                     _noActiveOrchestrator.value = false
+                    // Recovery converged — reset the back-off so a later legitimate
+                    // reconnect doesn't carry over a partial counter and trip the cap.
+                    recoveryAttempt.set(0)
                 }
 
                 // Track the true JSONL session ID for voice resume.
@@ -1019,25 +1048,77 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     /**
      * Backend rejected our orchestrator Start because the pool already has a
      * different orchestrator. This happens when our local_id is stale (e.g.
-     * the live orchestrator was created from another client). Refresh the
-     * pool and re-Start with the live local_id.
+     * the live orchestrator was created from another client, or the WS and
+     * apiClient point at different servers during a cold-start race). Refresh
+     * the pool and re-Start with the live local_id.
+     *
+     * Three guards keep this from turning into a tight loop on the first
+     * orchestrator_active that doesn't resolve:
+     *   - single-flight: drop re-entrant calls while one is in flight,
+     *   - back-off: 0 / 500 / 2000 ms before each attempt,
+     *   - retry cap: surface noActiveOrchestrator after [MAX_RECOVERY_RETRIES]
+     *     so the UI routes the user to History (the proven workaround).
+     * The retry counter is reset in the [WebSocketEvent.SessionStarted]
+     * handler — a successful start means recovery converged.
+     *
+     * If the WS itself is stale (e.g. disconnected without onFailure firing),
+     * we trigger a reconnect instead of sending into a void: the existing
+     * Connected handler at L562+ already knows how to send Start after the
+     * new handshake.
      */
     private fun recoverFromOrchestratorActive() {
+        if (!recoveryInFlight.compareAndSet(false, true)) {
+            Log.d(TAG, "recoverFromOrchestratorActive already in flight; ignoring")
+            return
+        }
         viewModelScope.launch {
-            val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
-            val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-            orchBucket.currentLocalId.value = live.localId
-            orchBucket.pendingResumeSessionId.value = live.sdkSessionId
-            persistOrchestratorLocalId(live.localId)
-            webSocketManager.send(
-                WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
-                endpoint = WebSocketEndpoint.ORCHESTRATOR
-            )
+            try {
+                val attempt = recoveryAttempt.getAndIncrement()
+                if (attempt >= MAX_RECOVERY_RETRIES) {
+                    Log.w(TAG, "recoverFromOrchestratorActive hit retry cap ($MAX_RECOVERY_RETRIES); routing user to History")
+                    _noActiveOrchestrator.value = true
+                    return@launch
+                }
+                if (attempt > 0) {
+                    // 500ms after the first failure, 2000ms after the second.
+                    delay(500L shl (attempt - 1))
+                }
+                val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
+                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
+                orchBucket.currentLocalId.value = live.localId
+                orchBucket.pendingResumeSessionId.value = live.sdkSessionId
+                persistOrchestratorLocalId(live.localId)
+                if (!webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
+                    // WS dropped silently — open a fresh one and let the Connected
+                    // handler resume the live orchestrator. Sending into a stale
+                    // socket would put us right back into this loop.
+                    Log.i(TAG, "WS not connected during recovery (attempt=$attempt); reconnecting")
+                    webSocketManager.connect(
+                        _settings.value.serverUrl,
+                        live.localId,
+                        WebSocketEndpoint.ORCHESTRATOR
+                    )
+                    return@launch
+                }
+                webSocketManager.send(
+                    WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                )
+            } finally {
+                recoveryInFlight.set(false)
+            }
         }
     }
 
     fun connect() {
         viewModelScope.launch {
+            // Wait for DataStore to surface the persisted serverUrl. On a cold
+            // start MainActivity.onResume() calls reconnectIfNeeded() before
+            // DataStore has emitted, so _settings.value still holds the default
+            // (Jetson) URL — meanwhile apiClient gets built ~1s later from the
+            // persisted (laptop) URL. The mismatch puts the recovery handler in
+            // an orchestrator_active loop forever.
+            settingsLoaded.await()
             // The implicit "connect" is for the orchestrator socket — the agent
             // socket is opened lazily in loadSession when the user picks a Claude session.
             webSocketManager.connect(
