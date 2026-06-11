@@ -2,2237 +2,365 @@ package com.assistant.peripheral.viewmodel
 
 import android.app.Application
 import android.content.Context
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.*
-import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import android.util.Log
 import com.assistant.peripheral.audio.AudioRecorder
+import com.assistant.peripheral.chat.ChatController
 import com.assistant.peripheral.data.*
 import com.assistant.peripheral.network.ApiClient
 import com.assistant.peripheral.network.DiscoveredServer
-import com.assistant.peripheral.network.LiveSession
-import com.assistant.peripheral.network.NetworkScanner
-import com.assistant.peripheral.network.WebSocketEndpoint
-import com.assistant.peripheral.voice.VoiceConfig
 import com.assistant.peripheral.network.WebSocketManager
 import com.assistant.peripheral.service.AssistantService
-import com.assistant.peripheral.voice.VoiceEvent
+import com.assistant.peripheral.voice.VoiceController
 import com.assistant.peripheral.voice.VoiceManager
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
-// DataStore for app settings
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+// Post-refactor (Inc 7): a thin coordinator. State lives in five
+// controllers — SettingsRepository (Inc 1), OrchestratorConnectionController
+// (Inc 2), ChatController (Inc 3), VoiceController (Inc 4),
+// SystemConfigController (Inc 5). The ViewModel:
+//   - constructs and wires the controllers
+//   - exposes their flows to Compose (every public flow is a pass-through
+//     or a `stateIn`/`shareIn` projection — no mutable flow fields)
+//   - drives the WS event collector that fans out to chat + voice
+//   - handles two pieces of Android glue: SharedPreferences mirror for
+//     AssistantService's button-trigger flag, and the AudioTrack body
+//     for the reconnect beep (Compose-free Android API).
 
 class AssistantViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "AssistantViewModel"
-        private const val MAX_CACHED_SESSIONS = 5  // Keep at most 5 sessions in cache
-        private const val MAX_CACHED_MESSAGES_PER_SESSION = 100  // Limit messages per cached session
-        // orchestrator_active recovery: 3 attempts at 0 / 500 / 2000 ms before
-        // giving up and surfacing the empty-state UI.
-        private const val MAX_RECOVERY_RETRIES = 3
     }
 
-    private val dataStore = application.dataStore
+    private val settingsRepository = com.assistant.peripheral.settings.SettingsRepository.create(application)
     private val webSocketManager = WebSocketManager()
     private val audioRecorder = AudioRecorder(application.applicationContext)
 
     // API client (created when server URL is known)
     private var apiClient: ApiClient? = null
 
-    // Voice manager for WebRTC (created lazily when apiClient is available)
-    private var voiceManager: VoiceManager? = null
-
-    // Completes on the first DataStore emission, after _settings.value has been
-    // populated from disk. connect() awaits this so the WS doesn't race the
-    // default Jetson URL against a persisted server URL — that mismatch put the
-    // app into a tight orchestrator_active loop (WS to one server, getLivePool
-    // to another, recovery hammering with the wrong local_id).
-    private val settingsLoaded = CompletableDeferred<Unit>()
-
-    // Bounded, single-flight state for recoverFromOrchestratorActive. Without
-    // these guards the error handler re-fires every ~200 ms with the same stale
-    // local_id and the backend's rejection keeps re-triggering it.
-    private val recoveryInFlight = AtomicBoolean(false)
-    private val recoveryAttempt = AtomicInteger(0)
-
-    // Connection state
-    val connectionState: StateFlow<ConnectionState> = webSocketManager.connectionState
-
-    // Per-endpoint chat state buckets — ensures events from the orchestrator
-    // socket and the agent socket never write into each other's UI state.
-    // The visible flows (messages, sessionStatus, hasMoreMessages, etc.) are
-    // derived: they mirror whichever bucket the user is currently looking at,
-    // chosen by [_isOrchestratorSession].
-    private class ChatStateBucket {
-        // The session id reported by the backend (sdk/JSONL id, or local_id on
-        // reconnect). Distinct per endpoint.
-        val currentSessionId = MutableStateFlow<String?>(null)
-        // The true JSONL/SDK id, set from pendingResumeSessionId on SessionStarted.
-        var jsonlSessionId: String? = null
-        // Local id — only meaningful for orchestrator (the pool is keyed by it);
-        // for agent the live local_id is generated per loadSession.
-        val currentLocalId = MutableStateFlow(UUID.randomUUID().toString())
-        // The conversation displayed for this tab.
-        val messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-        // Pagination state for message history.
-        var currentSessionIdForPagination: String? = null
-        var paginationStartIndex: Int = 0
-        val hasMoreMessages = MutableStateFlow(false)
-        // Streaming-message scratchpad — owned by this endpoint. Blocks are
-        // mutated in arrival order on the message itself; see mutateStreamingBlocks.
-        var streamingMessageId: String? = null
-        // Session lifecycle.
-        val sessionStatus = MutableStateFlow("idle")
-        // Used so SessionStarted can fetch history for the right sdk id.
-        val pendingResumeSessionId = MutableStateFlow<String?>(null)
-    }
-
-    private val buckets: Map<WebSocketEndpoint, ChatStateBucket> = mapOf(
-        WebSocketEndpoint.ORCHESTRATOR to ChatStateBucket(),
-        WebSocketEndpoint.AGENT to ChatStateBucket()
+    private val connectionController = com.assistant.peripheral.connection.OrchestratorConnectionController(
+        scope = viewModelScope,
+        settingsRepository = settingsRepository,
+        webSocketManager = webSocketManager,
+        getLivePool = { apiClient?.getLivePool() ?: emptyList() },
+        networkScan = { com.assistant.peripheral.network.NetworkScanner.scan(application) }
     )
 
-    private fun bucket(endpoint: WebSocketEndpoint): ChatStateBucket = buckets.getValue(endpoint)
-    private fun activeBucket(): ChatStateBucket = bucket(currentEndpoint())
-
-    // All sessions (from REST API)
-    private val _sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
-    val sessions: StateFlow<List<SessionInfo>> = _sessions.asStateFlow()
-
-    private val _sessionsLoading = MutableStateFlow(false)
-    val sessionsLoading: StateFlow<Boolean> = _sessionsLoading.asStateFlow()
-
-    // Live session pool (truly open sessions)
-    private val _liveSessionIds = MutableStateFlow<Set<String>>(emptySet())
-    val liveSessionIds: StateFlow<Set<String>> = _liveSessionIds.asStateFlow()
-
-    // Map from SDK/JSONL session id -> local_id so we can call /close (which is
-    // keyed by local_id) when the user closes from the sessions list (which keys
-    // by JSONL session id).
-    private val _sdkToLocalId = MutableStateFlow<Map<String, String>>(emptyMap())
-
-    // Whether current session is orchestrator — drives which bucket the UI sees.
-    private val _isOrchestratorSession = MutableStateFlow(false)
-    val isOrchestratorSession: StateFlow<Boolean> = _isOrchestratorSession.asStateFlow()
-
-    // ---- Public state, mirrored from the active bucket -------------------
-    // Each public flow follows _isOrchestratorSession and re-emits whichever
-    // bucket's flow matches. flatMapLatest cancels the previous inner
-    // collection on switch, so the UI never reads stale data from the
-    // background tab.
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    private fun <T> mirrorActive(initial: T, pick: (ChatStateBucket) -> StateFlow<T>): StateFlow<T> =
-        _isOrchestratorSession
-            .flatMapLatest { isOrch ->
-                pick(bucket(if (isOrch) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT))
-            }
-            .stateIn(viewModelScope, SharingStarted.Eagerly, initial)
-
-    val currentSessionId: StateFlow<String?> =
-        mirrorActive(null) { it.currentSessionId }
-
-    /**
-     * Local id for the *currently displayed* tab. The orchestrator's local id
-     * is the pool key on the backend; the agent's is generated per loadSession.
-     */
-    val currentLocalId: StateFlow<String> =
-        mirrorActive(buckets.getValue(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value) { it.currentLocalId }
-
-    val messages: StateFlow<List<ChatMessage>> =
-        mirrorActive(emptyList()) { it.messages }
-
-    val hasMoreMessages: StateFlow<Boolean> =
-        mirrorActive(false) { it.hasMoreMessages }
-
-    val sessionStatus: StateFlow<String> =
-        mirrorActive("idle") { it.sessionStatus }
-
-    private val _isLoadingMoreMessages = MutableStateFlow(false)
-    val isLoadingMoreMessages: StateFlow<Boolean> = _isLoadingMoreMessages.asStateFlow()
-
-    // Session cache - keeps messages and state for multiple sessions in memory
-
-    private data class CachedSession(
-        val messages: List<ChatMessage>,
-        val isOrchestrator: Boolean,
-        val paginationStartIndex: Int,
-        val hasMoreMessages: Boolean
+    private val chatController = ChatController(
+        scope = viewModelScope,
+        webSocketManager = webSocketManager,
+        settingsRepository = settingsRepository,
+        connectionController = connectionController,
+        listSessions = { apiClient?.listSessions() ?: emptyList() },
+        getLivePool = { apiClient?.getLivePool() ?: emptyList() },
+        getMessagesPaginated = { sid, limit, beforeIdx ->
+            apiClient?.getMessagesPaginated(sid, limit = limit, beforeIndex = beforeIdx)
+        },
+        closePoolSession = { localId -> apiClient?.closePoolSession(localId) ?: false },
+        deleteSession = { sid -> apiClient?.deleteSession(sid) ?: false },
+        renameSession = { sid, title -> apiClient?.renameSession(sid, title) ?: false },
+        duplicateSession = { sid -> apiClient?.duplicateSession(sid) },
+        truncateSession = { sid, drop -> apiClient?.truncateSession(sid, drop) ?: false },
+        forkSession = { sid, drop -> apiClient?.forkSession(sid, drop) }
     )
-    private val sessionCache = LinkedHashMap<String, CachedSession>(MAX_CACHED_SESSIONS, 0.75f, true)
+
+    private val voiceController = VoiceController(
+        scope = viewModelScope,
+        webSocketManager = webSocketManager,
+        chatController = chatController,
+        connectionController = connectionController,
+        audioRecorder = audioRecorder,
+        voiceManagerFactory = {
+            // Voice manager needs the current ApiClient — rebuilt on
+            // serverUrlChanged via the settings observer below. The
+            // factory closes over `apiClient` so the controller never
+            // touches it directly.
+            apiClient?.let { VoiceManager(application, it) }
+        },
+        getVoiceConfig = { apiClient?.getVoiceConfig() },
+        pauseWakeWord = { AssistantService.pauseWakeWord(application) },
+        resumeWakeWord = { AssistantService.resumeWakeWord(application) },
+        playBeep = { playReconnectBeep() }
+    )
+
+    private val systemConfigController = com.assistant.peripheral.system.SystemConfigController(
+        scope = viewModelScope,
+        getAssistantConfig = { apiClient?.getAssistantConfig() },
+        listMcpServers = { apiClient?.listMcpServers() ?: emptyMap() },
+        listOrchestratorModels = { apiClient?.listOrchestratorModels() ?: emptyList() },
+        listVoiceModels = { apiClient?.listVoiceModels() ?: emptyMap() },
+        listQwenHarnessModels = { apiClient?.listQwenHarnessModels() ?: emptyList() },
+        listSessionProviders = { apiClient?.listSessionProviders() ?: emptyList() },
+        listGoogleVoiceModels = { endpoint -> apiClient?.listGoogleVoiceModels(endpoint) ?: emptyList() },
+        updateAssistantConfig = { patch ->
+            apiClient?.updateAssistantConfig(patch)
+                ?: Result.failure(IllegalStateException("Not connected to a server"))
+        },
+    )
+
+    // ─────────────────────────────────────────────────────────────────
+    // Public facade — pass-throughs to controllers.
+    // ─────────────────────────────────────────────────────────────────
+
+    val connectionState: StateFlow<ConnectionState> = connectionController.connectionState
+
+    val sessions: StateFlow<List<SessionInfo>> = chatController.sessions
+    val sessionsLoading: StateFlow<Boolean> = chatController.sessionsLoading
+    val liveSessionIds: StateFlow<Set<String>> = chatController.liveSessionIds
+    val isOrchestratorSession: StateFlow<Boolean> = chatController.isOrchestratorSession
+    val currentSessionId: StateFlow<String?> = chatController.currentSessionId
+    val currentLocalId: StateFlow<String> = chatController.currentLocalId
+    val messages: StateFlow<List<ChatMessage>> = chatController.messages
+    val hasMoreMessages: StateFlow<Boolean> = chatController.hasMoreMessages
+    val sessionStatus: StateFlow<String> = chatController.sessionStatus
+    val isLoadingMoreMessages: StateFlow<Boolean> = chatController.isLoadingMoreMessages
+
+    val voiceState: StateFlow<VoiceState> = voiceController.voiceState
+    val voiceReconnectBanner: StateFlow<String?> = voiceController.voiceReconnectBanner
+    val vadState: StateFlow<String> = voiceController.vadState
+    val vadDurationMs: StateFlow<Long> = voiceController.vadDurationMs
+    val isMuted: StateFlow<Boolean> = voiceController.isMuted
+    val isRecording: StateFlow<Boolean> = voiceController.isRecording
 
     /**
-     * Ensure a streaming message exists in the given bucket. Creates one if needed.
+     * One-shot transient toast strings for the UI. Merged from chat +
+     * voice controllers. Compose collects via LaunchedEffect — there is
+     * no "clear" because each emission is a new event, not a held state.
      */
-    private fun ensureStreamingMessage(b: ChatStateBucket) {
-        if (b.streamingMessageId == null) {
-            val newId = UUID.randomUUID().toString()
-            b.streamingMessageId = newId
-            val newMessage = ChatMessage(
-                id = newId,
-                role = MessageRole.ASSISTANT,
-                content = "",
-                blocks = emptyList(),
-                isStreaming = true
-            )
-            b.messages.update { it + newMessage }
-        }
-    }
+    val toastMessage: SharedFlow<String> = merge(
+        chatController.toastMessages,
+        voiceController.toastMessages
+    ).shareIn(viewModelScope, SharingStarted.Eagerly, replay = 0)
 
-    // Recording state
-    private val _isRecording = MutableStateFlow(false)
-    val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
-
-    // Voice state
-    private val _voiceState = MutableStateFlow<VoiceState>(VoiceState.Off)
-    val voiceState: StateFlow<VoiceState> = _voiceState.asStateFlow()
-
-    // Increment B (voice subsystem refactor) — Silero VAD state from
-    // the backend ``voice_vad_state`` broadcast. ``idle`` until the
-    // manual-VAD pipeline transitions; ``listening``/``thinking``
-    // mirrors Silero. Composables observe this to render the
-    // "listening Ns" duration indicator.
-    private val _vadState = MutableStateFlow("idle")
-    val vadState: StateFlow<String> = _vadState.asStateFlow()
-    private val _vadDurationMs = MutableStateFlow(0L)
-    val vadDurationMs: StateFlow<Long> = _vadDurationMs.asStateFlow()
+    val noActiveOrchestrator: StateFlow<Boolean> = connectionController.noActiveOrchestrator
 
     /**
-     * The voice config in use for the *current* voice session, or null if
-     * voice isn't active. Captured at [startVoiceSession] time. We hold
-     * onto it so that an unplanned WS reconnect (e.g. keepalive ping
-     * timeout from the A300M's WiFi power-saving) can re-arm voice on
-     * the new WS with the same provider/model/voice instead of falling
-     * back to text mode and leaving the local mic loop pumping into a
-     * voiceless socket. Cleared in [finalizeVoiceStop].
+     * Non-null view of the SettingsRepository's `StateFlow<AppSettings?>`.
+     * Defaults to `AppSettings()` until the repository emits, matching the
+     * pre-refactor UI contract. Compose treats `settings` as always present.
      */
-    private var activeVoiceConfig: VoiceConfig? = null
+    val settings: StateFlow<AppSettings> = settingsRepository.settings
+        .filterNotNull()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
-    /**
-     * Inc 7: idempotency guard for [finalizeVoiceStop]. Set to true at the
-     * top of [finalizeVoiceStop] and cleared in [startVoiceSession]. Closes
-     * the duplicate-resume-intent race surfaced by Detour 3 testing —
-     * finalizeVoiceStop has three call sites (voice_ended ack timeout at
-     * voice_ending, WebSocketEvent.VoiceEnded/VoiceStopped handler, and
-     * stopVoiceSession's safety timeout); two can fire for the same
-     * session-end, sending two resumeWakeWord intents ~600-750 ms apart,
-     * the second tearing down the freshly-armed silence-monitor cycle.
-     *
-     * The structural fix is two-layer:
-     *  - This flag dedupes at the source (ViewModel).
-     *  - AssistantService.onStartCommand's EXTRA_RESUME_WAKE_WORD branch
-     *    short-circuits when voiceSessionActive is already false (defense
-     *    in depth against any other duplicate-intent paths).
-     */
-    private var voiceStopFinalized: Boolean = false
+    val discoveredServers: StateFlow<List<DiscoveredServer>> = connectionController.discoveredServers
+    val isScanning: StateFlow<Boolean> = connectionController.isScanning
 
-    /**
-     * One-shot transient message for the UI to display as a toast/snackbar.
-     * Set to a non-null string when something noteworthy happens (e.g. the
-     * audio router downgrades the user's requested output).  The UI consumes
-     * it and calls [clearToast] when it's done showing.
-     */
-    private val _toastMessage = MutableStateFlow<String?>(null)
-    val toastMessage: StateFlow<String?> = _toastMessage.asStateFlow()
-
-    fun clearToast() {
-        _toastMessage.value = null
-    }
-
-    /**
-     * Transient banner for the voice reconnect lifecycle. null = no
-     * banner. Set by [VoiceEvent.ReconnectWarning] (early heads-up
-     * from Gemini's goAway) and [VoiceEvent.Reconnecting] (relay is
-     * actively cycling). Cleared when [VoiceState] flips back to
-     * Active after the new upstream's setupComplete arrives.
-     */
-    private val _voiceReconnectBanner = MutableStateFlow<String?>(null)
-    val voiceReconnectBanner: StateFlow<String?> = _voiceReconnectBanner.asStateFlow()
-
-    // Muted state for voice
-    private val _isMuted = MutableStateFlow(false)
-    val isMuted: StateFlow<Boolean> = _isMuted.asStateFlow()
-
-    // True when we're connected to the server but no orchestrator session is live.
-    // The UI uses this to redirect from the Chat tab to History so the user can
-    // pick or create a session — we no longer auto-spawn one on connect.
-    private val _noActiveOrchestrator = MutableStateFlow(false)
-    val noActiveOrchestrator: StateFlow<Boolean> = _noActiveOrchestrator.asStateFlow()
-
-    // Settings
-    private val _settings = MutableStateFlow(AppSettings())
-    val settings: StateFlow<AppSettings> = _settings.asStateFlow()
-
-    // Network scan
-    private val _discoveredServers = MutableStateFlow<List<DiscoveredServer>>(emptyList())
-    val discoveredServers: StateFlow<List<DiscoveredServer>> = _discoveredServers.asStateFlow()
-
-    private val _isScanning = MutableStateFlow(false)
-    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
-
-    // System (backend) configuration — drives the System Settings tab.
-    // Loaded on demand when the System tab is opened and refreshed after
-    // each save. Independent of the App-side AppSettings.
-    private val _systemConfig = MutableStateFlow(SystemConfigState())
-    val systemConfig: StateFlow<SystemConfigState> = _systemConfig.asStateFlow()
-    private var savedFlashJob: kotlinx.coroutines.Job? = null
-
-    // Preference keys
-    private object PreferenceKeys {
-        val SERVER_URL = stringPreferencesKey("server_url")
-        val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
-        val ENABLE_WAKE_WORD = booleanPreferencesKey("enable_wake_word")
-        // Detour 3 naming swap-rename (plan §0.5):
-        //   TALK_WORD → turn-based single voice message ("push-to-talk")
-        //   WAKE_WORD → realtime WebRTC voice conversation
-        // On-the-wire keys use fully-qualified forms ("turn_talk_word",
-        // "realtime_wake_word") so the persistence layer is self-describing.
-        val TALK_WORD = stringPreferencesKey("turn_talk_word")
-        val WAKE_WORD = stringPreferencesKey("realtime_wake_word")
-        val THEME_MODE = stringPreferencesKey("theme_mode")
-        val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
-        val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
-        val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
-        val ECHO_DUCKING_GAIN = floatPreferencesKey("echo_ducking_gain")
-        val AUDIO_OUTPUT = stringPreferencesKey("audio_output")  // enum: EARPIECE / LOUDSPEAKER / BLUETOOTH
-        val ENABLE_BUTTON_TRIGGER = booleanPreferencesKey("enable_button_trigger")
-        val SAVED_SERVERS = stringPreferencesKey("saved_servers")
-        // Persisted across app restarts so we reattach to the same orchestrator
-        // session instead of forking a new one when getLivePool() races on launch.
-        val ORCHESTRATOR_LOCAL_ID = stringPreferencesKey("orchestrator_local_id")
-    }
-
-    // Saved servers are persisted as "label\turl|label\turl|..." — no quoting needed
-    // since labels/urls never contain tab or pipe in practice.
-    private fun encodeSavedServers(servers: List<SavedServer>): String =
-        servers.joinToString("|") { "${it.label}\t${it.url}" }
-
-    private fun decodeSavedServers(raw: String?): List<SavedServer> {
-        if (raw.isNullOrEmpty()) return emptyList()
-        return raw.split("|").mapNotNull { entry ->
-            val parts = entry.split("\t", limit = 2)
-            if (parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank())
-                SavedServer(parts[0], parts[1]) else null
-        }
-    }
+    val systemConfig: StateFlow<SystemConfigState> = systemConfigController.systemConfig
 
     init {
-        // Load settings from DataStore
+        // Observe settings. First emission restores the persisted orchestrator
+        // local_id (so cold start reattaches instead of forking a new UUID)
+        // and triggers `voiceController.onSettingsChanged` which builds the
+        // VoiceManager against the loaded serverUrl. Subsequent emissions
+        // refresh tunables; serverUrl changes rebuild apiClient + cascade
+        // through chat teardown + voice rebuild.
         viewModelScope.launch {
             var previousServerUrl: String? = null
             var firstEmission = true
-            dataStore.data.collect { preferences ->
-                val newServerUrl = preferences[PreferenceKeys.SERVER_URL] ?: AppSettings().serverUrl
+            settingsRepository.settings.collect { loaded ->
+                if (loaded == null) return@collect
+                val newServerUrl = loaded.serverUrl
                 val serverUrlChanged = previousServerUrl != null && previousServerUrl != newServerUrl
                 previousServerUrl = newServerUrl
 
-                // On first emission, restore the persisted orchestrator local_id so
-                // we reattach to the same session across app restarts. Without this,
-                // each launch generates a fresh UUID and forks a new orchestrator
-                // when getLivePool() races (e.g. backend slow on cold start).
                 if (firstEmission) {
                     firstEmission = false
-                    preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID]?.takeIf { it.isNotBlank() }?.let {
-                        bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value = it
+                    settingsRepository.persistedOrchestratorLocalId()?.let {
+                        chatController.setOrchestratorLocalIdForRestore(it)
                     }
                 }
 
-                _settings.value = AppSettings(
-                    serverUrl = newServerUrl,
-                    savedServers = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS]),
-                    autoConnect = preferences[PreferenceKeys.AUTO_CONNECT] ?: AppSettings().autoConnect,
-                    enableWakeWord = preferences[PreferenceKeys.ENABLE_WAKE_WORD] ?: AppSettings().enableWakeWord,
-                    talkWord = preferences[PreferenceKeys.TALK_WORD] ?: AppSettings().talkWord,
-                    wakeWord = preferences[PreferenceKeys.WAKE_WORD] ?: AppSettings().wakeWord,
-                    themeMode = try {
-                        ThemeMode.valueOf(preferences[PreferenceKeys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
-                    } catch (e: Exception) {
-                        ThemeMode.SYSTEM
-                    },
-                    micGainLevel = preferences[PreferenceKeys.MIC_GAIN_LEVEL] ?: 1.0f,
-                    wakeWordMicGainLevel = preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] ?: 1.0f,
-                    speakerVolumeLevel = preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] ?: 1.0f,
-                    echoDuckingGain = preferences[PreferenceKeys.ECHO_DUCKING_GAIN] ?: AppSettings().echoDuckingGain,
-                    audioOutput = AudioOutput.fromString(preferences[PreferenceKeys.AUDIO_OUTPUT]),
-                    enableButtonTrigger = preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] ?: false
-                )
-                // Sync button trigger setting to SharedPreferences so ButtonAccessibilityService can read it
                 getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
-                    .edit().putBoolean("button_trigger_enabled", _settings.value.enableButtonTrigger).apply()
-                // Release any connect() callers waiting on the persisted serverUrl.
-                // _settings.value is now the persisted (or default) value; without
-                // this gate the WS would open on the default Jetson URL one beat
-                // before the persisted URL lands, leaving apiClient and the WS
-                // pointing at different servers (root cause of the orchestrator_active loop).
-                if (!settingsLoaded.isCompleted) settingsLoaded.complete(Unit)
-                // Update API client when server URL changes
-                val needNewVoiceManager = voiceManager == null || serverUrlChanged
-                if (needNewVoiceManager) {
-                    apiClient = ApiClient(_settings.value.serverUrl)
-                    voiceManager?.release()
-                    voiceManager = VoiceManager(getApplication(), apiClient!!).also {
-                        it.setMicGain(_settings.value.micGainLevel)
-                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                        it.setAudioOutput(_settings.value.audioOutput)
-                    }
-                    setupVoiceManagerCallbacks()
-                } else {
-                    // Same server — just refresh tunables on the existing manager.
-                    // Rebuilding here on every DataStore emission was creating
-                    // overlapping VoiceManager instances + stale flow collectors,
-                    // which produced phantom duplicate sessions when the wake
-                    // word fired (two .start() calls slipping past the off-state
-                    // guard during the HTTP await).
-                    voiceManager?.let {
-                        it.setMicGain(_settings.value.micGainLevel)
-                        it.setEchoDuckingGain(_settings.value.echoDuckingGain)
-                        it.setAudioOutput(_settings.value.audioOutput)
-                    }
-                }
+                    .edit().putBoolean("button_trigger_enabled", loaded.enableButtonTrigger).apply()
 
-                // Clear all session state when switching servers
+                // Rebuild ApiClient on serverUrlChanged (or first emission).
+                if (apiClient == null || serverUrlChanged) {
+                    apiClient = ApiClient(loaded.serverUrl)
+                }
+                voiceController.onSettingsChanged(loaded)
+
                 if (serverUrlChanged) {
                     webSocketManager.disconnect()
-                    _sessions.value = emptyList()
-                    _liveSessionIds.value = emptySet()
-                    // The persisted id belongs to the previous server's pool — drop it
-                    // so we don't try to reattach to a session that doesn't exist here.
-                    clearOrchestratorLocalId()
-                    _isOrchestratorSession.value = false
-                    sessionCache.clear()
-                    // Wipe both per-endpoint buckets.
-                    for (b in buckets.values) {
-                        b.messages.value = emptyList()
-                        b.currentSessionId.value = null
-                        b.currentLocalId.value = UUID.randomUUID().toString()
-                        b.pendingResumeSessionId.value = null
-                        b.jsonlSessionId = null
-                        b.hasMoreMessages.value = false
-                        b.currentSessionIdForPagination = null
-                        b.paginationStartIndex = 0
-                        b.streamingMessageId = null
-                        b.sessionStatus.value = "idle"
-                    }
+                    settingsRepository.clearOrchestratorLocalId()
+                    chatController.onServerUrlChanged()
                 }
             }
         }
 
-        // Collect WebSocket events — every event is tagged with the endpoint
-        // that emitted it so we can route into the correct per-tab bucket.
-        //
-        // Run the dispatch on Dispatchers.Default so JSON parsing,
-        // bucket updates, and provider event handling don't compete
-        // with the UI thread.  All bucket fields are MutableStateFlow,
-        // which Compose's collectAsState() observes safely from any
-        // thread — no Main hop is needed for the writes themselves.
+        // Collect WS events on Dispatchers.Default so JSON parsing and
+        // bucket updates don't compete with the UI thread. Chat events go
+        // to ChatController; voice-bound events go to VoiceController.
         viewModelScope.launch(Dispatchers.Default) {
             webSocketManager.events.collect { (endpoint, event) ->
-                handleWebSocketEvent(endpoint, event)
-            }
-        }
-    }
-
-    private fun setupVoiceManagerCallbacks() {
-        voiceManager?.let { vm ->
-            // Collect voice state changes
-            viewModelScope.launch {
-                vm.state.collect { state ->
-                    _voiceState.value = state
-                    // Clear the reconnect banner once we're back in Active —
-                    // setupComplete on the new upstream re-fires
-                    // voice_status:ready which flips state here.
-                    if (state == VoiceState.Active && _voiceReconnectBanner.value != null) {
-                        _voiceReconnectBanner.value = null
-                    }
-                }
-            }
-
-            // Collect voice events for transcription and messages
-            viewModelScope.launch {
-                vm.events.collect { event ->
-                    handleVoiceEvent(event)
-                }
-            }
-
-            // Set callback for mirroring OpenAI events to backend via WebSocket
-            // Web frontend: wsRef.current?.send({ type: "voice_event", event })
-            vm.setVoiceEventCallback { eventMap ->
-                // Voice runs on the orchestrator socket only.
-                webSocketManager.send(
-                    WebSocketMessage.VoiceEvent(eventMap),
-                    endpoint = WebSocketEndpoint.ORCHESTRATOR
-                )
-            }
-
-            // Set callback for forwarding mic chunks to backend (WebSocket
-            // voice providers — Qwen and friends).  WebRTC providers
-            // bypass this; their audio goes peer-to-peer.
-            vm.setMicChunkCallback { audioB64 ->
-                webSocketManager.send(
-                    WebSocketMessage.VoiceAudioIn(audioB64),
-                    endpoint = WebSocketEndpoint.ORCHESTRATOR
-                )
-            }
-        }
-    }
-
-    private fun handleVoiceEvent(event: VoiceEvent) {
-        // Voice always belongs to the orchestrator bucket — even if the user is
-        // currently looking at a Claude Code session in the agent tab.
-        val b = bucket(WebSocketEndpoint.ORCHESTRATOR)
-        when (event) {
-            is VoiceEvent.UserTranscript -> {
-                // Add user voice transcript as a message
-                // Web frontend: optsRef.current.onUserTranscript?.(transcript)
-                val userMessage = ChatMessage(
-                    role = MessageRole.USER,
-                    content = "[voice] ${event.text}",
-                    blocks = listOf(MessageBlock.Text("[voice] ${event.text}"))
-                )
-                b.messages.update { it + userMessage }
-            }
-            is VoiceEvent.TextComplete -> {
-                // Add assistant response as a message
-                // Web frontend: optsRef.current.onAssistantComplete?.(transcript)
-                if (event.text.isNotEmpty()) {
-                    val assistantMessage = ChatMessage(
-                        role = MessageRole.ASSISTANT,
-                        content = event.text,
-                        blocks = listOf(MessageBlock.Text(event.text))
-                    )
-                    b.messages.update { it + assistantMessage }
-                }
-            }
-            is VoiceEvent.ToolUse -> {
-                // Tool call from assistant
-                // Web frontend: optsRef.current.onToolUse?.(callId, name, args)
-                Log.d(TAG, "Voice tool use: ${event.name}")
-                // Tool results are handled by backend and sent back via voice_command
-            }
-            is VoiceEvent.TurnComplete -> {
-                // Turn completed
-                // Web frontend: optsRef.current.onTurnComplete?.()
-                b.sessionStatus.value = "idle"
-            }
-            is VoiceEvent.Error -> {
-                Log.e(TAG, "Voice error: ${event.message}")
-                val errorMessage = ChatMessage(
-                    role = MessageRole.SYSTEM,
-                    content = "Voice error: ${event.message}"
-                )
-                b.messages.update { it + errorMessage }
-            }
-            is VoiceEvent.RoutingFallback -> {
-                // Surface as a toast so the user knows the requested
-                // audio output was downgraded (e.g. JBL on OpenAI).
-                Log.w(TAG, "Routing fallback: ${event.message}")
-                _toastMessage.value = event.message
-            }
-            is VoiceEvent.ReconnectWarning -> {
-                // Upstream goAway — fired ~30-60s before the actual cut.
-                // Light banner + a soft beep so the user can pause speech.
-                val secs = event.timeLeftSeconds
-                _voiceReconnectBanner.value = if (secs != null) {
-                    "Pausing in ~${secs}s to reconnect…"
-                } else {
-                    "Reconnecting shortly…"
-                }
-                playReconnectBeep()
-            }
-            is VoiceEvent.Reconnecting -> {
-                // Active cutover — mic chunks are being dropped right now.
-                _voiceReconnectBanner.value = "Pausing for a second to reconnect…"
-            }
-            is VoiceEvent.SessionEnded -> {
-                _voiceState.value = VoiceState.Off
-                _isMuted.value = false
-                _voiceReconnectBanner.value = null
-            }
-            is VoiceEvent.SessionCreated -> {
-                Log.d(TAG, "Voice session created")
-            }
-            is VoiceEvent.SpeechStarted -> {
-                Log.d(TAG, "User speech started")
-            }
-            is VoiceEvent.SpeechStopped -> {
-                Log.d(TAG, "User speech stopped")
-            }
-            is VoiceEvent.TextDelta -> {
-                // Streaming assistant text - could update UI incrementally
-                // For now, we wait for TextComplete
-            }
-        }
-    }
-
-    private fun handleWebSocketEvent(endpoint: WebSocketEndpoint, event: WebSocketEvent) {
-        // Every chat-mutating event writes into THIS endpoint's bucket — never
-        // into whichever tab the user happens to be looking at. That's the core
-        // isolation guarantee.
-        val b = bucket(endpoint)
-        when (event) {
-            is WebSocketEvent.Connected -> {
-                // Agent socket: the orchestrator-probe is irrelevant here. Just send the
-                // pending Start so the backend resumes/loads the requested Claude session.
-                if (endpoint == WebSocketEndpoint.AGENT) {
-                    pendingAgentResume?.let { pending ->
-                        pendingAgentResume = null
-                        webSocketManager.send(
-                            WebSocketMessage.Start(
-                                localId = pending.localId,
-                                resumeSdkId = pending.resumeSdkId
-                            ),
-                            endpoint = WebSocketEndpoint.AGENT
-                        )
-                    }
-                    return
-                }
-
-                // Orchestrator socket below.
-                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-                // If newSession() armed a pending Start (because it had to connect first),
-                // honour it and skip the resume-existing lookup.
-                if (pendingNewSessionStart) {
-                    pendingNewSessionStart = false
-                    _noActiveOrchestrator.value = false
-                    _isOrchestratorSession.value = true
-                    persistOrchestratorLocalId(orchBucket.currentLocalId.value)
-                    webSocketManager.send(
-                        WebSocketMessage.Start(localId = orchBucket.currentLocalId.value),
-                        endpoint = WebSocketEndpoint.ORCHESTRATOR
-                    )
-                    return
-                }
-
-                // Check for an existing orchestrator on the server and reconnect to it.
-                // If there isn't one, do NOT auto-spawn one — the UI will route the
-                // user to History so they can pick or explicitly create a session.
-                //
-                // The pool lookup is retried once on miss because the backend can be
-                // slow to publish pool state on cold start; without the retry, a
-                // transient empty response would falsely trigger the empty-state UI.
-                viewModelScope.launch {
-                    suspend fun findOrchestrator(): LiveSession? =
-                        apiClient?.getLivePool()?.find { it.isOrchestrator }
-
-                    var existing = findOrchestrator()
-                    if (existing == null) {
-                        kotlinx.coroutines.delay(400L)
-                        existing = findOrchestrator()
-                    }
-
-                    if (existing != null) {
-                        // Reuse the existing orchestrator's local_id so the backend
-                        // recognises this as a reconnect (not a new/conflicting session)
-                        orchBucket.currentLocalId.value = existing.localId
-                        _isOrchestratorSession.value = true
-                        persistOrchestratorLocalId(existing.localId)
-                        // Also track the sdk session id so we can load history
-                        orchBucket.pendingResumeSessionId.value = existing.sdkSessionId
-                        _noActiveOrchestrator.value = false
-
-                        // If voice was active when the WS dropped, re-arm
-                        // voice on the new WS instead of falling back to
-                        // text mode. Without this, the local mic capture
-                        // loop kept pushing chunks at a voiceless socket
-                        // and the user-facing session appeared frozen.
-                        val voiceCfg = activeVoiceConfig
-                        if (voiceCfg != null) {
-                            Log.i(TAG, "WS reconnect during live voice — re-arming via voice_start")
-                            webSocketManager.send(
-                                WebSocketMessage.VoiceStart(
-                                    localId = existing.localId,
-                                    resumeSdkId = existing.sdkSessionId,
-                                    voiceProvider = voiceCfg.provider,
-                                    voiceModel = voiceCfg.model,
-                                    voiceName = voiceCfg.voice,
-                                    voiceTranscriptionLanguage = voiceCfg.transcriptionLanguage,
-                                    voiceEndpoint = voiceCfg.endpoint.takeIf { it.isNotBlank() },
-                                ),
-                                endpoint = WebSocketEndpoint.ORCHESTRATOR
-                            )
-                        } else {
-                            webSocketManager.send(
-                                WebSocketMessage.Start(
-                                    localId = existing.localId,
-                                    resumeSdkId = existing.sdkSessionId
-                                ),
-                                endpoint = WebSocketEndpoint.ORCHESTRATOR
-                            )
-                        }
-                    } else {
-                        // No live orchestrator. Stay idle — UI will switch to History.
-                        orchBucket.pendingResumeSessionId.value = null
-                        _noActiveOrchestrator.value = true
-                        // Make sure stale session list is loaded so History has something to show.
-                        refreshSessions()
-                    }
-                }
-            }
-
-            is WebSocketEvent.SessionStarted -> {
-                b.currentSessionId.value = event.sessionId
-                b.sessionStatus.value = "idle"
-                // Only clear noActiveOrchestrator if THIS is the orchestrator endpoint —
-                // an agent SessionStarted shouldn't change the orchestrator's empty-state flag.
-                if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
-                    _noActiveOrchestrator.value = false
-                    // Recovery converged — reset the back-off so a later legitimate
-                    // reconnect doesn't carry over a partial counter and trip the cap.
-                    recoveryAttempt.set(0)
-                }
-
-                // Track the true JSONL session ID for voice resume.
-                // On reconnect the backend returns local_id as session_id — use
-                // pendingResumeSessionId (the actual SDK/JSONL id) instead.
-                b.jsonlSessionId = b.pendingResumeSessionId.value ?: event.sessionId
-
-                // If this is a voice session AND we initiated it, forward
-                // the session.update payload to OpenAI (system prompt +
-                // tool definitions). When we are NOT the initiator (the
-                // session is voice because another client on the same
-                // orchestrator started it), skip the forward — we don't
-                // own a provider transport on this device, and queueing
-                // the update just leaks state for a future start the
-                // user may never trigger here.
-                if (event.voiceInitiator) {
-                    event.voiceSessionUpdate?.let { update ->
-                        voiceManager?.handleBackendCommand(update)
-                    }
-                }
-
-                // Load/refresh messages when reconnecting to an existing session.
-                // Always re-fetch from server so any messages that arrived while the
-                // WebSocket was disconnected are not lost.
-                val resumeId = b.pendingResumeSessionId.value
-                if (resumeId != null) {
-                    viewModelScope.launch {
-                        try {
-                            val paginated = apiClient?.getMessagesPaginated(resumeId, limit = 50)
-                                ?: com.assistant.peripheral.network.PaginatedMessages(emptyList(), 0, false, 0)
-                            // Always update — server is the source of truth
-                            b.currentSessionIdForPagination = resumeId
-                            b.paginationStartIndex = paginated.startIndex
-                            b.hasMoreMessages.value = paginated.hasMore
-                            b.messages.value = paginated.messages
-                        } catch (_: Exception) {
-                            // Best-effort — keep existing messages if fetch fails
-                        }
-                    }
-                }
-                b.pendingResumeSessionId.value = null
-                refreshSessions()
-            }
-
-            is WebSocketEvent.SessionStopped -> {
-                b.sessionStatus.value = "disconnected"
-            }
-
-            is WebSocketEvent.Status -> {
-                b.sessionStatus.value = event.status
-            }
-
-            is WebSocketEvent.Disconnected -> {
-                // Reset the disconnected endpoint's streaming scratchpad. Other
-                // endpoint's bucket is untouched.
-                b.streamingMessageId = null
-                b.sessionStatus.value = "disconnected"
-            }
-
-            is WebSocketEvent.MessageStart -> {
-                b.streamingMessageId = event.messageId
-
-                val newMessage = ChatMessage(
-                    id = event.messageId,
-                    role = MessageRole.ASSISTANT,
-                    content = "",
-                    blocks = emptyList(),
-                    isStreaming = true
-                )
-                b.messages.update { it + newMessage }
-                b.sessionStatus.value = "streaming"
-            }
-
-            is WebSocketEvent.TextDelta -> {
-                // Ensure streaming message exists (orchestrator doesn't send message_start)
-                ensureStreamingMessage(b)
-                mutateStreamingBlocks(b) { blocks ->
-                    val last = blocks.lastOrNull()
-                    if (last is MessageBlock.Text && last.isStreaming) {
-                        blocks.dropLast(1) + last.copy(text = last.text + event.text)
-                    } else {
-                        blocks + MessageBlock.Text(event.text, isStreaming = true)
-                    }
-                }
-            }
-
-            is WebSocketEvent.TextComplete -> {
-                ensureStreamingMessage(b)
-                mutateStreamingBlocks(b) { blocks ->
-                    val last = blocks.lastOrNull()
-                    if (last is MessageBlock.Text && last.isStreaming) {
-                        blocks.dropLast(1) + MessageBlock.Text(event.text, isStreaming = false)
-                    } else {
-                        blocks + MessageBlock.Text(event.text, isStreaming = false)
-                    }
-                }
-            }
-
-            is WebSocketEvent.ThinkingDelta -> {
-                ensureStreamingMessage(b)
-                mutateStreamingBlocks(b) { blocks ->
-                    val last = blocks.lastOrNull()
-                    if (last is MessageBlock.Thinking && last.isStreaming) {
-                        blocks.dropLast(1) + last.copy(text = last.text + event.text)
-                    } else {
-                        blocks + MessageBlock.Thinking(event.text, isStreaming = true)
-                    }
-                }
-            }
-
-            is WebSocketEvent.ThinkingComplete -> {
-                ensureStreamingMessage(b)
-                mutateStreamingBlocks(b) { blocks ->
-                    val last = blocks.lastOrNull()
-                    if (last is MessageBlock.Thinking && last.isStreaming) {
-                        blocks.dropLast(1) + MessageBlock.Thinking(event.text, isStreaming = false)
-                    } else {
-                        blocks + MessageBlock.Thinking(event.text, isStreaming = false)
-                    }
-                }
-            }
-
-            is WebSocketEvent.ToolUse -> {
-                ensureStreamingMessage(b)
-                // Finalize any trailing streaming text/thinking block so its
-                // progress indicator clears when the model switches to a tool.
-                mutateStreamingBlocks(b) { blocks ->
-                    val finalized = when (val last = blocks.lastOrNull()) {
-                        is MessageBlock.Text -> if (last.isStreaming)
-                            blocks.dropLast(1) + last.copy(isStreaming = false) else blocks
-                        is MessageBlock.Thinking -> if (last.isStreaming)
-                            blocks.dropLast(1) + last.copy(isStreaming = false) else blocks
-                        else -> blocks
-                    }
-                    finalized + MessageBlock.ToolUse(
-                        toolUseId = event.toolUseId,
-                        toolName = event.toolName,
-                        toolInput = event.toolInput,
-                        isExecuting = false,
-                        isComplete = false
-                    )
-                }
-                b.sessionStatus.value = "tool_use"
-            }
-
-            is WebSocketEvent.ToolExecuting -> {
-                mutateStreamingBlocks(b) { blocks ->
-                    blocks.map { block ->
-                        if (block is MessageBlock.ToolUse && block.toolUseId == event.toolUseId) {
-                            block.copy(isExecuting = true)
-                        } else block
-                    }
-                }
-            }
-
-            is WebSocketEvent.ToolResult -> {
-                mutateStreamingBlocks(b) { blocks ->
-                    blocks.map { block ->
-                        if (block is MessageBlock.ToolUse && block.toolUseId == event.toolUseId) {
-                            block.copy(
-                                result = event.output,
-                                isError = event.isError,
-                                isExecuting = false,
-                                isComplete = true
-                            )
-                        } else block
-                    }
-                }
-            }
-
-            is WebSocketEvent.MessageEnd, is WebSocketEvent.TurnComplete -> {
-                b.streamingMessageId?.let { messageId ->
-                    b.messages.update { messages ->
-                        messages.map { msg ->
-                            if (msg.id == messageId) {
-                                msg.copy(
-                                    isStreaming = false,
-                                    blocks = msg.blocks.map { block ->
-                                        when (block) {
-                                            is MessageBlock.Text -> block.copy(isStreaming = false)
-                                            is MessageBlock.Thinking -> block.copy(isStreaming = false)
-                                            else -> block
-                                        }
-                                    }
-                                )
-                            } else msg
-                        }
-                    }
-                }
-                b.streamingMessageId = null
-                b.sessionStatus.value = "idle"
-
-                // Update cache with new messages — only meaningful for the
-                // currently-displayed tab (cache is keyed by sdk session id).
-                if (endpoint == currentEndpoint()) {
-                    saveCurrentSessionToCache()
-                }
-            }
-
-            is WebSocketEvent.CompactComplete -> {
-                // Add compact divider
-                val compactMessage = ChatMessage(
-                    role = MessageRole.SYSTEM,
-                    content = "",
-                    blocks = listOf(MessageBlock.Compact(event.summary))
-                )
-                b.messages.update { it + compactMessage }
-            }
-
-            is WebSocketEvent.VoiceVadState -> {
-                // Increment B (voice subsystem refactor) — mirror the
-                // backend's typed VAD state into observable flows so
-                // composables can render the "listening Ns" indicator
-                // when the user gets stuck in speech_started (the
-                // symptom of Bug 2 — 203s freeze).
-                _vadState.value = event.state
-                _vadDurationMs.value = event.durationMs
-            }
-
-            is WebSocketEvent.VoiceError -> {
-                // Typed voice-provider error. Render a categorised
-                // system message; the legacy ``Error`` event still
-                // arrives behind this one (back-compat) but its detail
-                // is the same string the user just saw, so the
-                // duplicate display is acceptable in Increment A. A
-                // later cleanup can suppress the legacy event once all
-                // clients have migrated.
-                val hintLine = event.recoveryHint?.let { "\n$it" } ?: ""
-                val docLine = event.providerDocUrl?.let { "\n$it" } ?: ""
-                val errorMessage = ChatMessage(
-                    role = MessageRole.SYSTEM,
-                    content = "Voice error (${event.category}): ${event.message}$hintLine$docLine"
-                )
-                b.messages.update { it + errorMessage }
-                if (!event.recoverable) {
-                    b.sessionStatus.value = "error"
-                }
-            }
-
-            is WebSocketEvent.Error -> {
-                val errorMessage = ChatMessage(
-                    role = MessageRole.SYSTEM,
-                    content = "Error: ${event.message}${event.detail?.let { "\n$it" } ?: ""}"
-                )
-                b.messages.update { it + errorMessage }
-                b.sessionStatus.value = "error"
-                // If the orchestrator rejected our Start because another orchestrator
-                // is already active (stale local_id), recover by refreshing the live
-                // pool and re-Starting against the actual pool key.
-                if (endpoint == WebSocketEndpoint.ORCHESTRATOR && event.message == "orchestrator_active") {
-                    recoverFromOrchestratorActive()
-                }
-            }
-
-            is WebSocketEvent.VoiceCommand -> {
-                // Forward voice_command from backend to OpenAI via VoiceManager.
-                // Voice runs only on the orchestrator socket.
-                @Suppress("UNCHECKED_CAST")
-                val command = event.command as? Map<String, Any?> ?: return
-                voiceManager?.handleBackendCommand(command)
-            }
-
-            is WebSocketEvent.VoiceProviderEvent -> {
-                // Provider event mirrored from backend (WebSocket
-                // voice providers — Qwen et al.).  The provider parses
-                // it and emits VoiceEvent on its own flow.
-                voiceManager?.handleProviderEvent(event.event)
-            }
-
-            is WebSocketEvent.VoiceAudioOut -> {
-                // Speaker chunk for WebSocket voice providers.
-                voiceManager?.pushSpeakerChunk(event.audioBase64)
-            }
-
-            is WebSocketEvent.VoiceEnding -> {
-                // Backend has begun teardown — show "Ending..." until
-                // VoiceEnded confirms. If the user already pressed stop,
-                // we're already in Ending and the timer is running;
-                // otherwise (agent-initiated end) we set state here.
-                if (_voiceState.value !is VoiceState.Ending) {
-                    _voiceState.value = VoiceState.Ending
-                    endingTimeoutJob?.cancel()
-                    endingTimeoutJob = viewModelScope.launch {
-                        kotlinx.coroutines.delay(ENDING_ACK_TIMEOUT_MS)
-                        Log.w(TAG, "voice_ended ack timeout after voice_ending")
-                        finalizeVoiceStop()
-                    }
-                }
-            }
-
-            is WebSocketEvent.VoiceEnded,
-            is WebSocketEvent.VoiceStopped -> {
-                // Backend teardown finished (or AI-initiated end via the
-                // legacy voice_stopped event). Finalize any in-progress
-                // streaming message (TurnComplete never arrives in voice
-                // mode), then do the local teardown via finalizeVoiceStop.
-                b.streamingMessageId?.let { messageId ->
-                    b.messages.update { messages ->
-                        messages.map { msg ->
-                            if (msg.id == messageId) {
-                                msg.copy(
-                                    isStreaming = false,
-                                    blocks = msg.blocks.map { block ->
-                                        when (block) {
-                                            is MessageBlock.Text -> block.copy(isStreaming = false)
-                                            is MessageBlock.Thinking -> block.copy(isStreaming = false)
-                                            else -> block
-                                        }
-                                    }
-                                )
-                            } else msg
-                        }
-                    }
-                }
-                b.streamingMessageId = null
-                b.sessionStatus.value = "idle"
-                finalizeVoiceStop()
-            }
-
-            is WebSocketEvent.VoiceTranscript -> {
-                // Handle voice transcripts (not used with realtime API)
-            }
-
-            // These are handled by ViewModel directly, not from WebSocket
-            is WebSocketEvent.SessionList,
-            is WebSocketEvent.HistoryLoaded,
-            is WebSocketEvent.ToolProgress -> {}
-        }
-    }
-
-    /**
-     * Mutate the in-flight assistant message's block list in place, preserving
-     * arrival order. The web frontend's reducer in useChatInstance.ts works
-     * the same way: each new text delta either extends the trailing streaming
-     * text block or starts a new one after whatever tool blocks were emitted
-     * since the last text. This is the source of truth for ordering — never
-     * rebuild blocks from per-type scratchpad buffers, which loses the order
-     * between text and tool calls.
-     */
-    private fun mutateStreamingBlocks(
-        b: ChatStateBucket,
-        transform: (List<MessageBlock>) -> List<MessageBlock>
-    ) {
-        val messageId = b.streamingMessageId ?: return
-        b.messages.update { messages ->
-            messages.map { msg ->
-                if (msg.id == messageId) msg.copy(blocks = transform(msg.blocks)) else msg
-            }
-        }
-    }
-
-    /**
-     * Backend rejected our orchestrator Start because the pool already has a
-     * different orchestrator. This happens when our local_id is stale (e.g.
-     * the live orchestrator was created from another client, or the WS and
-     * apiClient point at different servers during a cold-start race). Refresh
-     * the pool and re-Start with the live local_id.
-     *
-     * Three guards keep this from turning into a tight loop on the first
-     * orchestrator_active that doesn't resolve:
-     *   - single-flight: drop re-entrant calls while one is in flight,
-     *   - back-off: 0 / 500 / 2000 ms before each attempt,
-     *   - retry cap: surface noActiveOrchestrator after [MAX_RECOVERY_RETRIES]
-     *     so the UI routes the user to History (the proven workaround).
-     * The retry counter is reset in the [WebSocketEvent.SessionStarted]
-     * handler — a successful start means recovery converged.
-     *
-     * If the WS itself is stale (e.g. disconnected without onFailure firing),
-     * we trigger a reconnect instead of sending into a void: the existing
-     * Connected handler at L562+ already knows how to send Start after the
-     * new handshake.
-     */
-    private fun recoverFromOrchestratorActive() {
-        if (!recoveryInFlight.compareAndSet(false, true)) {
-            Log.d(TAG, "recoverFromOrchestratorActive already in flight; ignoring")
-            return
-        }
-        viewModelScope.launch {
-            try {
-                val attempt = recoveryAttempt.getAndIncrement()
-                if (attempt >= MAX_RECOVERY_RETRIES) {
-                    Log.w(TAG, "recoverFromOrchestratorActive hit retry cap ($MAX_RECOVERY_RETRIES); routing user to History")
-                    _noActiveOrchestrator.value = true
-                    return@launch
-                }
-                if (attempt > 0) {
-                    // 500ms after the first failure, 2000ms after the second.
-                    delay(500L shl (attempt - 1))
-                }
-                val live = apiClient?.getLivePool()?.find { it.isOrchestrator } ?: return@launch
-                val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-                orchBucket.currentLocalId.value = live.localId
-                orchBucket.pendingResumeSessionId.value = live.sdkSessionId
-                persistOrchestratorLocalId(live.localId)
-                if (!webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
-                    // WS dropped silently — open a fresh one and let the Connected
-                    // handler resume the live orchestrator. Sending into a stale
-                    // socket would put us right back into this loop.
-                    Log.i(TAG, "WS not connected during recovery (attempt=$attempt); reconnecting")
-                    webSocketManager.connect(
-                        _settings.value.serverUrl,
-                        live.localId,
-                        WebSocketEndpoint.ORCHESTRATOR
-                    )
-                    return@launch
-                }
-                webSocketManager.send(
-                    WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
-                    endpoint = WebSocketEndpoint.ORCHESTRATOR
-                )
-            } finally {
-                recoveryInFlight.set(false)
+                chatController.handleWebSocketEvent(endpoint, event)
+                voiceController.handleVoiceWebSocketEvent(event)
             }
         }
     }
 
     fun connect() {
         viewModelScope.launch {
-            // Wait for DataStore to surface the persisted serverUrl. On a cold
-            // start MainActivity.onResume() calls reconnectIfNeeded() before
-            // DataStore has emitted, so _settings.value still holds the default
-            // (Jetson) URL — meanwhile apiClient gets built ~1s later from the
-            // persisted (laptop) URL. The mismatch puts the recovery handler in
-            // an orchestrator_active loop forever.
-            settingsLoaded.await()
-            // The implicit "connect" is for the orchestrator socket — the agent
-            // socket is opened lazily in loadSession when the user picks a Claude session.
-            webSocketManager.connect(
-                _settings.value.serverUrl,
-                bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value
-            )
+            connectionController.connect(chatController.orchestratorCurrentLocalId())
         }
     }
 
     fun disconnect() {
-        webSocketManager.disconnect()
+        connectionController.disconnect()
     }
 
-    /**
-     * Persist the orchestrator local_id so reopening the app reattaches to the same
-     * session instead of forking a new one. Called whenever we learn the current
-     * orchestrator id (from getLivePool() or a session_started event).
-     */
-    private fun persistOrchestratorLocalId(localId: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ORCHESTRATOR_LOCAL_ID] = localId
-            }
-        }
-    }
-
-    private fun clearOrchestratorLocalId() {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences.remove(PreferenceKeys.ORCHESTRATOR_LOCAL_ID)
-            }
-        }
-    }
-
-    /**
-     * Re-establish the WebSocket connection if currently disconnected.
-     * Call from MainActivity.onResume() so the app reconnects after screen lock/unlock
-     * or switching back from another app.
-     */
     fun reconnectIfNeeded() {
-        val state = connectionState.value
-        if (state is ConnectionState.Disconnected || state is ConnectionState.Error) {
-            Log.d(TAG, "Reconnecting WebSocket on foreground (was $state)")
-            connect()
-        }
+        connectionController.reconnectIfNeeded(chatController.orchestratorCurrentLocalId())
     }
 
-    fun sendMessage(text: String) {
-        if (text.isBlank()) return
+    // ─────────────────────────────────────────────────────────────────
+    // Chat operations — pass-throughs to ChatController.
+    // ─────────────────────────────────────────────────────────────────
+
+    fun sendMessage(text: String) = chatController.sendMessage(text)
+    fun interrupt() = chatController.interrupt()
+    fun compact() = chatController.compact()
+    fun refreshSessions() = chatController.refreshSessions()
+    fun closeSession(sessionId: String) = chatController.closeSession(sessionId)
+    fun loadSession(sessionId: String, isOrchestrator: Boolean = false, liveLocalId: String? = null) =
+        chatController.loadSession(sessionId, isOrchestrator, liveLocalId)
+    fun loadMoreMessages() = chatController.loadMoreMessages()
+    fun newSession() = chatController.newSession(onNeedsConnect = { connect() })
+
+    // Inc 3.5 — conflict-mediated orchestrator entry points.
+    val orchestratorConflict: StateFlow<com.assistant.peripheral.chat.OrchestratorConflict?> =
+        chatController.orchestratorConflict
+
+    /** One-shot signal: an orchestrator session was actually opened — navigate to Chat. */
+    val orchestratorOpenedToChat: SharedFlow<Unit> = chatController.orchestratorOpenedToChat
+
+    fun requestLoadOrchestratorSession(sessionId: String, liveLocalId: String?) =
+        chatController.requestLoadOrchestratorSession(sessionId, liveLocalId, onNeedsConnect = { connect() })
+
+    fun requestNewOrchestratorSession() =
+        chatController.requestNewOrchestratorSession(onNeedsConnect = { connect() })
+
+    fun resolveOrchestratorConflict(decision: com.assistant.peripheral.chat.OrchestratorConflictResolution) =
+        chatController.resolveOrchestratorConflict(decision)
+    fun deleteSession(sessionId: String) = chatController.deleteSessionById(sessionId)
+    fun renameSession(sessionId: String, title: String) = chatController.renameSessionById(sessionId, title)
+    fun duplicateSession(sessionId: String) = chatController.duplicateSessionById(sessionId)
+    fun truncateSession(sessionId: String, dropLastN: Int, explicitLocalId: String? = null) =
+        chatController.truncateSessionById(sessionId, dropLastN, explicitLocalId)
+    fun forkSession(sessionId: String, dropLastN: Int) = chatController.forkSessionById(sessionId, dropLastN)
+    fun rewindCurrentSessionAt(uiIndex: Int) = chatController.rewindCurrentSessionAt(uiIndex)
+    fun forkCurrentSessionAt(uiIndex: Int) = chatController.forkCurrentSessionAt(uiIndex)
+
+    // ─────────────────────────────────────────────────────────────────
+    // Voice operations — pass-throughs to VoiceController (Inc 4).
+    // ─────────────────────────────────────────────────────────────────
+
+    fun startRecording() = voiceController.startRecording()
+    fun stopRecording() = voiceController.stopRecording()
+    fun startVoiceSession() = voiceController.startVoiceSession()
+    fun stopVoiceSession() = voiceController.stopVoiceSession()
+    fun toggleMute() = voiceController.toggleMute()
+
+    fun isBluetoothAudioAvailable(): Boolean = voiceController.isBluetoothAudioAvailable()
+    fun isWiredHeadphoneAvailable(): Boolean = voiceController.isWiredHeadphoneAvailable()
+
+    // Network discovery — pass-throughs to the connection controller (Inc 2).
+    fun scanForServers() = connectionController.scanForServers()
+    fun connectToDiscoveredServer(server: DiscoveredServer) =
+        connectionController.connectToDiscoveredServer(server)
+
+    // ─────────────────────────────────────────────────────────────────
+    // Settings setters — delegate to SettingsRepository. Side effects
+    // beyond DataStore (voice manager + audio router updates) live in
+    // VoiceController via [VoiceController.onSettingsChanged].
+    // ─────────────────────────────────────────────────────────────────
 
-        // Add user message to the active tab's bucket.
-        val userMessage = ChatMessage(
-            role = MessageRole.USER,
-            content = text,
-            blocks = listOf(MessageBlock.Text(text))
-        )
-        activeBucket().messages.update { it + userMessage }
-
-        // Send to server — route to whichever socket owns the current chat tab.
-        webSocketManager.send(WebSocketMessage.Send(text), endpoint = currentEndpoint())
-    }
-
-    fun interrupt() {
-        webSocketManager.send(WebSocketMessage.Interrupt, endpoint = currentEndpoint())
-        activeBucket().sessionStatus.value = "interrupted"
-    }
-
-    fun compact() {
-        webSocketManager.send(WebSocketMessage.Compact, endpoint = currentEndpoint())
-    }
-
-    // Session management - debounced to prevent rapid duplicate refreshes
-    private var lastRefreshTime = 0L
-    private val refreshDebounceMs = 500L
-
-    fun refreshSessions() {
-        val now = System.currentTimeMillis()
-        if (now - lastRefreshTime < refreshDebounceMs) {
-            // Skip if we just refreshed
-            return
-        }
-        lastRefreshTime = now
-
-        viewModelScope.launch {
-            _sessionsLoading.value = true
-
-            // Fetch both sessions and live pool in parallel
-            val sessions = apiClient?.listSessions() ?: emptyList()
-            val livePool = apiClient?.getLivePool() ?: emptyList()
-
-            // Extract SDK session IDs that are truly live
-            _liveSessionIds.value = livePool.map { it.sdkSessionId }.toSet()
-            _sdkToLocalId.value = livePool.associate { it.sdkSessionId to it.localId }
-
-            _sessions.value = sessions.sortedByDescending { it.lastActivity }
-            _sessionsLoading.value = false
-        }
-    }
-
-    /**
-     * Close a live (open) pool session without deleting its history.
-     * Called from the session list "Close" dropdown action. The session id passed
-     * in is the JSONL/SDK id; we look up its local_id from the live pool because
-     * /close is keyed by local_id.
-     *
-     * If closing the currently-loaded session, also clears the in-memory chat so
-     * the UI doesn't keep showing a session that's no longer running.
-     */
-    fun closeSession(sessionId: String) {
-        viewModelScope.launch {
-            // Look up local_id; refresh the pool first if we don't have one cached.
-            var localId = _sdkToLocalId.value[sessionId]
-            if (localId == null) {
-                val livePool = apiClient?.getLivePool() ?: emptyList()
-                _sdkToLocalId.value = livePool.associate { it.sdkSessionId to it.localId }
-                localId = _sdkToLocalId.value[sessionId]
-            }
-            if (localId == null) {
-                Log.w(TAG, "closeSession: no live local_id for $sessionId — already closed?")
-                return@launch
-            }
-
-            val ok = apiClient?.closePoolSession(localId) ?: false
-            if (!ok) {
-                Log.w(TAG, "closeSession: backend rejected close for $localId")
-                return@launch
-            }
-
-            // Optimistic UI update so the user sees the "open" badge disappear
-            // without waiting for the next refresh.
-            _liveSessionIds.update { it - sessionId }
-            _sdkToLocalId.update { it - sessionId }
-
-            // If we just closed the current session in either bucket, clear that
-            // bucket's chat. If the closed session was the orchestrator, also drop
-            // the persisted local_id so we don't try to reattach on next launch.
-            for ((ep, b) in buckets) {
-                if (b.currentSessionIdForPagination == sessionId || b.currentLocalId.value == localId) {
-                    b.messages.value = emptyList()
-                    b.currentSessionId.value = null
-                    b.currentSessionIdForPagination = null
-                    b.hasMoreMessages.value = false
-                    b.currentLocalId.value = UUID.randomUUID().toString()
-                    if (ep == WebSocketEndpoint.ORCHESTRATOR) {
-                        clearOrchestratorLocalId()
-                        _isOrchestratorSession.value = false
-                    }
-                }
-            }
-            sessionCache.remove(sessionId)
-
-            // Refresh in the background to reconcile with server state
-            refreshSessions()
-        }
-    }
-
-    /**
-     * Open a session in the appropriate tab. [liveLocalId] is the live pool's
-     * local_id for the session if it's currently running on the backend
-     * (passed from the History list, where SessionInfo.localId carries it).
-     * For orchestrator reconnect this is *required* — the backend's pool is
-     * keyed by local_id, so generating a fresh UUID here would be rejected
-     * with `orchestrator_active`.
-     */
-    fun loadSession(
-        sessionId: String,
-        isOrchestrator: Boolean = false,
-        liveLocalId: String? = null
-    ) {
-        viewModelScope.launch {
-            // Save current session to cache before switching
-            saveCurrentSessionToCache()
-
-            val endpoint = if (isOrchestrator) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
-            val b = bucket(endpoint)
-            // For orchestrator reattach we must reuse the live local_id; for agent
-            // sessions the local_id can be fresh per switch (the backend keys agent
-            // sessions by local_id but each switch is a new pool entry).
-            val localIdForStart = liveLocalId ?: UUID.randomUUID().toString()
-
-            // Check if session is already cached
-            val cached = sessionCache[sessionId]
-            if (cached != null) {
-                // Restore from cache - instant switch!
-                b.currentSessionIdForPagination = sessionId
-                b.paginationStartIndex = cached.paginationStartIndex
-                b.hasMoreMessages.value = cached.hasMoreMessages
-                b.messages.value = cached.messages
-                b.currentLocalId.value = localIdForStart
-                _isOrchestratorSession.value = cached.isOrchestrator
-                if (isOrchestrator) _noActiveOrchestrator.value = false
-
-                openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
-                return@launch
-            }
-
-            // Not cached - fetch from server with pagination
-            val paginated = apiClient?.getMessagesPaginated(sessionId, limit = 50)
-                ?: com.assistant.peripheral.network.PaginatedMessages(emptyList(), 0, false, 0)
-
-            if (paginated.totalCount > 0 || paginated.messages.isNotEmpty()) {
-                // Store pagination state for loading more
-                b.currentSessionIdForPagination = sessionId
-                b.paginationStartIndex = paginated.startIndex
-                b.hasMoreMessages.value = paginated.hasMore
-                b.messages.value = paginated.messages
-                b.currentLocalId.value = localIdForStart
-                _isOrchestratorSession.value = isOrchestrator
-                if (isOrchestrator) _noActiveOrchestrator.value = false
-
-                openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
-            }
-        }
-    }
-
-    /**
-     * Connect (if needed) the given endpoint and Start the session on it.
-     *
-     * Crucially, this does NOT touch the *other* endpoint's socket: opening a
-     * Claude Code (agent) session must not tear down the orchestrator socket,
-     * which may be running an active realtime voice conversation.
-     *
-     * If the target socket is already connected we re-Start it on the new
-     * local_id immediately. Otherwise we queue the Start via pendingAgentResume
-     * (or the bucket's pendingResumeSessionId for orchestrator) and the
-     * Connected handler sends it once the handshake completes.
-     */
-    private fun openSessionOnEndpoint(
-        endpoint: WebSocketEndpoint,
-        localId: String,
-        resumeSdkId: String
-    ) {
-        if (webSocketManager.isConnected(endpoint)) {
-            webSocketManager.send(
-                WebSocketMessage.Start(localId = localId, resumeSdkId = resumeSdkId),
-                endpoint = endpoint
-            )
-            return
-        }
-        when (endpoint) {
-            WebSocketEndpoint.AGENT -> {
-                pendingAgentResume = PendingAgentResume(localId, resumeSdkId)
-            }
-            WebSocketEndpoint.ORCHESTRATOR -> {
-                // The orchestrator-probe in the Connected handler will pick up
-                // the live orchestrator on the server and resume it. We don't
-                // need pendingNewSessionStart — that path is for fresh sessions.
-                bucket(WebSocketEndpoint.ORCHESTRATOR).pendingResumeSessionId.value = resumeSdkId
-            }
-        }
-        webSocketManager.connect(_settings.value.serverUrl, localId, endpoint)
-    }
-
-    /**
-     * Save the *active* tab's session state to cache for quick restoration later.
-     * Limits messages to prevent TransactionTooLargeException.
-     */
-    private fun saveCurrentSessionToCache() {
-        val b = activeBucket()
-        val sessionId = b.currentSessionIdForPagination ?: return
-        if (b.messages.value.isEmpty()) return
-
-        val messagesToCache = if (b.messages.value.size > MAX_CACHED_MESSAGES_PER_SESSION) {
-            b.messages.value.takeLast(MAX_CACHED_MESSAGES_PER_SESSION)
-        } else {
-            b.messages.value
-        }
-
-        sessionCache[sessionId] = CachedSession(
-            messages = messagesToCache,
-            isOrchestrator = _isOrchestratorSession.value,
-            paginationStartIndex = b.paginationStartIndex,
-            hasMoreMessages = b.hasMoreMessages.value || b.messages.value.size > MAX_CACHED_MESSAGES_PER_SESSION
-        )
-
-        while (sessionCache.size > MAX_CACHED_SESSIONS) {
-            val oldestKey = sessionCache.keys.firstOrNull() ?: break
-            sessionCache.remove(oldestKey)
-        }
-    }
-
-    /**
-     * Load older messages when user scrolls up (reverse infinite scroll).
-     * Messages are prepended to the existing list.
-     */
-    fun loadMoreMessages() {
-        val b = activeBucket()
-        if (_isLoadingMoreMessages.value || !b.hasMoreMessages.value) return
-        val sessionId = b.currentSessionIdForPagination ?: return
-
-        viewModelScope.launch {
-            _isLoadingMoreMessages.value = true
-            try {
-                val paginated = apiClient?.getMessagesPaginated(
-                    sessionId,
-                    limit = 50,
-                    beforeIndex = b.paginationStartIndex
-                ) ?: return@launch
-
-                if (paginated.messages.isNotEmpty()) {
-                    b.messages.update { paginated.messages + it }
-                    b.paginationStartIndex = paginated.startIndex
-                    b.hasMoreMessages.value = paginated.hasMore
-                }
-            } finally {
-                _isLoadingMoreMessages.value = false
-            }
-        }
-    }
-
-    fun newSession() {
-        // newSession is orchestrator-only — operate on the orchestrator bucket.
-        val b = bucket(WebSocketEndpoint.ORCHESTRATOR)
-
-        // Save current session to cache before starting new one
-        saveCurrentSessionToCache()
-
-        // Generate new local ID for the orchestrator's pool entry
-        b.currentLocalId.value = UUID.randomUUID().toString()
-        b.messages.value = emptyList()
-        b.currentSessionIdForPagination = null
-        b.paginationStartIndex = 0
-        b.hasMoreMessages.value = false
-        _noActiveOrchestrator.value = false
-
-        // Persist so a later reconnect finds this same session instead of forking.
-        persistOrchestratorLocalId(b.currentLocalId.value)
-
-        // Mark the active tab as orchestrator so subsequent send() routes there.
-        _isOrchestratorSession.value = true
-
-        // (Re)connect WebSocket and explicitly start the new session.
-        if (webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
-            // Already connected — the Connected handler won't re-fire, so send Start ourselves.
-            webSocketManager.send(WebSocketMessage.Stop, endpoint = WebSocketEndpoint.ORCHESTRATOR)
-            webSocketManager.send(
-                WebSocketMessage.Start(localId = b.currentLocalId.value),
-                endpoint = WebSocketEndpoint.ORCHESTRATOR
-            )
-        } else {
-            // Not connected — connect, then send Start once Connected fires.
-            // We arm pendingNewSessionStart so the Connected handler picks it up.
-            pendingNewSessionStart = true
-            connect()
-        }
-    }
-
-    // Set by newSession() when we need to (re)connect first; consumed in the Connected handler.
-    private var pendingNewSessionStart: Boolean = false
-
-    // When loadSession() opens an agent session but the AGENT socket isn't connected yet,
-    // we stash the resume sdk id here. The Connected(AGENT) handler picks it up and
-    // sends the Start. Avoids racing send() against an in-flight WS handshake.
-    private data class PendingAgentResume(val localId: String, val resumeSdkId: String)
-    private var pendingAgentResume: PendingAgentResume? = null
-
-    /** Pick the WebSocket endpoint that owns the currently-displayed session. */
-    private fun currentEndpoint(): WebSocketEndpoint =
-        if (_isOrchestratorSession.value) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
-
-    fun deleteSession(sessionId: String) {
-        viewModelScope.launch {
-            val success = apiClient?.deleteSession(sessionId) ?: false
-            if (success) {
-                _sessions.update { it.filter { s -> s.sessionId != sessionId } }
-                // Also remove from cache
-                sessionCache.remove(sessionId)
-            } else {
-                Log.w(TAG, "deleteSession: backend rejected $sessionId")
-                _toastMessage.value = "Delete failed."
-            }
-        }
-    }
-
-    fun renameSession(sessionId: String, title: String) {
-        viewModelScope.launch {
-            val success = apiClient?.renameSession(sessionId, title) ?: false
-            if (success) {
-                _sessions.update { sessions ->
-                    sessions.map { s ->
-                        if (s.sessionId == sessionId) s.copy(title = title) else s
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Duplicate a session: copies its JSONL + title under a fresh UUID.
-     * Refreshes the session list so the copy appears at the top.
-     */
-    fun duplicateSession(sessionId: String) {
-        viewModelScope.launch {
-            val newId = apiClient?.duplicateSession(sessionId)
-            if (newId != null) {
-                lastRefreshTime = 0L  // bypass refresh debounce
-                refreshSessions()
-                _toastMessage.value = "Conversation duplicated."
-            } else {
-                Log.w(TAG, "duplicateSession: backend rejected $sessionId")
-                _toastMessage.value = "Duplicate failed."
-            }
-        }
-    }
-
-    /**
-     * Rewind a session: drop the last [dropLastN] visible messages.
-     * The session must be closed first (backend rejects truncate on live
-     * sessions, including the orchestrator). [explicitLocalId] is the live
-     * pool's local_id for [sessionId] when known by the caller — required
-     * for orchestrator rewinds, since `_sdkToLocalId` only reliably tracks
-     * agent sessions.
-     */
-    fun truncateSession(
-        sessionId: String,
-        dropLastN: Int,
-        explicitLocalId: String? = null,
-    ) {
-        viewModelScope.launch {
-            // Close the live session first if we can identify one. Prefer the
-            // explicit local_id (from the active bucket); fall back to the
-            // SDK→local map for callers that only know the JSONL id.
-            val localId = explicitLocalId ?: _sdkToLocalId.value[sessionId]
-            if (localId != null) {
-                apiClient?.closePoolSession(localId)
-                _liveSessionIds.update { it - sessionId }
-                _sdkToLocalId.update { it - sessionId }
-            }
-
-            val ok = apiClient?.truncateSession(sessionId, dropLastN) ?: false
-            if (!ok) {
-                Log.w(TAG, "truncateSession: backend rejected $sessionId drop=$dropLastN")
-                _toastMessage.value = "Rewind failed — session may still be open."
-                return@launch
-            }
-
-            // If we were displaying this session in either bucket, clear it; user
-            // can re-open from the session list to see the rewound state.
-            for ((_, b) in buckets) {
-                if (b.currentSessionIdForPagination == sessionId) {
-                    b.messages.value = emptyList()
-                    b.currentSessionId.value = null
-                    b.currentSessionIdForPagination = null
-                    b.hasMoreMessages.value = false
-                    b.jsonlSessionId = null
-                }
-            }
-            sessionCache.remove(sessionId)
-
-            _toastMessage.value = "Conversation rewound."
-            lastRefreshTime = 0L
-            refreshSessions()
-        }
-    }
-
-    /**
-     * Fork a session: duplicate, then drop the last [dropLastN] messages in the copy.
-     * The original session is untouched.
-     */
-    fun forkSession(sessionId: String, dropLastN: Int) {
-        viewModelScope.launch {
-            val newId = apiClient?.forkSession(sessionId, dropLastN)
-            if (newId != null) {
-                lastRefreshTime = 0L
-                refreshSessions()
-                _toastMessage.value = "Conversation forked."
-            } else {
-                Log.w(TAG, "forkSession: backend rejected $sessionId drop=$dropLastN")
-                _toastMessage.value = "Fork failed."
-            }
-        }
-    }
-
-    /**
-     * Rewind the *currently displayed* session at the UI-visible message
-     * position [uiIndex]. Converts to a bottom-relative drop count so the
-     * action survives pagination — the frontend may only have the most
-     * recent page loaded, so an absolute top-index would be unreliable.
-     *
-     * Passes the bucket's live local_id through to [truncateSession] so the
-     * orchestrator path (which isn't reliably indexed in `_sdkToLocalId`)
-     * can still close the pool session before the truncate call.
-     */
-    fun rewindCurrentSessionAt(uiIndex: Int) {
-        val b = activeBucket()
-        val sessionId = b.jsonlSessionId ?: b.currentSessionIdForPagination ?: b.currentSessionId.value
-        if (sessionId == null) {
-            Log.w(TAG, "rewindCurrentSessionAt: no session id on active bucket")
-            return
-        }
-        val total = b.messages.value.size
-        val dropLastN = (total - 1 - uiIndex).coerceAtLeast(0)
-        truncateSession(sessionId, dropLastN, explicitLocalId = b.currentLocalId.value)
-    }
-
-    /**
-     * Fork the *currently displayed* session at the UI-visible message
-     * position [uiIndex]. See [rewindCurrentSessionAt] for the index
-     * mapping; the original session is left untouched.
-     */
-    fun forkCurrentSessionAt(uiIndex: Int) {
-        val b = activeBucket()
-        val sessionId = b.jsonlSessionId ?: b.currentSessionIdForPagination ?: b.currentSessionId.value
-        if (sessionId == null) {
-            Log.w(TAG, "forkCurrentSessionAt: no session id on active bucket")
-            return
-        }
-        val total = b.messages.value.size
-        val dropLastN = (total - 1 - uiIndex).coerceAtLeast(0)
-        forkSession(sessionId, dropLastN)
-    }
-
-    // Recording
-    fun startRecording() {
-        viewModelScope.launch {
-            val success = audioRecorder.startRecording()
-            if (success) {
-                _isRecording.value = true
-            } else {
-                val errorMessage = ChatMessage(
-                    role = MessageRole.SYSTEM,
-                    content = "Failed to start recording. Check microphone permission."
-                )
-                activeBucket().messages.update { it + errorMessage }
-            }
-        }
-    }
-
-    fun stopRecording() {
-        viewModelScope.launch {
-            val base64Audio = audioRecorder.stopRecording()
-            _isRecording.value = false
-
-            if (base64Audio != null) {
-                val userMessage = ChatMessage(
-                    role = MessageRole.USER,
-                    content = "[Voice message]",
-                    blocks = listOf(MessageBlock.Text("[Voice message]"))
-                )
-                activeBucket().messages.update { it + userMessage }
-
-                // Send audio to server — route to whichever socket owns the current chat tab.
-                webSocketManager.send(
-                    WebSocketMessage.SendAudio(base64Audio, "wav"),
-                    endpoint = currentEndpoint()
-                )
-            }
-        }
-    }
-
-    // Voice session controls (WebRTC)
-    fun startVoiceSession() {
-        // Voice only works with orchestrator sessions
-        if (!_isOrchestratorSession.value) {
-            _voiceState.value = VoiceState.Error("Voice only available for orchestrator sessions")
-            return
-        }
-
-        val vm = voiceManager
-        if (vm == null) {
-            _voiceState.value = VoiceState.Error("Voice manager not initialized")
-            return
-        }
-
-        // Pause wake word detection while voice session is active — the mic is owned
-        // by WebRTC and we don't want keywords triggering extra recordings or new sessions.
-        // Inc 7: capture the ack-deferred so the coroutine below can await
-        // it (with a 2 s timeout per plan §9 decision 5) before calling
-        // vm.start(cfg). This replaces the 200 ms HAL settle guess in
-        // WebSocketPcmProvider.connect with a true hand-off ack.
-        val pauseAck = AssistantService.pauseWakeWord(getApplication())
-        // Inc 7: reset the finalize-voice-stop idempotency flag for the
-        // new session. finalizeVoiceStop self-guards to short-circuit
-        // duplicate calls; this re-enables it for the new session.
-        voiceStopFinalized = false
-
-        val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
-        viewModelScope.launch {
-            // Inc 7: await the pause ack with a 2 s budget. On stalled
-            // service the timeout returns null and we proceed with the
-            // legacy fire-and-forget behavior (caller may still race the
-            // mic, but no worse than pre-Inc-7).
-            kotlinx.coroutines.withTimeoutOrNull(2_000L) { pauseAck.await() }
-                ?: Log.w(TAG, "pauseWakeWord ack timeout — proceeding without confirmed release")
-            // Fetch the backend's configured voice defaults — provider,
-            // model, voice, transcription language.  The Android app
-            // doesn't carry its own preferences; the source of truth is
-            // assistant_config.json (toggled from the web frontend).
-            val cfg = apiClient!!.getVoiceConfig()
-
-            // Remember the config so a WS reconnect during this session
-            // can re-arm voice (see handleWebSocketEvent's Connected
-            // handler). Cleared in finalizeVoiceStop.
-            activeVoiceConfig = cfg
-
-            // Send voice_start with the orchestrator bucket's local_id and the true
-            // JSONL session id so the backend resumes from the correct history file.
-            // The voice fields come from the backend config we just fetched —
-            // sending them explicitly keeps the WS handler and the REST endpoint
-            // pinned to the same values for this session.
-            webSocketManager.send(
-                WebSocketMessage.VoiceStart(
-                    localId = orchBucket.currentLocalId.value,
-                    resumeSdkId = orchBucket.jsonlSessionId ?: orchBucket.currentSessionId.value,
-                    voiceProvider = cfg.provider,
-                    voiceModel = cfg.model,
-                    voiceName = cfg.voice,
-                    voiceTranscriptionLanguage = cfg.transcriptionLanguage,
-                    voiceEndpoint = cfg.endpoint.takeIf { it.isNotBlank() },
-                ),
-                endpoint = WebSocketEndpoint.ORCHESTRATOR
-            )
-            // Then connect using the matching transport (WebRTC for OpenAI,
-            // WebSocket for Qwen, etc).
-            vm.start(cfg)
-        }
-    }
-
-    // Job for the "Ending..." → Off safety timeout. The backend emits
-    // VoiceEnded once teardown finishes; this fires only if the ack
-    // never arrives so the UI doesn't stay stuck on "Ending" forever.
-    private var endingTimeoutJob: kotlinx.coroutines.Job? = null
-    private val ENDING_ACK_TIMEOUT_MS = 5000L
-
-    /**
-     * User-initiated stop: ask the backend to end ONLY the voice
-     * connection (keeping the orchestrator session alive in the pool
-     * for re-arm) and show "Ending..." until VoiceEnded arrives.
-     *
-     * The orchestrator session IS the tab — it survives the voice
-     * connection ending, the same way it survives a WS disconnect.
-     * The next wake word re-arms voice on the same session via
-     * restart_voice, preserving JSONL / agent context. Sending
-     * WebSocketMessage.Stop (which drops the whole pool slot) was
-     * wrong: it forced every wake word to start a fresh session with
-     * empty history. Use VoiceStop instead.
-     *
-     * The full local cleanup happens in [finalizeVoiceStop] when the
-     * ack arrives (or the safety timeout fires).
-     */
-    fun stopVoiceSession() {
-        webSocketManager.send(
-            WebSocketMessage.VoiceStop,
-            endpoint = WebSocketEndpoint.ORCHESTRATOR,
-        )
-        _voiceState.value = VoiceState.Ending
-        // Safety timeout — covers server crash, dropped WS, etc.
-        endingTimeoutJob?.cancel()
-        endingTimeoutJob = viewModelScope.launch {
-            kotlinx.coroutines.delay(ENDING_ACK_TIMEOUT_MS)
-            Log.w(TAG, "voice_ended ack timeout — forcing local stop")
-            finalizeVoiceStop()
-        }
-    }
-
-    /**
-     * Local teardown of the voice session. Called when the backend
-     * confirms teardown ([WebSocketEvent.VoiceEnded] / legacy
-     * [WebSocketEvent.VoiceStopped]) or when the safety timeout fires.
-     * Idempotent — safe to call after the session is already Off.
-     */
-    private fun finalizeVoiceStop() {
-        // Inc 7: idempotency guard. Multiple call sites
-        // (voice_ended ack timeout at voice_ending, VoiceEnded/VoiceStopped
-        // handler, stopVoiceSession's safety timeout) can fire for the same
-        // session-end. Without this guard, two resumeWakeWord intents fire
-        // ~600-750 ms apart and the second tears down the freshly-armed
-        // recognizer ("AudioRecord.startRecording() failed — mic busy" log).
-        // The flag is reset in startVoiceSession so a fresh session re-enables
-        // the path.
-        if (voiceStopFinalized) {
-            Log.d(TAG, "finalizeVoiceStop ignored — already finalized for this session")
-            return
-        }
-        voiceStopFinalized = true
-        endingTimeoutJob?.cancel()
-        endingTimeoutJob = null
-        activeVoiceConfig = null  // voice over → no resume on reconnect
-        // Increment B: clear VAD observability so any stale
-        // "listening Ns" indicator disappears the moment the session
-        // ends.
-        _vadState.value = "idle"
-        _vadDurationMs.value = 0L
-        viewModelScope.launch {
-            voiceManager?.stop()
-            _voiceState.value = VoiceState.Off
-            _isMuted.value = false
-            // Wait for WebRTC to release the mic before re-arming wake word.
-            // Without this delay, AudioRecord fails 20+ times with "other input already
-            // started" — the WebRTC AudioRecord is still held by the system even after
-            // stop() returns, causing the wake word detector process to crash.
-            // The 1500 ms delay is empirically tuned; Inc 7's deferred ack is
-            // additive defense, not a replacement for the HAL settle wait.
-            kotlinx.coroutines.delay(1500L)
-            // Inc 7: capture the ack-deferred and await it with a 2 s budget
-            // (plan §9 decision 5). On timeout we log and continue — the
-            // resume intent fired regardless; the await just confirms the
-            // service drained the body.
-            val resumeAck = AssistantService.resumeWakeWord(getApplication())
-            kotlinx.coroutines.withTimeoutOrNull(2_000L) { resumeAck.await() }
-                ?: Log.w(TAG, "resumeWakeWord ack timeout — service may be slow or short-circuited")
-        }
-    }
-
-    fun toggleMute() {
-        val newMuteState = voiceManager?.toggleMute() ?: !_isMuted.value
-        _isMuted.value = newMuteState
-    }
-
-    // Network discovery
-    fun scanForServers() {
-        if (_isScanning.value) return
-        viewModelScope.launch {
-            _isScanning.value = true
-            _discoveredServers.value = emptyList()
-            try {
-                val servers = NetworkScanner.scan(getApplication())
-                _discoveredServers.value = servers
-                // Auto-connect to first discovered server only if using the default URL
-                // (don't overwrite a user-configured server URL)
-                val currentUrl = _settings.value.serverUrl
-                val defaultUrl = AppSettings().serverUrl
-                if (servers.isNotEmpty() && connectionState.value !is ConnectionState.Connected && currentUrl == defaultUrl) {
-                    connectToDiscoveredServer(servers.first())
-                }
-            } finally {
-                _isScanning.value = false
-            }
-        }
-    }
-
-    fun connectToDiscoveredServer(server: DiscoveredServer) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SERVER_URL] = server.wsUrl
-            }
-            // connect() will be triggered by settings update via DataStore flow
-        }
-    }
-
-    // Settings
     fun updateServerUrl(url: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SERVER_URL] = url
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateServerUrl(url) }
     }
 
     fun addSavedServer(label: String, url: String) {
-        val cleanLabel = label.trim()
-        val cleanUrl = url.trim()
-        if (cleanLabel.isEmpty() || cleanUrl.isEmpty()) return
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                val existing = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS])
-                // Replace any entry with the same url, else append.
-                val updated = existing.filterNot { it.url == cleanUrl } + SavedServer(cleanLabel, cleanUrl)
-                preferences[PreferenceKeys.SAVED_SERVERS] = encodeSavedServers(updated)
-            }
-        }
+        viewModelScope.launch { settingsRepository.addSavedServer(label, url) }
     }
 
     fun removeSavedServer(url: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                val existing = decodeSavedServers(preferences[PreferenceKeys.SAVED_SERVERS])
-                val updated = existing.filterNot { it.url == url }
-                preferences[PreferenceKeys.SAVED_SERVERS] = encodeSavedServers(updated)
-            }
-        }
+        viewModelScope.launch { settingsRepository.removeSavedServer(url) }
     }
 
     fun selectSavedServer(server: SavedServer) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SERVER_URL] = server.url
-            }
-        }
+        viewModelScope.launch { settingsRepository.selectSavedServer(server) }
     }
 
     fun updateThemeMode(mode: ThemeMode) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.THEME_MODE] = mode.name
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateThemeMode(mode) }
     }
 
     fun updateAutoConnect(enabled: Boolean) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.AUTO_CONNECT] = enabled
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateAutoConnect(enabled) }
     }
 
     fun updateMicGainLevel(level: Float) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
-            }
-            voiceManager?.setMicGain(level)
-        }
+        viewModelScope.launch { settingsRepository.updateMicGainLevel(level) }
+        // Side-effect — voice manager rebuild gate consumes the settings
+        // flow and refreshes the live mic gain. The setter delegate above
+        // emits a new AppSettings; VoiceController.onSettingsChanged picks
+        // it up via the settings observer (Inc 4).
     }
 
     fun updateEchoDuckingGain(gain: Float) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ECHO_DUCKING_GAIN] = gain.coerceIn(0.0f, 1.0f)
-            }
-            voiceManager?.setEchoDuckingGain(gain)
-        }
+        viewModelScope.launch { settingsRepository.updateEchoDuckingGain(gain) }
     }
 
     fun updateWakeWordMicGainLevel(level: Float) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f)
-            }
-            // No inline AssistantService.updateWakeWord call — MainActivity's
-            // LaunchedEffect keyed on settings.wakeWordMicGainLevel picks the
-            // change up off the settings StateFlow and applies it once.
-        }
+        viewModelScope.launch { settingsRepository.updateWakeWordMicGainLevel(level) }
     }
 
     fun updateAudioOutput(output: AudioOutput) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.AUDIO_OUTPUT] = output.name
-            }
-            // Apply immediately to VoiceManager so next session picks it up
-            voiceManager?.setAudioOutput(output)
-        }
+        viewModelScope.launch { settingsRepository.updateAudioOutput(output) }
     }
 
-    /**
-     * Whether a Bluetooth audio output device is currently available (paired + connected).
-     * UI should call this to decide whether to enable the BLUETOOTH segment. Safe to call
-     * on any thread; returns false if VoiceManager hasn't been initialized yet.
-     */
-    fun isBluetoothAudioAvailable(): Boolean =
-        voiceManager?.isBluetoothAudioAvailable() == true
-
-    /**
-     * Whether a wired 3.5mm headphone/headset is currently plugged in.
-     * UI should call this to decide whether to enable the WIRED segment.
-     */
-    fun isWiredHeadphoneAvailable(): Boolean =
-        voiceManager?.isWiredHeadphoneAvailable() == true
-
     fun updateSpeakerVolumeLevel(level: Float) {
-        viewModelScope.launch {
-            val clamped = level.coerceIn(0.0f, 1.5f)
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.SPEAKER_VOLUME_LEVEL] = clamped
-            }
-            // Apply to system audio
-            val audioManager = getApplication<Application>().getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val newVolume = (clamped * maxVolume).toInt().coerceIn(0, maxVolume)
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVolume, 0)
-        }
+        viewModelScope.launch { settingsRepository.updateSpeakerVolumeLevel(level) }
     }
 
     fun updateEnableButtonTrigger(enabled: Boolean) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ENABLE_BUTTON_TRIGGER] = enabled
-            }
-            // Write to shared prefs so ButtonAccessibilityService can read it without a Context ref
-            getApplication<Application>().getSharedPreferences("assistant_service_prefs", Context.MODE_PRIVATE)
-                .edit().putBoolean("button_trigger_enabled", enabled).apply()
-        }
+        viewModelScope.launch { settingsRepository.updateEnableButtonTrigger(enabled) }
     }
 
-    // Inline AssistantService.updateWakeWord calls intentionally removed from
-    // updateEnableWakeWord / updateTalkWord / updateWakeWord — MainActivity's
-    // LaunchedEffect (keyed on enableWakeWord / talkWord / wakeWord /
-    // wakeWordMicGainLevel) is the single ingress to the service. Each setting
-    // change emits a DataStore update; the LaunchedEffect picks it up and fires
-    // exactly one updateWakeWord intent, instead of the old double-intent
-    // pattern (one inline, one from the effect — see commit d6181b1).
-    //
-    // Naming (Detour 3 / plan §0.5):
-    //   updateTalkWord  → turn-based single voice message phrase
-    //   updateWakeWord  → realtime WebRTC voice conversation phrase
-
     fun updateEnableWakeWord(enabled: Boolean) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.ENABLE_WAKE_WORD] = enabled
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateEnableWakeWord(enabled) }
     }
 
     fun updateTalkWord(word: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.TALK_WORD] = word
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateTalkWord(word) }
     }
 
     fun updateWakeWord(word: String) {
-        viewModelScope.launch {
-            dataStore.edit { preferences ->
-                preferences[PreferenceKeys.WAKE_WORD] = word
-            }
-        }
+        viewModelScope.launch { settingsRepository.updateWakeWord(word) }
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // System (backend) configuration — System Settings tab
+    // System (backend) configuration — pass-throughs to SystemConfigController.
     // ─────────────────────────────────────────────────────────────────
 
-    /**
-     * Load the full backend system config (assistant config + MCP servers +
-     * model catalog + voice models + session providers + Qwen harness models).
-     *
-     * Each sub-list is fetched in parallel. Failures of individual lists fall
-     * through to empty defaults — only a full failure to load the main config
-     * surfaces as an error.
-     */
-    fun loadSystemConfig() {
-        val client = apiClient
-        if (client == null) {
-            _systemConfig.value = _systemConfig.value.copy(
-                error = "Not connected to a server",
-                loading = false,
-            )
-            return
-        }
-        viewModelScope.launch {
-            _systemConfig.value = _systemConfig.value.copy(loading = true, error = null)
-            try {
-                // Fan out — these don't depend on each other.
-                val cfgDef = async(Dispatchers.IO) { client.getAssistantConfig() }
-                val mcpDef = async(Dispatchers.IO) { client.listMcpServers() }
-                val modelsDef = async(Dispatchers.IO) { client.listOrchestratorModels() }
-                val voiceDef = async(Dispatchers.IO) { client.listVoiceModels() }
-                val qwenDef = async(Dispatchers.IO) { client.listQwenHarnessModels() }
-                val providersDef = async(Dispatchers.IO) { client.listSessionProviders() }
-
-                val cfg = cfgDef.await()
-                if (cfg == null) {
-                    _systemConfig.value = _systemConfig.value.copy(
-                        loading = false,
-                        error = "Failed to load configuration",
-                    )
-                    return@launch
-                }
-                // Merge dynamic Gemini Live list into static voice providers.
-                // The endpoint (vertex / aistudio) decides which Google backend
-                // the catalog is fetched from — mirrors the web ConfigPage.
-                val googleVoice = client.listGoogleVoiceModels(cfg.defaultVoiceEndpoint)
-                val voiceProviders = voiceDef.await().toMutableMap()
-                if (googleVoice.isNotEmpty()) voiceProviders["google"] = googleVoice
-
-                // Auto-correct: if the saved Gemini model is no longer in the
-                // discovered catalog (Google renames Live ids periodically),
-                // write through to the new default and surface a banner.
-                val (correctedCfg, correction) = maybeAutoCorrectVoiceModel(
-                    client, cfg, googleVoice,
-                )
-
-                _systemConfig.value = SystemConfigState(
-                    config = correctedCfg,
-                    mcpServers = mcpDef.await(),
-                    models = modelsDef.await(),
-                    voiceProviders = voiceProviders,
-                    qwenHarnessModels = qwenDef.await(),
-                    sessionProviders = providersDef.await(),
-                    loading = false,
-                    voiceModelAutoCorrected = correction,
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "loadSystemConfig error: ${e.message}", e)
-                _systemConfig.value = _systemConfig.value.copy(
-                    loading = false,
-                    error = e.message ?: "Failed to load configuration",
-                )
-            }
-        }
-    }
+    fun loadSystemConfig() = systemConfigController.loadSystemConfig()
+    fun updateSystemConfig(patch: ConfigPatch) = systemConfigController.updateSystemConfig(patch)
+    fun dismissVoiceModelAutoCorrected() = systemConfigController.dismissVoiceModelAutoCorrected()
+    fun toggleMcp(name: String) = systemConfigController.toggleMcp(name)
 
     /**
-     * Apply a partial update to the backend config. The full updated config
-     * is returned and stored on success; on failure the current state is left
-     * unchanged and an error message is surfaced.
-     */
-    fun updateSystemConfig(patch: ConfigPatch) {
-        val client = apiClient ?: return
-        viewModelScope.launch {
-            val prevEndpoint = _systemConfig.value.config?.defaultVoiceEndpoint
-            _systemConfig.value = _systemConfig.value.copy(saving = true, error = null)
-            val result = client.updateAssistantConfig(patch)
-            result.fold(
-                onSuccess = { newCfg ->
-                    // Refetch the Google voice catalog when the user flips the
-                    // backend, since the model list is per-endpoint. Mirrors
-                    // the web ConfigPage useEffect.
-                    var effectiveCfg = newCfg
-                    var correction: VoiceModelAutoCorrection? = _systemConfig.value.voiceModelAutoCorrected
-                    val voiceProviders = if (
-                        newCfg.defaultVoiceEndpoint != prevEndpoint
-                    ) {
-                        val googleVoice = client.listGoogleVoiceModels(newCfg.defaultVoiceEndpoint)
-                        val merged = _systemConfig.value.voiceProviders.toMutableMap()
-                        if (googleVoice.isNotEmpty()) {
-                            merged["google"] = googleVoice
-                            // The newly-fetched catalog may not include the
-                            // saved model id (especially after flipping
-                            // Vertex↔AI Studio, where the canonical id
-                            // differs). Auto-correct here too.
-                            val (corrected, c) = maybeAutoCorrectVoiceModel(
-                                client, newCfg, googleVoice,
-                            )
-                            effectiveCfg = corrected
-                            if (c != null) correction = c
-                        }
-                        merged
-                    } else {
-                        _systemConfig.value.voiceProviders
-                    }
-                    _systemConfig.value = _systemConfig.value.copy(
-                        config = effectiveCfg,
-                        voiceProviders = voiceProviders,
-                        saving = false,
-                        savedFlash = true,
-                        voiceModelAutoCorrected = correction,
-                    )
-                    savedFlashJob?.cancel()
-                    savedFlashJob = viewModelScope.launch {
-                        kotlinx.coroutines.delay(2000)
-                        _systemConfig.value = _systemConfig.value.copy(savedFlash = false)
-                    }
-                },
-                onFailure = { e ->
-                    _systemConfig.value = _systemConfig.value.copy(
-                        saving = false,
-                        error = e.message ?: "Failed to save",
-                    )
-                },
-            )
-        }
-    }
-
-    fun dismissVoiceModelAutoCorrected() {
-        _systemConfig.value = _systemConfig.value.copy(voiceModelAutoCorrected = null)
-    }
-
-    /**
-     * Snap the saved Gemini Live model to the discovered default when
-     * the catalog no longer lists it. Returns the (possibly updated)
-     * config and the correction record (null = no change needed).
-     *
-     * Empty catalog → no-op: we only correct when we have a known-good
-     * list. Failures fall through silently, leaving the saved value as
-     * the source of truth.
-     */
-    private suspend fun maybeAutoCorrectVoiceModel(
-        client: ApiClient,
-        cfg: AssistantConfig,
-        discovered: List<VoiceModelEntry>,
-    ): Pair<AssistantConfig, VoiceModelAutoCorrection?> {
-        if (cfg.defaultVoiceProvider != "google") return cfg to null
-        if (discovered.isEmpty()) return cfg to null
-        if (discovered.any { it.id == cfg.defaultVoiceModel }) return cfg to null
-        val newDefault = discovered.firstOrNull { it.isDefault } ?: discovered.first()
-        val voiceListed = newDefault.voices.any { it.id == cfg.defaultVoiceName }
-        val patch = ConfigPatch(
-            defaultVoiceModel = newDefault.id,
-            defaultVoiceName = if (voiceListed) null else newDefault.voice,
-        )
-        val result = client.updateAssistantConfig(patch)
-        return result.fold(
-            onSuccess = { updated ->
-                updated to VoiceModelAutoCorrection(
-                    from = cfg.defaultVoiceModel,
-                    to = newDefault.id,
-                )
-            },
-            onFailure = { e ->
-                Log.w(TAG, "auto-correct voice model failed: ${e.message}")
-                cfg to null
-            },
-        )
-    }
-
-    /** Toggle a single MCP server in `enabled_mcps`. */
-    fun toggleMcp(name: String) {
-        val cfg = _systemConfig.value.config ?: return
-        val next = cfg.enabledMcps.toMutableList()
-        if (next.contains(name)) next.remove(name) else next.add(name)
-        updateSystemConfig(ConfigPatch(enabledMcps = next))
-    }
-
-    /**
-     * Play a short two-tone cue (~300ms total) signalling that the voice
-     * upstream is about to cycle. The first attempt at this (single tone
-     * on STREAM_NOTIFICATION, 2026-06-04) was inaudible on the A300M
-     * during an active call because the notification stream is
-     * effectively muted by the call audio plane. Switched to STREAM_MUSIC
-     * which is the same stream the voice playback is using — guaranteed
-     * audible whenever the agent's voice is.
-     *
-     * Two tones (880Hz → 660Hz) chosen because a single beep blended too
-     * easily with the agent's own speech. The descending interval is a
-     * clear "wrap up" cue without sounding alarming.
-     *
-     * Fire-and-forget — we don't block the caller. If audio init fails
-     * (very old device, unusual route, etc.) we log and continue; the
-     * banner still appears.
+     * Two-tone reconnect cue (~300ms) on STREAM_MUSIC so it's audible while
+     * the agent is speaking. Inc 4 moved the trigger (ReconnectWarning →
+     * playBeep) into VoiceController; the AudioTrack body stays here as a
+     * lambda dep so Robolectric tests don't need to mount audio HW.
      */
     private fun playReconnectBeep() {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
@@ -2245,9 +373,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 val totalFrames = toneFrames * 2 + gapFrames
                 val pcm = ShortArray(totalFrames)
                 val fadeFrames = sr * 15 / 1000
-                // Volume — 50% amplitude. We're sharing the music stream
-                // with the agent's voice (which clips at 100%) so being
-                // distinctly audible matters more than being polite.
                 val amplitude = 0.50
                 fun fillTone(offset: Int, freq: Double) {
                     val twoPiF = 2.0 * Math.PI * freq
@@ -2262,7 +387,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
                 fillTone(0, 880.0)
-                // Gap stays as zero-filled silence.
                 fillTone(toneFrames + gapFrames, 660.0)
 
                 val bufSize = AudioTrack.getMinBufferSize(
@@ -2301,7 +425,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         super.onCleared()
-        voiceManager?.release()
+        voiceController.release()
         webSocketManager.release()
         audioRecorder.release()
     }

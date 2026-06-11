@@ -129,6 +129,7 @@ dependencies {
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.1.0")
     testImplementation("app.cash.turbine:turbine:1.0.0")  // Flow testing
     testImplementation("org.robolectric:robolectric:4.11.1")  // Android mocking
+    testImplementation("androidx.test:core:1.5.0")  // ApplicationProvider for Robolectric
 
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
