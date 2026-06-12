@@ -135,6 +135,8 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
+from typing import NamedTuple
+
 from ..base_session import BaseSessionManager, TurnAbandoned
 from ..config import ManagerConfig
 from ..types import (
@@ -193,6 +195,27 @@ _STALL_REPEAT_INTERVAL_S = 60.0  # re-emit every minute thereafter
 # backoff:10 lastrcv:8min).  Raise SessionAbandoned so callers can give up
 # cleanly and (in the orchestrator's case) retry once.
 _TURN_ABANDON_S = 240.0
+
+# Replay buffer: how many recent ``Event``s the SessionManager keeps so a
+# WS reconnecting mid-turn can replay them.  Sized to cover ~10 minutes
+# of a tool-heavy turn (text deltas dominate at ~10/s of streaming).
+# Bounded so an idle session that nobody's watching for hours doesn't
+# accumulate megabytes of dropped events.  Each event is small (typically
+# a JSON payload <1 KB), so 500 entries ≈ 0.5 MB per session worst-case.
+_REPLAY_BUFFER_SIZE = 500
+
+
+class SequencedEvent(NamedTuple):
+    """A typed Event paired with its monotonic dispatch seq.
+
+    The receive loop puts these into ``_event_inbox``; ``send()`` unpacks
+    them so callers continue to receive bare ``Event``s; the pool reads
+    the seq off the wrapper to attach ``{seq, stream_id, ...}`` to the
+    outbound broadcast payload.  Side-channel-free.
+    """
+
+    seq: int
+    event: Event
 
 
 class SessionAbandoned(TurnAbandoned):
@@ -317,6 +340,30 @@ class ClaudeSessionManager(BaseSessionManager):
         self._subprocess_pid: int | None = None
         # Override base class defaults with Claude's gated-tool set.
         self._gated_tools = set(_DEFAULT_GATED_TOOLS)
+        # Persistent SDK receive loop — owns ``client.receive_messages()``
+        # for the whole session lifetime, not just one ``send()`` call.
+        # See the design note in ``_receive_loop`` for why.
+        self._receive_task: asyncio.Task[None] | None = None
+        self._receive_loop_done: asyncio.Event = asyncio.Event()
+        # Bounded replay ring of ``(seq, event)`` pairs so a reconnecting
+        # WS can catch up on activity that happened while it was offline.
+        # Each event the receive loop dispatches gets a monotonic ``seq``
+        # within the current ``_stream_id`` (set when the receive loop
+        # starts; changes on every subprocess (re)connect or backend
+        # restart).  A frontend that holds ``(stream_id, seq)`` can ask
+        # for everything newer; a mismatch falls back to REST.
+        from collections import deque
+        self._replay_buffer: deque[tuple[int, Event]] = deque(
+            maxlen=_REPLAY_BUFFER_SIZE,
+        )
+        self._stream_id: str | None = None
+        self._next_seq: int = 0
+        # Last seq yielded by ``send()`` to a caller.  The pool's broadcast
+        # path reads this in the same coroutine immediately after the
+        # ``async for`` yields, before any ``await`` — so the value is
+        # always for the event just yielded.  None when no SequencedEvent
+        # has been yielded (initial state, or after a non-sequenced inject).
+        self._last_yielded_seq: int | None = None
 
     @property
     def provider_name(self) -> str:
@@ -388,6 +435,28 @@ class ClaudeSessionManager(BaseSessionManager):
                     logger.exception("get_server_info failed for session %s", self._local_id)
 
             self._status = SessionStatus.IDLE
+
+            # Mint a fresh stream identity for this connection.  Anything
+            # the SDK emits from here on belongs to this stream.  A
+            # reconnecting frontend with a different ``stream_id`` falls
+            # through to REST replay; with the same id, the backend
+            # serves seq-ordered playback from the buffer.
+            import time as _time
+            self._stream_id = f"{self._local_id}:{int(_time.time() * 1000)}"
+            self._next_seq = 0
+            self._replay_buffer.clear()
+
+            # Spawn the persistent receive loop.  See ``_receive_loop`` for
+            # the design rationale — it owns ``client.receive_messages()``
+            # for the whole session lifetime so the SDK buffer never
+            # accumulates stale events between turns, and ``self._status``
+            # tracks subprocess activity even when no caller is iterating
+            # ``send()``.
+            self._receive_loop_done.clear()
+            self._receive_task = asyncio.create_task(
+                self._receive_loop(),
+                name=f"sm-receive-{self._local_id}",
+            )
         except BaseException as e:
             # Surface the error to start() and exit; do NOT signal _connect_done
             # before recording the error or start() will see "succeeded".
@@ -402,6 +471,19 @@ class ClaudeSessionManager(BaseSessionManager):
         try:
             await self._stop_requested.wait()
         finally:
+            # Cancel the receive loop BEFORE disconnect — receive_messages()
+            # is parked on the SDK's anyio receive stream, and disconnecting
+            # will close that stream from under it.  Cancelling first lets
+            # the loop unwind cleanly.
+            if self._receive_task is not None and not self._receive_task.done():
+                self._receive_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._receive_task), timeout=2.0,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
+            self._receive_task = None
             # Disconnect runs in this same task, so the SDK's task group
             # __aexit__ sees the same owner that __aenter__'d it.
             #
@@ -496,6 +578,15 @@ class ClaudeSessionManager(BaseSessionManager):
         Yields ``TextDelta`` for each streaming token, ``ToolUse`` / ``ToolResult``
         for tool interactions, and ``TurnComplete`` at the end.
 
+        Architecture: ``send()`` is a thin subscriber.  The real SDK receive
+        work happens in ``_receive_loop``, a task that runs for the whole
+        session lifetime.  ``send()`` registers an inbox on the loop,
+        triggers the turn with ``client.query()``, then iterates the inbox
+        until it sees ``TurnComplete``.  On exit (clean, error, or external
+        cancellation), it only deregisters — the loop keeps consuming
+        whatever the SDK still has to say, so the buffer never accumulates
+        stale events and ``self._status`` stays accurate.
+
         While receiving, a stall watchdog yields :class:`SessionStalled`
         events if the SDK goes silent for an extended period — the stream
         is *not* aborted (the caller may want to keep waiting), but the UI
@@ -504,46 +595,17 @@ class ClaudeSessionManager(BaseSessionManager):
         if self._client is None:
             raise RuntimeError("SessionManager is not connected — call start() first")
 
-        # Drain any stale messages left in the SDK's per-client receive buffer
-        # before kicking off this turn.  Background:
-        #
-        # The SDK keeps a single shared ``anyio.MemoryObjectStream`` (size 100)
-        # for ALL messages from the bundled ``claude`` CLI.  ``receive_response()``
-        # is just "iterate until you see ANY ResultMessage, then return" — it
-        # has no per-turn fence.  If the previous turn was interrupted while
-        # the CLI was mid-stream (e.g. the WS tab reloaded, our drain task got
-        # cancelled, ``_interrupt_if_orphaned`` fired), the CLI may continue
-        # to emit messages — including a synthesized terminal ResultMessage —
-        # *after* our drain task has already been torn down.  Those messages
-        # then sit in the SDK's buffer and get picked up by the NEXT turn's
-        # ``receive_response()``, which sees the leftover ResultMessage and
-        # exits immediately.  Status flips to IDLE, the frontend gets a fake
-        # turn_complete with no content, and the CLI happily processes the
-        # actual prompt with no Python reader watching.
-        #
-        # The buffer is bounded (size 100), so this drain is fast.  We also
-        # log a warning on non-zero drain counts — that's the smoking gun for
-        # the cross-turn-contamination bug class.
-        #
-        # First drain pass catches messages already buffered.  We then yield
-        # the loop briefly so any in-flight sends from the read-task
-        # (cancelled but not yet awaited at the prior turn's tear-down) can
-        # complete and land in the buffer; a second drain catches those.
-        # The 50 ms is empirical: enough for one or two anyio task switches
-        # without adding meaningful latency to a normal send().
-        stale_drained = await self._drain_stale_sdk_messages()
-        await asyncio.sleep(0.05)
-        stale_drained += await self._drain_stale_sdk_messages()
-        if stale_drained:
-            logger.warning(
-                "Drained %d stale SDK message(s) for session %s before turn "
-                "(prior turn left messages in the SDK buffer)",
-                stale_drained,
-                self._local_id,
-            )
+        if self._receive_loop_done.is_set():
+            raise RuntimeError("Session receive loop has exited — session is dead")
 
-        self._status = SessionStatus.STREAMING
-        await self._client.query(prompt)
+        # Register an inbox the receive loop will deliver events into. The
+        # base class shares this same attribute with the ``can_use_tool``
+        # callback so permission events can be injected mid-stream.
+        # The receive loop wraps each dispatched event in ``SequencedEvent``;
+        # we unwrap below.
+        loop = asyncio.get_running_loop()
+        inbox: asyncio.Queue[SequencedEvent | Event] = asyncio.Queue()
+        self._event_inbox = inbox
 
         # Last-tool tracking so the SessionStalled event can name the tool
         # the SDK was waiting on (the most useful single piece of context
@@ -551,36 +613,20 @@ class ClaudeSessionManager(BaseSessionManager):
         last_tool_name: str | None = None
         last_tool_use_id: str | None = None
 
-        # We run the SDK receiver in a dedicated task that pushes messages
-        # into a queue.  The watchdog reads from the queue with a short
-        # `wait_for`, which we can safely time out and retry without
-        # disturbing the generator (cancelling `__anext__` directly tears
-        # down the async generator).
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[object] = asyncio.Queue()
-        # Expose the same queue to the can_use_tool callback so it can inject
-        # PermissionRequest / PermissionResolved events into the live stream
-        # without a second drain task or out-of-order delivery.
-        self._event_inbox = queue
-        SENTINEL_DONE = object()
+        # Trigger the turn AFTER the inbox is wired up so the very first
+        # event the receive loop dispatches lands in our queue, not the
+        # replay ring.
+        await self._client.query(prompt)
+        self._status = SessionStatus.STREAMING
 
-        async def _drain() -> None:
-            try:
-                async for m in self._client.receive_response():
-                    await queue.put(m)
-            except BaseException as exc:  # noqa: BLE001
-                await queue.put(exc)
-            else:
-                await queue.put(SENTINEL_DONE)
-
-        drain_task = asyncio.create_task(_drain(), name="sdk-receive-drain")
         turn_started_at = loop.time()
         last_msg_at = turn_started_at
         stall_notified_at: float | None = None
         messages_received = 0
+        turn_complete_seen = False
 
         try:
-            while True:
+            while not turn_complete_seen:
                 now = loop.time()
                 if stall_notified_at is None:
                     next_notice_in = max(0.0, _STALL_FIRST_NOTICE_S - (now - last_msg_at))
@@ -591,8 +637,8 @@ class ClaudeSessionManager(BaseSessionManager):
                     )
 
                 try:
-                    msg = await asyncio.wait_for(
-                        queue.get(), timeout=max(next_notice_in, 0.5),
+                    item = await asyncio.wait_for(
+                        inbox.get(), timeout=max(next_notice_in, 0.5),
                     )
                 except asyncio.TimeoutError:
                     now = loop.time()
@@ -614,52 +660,227 @@ class ClaudeSessionManager(BaseSessionManager):
                 stall_notified_at = None  # reset on any fresh activity
                 messages_received += 1
 
-                if msg is SENTINEL_DONE:
-                    break
-                if isinstance(msg, BaseException):
-                    raise msg
+                # Receive loop always wraps in SequencedEvent; fallback
+                # path for direct inbox.put_nowait callers (e.g. older
+                # tests, future extensions) yields the bare event.
+                # We stash the seq on the manager so the pool's broadcast
+                # path can wrap the outbound payload with it.  Safe because
+                # send() and the pool's iteration are the same coroutine —
+                # no ``await`` runs between the stash and the pool's read.
+                if isinstance(item, SequencedEvent):
+                    event = item.event
+                    self._last_yielded_seq = item.seq
+                else:
+                    event = item
+                    self._last_yielded_seq = None
+
+                if isinstance(event, ToolUse):
+                    last_tool_name = event.tool_name
+                    last_tool_use_id = event.tool_use_id
+                elif isinstance(event, (ToolResult, TurnComplete)):
+                    last_tool_name = None
+                    last_tool_use_id = None
+
+                yield event
+
+                if isinstance(event, TurnComplete):
+                    turn_complete_seen = True
+        finally:
+            # Detach the inbox so subsequent events go to the replay buffer
+            # only.  The receive loop keeps running — that's the whole point
+            # of this refactor.  Permissions that were still pending at this
+            # point can never be answered through this stream, so resolve
+            # them as 'deny' to unblock the SDK.
+            if self._event_inbox is inbox:
+                self._event_inbox = None
+            self._drain_pending_permissions()
+
+    async def _receive_loop(self) -> None:
+        """Long-lived consumer of ``client.receive_messages()``.
+
+        Owns the SDK's per-client receive stream for the whole session
+        lifetime.  This replaces the previous design where ``send()``
+        spawned a per-turn ``_drain`` task: that design lost messages
+        whenever ``send()`` exited mid-turn (an interrupt, a frontend
+        disconnect, a stall watchdog raising) because the SDK kept
+        producing events into a buffer with no reader, the next ``send()``
+        called ``_drain_stale_sdk_messages`` and threw them away, and the
+        session status froze at IDLE while the bundled CLI was still
+        working.
+
+        Here, the loop runs continuously: it dispatches each event to the
+        active ``send()`` inbox if there is one, and always appends to a
+        bounded replay ring so a reconnecting WS can catch up.
+        ``self._status`` updates inside ``_process_message`` and reflects
+        the subprocess state, not the state of any particular caller.
+        """
+        assert self._client is not None
+        try:
+            async for msg in self._client.receive_messages():
                 if msg is None:
                     # Patched parser ignored an unknown message type.
                     continue
                 if isinstance(msg, Event):
-                    # Out-of-band event injected by can_use_tool — yield as-is.
-                    yield msg
+                    # Defensive: shouldn't happen since receive_messages()
+                    # yields SDK Message subclasses, not our typed events.
+                    # But the permission callback path used to inject Events
+                    # here; route them through the dispatch just in case.
+                    self._inject_event(msg)
                     continue
-
-                async for event in self._process_message(msg):
-                    if isinstance(event, ToolUse):
-                        last_tool_name = event.tool_name
-                        last_tool_use_id = event.tool_use_id
-                    elif isinstance(event, (ToolResult, TurnComplete)):
-                        last_tool_name = None
-                        last_tool_use_id = None
-                    yield event
-        finally:
-            if not drain_task.done():
-                drain_task.cancel()
                 try:
-                    # Bound the wait. _drain is parked inside the SDK's anyio-managed
-                    # receive_response(); the cancel propagates into the SDK task group,
-                    # which is vulnerable to anyio#695 / claude-agent-sdk#378 — a busy
-                    # loop in _deliver_cancellation that pins 100% CPU forever. If the
-                    # task doesn't honour the cancel within 2s, detach: the GC will
-                    # reap it, and we'd rather leak one stuck task than starve the
-                    # whole event loop.
-                    await asyncio.wait_for(asyncio.shield(drain_task), timeout=2.0)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "drain_task for session %s did not respond to cancel within 2s; "
-                        "detaching (suspected anyio cancel-scope busy-loop)",
+                    async for event in self._process_message(msg):
+                        self._inject_event(event)
+                        if isinstance(event, TurnComplete):
+                            # The bundled CLI emitted a terminal ResultMessage
+                            # — the turn is over even if nobody was listening.
+                            # Status returns to IDLE so the pool/live endpoint
+                            # reflects reality.
+                            self._status = SessionStatus.IDLE
+                except Exception:
+                    logger.exception(
+                        "receive_loop: failed to process message for session %s",
                         self._local_id,
                     )
-                except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The loop crashed.  Mark the session as effectively dead so
+            # subsequent send() calls fail fast instead of hanging on an
+            # inbox that nothing will ever fill.  The lifecycle task's
+            # disconnect path will run as normal when stop() is called.
+            logger.exception(
+                "receive_loop for session %s crashed — session is no longer usable",
+                self._local_id,
+            )
+        finally:
+            self._receive_loop_done.set()
+            # Unblock any send() waiting on an inbox that won't ever be fed.
+            inbox = self._event_inbox
+            if inbox is not None:
+                # A TurnComplete with no cost/usage signals "the turn ended,
+                # even if not cleanly".  send() will yield it and exit.
+                try:
+                    inbox.put_nowait(TurnComplete(
+                        cost=None, usage={}, num_turns=0,
+                        session_id=self._provider_session_id,
+                        is_error=True, result="receive_loop_exited",
+                    ))
+                except asyncio.QueueFull:
                     pass
-            # Stop accepting injected events; cancel any orphan permissions so
-            # the SDK doesn't leak a future that nothing will ever resolve.
-            self._event_inbox = None
-            self._drain_pending_permissions()
 
-        self._status = SessionStatus.IDLE
+    def _inject_event(self, event: Event) -> None:
+        """Override the base class hook: assign a monotonic seq, append
+        to the replay ring, and wrap before queueing.
+
+        Each dispatch assigns a monotonic ``seq`` within the current
+        ``_stream_id`` so a reconnecting WS can resume exactly where it
+        left off.  The seq travels with the event by wrapping it into a
+        :class:`SequencedEvent` named-tuple before queueing — the inbox
+        consumer (``send()``) unpacks and yields the bare event, while
+        the pool's broadcast wrapper reads the seq off the tuple for the
+        ``{seq, stream_id, ...}`` wire payload.
+
+        Called from the receive loop and from the permission callback
+        path (the latter via :meth:`_emit_permission_request` in the base
+        class).
+        """
+        seq = self._next_seq
+        self._next_seq += 1
+        self._replay_buffer.append((seq, event))
+        wrapped = SequencedEvent(seq=seq, event=event)
+        inbox = self._event_inbox
+        if inbox is not None:
+            try:
+                inbox.put_nowait(wrapped)
+            except asyncio.QueueFull:
+                # asyncio.Queue() is unbounded by default; this is defensive.
+                logger.warning(
+                    "send() inbox full for session %s; event dropped",
+                    self._local_id,
+                )
+
+    def replay_recent_events(self) -> list[tuple[int, Event]]:
+        """Snapshot of the replay ring as ``(seq, event)`` pairs, oldest → newest.
+
+        Bounded by ``_REPLAY_BUFFER_SIZE``.  Used directly by tests; the
+        pool prefers :meth:`replay_after` which encodes the resume protocol.
+        """
+        return list(self._replay_buffer)
+
+    def replay_after(
+        self,
+        stream_id: str | None,
+        after_seq: int | None,
+    ) -> tuple[str, list[tuple[int, Event]]]:
+        """Resume protocol: return events the caller hasn't seen yet.
+
+        Returns ``(status, events)`` where status is:
+
+        * ``"ok"``       — events newer than ``after_seq`` are returned in
+                           order.  Empty list if the caller is up to date.
+        * ``"overflow"`` — ``after_seq`` is older than the oldest entry
+                           in the ring.  The caller should fall back to REST.
+        * ``"mismatch"`` — ``stream_id`` doesn't match the current stream
+                           (backend restarted, subprocess re-spawned, etc).
+                           Caller should fall back to REST.
+
+        ``stream_id=None`` / ``after_seq=None`` means "no checkpoint" —
+        returns ``("ok", [])`` so callers can use this in a uniform code
+        path without None-checks.
+        """
+        if stream_id is None or after_seq is None:
+            return "ok", []
+        if self._stream_id is None:
+            # Receive loop hasn't started yet — nothing to replay.
+            return "ok", []
+        if stream_id != self._stream_id:
+            return "mismatch", []
+        if not self._replay_buffer:
+            # Caller has a checkpoint, we have an empty buffer (fresh
+            # stream).  If their after_seq is ahead of our next_seq,
+            # we're behind them — treat as mismatch.  Otherwise OK with
+            # no events to send.
+            if after_seq >= self._next_seq:
+                return "mismatch", []
+            return "ok", []
+
+        oldest_seq = self._replay_buffer[0][0]
+        latest_seq = self._replay_buffer[-1][0]
+
+        if after_seq >= latest_seq:
+            return "ok", []  # caller is up to date
+        if after_seq < oldest_seq - 1:
+            # Their last-seen is older than what we still have buffered.
+            # The buffer evicts from the front, so anything missed beyond
+            # this point is gone forever.  Tell the caller to REST.
+            return "overflow", []
+
+        events = [
+            (seq, event)
+            for seq, event in self._replay_buffer
+            if seq > after_seq
+        ]
+        return "ok", events
+
+    @property
+    def stream_id(self) -> str | None:
+        """Identifier for the current receive-loop session — changes every
+        time the SDK subprocess (re)connects.  Used by the resume protocol
+        to detect a backend restart and force a REST refetch.
+        """
+        return self._stream_id
+
+    @property
+    def last_yielded_seq(self) -> int | None:
+        """Seq of the most recent event ``send()`` yielded, or ``None``.
+
+        The pool's broadcast path reads this in the same coroutine
+        immediately after ``async for event in sm.send(...)`` yields, so
+        the value reliably matches the just-yielded event.  Wraps the
+        outgoing WS payload with ``{seq, stream_id, ...}`` for the resume
+        protocol.
+        """
+        return self._last_yielded_seq
 
     # ------------------------------------------------------------------
     # Properties
@@ -706,76 +927,18 @@ class ClaudeSessionManager(BaseSessionManager):
         return PermissionResultDeny(message=message or "Denied", interrupt=False)
 
     async def _drain_stale_sdk_messages(self) -> int:
-        """Discard any messages sitting in the SDK's per-client receive buffer.
+        """Legacy hook — no-op in the persistent-receive-loop design.
 
-        Called at the top of every ``send()`` to prevent leftover messages
-        from a previously-cancelled turn from being consumed by the new
-        turn's ``receive_response()``.  See the comment in ``send()`` for the
-        full rationale.
+        Previously this method was called at the top of every ``send()`` to
+        discard messages left in the SDK buffer by a prior cancelled turn.
+        That whole failure mode is gone now: ``_receive_loop`` consumes
+        messages continuously for the session's lifetime, so the buffer
+        never accumulates stale events to begin with.
 
-        Reaches into ``client._query._message_receive`` because the SDK has
-        no public drain API.  Wrapped in defensive ``getattr``s so a future
-        SDK refactor degrades to "drain doesn't run" rather than crashing
-        the session — at worst we regress to the pre-fix behavior for one
-        turn until the user files a bug.
-
-        Returns the number of messages drained.  Always 0 on a healthy
-        session; non-zero indicates the cross-turn-contamination bug
-        condition just triggered (and was prevented).
+        Kept as a public method so external callers (tests, instrumentation)
+        that referenced it don't blow up; always returns 0.
         """
-        client = self._client
-        if client is None:
-            return 0
-        query = getattr(client, "_query", None)
-        if query is None:
-            return 0
-        receive_stream = getattr(query, "_message_receive", None)
-        if receive_stream is None:
-            return 0
-
-        # Be strict about the type — defensive against future SDK refactors and
-        # against tests that pass a MagicMock client (whose auto-mocked
-        # ``receive_nowait`` would never raise ``WouldBlock`` and would spin
-        # the drain loop until the cap, polluting logs).
-        from anyio import WouldBlock, EndOfStream
-        from anyio.streams.memory import MemoryObjectReceiveStream
-
-        if not isinstance(receive_stream, MemoryObjectReceiveStream):
-            return 0
-
-        drained = 0
-        # Hard cap matches the SDK's buffer size (100) plus a safety margin —
-        # if the buffer somehow grows past that, breaking out instead of
-        # spinning forever is the right call.
-        for _ in range(200):
-            try:
-                msg = receive_stream.receive_nowait()
-            except (WouldBlock, EndOfStream):
-                break
-            except Exception:
-                logger.exception(
-                    "Unexpected error draining SDK buffer for session %s",
-                    self._local_id,
-                )
-                break
-            drained += 1
-            # Be loud about what we threw away — if a user later asks "where
-            # did my message go?", this log answers it.
-            if isinstance(msg, dict):
-                msg_type = msg.get("type", "?")
-                logger.warning(
-                    "Discarded stale SDK message type=%s for session %s "
-                    "(from a previously-cancelled turn)",
-                    msg_type,
-                    self._local_id,
-                )
-            else:
-                logger.warning(
-                    "Discarded stale SDK message %r for session %s",
-                    type(msg).__name__,
-                    self._local_id,
-                )
-        return drained
+        return 0
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build SDK options from our config."""

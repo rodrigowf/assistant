@@ -10,6 +10,12 @@ import type {
 } from "../types";
 import { useWebSocket } from "./useWebSocket";
 import { getMessagesPaginated } from "../api/rest";
+import {
+  checkpointFromEvent,
+  clearCheckpoint,
+  readCheckpoint,
+  writeCheckpoint,
+} from "../utils/checkpoint";
 
 // -------------------------------------------------------------------
 // State
@@ -584,9 +590,56 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   const pendingPermissionRef = useRef<PendingPermission | null>(null);
   pendingPermissionRef.current = state.pendingPermission;
 
+  // Refetch the JSONL message tail via REST. Called at init time and as
+  // the fallback when the backend signals ``replay_overflow`` (our WS
+  // checkpoint was too old for in-memory replay, so the JSONL on disk is
+  // the only authoritative source for the missed events).
+  const reloadHistoryFromRest = useCallback(async (): Promise<boolean> => {
+    const sdkId = resumeSdkIdRef.current;
+    if (!sdkId || skipHistory) return false;
+    try {
+      const page = await getMessagesPaginated(sdkId, 50);
+      dispatch({ type: "LOAD_HISTORY", messages: page.messages });
+      setHasMoreMessages(page.has_more);
+      paginationStartIndexRef.current = page.start_index;
+      return true;
+    } catch {
+      // Session may not exist on the backend yet (e.g. brand-new tab,
+      // or running on a remote backend that hasn't synced).
+      return false;
+    }
+  }, [skipHistory]);
+  const reloadHistoryFromRestRef = useRef(reloadHistoryFromRest);
+  reloadHistoryFromRestRef.current = reloadHistoryFromRest;
+
   const handleEvent = useCallback((event: ServerEvent) => {
+    // Resume protocol: persist the (seq, stream_id) carried on every
+    // wire event so a future reconnect can ask the backend to replay
+    // from this point.  No-op for events from non-protocol backends.
+    const checkpoint = checkpointFromEvent(event as unknown as Record<string, unknown>);
+    if (checkpoint) {
+      writeCheckpoint(localIdRef.current, checkpoint);
+    }
     switch (event.type) {
       case "session_started": {
+        // Resume protocol: backend's view of the current stream.  We
+        // seed our checkpoint to (next_seq - 1) so a brand-new tab
+        // immediately has the right "last seen" boundary even before
+        // it observes a live event.  On ``replay_overflow``, the
+        // backend has already given up on WS replay — drop our stale
+        // checkpoint and fall back to a full REST refetch.
+        if (event.replay_overflow) {
+          clearCheckpoint(localIdRef.current);
+          void reloadHistoryFromRestRef.current?.();
+        } else if (event.resume_state) {
+          const { stream_id, next_seq } = event.resume_state;
+          if (typeof next_seq === "number" && next_seq > 0) {
+            writeCheckpoint(localIdRef.current, {
+              stream_id,
+              seq: next_seq - 1,
+            });
+          }
+        }
         // Chat sessions carry the window directly; orchestrator nests it under
         // model_info. Either may be null/undefined — the reducer keeps the
         // previous value (or null → falls back to DEFAULT_CONTEXT_WINDOW).
@@ -737,6 +790,14 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     if (sdkId) {
       startMsg.resume_sdk_id = sdkId;
     }
+    // Resume protocol: if we have a checkpoint persisted from a prior
+    // connection of this tab, ask the backend to replay events newer
+    // than ``seq``.  Backend either streams them in order or responds
+    // with ``replay_overflow`` (handled in handleEvent → REST refetch).
+    const checkpoint = readCheckpoint(localIdRef.current);
+    if (checkpoint) {
+      startMsg.resume_from = checkpoint;
+    }
     pendingStartRef.current = null;
     wsSendRef.current?.(startMsg);
   }, []);
@@ -765,21 +826,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       setHasMoreMessages(false);
       paginationStartIndexRef.current = 0;
 
-      // Load history using the SDK session ID (JSONL filename)
-      const sdkId = resumeSdkIdRef.current;
-      if (sdkId && !skipHistory) {
-        try {
-          const page = await getMessagesPaginated(sdkId, 50);
-          if (cancelled) return;
-          dispatch({ type: "LOAD_HISTORY", messages: page.messages });
-          setHasMoreMessages(page.has_more);
-          paginationStartIndexRef.current = page.start_index;
-        } catch {
-          // Session may not exist yet (e.g. running on remote backend)
-        }
-      }
-
+      await reloadHistoryFromRest();
       if (cancelled) return;
+
       pendingStartRef.current = { resumeSdkId: resumeSdkIdRef.current };
       setWsActive(true);
     }

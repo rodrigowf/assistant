@@ -46,32 +46,68 @@ def _mock_result(session_id="test-session-123", cost=0.01, num_turns=1, is_error
 def _make_mock_client(init_messages=None, response_messages_fn=None, server_info=None):
     """Create a mock ClaudeSDKClient.
 
-    receive_messages and receive_response must return async iterators directly
-    (not coroutines), so we use plain functions that return async generators.
+    In the persistent-receive-loop design, ``client.receive_messages()`` is
+    the single source of all SDK events. Each call to ``client.query()``
+    enqueues whatever ``response_messages_fn`` yields onto the same stream
+    the receive loop is reading from. ``init_messages`` are enqueued at
+    connect time.
 
     Args:
-        init_messages: Messages to yield from receive_messages (legacy, unused now)
-        response_messages_fn: Function returning async iterator for receive_response
-        server_info: Dict to return from get_server_info (default: {"session_id": "test-session"})
+        init_messages: Messages enqueued before any turn (e.g. SystemMessage init).
+        response_messages_fn: Async-generator factory; called for each query() to
+            produce that turn's messages. The factory may also be a function that
+            returns an async iterator directly.
+        server_info: Dict returned from get_server_info (default: {"session_id": "test-session"}).
     """
     client = MagicMock()
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
-    client.query = AsyncMock()
     client.interrupt = AsyncMock()
 
-    # get_server_info returns initialization data after connect()
     if server_info is None:
         server_info = {"session_id": "test-session"}
     client.get_server_info = AsyncMock(return_value=server_info)
 
-    async def _receive_messages():
-        if init_messages:
-            for msg in init_messages:
-                yield msg
+    # Single queue that receive_messages() drains.  query() enqueues the
+    # response messages for the turn it triggered, mirroring how the real
+    # SDK funnels everything through one ``_message_receive`` stream.
+    msg_queue: asyncio.Queue = asyncio.Queue()
+    if init_messages:
+        for m in init_messages:
+            msg_queue.put_nowait(m)
 
+    # query() must be fire-and-forget like the real SDK: it kicks off the
+    # response stream and returns immediately. The receive loop is a
+    # separate task that reads from receive_messages() concurrently.
+    # Wrapped in AsyncMock so tests can still call assert_awaited_with().
+    _query_tasks: list[asyncio.Task] = []
+
+    async def _drain_response_into_queue():
+        if response_messages_fn is None:
+            return
+        agen = response_messages_fn()
+        try:
+            async for m in agen:
+                await msg_queue.put(m)
+        except (asyncio.CancelledError, GeneratorExit):
+            return
+
+    async def _query_side_effect(_prompt):
+        if response_messages_fn is None:
+            return
+        _query_tasks.append(asyncio.create_task(_drain_response_into_queue()))
+
+    client.query = AsyncMock(side_effect=_query_side_effect)
+    client._query_tasks = _query_tasks  # exposed for test cleanup
+
+    async def _receive_messages():
+        while True:
+            m = await msg_queue.get()
+            yield m
     client.receive_messages = _receive_messages
 
+    # Some legacy tests reach for receive_response() directly; keep it
+    # wired to the same factory so they keep working.
     if response_messages_fn is not None:
         client.receive_response = response_messages_fn
 
@@ -817,109 +853,518 @@ class TestSessionManagerStallWatchdog:
         assert any(isinstance(e, TurnComplete) for e in events)
 
 
-class TestSessionManagerStaleMessageDrain:
-    """Tests for the cross-turn-contamination guard in send().
+class TestSessionManagerPersistentReceiveLoop:
+    """Tests for the cross-turn correctness invariants the persistent
+    receive loop guarantees.
 
-    The bundled `claude` CLI keeps emitting messages for a brief window
-    after we issue an interrupt — including a synthesized terminal
-    ResultMessage — and those messages land in the SDK's per-client buffer.
-    Without the drain in send(), the next turn's receive_response() picks up
-    that stale ResultMessage and exits before the real turn produces any
-    output.  Symptom: status flips to IDLE, a fake turn_complete reaches the
-    UI, and the actual prompt processes silently with no Python reader.
+    Background: the OLD design spawned a per-turn ``_drain`` task inside
+    ``send()`` that read ``receive_response()``.  If ``send()`` exited for
+    any reason (interrupt, frontend disconnect cancelling the WS task,
+    stall watchdog raising) the drain task was cancelled but the bundled
+    CLI kept producing events into the SDK buffer with no reader.  Three
+    things broke at once:
+
+      1. Status froze at IDLE while the subprocess was still working.
+      2. Events accumulated in the SDK's bounded MemoryObjectStream
+         (cap 100) until the next ``send()`` came in and threw them
+         all away.
+      3. The next ``send()``'s ``receive_response()`` could pick up a
+         leftover ``ResultMessage`` and exit before the real turn
+         produced any output.
+
+    The new design: one ``_receive_loop`` task per session lifetime that
+    consumes ``receive_messages()`` continuously and updates status
+    regardless of whether anyone's iterating ``send()``.
     """
 
     @pytest.mark.asyncio
-    async def test_drain_discards_stale_messages_before_new_turn(self):
-        """Pre-existing messages in the SDK buffer are drained, not
-        consumed by the new turn's receive_response()."""
-        from claude_agent_sdk import SystemMessage
-        import anyio
+    async def test_status_stays_accurate_when_send_iterator_exits_early(self):
+        """If a caller stops iterating ``send()`` early, the receive loop
+        keeps consuming SDK messages and status reflects subprocess
+        state — not a phantom IDLE.
 
-        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
-        result = _mock_result(session_id="s1")
-
-        async def fake_response():
-            # The real turn's events — only these should reach the caller.
-            yield result
-
-        client = _make_mock_client([init_msg], fake_response)
-
-        # Inject a real anyio stream into client._query and pre-load it
-        # with stale messages from the "previous, cancelled turn".
-        send_stream, receive_stream = anyio.create_memory_object_stream(
-            max_buffer_size=100
+        Regression for the chronic "UI shows stopped while session is
+        working" bug class: the WS subscriber disconnects mid-tool, the
+        outer ``_drive_turn`` task gets cancelled, the inner ``send()``
+        exits — and we used to set status = IDLE here.  Pool/live returned
+        ``idle`` to the next reconnecting client and the UI showed no
+        activity until the next user prompt drained 100+ stale messages.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            ToolUseBlock,
         )
-        client._query = MagicMock()
-        client._query._message_receive = receive_stream
-
-        stale_result = {"type": "result", "session_id": "s0", "is_error": True}
-        stale_assistant = {"type": "assistant", "session_id": "s0"}
-        await send_stream.send(stale_assistant)
-        await send_stream.send(stale_result)
-
-        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
-            sm = SessionManager()
-            await sm.start()
-
-            events = []
-            async for event in sm.send("turn 2 prompt"):
-                events.append(event)
-
-        # The fresh ResultMessage from fake_response — not the stale one —
-        # is what produced the TurnComplete.
-        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
-        assert len(turn_completes) == 1
-        assert turn_completes[0].session_id == "s1"
-
-        # Buffer was drained (statistics reports current_buffer_used == 0).
-        # If the drain didn't run, the two pre-loaded items would still be
-        # sitting in the buffer.
-        assert receive_stream.statistics().current_buffer_used == 0
-
-    @pytest.mark.asyncio
-    async def test_drain_no_op_on_clean_buffer(self):
-        """When the buffer is empty (the steady-state case), the drain is a
-        no-op and the turn proceeds normally with no extra warnings."""
-        from claude_agent_sdk import SystemMessage
-        import anyio
 
         init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        tool_use_msg = AssistantMessage(
+            model="claude-test",
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            parent_tool_use_id=None,
+        )
+        # ResultMessage held back so the test can observe TOOL_USE state.
         result = _mock_result(session_id="s1")
 
+        release_result = asyncio.Event()
+
         async def fake_response():
+            yield tool_use_msg
+            await release_result.wait()
             yield result
 
         client = _make_mock_client([init_msg], fake_response)
-        # Real but empty stream.
-        _send, recv = anyio.create_memory_object_stream(max_buffer_size=100)
-        client._query = MagicMock()
-        client._query._message_receive = recv
 
         with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
-            events = []
-            async for event in sm.send("clean turn"):
-                events.append(event)
+            # Caller starts iterating, observes the ToolUse, then walks
+            # away — like a WS disconnect cancelling the drive task.
+            agen = sm.send("hi").__aiter__()
+            first = await agen.__anext__()
+            assert isinstance(first, ToolUse)
+            # Stop iterating: aclose() runs send()'s finally block.
+            await agen.aclose()
 
-        assert any(isinstance(e, TurnComplete) for e in events)
-        assert recv.statistics().current_buffer_used == 0
+            # Status MUST still reflect "tool_use" — the subprocess is
+            # still running the tool.  In the old design this was
+            # SessionStatus.IDLE because send()'s finally set it.
+            assert sm.status == SessionStatus.TOOL_USE
+
+            # The receive loop is still running.  When the SDK eventually
+            # emits ResultMessage, status flips to IDLE — even with no
+            # active subscriber.
+            release_result.set()
+            for _ in range(50):
+                if sm.status == SessionStatus.IDLE:
+                    break
+                await asyncio.sleep(0.01)
+            assert sm.status == SessionStatus.IDLE
+
+            await sm.stop()
 
     @pytest.mark.asyncio
-    async def test_drain_helper_returns_zero_on_mock_query(self):
-        """Defensive: if the SDK refactors and _message_receive isn't an
-        actual MemoryObjectReceiveStream, the drain returns 0 instead of
-        raising or spinning the cap loop against a MagicMock."""
+    async def test_replay_buffer_captures_events_after_send_exits(self):
+        """Events the SDK produces after ``send()`` returns are still
+        captured in the replay ring — a reconnecting WS can read them
+        and catch up instead of seeing nothing.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        tool_use_msg = AssistantMessage(
+            model="claude-test",
+            content=[TextBlock(text="thinking…")],
+            parent_tool_use_id=None,
+        )
+        late_msg = AssistantMessage(
+            model="claude-test",
+            content=[TextBlock(text="late-arrival text")],
+            parent_tool_use_id=None,
+        )
+        result = _mock_result(session_id="s1")
+        release_late = asyncio.Event()
+
+        async def fake_response():
+            yield tool_use_msg
+            await release_late.wait()
+            yield late_msg
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            agen = sm.send("hi").__aiter__()
+            first = await agen.__anext__()
+            assert isinstance(first, TextComplete)
+            await agen.aclose()
+
+            release_late.set()
+            for _ in range(50):
+                if sm.status == SessionStatus.IDLE:
+                    break
+                await asyncio.sleep(0.01)
+
+            # Replay ring is now ``(seq, event)`` pairs; unpack.
+            texts = [
+                event.text
+                for _seq, event in sm.replay_recent_events()
+                if isinstance(event, TextComplete)
+            ]
+            assert "thinking…" in texts
+            assert "late-arrival text" in texts
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_stale_messages_picked_up_by_next_turn(self):
+        """A second ``send()`` after an early-exit first call doesn't see
+        any leftovers from the first turn — the receive loop already
+        consumed them and dispatched the trailing ResultMessage to status.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        turn1_text = AssistantMessage(
+            model="claude-test",
+            content=[TextBlock(text="turn 1 text")],
+            parent_tool_use_id=None,
+        )
+        turn1_result = _mock_result(session_id="s1")
+        turn2_text = AssistantMessage(
+            model="claude-test",
+            content=[TextBlock(text="turn 2 text")],
+            parent_tool_use_id=None,
+        )
+        turn2_result = _mock_result(session_id="s1")
+
+        call_count = 0
+        async def fake_response():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield turn1_text
+                yield turn1_result
+            else:
+                yield turn2_text
+                yield turn2_result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            agen = sm.send("turn 1").__aiter__()
+            await agen.__anext__()  # turn 1 text
+            await agen.aclose()  # bail before TurnComplete
+
+            # Give the receive loop a moment to drain turn 1's ResultMessage.
+            for _ in range(20):
+                if sm.status == SessionStatus.IDLE:
+                    break
+                await asyncio.sleep(0.01)
+
+            # Turn 2 fires; the receive loop dispatches to the new inbox.
+            events = [e async for e in sm.send("turn 2")]
+            texts = [e.text for e in events if isinstance(e, TextComplete)]
+            tcs = [e for e in events if isinstance(e, TurnComplete)]
+
+            # Turn 2's text reaches the subscriber, NOT turn 1's leftover.
+            assert texts == ["turn 2 text"]
+            assert len(tcs) == 1
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_drain_helper_is_now_a_no_op(self):
+        """The legacy ``_drain_stale_sdk_messages`` was kept as a no-op
+        for callers/instrumentation; the persistent receive loop makes
+        the underlying failure mode impossible.
+        """
         client = _make_mock_client(server_info={"session_id": "s1"})
 
         with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
             sm = SessionManager()
             await sm.start()
 
-            drained = await sm._drain_stale_sdk_messages()
-            assert drained == 0
+            assert await sm._drain_stale_sdk_messages() == 0
+
+            await sm.stop()
+
+
+class TestSessionManagerResumeProtocol:
+    """Tests for the (stream_id, seq) resume protocol used by the
+    WebSocket reconnect-replay path.
+
+    The persistent receive loop assigns a monotonic seq to every event
+    it dispatches.  A reconnecting frontend supplies its last-seen
+    (stream_id, seq) and the backend either replays buffered events
+    newer than that seq, or signals overflow/mismatch so the frontend
+    falls back to a REST refetch.  This protocol is what eliminates
+    the "UI looks stopped while session is working" failure mode that
+    persisted after the persistent receive loop fix — a brief WS
+    disconnect during a long turn no longer drops events permanently.
+    """
+
+    @staticmethod
+    async def _run_until_idle(sm, *, timeout_s: float = 0.5) -> None:
+        """Spin until the receive loop has marked the session IDLE again.
+
+        Tests need this because event dispatch + status mutation happen
+        asynchronously inside the receive loop.  Bounded so a hung test
+        fails fast rather than timing out the suite.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while sm.status != SessionStatus.IDLE:
+            if loop.time() >= deadline:
+                raise AssertionError(
+                    f"Receive loop did not return to IDLE within {timeout_s}s"
+                )
+            await asyncio.sleep(0.005)
+
+    @pytest.mark.asyncio
+    async def test_stream_id_is_set_at_connect_and_persists(self):
+        """``stream_id`` is minted when the receive loop starts and stays
+        stable across turns until the SDK reconnects.
+        """
+        from claude_agent_sdk import SystemMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            stream_id_at_start = sm.stream_id
+            assert stream_id_at_start is not None
+            assert stream_id_at_start.startswith(sm.local_id + ":")
+
+            # One full turn — stream_id stays the same.
+            async for _ in sm.send("hi"):
+                pass
+
+            assert sm.stream_id == stream_id_at_start
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_seq_increments_monotonically_per_dispatched_event(self):
+        """Every event the receive loop dispatches gets a seq exactly one
+        higher than the last.  No gaps, no resets within a stream.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        text_msg = AssistantMessage(
+            model="claude-test",
+            content=[TextBlock(text="alpha")],
+            parent_tool_use_id=None,
+        )
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield text_msg
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            async for _ in sm.send("hi"):
+                pass
+
+            await self._run_until_idle(sm)
+
+            seqs = [seq for seq, _event in sm.replay_recent_events()]
+            assert seqs, "replay buffer should have at least the TextComplete + TurnComplete"
+            # Strictly monotonic, contiguous from oldest seq onwards.
+            assert seqs == list(range(seqs[0], seqs[-1] + 1))
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_no_checkpoint_returns_ok_empty(self):
+        """``replay_after(None, None)`` is the uniform-code-path entry
+        for callers that don't have a checkpoint yet — empty replay
+        with status ok so they don't need to special-case the None branch.
+        """
+        client = _make_mock_client(server_info={"session_id": "s1"})
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            status, events = sm.replay_after(None, None)
+            assert status == "ok"
+            assert events == []
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_matching_stream_returns_newer_events(self):
+        """A reconnecting subscriber with the right ``stream_id`` and a
+        seq older than the most-recently-dispatched seq gets exactly
+        the missed events, in order.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        msgs = [
+            AssistantMessage(
+                model="t",
+                content=[TextBlock(text=f"chunk-{i}")],
+                parent_tool_use_id=None,
+            )
+            for i in range(5)
+        ]
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            for m in msgs:
+                yield m
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            async for _ in sm.send("hi"):
+                pass
+            await self._run_until_idle(sm)
+
+            all_seqs = [seq for seq, _ in sm.replay_recent_events()]
+            assert len(all_seqs) >= 6  # 5 text + 1 result
+
+            # Subscriber "saw" up to and including the 2nd seq —
+            # everything strictly after should come back.
+            after_seq = all_seqs[1]
+            status, replay = sm.replay_after(sm.stream_id, after_seq)
+            assert status == "ok"
+            replay_seqs = [seq for seq, _ in replay]
+            assert replay_seqs == all_seqs[2:]
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_current_seq_returns_empty(self):
+        """Subscriber's seq is already at the head — no replay needed."""
+        from claude_agent_sdk import SystemMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            async for _ in sm.send("hi"):
+                pass
+            await self._run_until_idle(sm)
+
+            all_seqs = [seq for seq, _ in sm.replay_recent_events()]
+            assert all_seqs
+
+            status, replay = sm.replay_after(sm.stream_id, all_seqs[-1])
+            assert status == "ok"
+            assert replay == []
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_mismatched_stream_returns_mismatch(self):
+        """A stale ``stream_id`` (e.g. backend restarted under the client)
+        returns mismatch so the client falls back to REST.
+        """
+        client = _make_mock_client(server_info={"session_id": "s1"})
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            status, replay = sm.replay_after("definitely-not-our-stream:9999", 0)
+            assert status == "mismatch"
+            assert replay == []
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_overflowed_seq_returns_overflow(self):
+        """Subscriber's checkpoint is older than the buffer's oldest
+        entry — the missed events are gone forever; signal overflow
+        so the client REST-refetches the JSONL tail.
+        """
+        from manager.claude import session as session_mod
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        # Shrink the buffer so the test runs in milliseconds.
+        original = session_mod._REPLAY_BUFFER_SIZE
+        session_mod._REPLAY_BUFFER_SIZE = 4
+
+        try:
+            init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+
+            # 8 text deltas → buffer holds the most recent 4 only.
+            text_msgs = [
+                AssistantMessage(
+                    model="t",
+                    content=[TextBlock(text=f"t{i}")],
+                    parent_tool_use_id=None,
+                )
+                for i in range(8)
+            ]
+            result = _mock_result(session_id="s1")
+
+            async def fake_response():
+                for m in text_msgs:
+                    yield m
+                yield result
+
+            client = _make_mock_client([init_msg], fake_response)
+
+            with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+                sm = SessionManager()
+                # Have to rebuild the deque with the new maxlen since
+                # __init__ already captured the old value.
+                from collections import deque as _deque
+                sm._replay_buffer = _deque(maxlen=session_mod._REPLAY_BUFFER_SIZE)
+                await sm.start()
+
+                async for _ in sm.send("hi"):
+                    pass
+                await self._run_until_idle(sm)
+
+                buffered_seqs = [seq for seq, _ in sm.replay_recent_events()]
+                assert len(buffered_seqs) == session_mod._REPLAY_BUFFER_SIZE
+
+                # Ask for everything from seq=0 — way older than the
+                # current oldest.  Must be overflow.
+                status, replay = sm.replay_after(sm.stream_id, 0)
+                assert status == "overflow"
+                assert replay == []
+
+                await sm.stop()
+        finally:
+            session_mod._REPLAY_BUFFER_SIZE = original
 
 
 class TestSessionManagerCostTracking:
