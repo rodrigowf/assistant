@@ -265,3 +265,223 @@ async def test_start_turn_unknown_session_raises():
     pool = SessionPool()
     with pytest.raises(ValueError, match="No session"):
         await pool.start_turn("nope", "hello")
+
+
+# ---------------------------------------------------------------------------
+# Resume protocol — pool-level helpers (replay_for_subscriber, _wrap_payload,
+# resume_state_for) match the SessionManager-level invariants tested in
+# test_session.py::TestSessionManagerResumeProtocol.  These tests exercise
+# the pool's translation of those invariants into the wire payloads sent
+# to the WebSocket.
+# ---------------------------------------------------------------------------
+
+
+def _resume_stub_session_manager(stream_id: str | None, ring: list[tuple[int, object]]):
+    """Stub SessionManager with the resume-protocol surface filled in.
+
+    The pool's resume helpers read ``stream_id``, ``_next_seq``, and
+    ``replay_after``; everything else is irrelevant for these tests.
+    """
+    sm = MagicMock()
+    sm.local_id = "rsp-session"
+    sm.session_id = "rsp-session"
+    sm.sdk_session_id = "sdk-rsp"
+    sm.status = SessionStatus.IDLE
+    sm.subprocess_pid = None
+    sm.is_active = True
+    sm.stream_id = stream_id
+    # Pool reads ``_next_seq`` via ``getattr`` for ``resume_state_for``.
+    sm._next_seq = (ring[-1][0] + 1) if ring else 0
+    sm.last_yielded_seq = None
+
+    def _replay_after(client_stream_id, after_seq):
+        if client_stream_id is None or after_seq is None:
+            return "ok", []
+        if stream_id is None:
+            return "ok", []
+        if client_stream_id != stream_id:
+            return "mismatch", []
+        if not ring:
+            if after_seq >= sm._next_seq:
+                return "mismatch", []
+            return "ok", []
+        oldest = ring[0][0]
+        latest = ring[-1][0]
+        if after_seq >= latest:
+            return "ok", []
+        if after_seq < oldest - 1:
+            return "overflow", []
+        return "ok", [(s, e) for s, e in ring if s > after_seq]
+
+    sm.replay_after = _replay_after
+    return sm
+
+
+def test_resume_state_for_returns_none_when_session_missing():
+    pool = SessionPool()
+    assert pool.resume_state_for("does-not-exist") is None
+
+
+def test_resume_state_for_returns_stream_id_and_next_seq():
+    pool = SessionPool()
+    sm = _resume_stub_session_manager(
+        stream_id="rsp-session:1700000000000",
+        ring=[
+            (0, TextDelta(text="a")),
+            (1, TextDelta(text="b")),
+        ],
+    )
+    _install(pool, sm)
+
+    state = pool.resume_state_for(sm.local_id)
+    assert state == {
+        "stream_id": "rsp-session:1700000000000",
+        "next_seq": 2,
+    }
+
+
+def test_resume_state_for_none_when_provider_does_not_support_protocol():
+    """Providers that haven't implemented ``stream_id`` (Qwen, Gemini) get
+    ``None`` — frontend treats those sessions as non-resumable and falls
+    back to REST refetch automatically.
+    """
+    pool = SessionPool()
+    sm = _resume_stub_session_manager(stream_id=None, ring=[])
+    _install(pool, sm)
+    assert pool.resume_state_for(sm.local_id) is None
+
+
+def test_replay_for_subscriber_no_checkpoint_returns_ok_empty():
+    pool = SessionPool()
+    sm = _resume_stub_session_manager(
+        stream_id="rsp:1", ring=[(0, TextDelta(text="x"))],
+    )
+    _install(pool, sm)
+
+    status, payloads = pool.replay_for_subscriber(sm.local_id, None)
+    assert status == "ok"
+    assert payloads == []
+
+
+def test_replay_for_subscriber_replays_missed_events_in_order():
+    """Subscriber's checkpoint matches the live stream and references a
+    seq older than the head — they get every newer event, in order,
+    each carrying its assigned seq + stream_id in the wire payload.
+    """
+    pool = SessionPool()
+    ring = [
+        (5, TextDelta(text="alpha")),
+        (6, TextDelta(text="beta")),
+        (7, TextDelta(text="gamma")),
+    ]
+    sm = _resume_stub_session_manager(stream_id="rsp:1700", ring=ring)
+    _install(pool, sm)
+
+    status, payloads = pool.replay_for_subscriber(
+        sm.local_id, {"stream_id": "rsp:1700", "seq": 5},
+    )
+    assert status == "ok"
+    assert len(payloads) == 2
+    seqs = [p["seq"] for p in payloads]
+    assert seqs == [6, 7]
+    assert all(p["stream_id"] == "rsp:1700" for p in payloads)
+    # Wire payload carries the serialized event content too — the
+    # frontend dispatches it through the same reducer as live events.
+    assert payloads[0]["type"] == "text_delta"
+    assert payloads[0]["text"] == "beta"
+
+
+def test_replay_for_subscriber_mismatch_status_for_stale_stream_id():
+    pool = SessionPool()
+    sm = _resume_stub_session_manager(stream_id="rsp:NEW", ring=[(0, TextDelta(text="x"))])
+    _install(pool, sm)
+
+    status, payloads = pool.replay_for_subscriber(
+        sm.local_id, {"stream_id": "rsp:OLD", "seq": 0},
+    )
+    assert status == "mismatch"
+    assert payloads == []
+
+
+def test_replay_for_subscriber_overflow_status_when_seq_too_old():
+    pool = SessionPool()
+    # Ring's oldest seq is 100; subscriber's checkpoint is 0 — long gone.
+    ring = [(i, TextDelta(text=f"t{i}")) for i in range(100, 105)]
+    sm = _resume_stub_session_manager(stream_id="rsp:1", ring=ring)
+    _install(pool, sm)
+
+    status, payloads = pool.replay_for_subscriber(
+        sm.local_id, {"stream_id": "rsp:1", "seq": 0},
+    )
+    assert status == "overflow"
+    assert payloads == []
+
+
+def test_replay_for_subscriber_malformed_handshake_treated_as_no_checkpoint():
+    """Belt-and-braces: a malformed resume_from dict (wrong types, missing
+    keys) doesn't crash — it just behaves as if no checkpoint was sent.
+    """
+    pool = SessionPool()
+    sm = _resume_stub_session_manager(stream_id="rsp:1", ring=[(0, TextDelta(text="x"))])
+    _install(pool, sm)
+
+    for bad in (
+        {},
+        {"stream_id": 42, "seq": 0},
+        {"stream_id": "ok", "seq": "not-an-int"},
+        {"only_seq": 5},
+    ):
+        status, payloads = pool.replay_for_subscriber(sm.local_id, bad)
+        assert status == "ok"
+        assert payloads == []
+
+
+def test_replay_for_subscriber_unsupported_for_provider_without_protocol():
+    """Providers (Qwen, Gemini) that haven't implemented ``replay_after``
+    return ``unsupported`` — the route layer treats this the same as
+    ``ok`` with no replay, preserving old behaviour for those providers.
+    """
+    pool = SessionPool()
+    sm = MagicMock()
+    sm.local_id = "qwen-session"
+    sm.sdk_session_id = "sdk"
+    sm.stream_id = None
+    sm.status = SessionStatus.IDLE
+    # Crucially: no replay_after attribute.
+    del sm.replay_after
+    _install(pool, sm)
+
+    status, payloads = pool.replay_for_subscriber(
+        sm.local_id, {"stream_id": "x", "seq": 0},
+    )
+    assert status == "unsupported"
+    assert payloads == []
+
+
+def test_wrap_payload_stamps_seq_and_stream_id_when_available():
+    pool = SessionPool()
+    sm = MagicMock()
+    sm.stream_id = "rsp:42"
+    sm.last_yielded_seq = 17
+
+    out = pool._wrap_payload(sm, {"type": "text_delta", "text": "x"})
+    assert out["seq"] == 17
+    assert out["stream_id"] == "rsp:42"
+    assert out["type"] == "text_delta"
+
+
+def test_wrap_payload_no_op_when_session_lacks_protocol():
+    """Qwen-style provider with no stream_id: payload passes through
+    unchanged so the frontend treats it as a non-resumable broadcast.
+    """
+    pool = SessionPool()
+    sm = MagicMock()
+    sm.stream_id = None
+    sm.last_yielded_seq = None
+    payload = {"type": "text_delta", "text": "x"}
+    out = pool._wrap_payload(sm, payload)
+    # ``setdefault`` would not inject None either, but we want to be
+    # explicit: no seq/stream_id at all on the wire.
+    assert "seq" not in out
+    assert "stream_id" not in out
+    assert out is payload  # same object, no copy

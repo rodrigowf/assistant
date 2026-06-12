@@ -269,6 +269,29 @@ class BaseSessionManager(ABC):
     def pending_permission_ids(self) -> list[str]:
         return [rid for rid, fut in self._pending_permissions.items() if not fut.done()]
 
+    def _inject_event(self, event: Event) -> None:
+        """Push an out-of-band event into the active ``send()`` stream.
+
+        Default implementation enqueues directly on the inbox.  Subclasses
+        that track replay/sequencing (e.g. Claude's persistent receive
+        loop) override this to assign a seq, append to the replay ring,
+        and wrap the event before queueing.
+
+        Safe to call when there is no active stream — the call is a no-op
+        in that case so callers don't need to None-check.
+        """
+        inbox = self._event_inbox
+        if inbox is None:
+            return
+        try:
+            inbox.put_nowait(event)
+        except asyncio.QueueFull:
+            import logging
+            logging.getLogger(__name__).warning(
+                "send() inbox full for session %s; injected event dropped",
+                self._local_id,
+            )
+
     async def _emit_permission_request(
         self,
         tool_name: str,
@@ -280,8 +303,7 @@ class BaseSessionManager(ABC):
         Auto-allows (returns ``("allow", None)``) when there's no active
         stream — a permission popup without a UI to display it would deadlock.
         """
-        inbox = self._event_inbox
-        if inbox is None:
+        if self._event_inbox is None:
             return "allow", None
 
         request_id = str(uuid.uuid4())
@@ -289,7 +311,7 @@ class BaseSessionManager(ABC):
         future: asyncio.Future[tuple[str, str | None, str]] = loop.create_future()
         self._pending_permissions[request_id] = future
 
-        await inbox.put(PermissionRequest(
+        self._inject_event(PermissionRequest(
             request_id=request_id,
             tool_name=tool_name,
             tool_input=dict(tool_input),
@@ -300,7 +322,7 @@ class BaseSessionManager(ABC):
         finally:
             self._pending_permissions.pop(request_id, None)
 
-        await inbox.put(PermissionResolved(
+        self._inject_event(PermissionResolved(
             request_id=request_id,
             decision=decision,
             responder=responder,

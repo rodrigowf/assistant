@@ -724,7 +724,7 @@ class SessionPool:
                 exclude=source_ws,
             )
             async for event in sm.send(text):
-                payload = serialize_event(event)
+                payload = self._wrap_payload(sm, serialize_event(event))
                 await self._broadcast_session(session_id, payload)
                 if payload.get("type") in ("permission_request", "permission_resolved"):
                     # Mirror to the orchestrator so its UI can show a matching
@@ -913,6 +913,111 @@ class SessionPool:
         except (asyncio.CancelledError, Exception):
             pass
         return True
+
+    # ------------------------------------------------------------------
+    # Resume protocol — wrap broadcasts with (seq, stream_id) so a
+    # reconnecting WS can resume from a checkpoint without losing events.
+    # See ``manager/claude/session.py``'s ``replay_after`` for the matching
+    # backend logic and ``frontend/src/utils/checkpoint.ts`` for the client.
+    # ------------------------------------------------------------------
+
+    def _wrap_payload(
+        self,
+        sm: BaseSessionManager,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach resume-protocol metadata to a broadcast payload.
+
+        Reads the seq the session just yielded (set inside ``sm.send`` in
+        the same coroutine — no await intervenes) and the session's
+        current stream id.  Either may be missing for providers that
+        don't support the protocol (Qwen, Gemini); in that case the
+        payload is returned unchanged and the frontend treats this
+        session as non-resumable (the protocol is purely additive).
+        """
+        stream_id = getattr(sm, "stream_id", None)
+        seq = getattr(sm, "last_yielded_seq", None)
+        if stream_id is None or seq is None:
+            return payload
+        # Don't overwrite if a caller already filled these (defensive —
+        # the replay path stamps its own seqs in :meth:`replay_for_subscriber`).
+        payload.setdefault("seq", seq)
+        payload.setdefault("stream_id", stream_id)
+        return payload
+
+    def resume_state_for(self, session_id: str) -> dict[str, Any] | None:
+        """Snapshot of a session's resume-protocol state, or None.
+
+        ``{"stream_id": str, "next_seq": int}``.  Returned to the
+        frontend in ``session_started`` so a fresh subscriber (no
+        prior checkpoint) immediately learns the stream identity and
+        can start tracking seqs from this point forward.
+        """
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            return None
+        stream_id = getattr(sm, "stream_id", None)
+        if stream_id is None:
+            return None
+        # ``_next_seq`` is the seq the *next* dispatch will use; the
+        # last delivered seq is one less.  Hand the frontend the
+        # next-seq directly — it represents "the boundary above which
+        # nothing has been delivered yet", which is the right thing
+        # to compare future seqs against.
+        next_seq = getattr(sm, "_next_seq", 0)
+        return {"stream_id": stream_id, "next_seq": next_seq}
+
+    def replay_for_subscriber(
+        self,
+        session_id: str,
+        resume_from: dict[str, Any] | None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Build the resume batch for a (re)connecting subscriber.
+
+        Returns ``(status, wire_payloads)``:
+
+        * ``"ok"``       — ``wire_payloads`` are serialized events the
+                           caller can send to the WS in order.  Empty
+                           if the subscriber is current.
+        * ``"overflow"`` — checkpoint is older than the buffer; caller
+                           must REST-refetch.  ``wire_payloads`` empty.
+        * ``"mismatch"`` — checkpoint references a stale stream;
+                           caller must REST-refetch.  ``wire_payloads`` empty.
+        * ``"unsupported"`` — provider doesn't implement the protocol
+                           (no ``replay_after``).  Treated as ``"ok"``
+                           with no replay; old behavior preserved.
+
+        ``resume_from`` is the dict the client sent in the ``start``
+        handshake; ``None`` means "no checkpoint, no replay needed".
+        """
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            return "ok", []
+        replay = getattr(sm, "replay_after", None)
+        if replay is None:
+            return "unsupported", []
+        if resume_from is None:
+            return "ok", []
+
+        stream_id = resume_from.get("stream_id")
+        after_seq = resume_from.get("seq")
+        if not isinstance(stream_id, str) or not isinstance(after_seq, int):
+            # Malformed handshake — treat as no checkpoint rather than
+            # erroring; the frontend will receive an empty replay and
+            # behave as a fresh subscriber.
+            return "ok", []
+
+        status, sequenced = replay(stream_id, after_seq)
+        if status != "ok":
+            return status, []
+
+        payloads: list[dict[str, Any]] = []
+        for seq, event in sequenced:
+            wire = serialize_event(event)
+            wire["seq"] = seq
+            wire["stream_id"] = sm.stream_id
+            payloads.append(wire)
+        return "ok", payloads
 
     # ------------------------------------------------------------------
     # Internal helpers
