@@ -273,6 +273,13 @@ async def _handle_start(
     The frontend sends ``local_id`` (stable tab UUID) and optionally
     ``resume_sdk_id`` (Claude Code SDK session ID for resuming from history).
     Optionally includes ``mcp_servers`` dict to specify which MCPs to load.
+
+    Resume protocol (optional): the frontend may include ``resume_from``:
+        ``{"stream_id": <str>, "seq": <int>}``
+    which tells the backend the last seq the frontend received on the
+    previous WS connection.  The backend either replays missed events
+    in order, or signals ``replay_overflow`` so the frontend falls back
+    to a full REST refetch.  See ``api/pool.py``'s ``replay_for_subscriber``.
     """
     import asyncio
 
@@ -280,18 +287,13 @@ async def _handle_start(
     resume_sdk_id = msg.get("resume_sdk_id") or msg.get("session_id")
     fork = msg.get("fork", False)
     mcp_servers = msg.get("mcp_servers")  # Optional: dict of MCP servers to load
+    resume_from = msg.get("resume_from")  # Optional resume-protocol checkpoint
 
     # Check if this session already exists in the pool (re-subscribing)
     if local_id and pool.has(local_id):
         sm = pool.get(local_id)
         pool.subscribe(local_id, ws)
-        from manager.context_windows import context_window_for
-        ctx_window = context_window_for(sm.provider_name, getattr(sm._config, "model", None))
-        await ws.send_bytes(orjson.dumps({
-            "type": "session_started",
-            "session_id": local_id,
-            "context_window": ctx_window,
-        }))
+        await _send_session_started(ws, pool, sm, local_id, resume_from)
         return sm, local_id
 
     # Create a new session via the pool.
@@ -362,14 +364,58 @@ async def _handle_start(
 
     sm = pool.get(session_id)
     pool.subscribe(session_id, ws)
+    # Fresh session creation never carries a resume checkpoint that matches —
+    # the stream is brand-new — but we still send the resume_state so the
+    # frontend can start tracking seqs from this point forward.
+    await _send_session_started(ws, pool, sm, session_id, resume_from=None)
+    return sm, session_id
+
+
+async def _send_session_started(
+    ws: WebSocket,
+    pool: SessionPool,
+    sm: BaseSessionManager,
+    session_id: str,
+    resume_from: dict | None,
+) -> None:
+    """Emit the ``session_started`` envelope, then any replay batch.
+
+    Encapsulates the resume-protocol wire format so both code paths
+    (fresh create + re-subscribe to existing pool entry) stay in sync.
+
+    Envelope shape::
+
+        {
+          "type": "session_started",
+          "session_id": "<local_id>",
+          "context_window": <int | null>,
+          "resume_state": {"stream_id": "...", "next_seq": 17} | null,
+          "replay_overflow": true                          // only if applicable
+        }
+
+    Followed (when status == "ok" and replay has events) by zero or
+    more event payloads in seq order, each carrying its own
+    ``seq`` + ``stream_id``.
+    """
     from manager.context_windows import context_window_for
     ctx_window = context_window_for(sm.provider_name, getattr(sm._config, "model", None))
-    await ws.send_bytes(orjson.dumps({
+    resume_state = pool.resume_state_for(session_id)
+    status, replay_payloads = pool.replay_for_subscriber(session_id, resume_from)
+
+    envelope: dict[str, object] = {
         "type": "session_started",
         "session_id": session_id,
         "context_window": ctx_window,
-    }))
-    return sm, session_id
+    }
+    if resume_state is not None:
+        envelope["resume_state"] = resume_state
+    if status in ("overflow", "mismatch"):
+        envelope["replay_overflow"] = True
+    await ws.send_bytes(orjson.dumps(envelope))
+
+    if status == "ok" and replay_payloads:
+        for payload in replay_payloads:
+            await ws.send_bytes(orjson.dumps(payload))
 
 
 async def _handle_compact(ws: WebSocket, pool: SessionPool, session_id: str) -> None:

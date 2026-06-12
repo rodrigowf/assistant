@@ -245,6 +245,54 @@ class ChatController(
 
     private var eventsJob: kotlinx.coroutines.Job? = null
 
+    /**
+     * Build a [WebSocketMessage.Start] for the given [localId], attaching
+     * the persisted resume-protocol checkpoint when one exists.
+     *
+     * Centralises the resume-from plumbing so every callsite that opens
+     * or re-opens a socket benefits from replay-on-reconnect without
+     * having to know the protocol's wire format.  No-op (no resume_from
+     * attached) for sessions that have never seen a (stream_id, seq)
+     * pair — e.g. brand-new sessions, or sessions hosted on a backend
+     * that doesn't implement the protocol.
+     *
+     * Exposed as ``internal`` so VoiceController can reuse the same
+     * checkpoint plumbing on its own Start-opening path.
+     */
+    internal suspend fun buildStartMessage(
+        localId: String,
+        resumeSdkId: String? = null,
+    ): WebSocketMessage.Start {
+        val checkpoint = if (localId.isNotBlank()) {
+            settingsRepository.readResumeCheckpoint(localId)
+        } else null
+        return WebSocketMessage.Start(
+            localId = localId.ifBlank { null },
+            resumeSdkId = resumeSdkId,
+            resumeFrom = checkpoint?.let {
+                WebSocketMessage.ResumeCheckpointSnapshot(it.streamId, it.seq)
+            },
+        )
+    }
+
+    /**
+     * Fire-and-forget version of [buildStartMessage] + [WebSocketManager.send].
+     * For callsites that aren't already in a suspend context — we launch
+     * a brief coroutine just to read the checkpoint asynchronously.
+     */
+    private fun sendStartWithCheckpoint(
+        endpoint: WebSocketEndpoint,
+        localId: String,
+        resumeSdkId: String? = null,
+    ) {
+        scope.launch {
+            webSocketManager.send(
+                buildStartMessage(localId, resumeSdkId),
+                endpoint = endpoint,
+            )
+        }
+    }
+
     init {
         eventsJob = scope.launch {
             connectionController.events.collect { ev -> handleConnectionEvent(ev) }
@@ -281,9 +329,9 @@ class ChatController(
             is ConnectionEvent.NewSessionAdopted -> {
                 _isOrchestratorSession.value = true
                 scope.launch { settingsRepository.persistOrchestratorLocalId(orchBucket.currentLocalId.value) }
-                webSocketManager.send(
-                    WebSocketMessage.Start(localId = orchBucket.currentLocalId.value),
-                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                sendStartWithCheckpoint(
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR,
+                    localId = orchBucket.currentLocalId.value,
                 )
             }
             is ConnectionEvent.Reconnected,
@@ -318,12 +366,10 @@ class ChatController(
                 if (endpoint == WebSocketEndpoint.AGENT) {
                     pendingAgentResume?.let { pending ->
                         pendingAgentResume = null
-                        webSocketManager.send(
-                            WebSocketMessage.Start(
-                                localId = pending.localId,
-                                resumeSdkId = pending.resumeSdkId
-                            ),
-                            endpoint = WebSocketEndpoint.AGENT
+                        sendStartWithCheckpoint(
+                            endpoint = WebSocketEndpoint.AGENT,
+                            localId = pending.localId,
+                            resumeSdkId = pending.resumeSdkId,
                         )
                     }
                     return
@@ -371,6 +417,53 @@ class ChatController(
                 }
                 b.pendingResumeSessionId.value = null
                 refreshSessions()
+            }
+
+            is WebSocketEvent.ResumeCheckpoint -> {
+                // Resume protocol: persist the latest (stream_id, seq) for
+                // the current local_id on this endpoint so a future
+                // reconnect can ask the backend to replay missed events.
+                // event.sessionId may be the per-event session_id, but
+                // we key on the LOCAL_id (stable per tab), so use the
+                // bucket's current local id.
+                val localId = b.currentLocalId.value
+                if (localId.isNotBlank()) {
+                    scope.launch {
+                        settingsRepository.writeResumeCheckpoint(
+                            localId,
+                            SettingsRepository.ResumeCheckpoint(event.streamId, event.seq),
+                        )
+                    }
+                }
+            }
+
+            is WebSocketEvent.ResumeStateAnnouncement -> {
+                // Resume protocol: backend's snapshot in ``session_started``.
+                // Seed the checkpoint to (next_seq - 1) so a brand-new
+                // subscriber starts comparing future seqs against the
+                // current boundary.
+                val localId = b.currentLocalId.value
+                if (localId.isNotBlank() && event.nextSeq > 0) {
+                    scope.launch {
+                        settingsRepository.writeResumeCheckpoint(
+                            localId,
+                            SettingsRepository.ResumeCheckpoint(
+                                event.streamId, event.nextSeq - 1,
+                            ),
+                        )
+                    }
+                }
+            }
+
+            is WebSocketEvent.ReplayOverflow -> {
+                // Resume protocol: backend couldn't satisfy our checkpoint
+                // (too old, or referenced a stale stream).  Drop the
+                // checkpoint and let the existing REST refetch path in
+                // SessionStarted recover the missed messages.
+                val localId = b.currentLocalId.value
+                if (localId.isNotBlank()) {
+                    scope.launch { settingsRepository.clearResumeCheckpoint(localId) }
+                }
             }
 
             is WebSocketEvent.SessionStopped -> {
@@ -760,8 +853,8 @@ class ChatController(
     ) {
         if (webSocketManager.isConnected(endpoint)) {
             webSocketManager.send(
-                WebSocketMessage.Start(localId = localId, resumeSdkId = resumeSdkId),
-                endpoint = endpoint
+                buildStartMessage(localId = localId, resumeSdkId = resumeSdkId),
+                endpoint = endpoint,
             )
             return
         }
@@ -847,9 +940,9 @@ class ChatController(
 
         if (webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
             webSocketManager.send(WebSocketMessage.Stop, endpoint = WebSocketEndpoint.ORCHESTRATOR)
-            webSocketManager.send(
-                WebSocketMessage.Start(localId = b.currentLocalId.value),
-                endpoint = WebSocketEndpoint.ORCHESTRATOR
+            sendStartWithCheckpoint(
+                endpoint = WebSocketEndpoint.ORCHESTRATOR,
+                localId = b.currentLocalId.value,
             )
         } else {
             connectionController.armNewSessionStart()

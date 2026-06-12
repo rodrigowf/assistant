@@ -992,9 +992,11 @@ class TestSessionManagerPersistentReceiveLoop:
                     break
                 await asyncio.sleep(0.01)
 
+            # Replay ring is now ``(seq, event)`` pairs; unpack.
             texts = [
-                e.text for e in sm.replay_recent_events()
-                if isinstance(e, TextComplete)
+                event.text
+                for _seq, event in sm.replay_recent_events()
+                if isinstance(event, TextComplete)
             ]
             assert "thinking…" in texts
             assert "late-arrival text" in texts
@@ -1080,6 +1082,289 @@ class TestSessionManagerPersistentReceiveLoop:
             assert await sm._drain_stale_sdk_messages() == 0
 
             await sm.stop()
+
+
+class TestSessionManagerResumeProtocol:
+    """Tests for the (stream_id, seq) resume protocol used by the
+    WebSocket reconnect-replay path.
+
+    The persistent receive loop assigns a monotonic seq to every event
+    it dispatches.  A reconnecting frontend supplies its last-seen
+    (stream_id, seq) and the backend either replays buffered events
+    newer than that seq, or signals overflow/mismatch so the frontend
+    falls back to a REST refetch.  This protocol is what eliminates
+    the "UI looks stopped while session is working" failure mode that
+    persisted after the persistent receive loop fix — a brief WS
+    disconnect during a long turn no longer drops events permanently.
+    """
+
+    @staticmethod
+    async def _run_until_idle(sm, *, timeout_s: float = 0.5) -> None:
+        """Spin until the receive loop has marked the session IDLE again.
+
+        Tests need this because event dispatch + status mutation happen
+        asynchronously inside the receive loop.  Bounded so a hung test
+        fails fast rather than timing out the suite.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while sm.status != SessionStatus.IDLE:
+            if loop.time() >= deadline:
+                raise AssertionError(
+                    f"Receive loop did not return to IDLE within {timeout_s}s"
+                )
+            await asyncio.sleep(0.005)
+
+    @pytest.mark.asyncio
+    async def test_stream_id_is_set_at_connect_and_persists(self):
+        """``stream_id`` is minted when the receive loop starts and stays
+        stable across turns until the SDK reconnects.
+        """
+        from claude_agent_sdk import SystemMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            stream_id_at_start = sm.stream_id
+            assert stream_id_at_start is not None
+            assert stream_id_at_start.startswith(sm.local_id + ":")
+
+            # One full turn — stream_id stays the same.
+            async for _ in sm.send("hi"):
+                pass
+
+            assert sm.stream_id == stream_id_at_start
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_seq_increments_monotonically_per_dispatched_event(self):
+        """Every event the receive loop dispatches gets a seq exactly one
+        higher than the last.  No gaps, no resets within a stream.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        text_msg = AssistantMessage(
+            model="claude-test",
+            content=[TextBlock(text="alpha")],
+            parent_tool_use_id=None,
+        )
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield text_msg
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            async for _ in sm.send("hi"):
+                pass
+
+            await self._run_until_idle(sm)
+
+            seqs = [seq for seq, _event in sm.replay_recent_events()]
+            assert seqs, "replay buffer should have at least the TextComplete + TurnComplete"
+            # Strictly monotonic, contiguous from oldest seq onwards.
+            assert seqs == list(range(seqs[0], seqs[-1] + 1))
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_no_checkpoint_returns_ok_empty(self):
+        """``replay_after(None, None)`` is the uniform-code-path entry
+        for callers that don't have a checkpoint yet — empty replay
+        with status ok so they don't need to special-case the None branch.
+        """
+        client = _make_mock_client(server_info={"session_id": "s1"})
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            status, events = sm.replay_after(None, None)
+            assert status == "ok"
+            assert events == []
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_matching_stream_returns_newer_events(self):
+        """A reconnecting subscriber with the right ``stream_id`` and a
+        seq older than the most-recently-dispatched seq gets exactly
+        the missed events, in order.
+        """
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        msgs = [
+            AssistantMessage(
+                model="t",
+                content=[TextBlock(text=f"chunk-{i}")],
+                parent_tool_use_id=None,
+            )
+            for i in range(5)
+        ]
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            for m in msgs:
+                yield m
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            async for _ in sm.send("hi"):
+                pass
+            await self._run_until_idle(sm)
+
+            all_seqs = [seq for seq, _ in sm.replay_recent_events()]
+            assert len(all_seqs) >= 6  # 5 text + 1 result
+
+            # Subscriber "saw" up to and including the 2nd seq —
+            # everything strictly after should come back.
+            after_seq = all_seqs[1]
+            status, replay = sm.replay_after(sm.stream_id, after_seq)
+            assert status == "ok"
+            replay_seqs = [seq for seq, _ in replay]
+            assert replay_seqs == all_seqs[2:]
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_current_seq_returns_empty(self):
+        """Subscriber's seq is already at the head — no replay needed."""
+        from claude_agent_sdk import SystemMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        result = _mock_result(session_id="s1")
+
+        async def fake_response():
+            yield result
+
+        client = _make_mock_client([init_msg], fake_response)
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            async for _ in sm.send("hi"):
+                pass
+            await self._run_until_idle(sm)
+
+            all_seqs = [seq for seq, _ in sm.replay_recent_events()]
+            assert all_seqs
+
+            status, replay = sm.replay_after(sm.stream_id, all_seqs[-1])
+            assert status == "ok"
+            assert replay == []
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_mismatched_stream_returns_mismatch(self):
+        """A stale ``stream_id`` (e.g. backend restarted under the client)
+        returns mismatch so the client falls back to REST.
+        """
+        client = _make_mock_client(server_info={"session_id": "s1"})
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            status, replay = sm.replay_after("definitely-not-our-stream:9999", 0)
+            assert status == "mismatch"
+            assert replay == []
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_with_overflowed_seq_returns_overflow(self):
+        """Subscriber's checkpoint is older than the buffer's oldest
+        entry — the missed events are gone forever; signal overflow
+        so the client REST-refetches the JSONL tail.
+        """
+        from manager.claude import session as session_mod
+        from claude_agent_sdk import (
+            AssistantMessage,
+            SystemMessage,
+            TextBlock,
+        )
+
+        # Shrink the buffer so the test runs in milliseconds.
+        original = session_mod._REPLAY_BUFFER_SIZE
+        session_mod._REPLAY_BUFFER_SIZE = 4
+
+        try:
+            init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+
+            # 8 text deltas → buffer holds the most recent 4 only.
+            text_msgs = [
+                AssistantMessage(
+                    model="t",
+                    content=[TextBlock(text=f"t{i}")],
+                    parent_tool_use_id=None,
+                )
+                for i in range(8)
+            ]
+            result = _mock_result(session_id="s1")
+
+            async def fake_response():
+                for m in text_msgs:
+                    yield m
+                yield result
+
+            client = _make_mock_client([init_msg], fake_response)
+
+            with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+                sm = SessionManager()
+                # Have to rebuild the deque with the new maxlen since
+                # __init__ already captured the old value.
+                from collections import deque as _deque
+                sm._replay_buffer = _deque(maxlen=session_mod._REPLAY_BUFFER_SIZE)
+                await sm.start()
+
+                async for _ in sm.send("hi"):
+                    pass
+                await self._run_until_idle(sm)
+
+                buffered_seqs = [seq for seq, _ in sm.replay_recent_events()]
+                assert len(buffered_seqs) == session_mod._REPLAY_BUFFER_SIZE
+
+                # Ask for everything from seq=0 — way older than the
+                # current oldest.  Must be overflow.
+                status, replay = sm.replay_after(sm.stream_id, 0)
+                assert status == "overflow"
+                assert replay == []
+
+                await sm.stop()
+        finally:
+            session_mod._REPLAY_BUFFER_SIZE = original
 
 
 class TestSessionManagerCostTracking:

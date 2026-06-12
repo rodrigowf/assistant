@@ -123,6 +123,67 @@ class SettingsRepository(
     }
 
     // ----------------------------------------------------------------
+    // WebSocket resume protocol — per-session (stream_id, seq) checkpoint
+    //
+    // The backend stamps every broadcast event with a monotonic ``seq``
+    // within a ``stream_id`` (changes when the SDK subprocess (re)connects).
+    // We persist the latest pair per session so a reconnecting socket can
+    // ask the backend to replay events newer than that seq.  Older
+    // backends without the protocol simply never emit the fields, and
+    // the client falls back to its prior behaviour (full REST refetch).
+    //
+    // Keyed by the session's stable ``local_id`` to survive across app
+    // restarts and (for the orchestrator) cold starts.
+    // ----------------------------------------------------------------
+
+    /** Read the persisted checkpoint for a session, or null if none/malformed. */
+    suspend fun readResumeCheckpoint(localId: String): ResumeCheckpoint? {
+        if (localId.isBlank()) return null
+        val raw = dataStore.data.first()[resumeCheckpointKey(localId)] ?: return null
+        // Stored as "<streamId>|<seq>" — compact and unambiguous since
+        // the stream id format never contains a '|'.
+        val parts = raw.split('|', limit = 2)
+        if (parts.size != 2) return null
+        val seq = parts[1].toIntOrNull() ?: return null
+        return ResumeCheckpoint(streamId = parts[0], seq = seq)
+    }
+
+    /**
+     * Persist a checkpoint for [localId].  Monotonic within the same
+     * [ResumeCheckpoint.streamId] — a write that would move seq backward
+     * is silently dropped (defensive against out-of-order delivery).  A
+     * different stream id always overwrites (the old checkpoint is
+     * meaningless after a backend restart).
+     */
+    suspend fun writeResumeCheckpoint(localId: String, checkpoint: ResumeCheckpoint) {
+        if (localId.isBlank()) return
+        val existing = readResumeCheckpoint(localId)
+        if (
+            existing != null &&
+            existing.streamId == checkpoint.streamId &&
+            existing.seq >= checkpoint.seq
+        ) {
+            return
+        }
+        dataStore.edit {
+            it[resumeCheckpointKey(localId)] = "${checkpoint.streamId}|${checkpoint.seq}"
+        }
+    }
+
+    /** Drop a session's checkpoint (e.g. after [WebSocketEvent.ReplayOverflow]). */
+    suspend fun clearResumeCheckpoint(localId: String) {
+        if (localId.isBlank()) return
+        dataStore.edit { it.remove(resumeCheckpointKey(localId)) }
+    }
+
+    private fun resumeCheckpointKey(localId: String) =
+        stringPreferencesKey("ws_resume_checkpoint:$localId")
+
+    /** Local mirror of WebSocketMessage.ResumeCheckpointSnapshot, decoupled
+     *  from the network layer so settings code doesn't pull in JSON deps. */
+    data class ResumeCheckpoint(val streamId: String, val seq: Int)
+
+    // ----------------------------------------------------------------
     // Setters — one suspend fun per ViewModel setter on HEAD
     // ----------------------------------------------------------------
 

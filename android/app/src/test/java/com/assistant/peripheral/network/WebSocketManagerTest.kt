@@ -76,6 +76,73 @@ class WebSocketManagerTest {
         assertNull(message.resumeSdkId)
     }
 
+    // ==========================================================================
+    // Resume protocol — WS reconnect-replay
+    //
+    // The wire-level contract is exercised in tests/test_api_chat.py at the
+    // backend; these tests verify the Android-side data-class plumbing
+    // (the field travels from Start → resume_from JSON; SessionStarted
+    // carries the announcement).
+    // ==========================================================================
+
+    @Test
+    fun `Start message carries an optional resume_from checkpoint`() {
+        val checkpoint = WebSocketMessage.ResumeCheckpointSnapshot(
+            streamId = "local-xyz:170000000",
+            seq = 42,
+        )
+        val message = WebSocketMessage.Start(
+            localId = "local-xyz",
+            resumeSdkId = "sdk-abc",
+            resumeFrom = checkpoint,
+        )
+
+        assertEquals(checkpoint, message.resumeFrom)
+        assertEquals("local-xyz:170000000", message.resumeFrom?.streamId)
+        assertEquals(42, message.resumeFrom?.seq)
+    }
+
+    @Test
+    fun `Start message defaults resume_from to null for back-compat`() {
+        val message = WebSocketMessage.Start(localId = "local-1", resumeSdkId = "sdk-2")
+
+        // Older callers that don't know about the resume protocol get
+        // the same Start they always did — additive change.
+        assertNull(message.resumeFrom)
+    }
+
+    @Test
+    fun `ResumeCheckpoint event carries stream identity and seq`() {
+        val ev = WebSocketEvent.ResumeCheckpoint(
+            sessionId = "s",
+            streamId = "stream:1",
+            seq = 7,
+        )
+
+        assertEquals("s", ev.sessionId)
+        assertEquals("stream:1", ev.streamId)
+        assertEquals(7, ev.seq)
+    }
+
+    @Test
+    fun `ResumeStateAnnouncement carries backend snapshot`() {
+        val ev = WebSocketEvent.ResumeStateAnnouncement(
+            sessionId = "s",
+            streamId = "stream:1",
+            nextSeq = 17,
+        )
+
+        assertEquals("s", ev.sessionId)
+        assertEquals("stream:1", ev.streamId)
+        assertEquals(17, ev.nextSeq)
+    }
+
+    @Test
+    fun `ReplayOverflow event names the affected session`() {
+        val ev = WebSocketEvent.ReplayOverflow(sessionId = "s")
+        assertEquals("s", ev.sessionId)
+    }
+
     @Test
     fun `Send message serializes correctly`() {
         val message = WebSocketMessage.Send("Hello, world!")

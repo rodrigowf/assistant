@@ -135,6 +135,8 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
+from typing import NamedTuple
+
 from ..base_session import BaseSessionManager, TurnAbandoned
 from ..config import ManagerConfig
 from ..types import (
@@ -195,11 +197,25 @@ _STALL_REPEAT_INTERVAL_S = 60.0  # re-emit every minute thereafter
 _TURN_ABANDON_S = 240.0
 
 # Replay buffer: how many recent ``Event``s the SessionManager keeps so a
-# WS reconnecting mid-turn can replay them.  Sized to cover a typical
-# tool-heavy turn (a few text deltas + a tool_use + tool_result + …).
+# WS reconnecting mid-turn can replay them.  Sized to cover ~10 minutes
+# of a tool-heavy turn (text deltas dominate at ~10/s of streaming).
 # Bounded so an idle session that nobody's watching for hours doesn't
-# accumulate megabytes of dropped events.
-_REPLAY_BUFFER_SIZE = 200
+# accumulate megabytes of dropped events.  Each event is small (typically
+# a JSON payload <1 KB), so 500 entries ≈ 0.5 MB per session worst-case.
+_REPLAY_BUFFER_SIZE = 500
+
+
+class SequencedEvent(NamedTuple):
+    """A typed Event paired with its monotonic dispatch seq.
+
+    The receive loop puts these into ``_event_inbox``; ``send()`` unpacks
+    them so callers continue to receive bare ``Event``s; the pool reads
+    the seq off the wrapper to attach ``{seq, stream_id, ...}`` to the
+    outbound broadcast payload.  Side-channel-free.
+    """
+
+    seq: int
+    event: Event
 
 
 class SessionAbandoned(TurnAbandoned):
@@ -329,11 +345,25 @@ class ClaudeSessionManager(BaseSessionManager):
         # See the design note in ``_receive_loop`` for why.
         self._receive_task: asyncio.Task[None] | None = None
         self._receive_loop_done: asyncio.Event = asyncio.Event()
-        # Bounded replay ring of recently-processed events so a reconnecting
-        # WS can catch up on tail-end activity that happened while it was
-        # disconnected.  Bounded to ``_REPLAY_BUFFER_SIZE`` to cap memory.
+        # Bounded replay ring of ``(seq, event)`` pairs so a reconnecting
+        # WS can catch up on activity that happened while it was offline.
+        # Each event the receive loop dispatches gets a monotonic ``seq``
+        # within the current ``_stream_id`` (set when the receive loop
+        # starts; changes on every subprocess (re)connect or backend
+        # restart).  A frontend that holds ``(stream_id, seq)`` can ask
+        # for everything newer; a mismatch falls back to REST.
         from collections import deque
-        self._replay_buffer: deque[Event] = deque(maxlen=_REPLAY_BUFFER_SIZE)
+        self._replay_buffer: deque[tuple[int, Event]] = deque(
+            maxlen=_REPLAY_BUFFER_SIZE,
+        )
+        self._stream_id: str | None = None
+        self._next_seq: int = 0
+        # Last seq yielded by ``send()`` to a caller.  The pool's broadcast
+        # path reads this in the same coroutine immediately after the
+        # ``async for`` yields, before any ``await`` — so the value is
+        # always for the event just yielded.  None when no SequencedEvent
+        # has been yielded (initial state, or after a non-sequenced inject).
+        self._last_yielded_seq: int | None = None
 
     @property
     def provider_name(self) -> str:
@@ -405,6 +435,16 @@ class ClaudeSessionManager(BaseSessionManager):
                     logger.exception("get_server_info failed for session %s", self._local_id)
 
             self._status = SessionStatus.IDLE
+
+            # Mint a fresh stream identity for this connection.  Anything
+            # the SDK emits from here on belongs to this stream.  A
+            # reconnecting frontend with a different ``stream_id`` falls
+            # through to REST replay; with the same id, the backend
+            # serves seq-ordered playback from the buffer.
+            import time as _time
+            self._stream_id = f"{self._local_id}:{int(_time.time() * 1000)}"
+            self._next_seq = 0
+            self._replay_buffer.clear()
 
             # Spawn the persistent receive loop.  See ``_receive_loop`` for
             # the design rationale — it owns ``client.receive_messages()``
@@ -561,8 +601,10 @@ class ClaudeSessionManager(BaseSessionManager):
         # Register an inbox the receive loop will deliver events into. The
         # base class shares this same attribute with the ``can_use_tool``
         # callback so permission events can be injected mid-stream.
+        # The receive loop wraps each dispatched event in ``SequencedEvent``;
+        # we unwrap below.
         loop = asyncio.get_running_loop()
-        inbox: asyncio.Queue[Event] = asyncio.Queue()
+        inbox: asyncio.Queue[SequencedEvent | Event] = asyncio.Queue()
         self._event_inbox = inbox
 
         # Last-tool tracking so the SessionStalled event can name the tool
@@ -595,7 +637,7 @@ class ClaudeSessionManager(BaseSessionManager):
                     )
 
                 try:
-                    event = await asyncio.wait_for(
+                    item = await asyncio.wait_for(
                         inbox.get(), timeout=max(next_notice_in, 0.5),
                     )
                 except asyncio.TimeoutError:
@@ -617,6 +659,20 @@ class ClaudeSessionManager(BaseSessionManager):
                 last_msg_at = loop.time()
                 stall_notified_at = None  # reset on any fresh activity
                 messages_received += 1
+
+                # Receive loop always wraps in SequencedEvent; fallback
+                # path for direct inbox.put_nowait callers (e.g. older
+                # tests, future extensions) yields the bare event.
+                # We stash the seq on the manager so the pool's broadcast
+                # path can wrap the outbound payload with it.  Safe because
+                # send() and the pool's iteration are the same coroutine —
+                # no ``await`` runs between the stash and the pool's read.
+                if isinstance(item, SequencedEvent):
+                    event = item.event
+                    self._last_yielded_seq = item.seq
+                else:
+                    event = item
+                    self._last_yielded_seq = None
 
                 if isinstance(event, ToolUse):
                     last_tool_name = event.tool_name
@@ -669,11 +725,11 @@ class ClaudeSessionManager(BaseSessionManager):
                     # yields SDK Message subclasses, not our typed events.
                     # But the permission callback path used to inject Events
                     # here; route them through the dispatch just in case.
-                    self._dispatch_event(msg)
+                    self._inject_event(msg)
                     continue
                 try:
                     async for event in self._process_message(msg):
-                        self._dispatch_event(event)
+                        self._inject_event(event)
                         if isinstance(event, TurnComplete):
                             # The bundled CLI emitted a terminal ResultMessage
                             # — the turn is over even if nobody was listening.
@@ -712,16 +768,30 @@ class ClaudeSessionManager(BaseSessionManager):
                 except asyncio.QueueFull:
                     pass
 
-    def _dispatch_event(self, event: Event) -> None:
-        """Route an event to the active send() inbox (if any) and the
-        replay ring.  Called from the receive loop and from the permission
-        callback path.
+    def _inject_event(self, event: Event) -> None:
+        """Override the base class hook: assign a monotonic seq, append
+        to the replay ring, and wrap before queueing.
+
+        Each dispatch assigns a monotonic ``seq`` within the current
+        ``_stream_id`` so a reconnecting WS can resume exactly where it
+        left off.  The seq travels with the event by wrapping it into a
+        :class:`SequencedEvent` named-tuple before queueing — the inbox
+        consumer (``send()``) unpacks and yields the bare event, while
+        the pool's broadcast wrapper reads the seq off the tuple for the
+        ``{seq, stream_id, ...}`` wire payload.
+
+        Called from the receive loop and from the permission callback
+        path (the latter via :meth:`_emit_permission_request` in the base
+        class).
         """
-        self._replay_buffer.append(event)
+        seq = self._next_seq
+        self._next_seq += 1
+        self._replay_buffer.append((seq, event))
+        wrapped = SequencedEvent(seq=seq, event=event)
         inbox = self._event_inbox
         if inbox is not None:
             try:
-                inbox.put_nowait(event)
+                inbox.put_nowait(wrapped)
             except asyncio.QueueFull:
                 # asyncio.Queue() is unbounded by default; this is defensive.
                 logger.warning(
@@ -729,14 +799,88 @@ class ClaudeSessionManager(BaseSessionManager):
                     self._local_id,
                 )
 
-    def replay_recent_events(self) -> list[Event]:
-        """Snapshot of the replay ring buffer (oldest → newest).
+    def replay_recent_events(self) -> list[tuple[int, Event]]:
+        """Snapshot of the replay ring as ``(seq, event)`` pairs, oldest → newest.
 
-        The pool calls this on WS reconnect so a UI that was disconnected
-        mid-turn can catch up on events it missed.  Bounded by
-        ``_REPLAY_BUFFER_SIZE``.
+        Bounded by ``_REPLAY_BUFFER_SIZE``.  Used directly by tests; the
+        pool prefers :meth:`replay_after` which encodes the resume protocol.
         """
         return list(self._replay_buffer)
+
+    def replay_after(
+        self,
+        stream_id: str | None,
+        after_seq: int | None,
+    ) -> tuple[str, list[tuple[int, Event]]]:
+        """Resume protocol: return events the caller hasn't seen yet.
+
+        Returns ``(status, events)`` where status is:
+
+        * ``"ok"``       — events newer than ``after_seq`` are returned in
+                           order.  Empty list if the caller is up to date.
+        * ``"overflow"`` — ``after_seq`` is older than the oldest entry
+                           in the ring.  The caller should fall back to REST.
+        * ``"mismatch"`` — ``stream_id`` doesn't match the current stream
+                           (backend restarted, subprocess re-spawned, etc).
+                           Caller should fall back to REST.
+
+        ``stream_id=None`` / ``after_seq=None`` means "no checkpoint" —
+        returns ``("ok", [])`` so callers can use this in a uniform code
+        path without None-checks.
+        """
+        if stream_id is None or after_seq is None:
+            return "ok", []
+        if self._stream_id is None:
+            # Receive loop hasn't started yet — nothing to replay.
+            return "ok", []
+        if stream_id != self._stream_id:
+            return "mismatch", []
+        if not self._replay_buffer:
+            # Caller has a checkpoint, we have an empty buffer (fresh
+            # stream).  If their after_seq is ahead of our next_seq,
+            # we're behind them — treat as mismatch.  Otherwise OK with
+            # no events to send.
+            if after_seq >= self._next_seq:
+                return "mismatch", []
+            return "ok", []
+
+        oldest_seq = self._replay_buffer[0][0]
+        latest_seq = self._replay_buffer[-1][0]
+
+        if after_seq >= latest_seq:
+            return "ok", []  # caller is up to date
+        if after_seq < oldest_seq - 1:
+            # Their last-seen is older than what we still have buffered.
+            # The buffer evicts from the front, so anything missed beyond
+            # this point is gone forever.  Tell the caller to REST.
+            return "overflow", []
+
+        events = [
+            (seq, event)
+            for seq, event in self._replay_buffer
+            if seq > after_seq
+        ]
+        return "ok", events
+
+    @property
+    def stream_id(self) -> str | None:
+        """Identifier for the current receive-loop session — changes every
+        time the SDK subprocess (re)connects.  Used by the resume protocol
+        to detect a backend restart and force a REST refetch.
+        """
+        return self._stream_id
+
+    @property
+    def last_yielded_seq(self) -> int | None:
+        """Seq of the most recent event ``send()`` yielded, or ``None``.
+
+        The pool's broadcast path reads this in the same coroutine
+        immediately after ``async for event in sm.send(...)`` yields, so
+        the value reliably matches the just-yielded event.  Wraps the
+        outgoing WS payload with ``{seq, stream_id, ...}`` for the resume
+        protocol.
+        """
+        return self._last_yielded_seq
 
     # ------------------------------------------------------------------
     # Properties
