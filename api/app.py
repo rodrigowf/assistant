@@ -55,6 +55,11 @@ async def lifespan(app: FastAPI):
     # SessionManager is the primary defense).  Cheap when nothing is
     # leaked: a few os.kill(0) liveness checks every 30s.
     await app.state.pool.start_orphan_reaper()
+    # Background dead-session reaper — sweeps for SessionManagers whose
+    # receive loop has exited (SSH transport died, subprocess crashed)
+    # and closes them with a typed broadcast so the UI learns the truth
+    # within a few seconds instead of seeing a frozen "streaming" status.
+    await app.state.pool.start_dead_session_reaper()
 
     project_path = Path(config.project_dir)
 
@@ -105,6 +110,11 @@ async def lifespan(app: FastAPI):
             await app.state.pool.stop_orphan_reaper()
         except Exception:
             logger.exception("Error stopping orphan reaper on shutdown")
+
+        try:
+            await app.state.pool.stop_dead_session_reaper()
+        except Exception:
+            logger.exception("Error stopping dead-session reaper on shutdown")
 
         # Drain the session pool first so remote SSH + claude children get
         # clean SIGTERMs instead of being orphaned by the backend exiting.

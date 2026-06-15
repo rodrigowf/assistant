@@ -4,13 +4,33 @@ import { StatusBar } from "./StatusBar";
 import { VoiceControls } from "./VoiceControls";
 import { PermissionBar } from "./PermissionBar";
 import type { ChatMessage, SessionStatus, ConnectionState, VoiceStatus } from "../types";
-import type { StallInfo, PendingPermission } from "../hooks/useChatInstance";
+import type { StallInfo, PendingPermission, TerminationState } from "../hooks/useChatInstance";
 
 function formatStallElapsed(s: number): string {
   if (s < 90) return `${Math.round(s)}s`;
   const m = Math.floor(s / 60);
   const rem = Math.round(s - m * 60);
   return rem > 0 ? `${m}m${rem}s` : `${m}m`;
+}
+
+/**
+ * Human-readable headline for a TerminationState.reason.  The detail
+ * field carries the technical cause (e.g. "exit code 255"); this is
+ * just the framing the user sees first.
+ */
+function terminationHeadline(reason: TerminationState["reason"]): string {
+  switch (reason) {
+    case "subprocess_crashed":
+      return "This session crashed";
+    case "subprocess_lost":
+      return "This session ended unexpectedly";
+    case "unreachable":
+      return "The host is unreachable";
+    case "replaced":
+      return "This session was replaced";
+    case "closed_by_user":
+      return "This session was closed";
+  }
 }
 
 interface Props {
@@ -22,6 +42,14 @@ interface Props {
   error: string | null;
   /** Set when the backend reports the SDK is stuck on a tool. */
   stall?: StallInfo | null;
+  /** Set when the backend signals the underlying session is gone
+   *  (subprocess crashed, SSH transport closed).  Drives the
+   *  recovery banner — distinct from generic ``error``. */
+  termination?: TerminationState | null;
+  /** Click handler for "open a fresh session" from the termination
+   *  banner.  Receives the SDK session id so the new tab resumes
+   *  from the same on-disk JSONL. */
+  onRecoverFromTermination?: (sdkSessionId: string) => void;
   /** Set when the SDK is waiting for a permission decision (popup). */
   pendingPermission?: PendingPermission | null;
   onRespondToPermission?: (decision: "allow" | "deny", message?: string) => void;
@@ -67,6 +95,8 @@ export function ChatPanel({
   turns,
   error,
   stall,
+  termination,
+  onRecoverFromTermination,
   pendingPermission,
   onRespondToPermission,
   onSend,
@@ -110,6 +140,23 @@ export function ChatPanel({
       />
       {error && (
         <div className="error-banner">{error}</div>
+      )}
+      {termination && (
+        <div className="termination-banner" role="alert">
+          <div className="termination-banner-text">
+            <strong>{terminationHeadline(termination.reason)}</strong>
+            {termination.detail ? <>: {termination.detail}</> : null}
+          </div>
+          {termination.sdkSessionId && onRecoverFromTermination && (
+            <button
+              type="button"
+              className="termination-banner-button"
+              onClick={() => onRecoverFromTermination(termination.sdkSessionId!)}
+            >
+              Continue in new tab
+            </button>
+          )}
+        </div>
       )}
       {stall && isStreaming && (
         <div className="stall-banner">

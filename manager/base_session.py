@@ -31,7 +31,13 @@ from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 
 from .config import ManagerConfig
-from .types import Event, PermissionRequest, PermissionResolved, SessionStatus
+from .types import (
+    Event,
+    PermissionRequest,
+    PermissionResolved,
+    SessionStatus,
+    TerminationReason,
+)
 
 if TYPE_CHECKING:
     pass
@@ -52,6 +58,32 @@ class TurnAbandoned(Exception):
             "(upstream request appears wedged)"
         )
         self.elapsed_seconds = elapsed_seconds
+
+
+class SessionDeadError(RuntimeError):
+    """Raised when a caller tries to use a session whose underlying
+    receive loop / subprocess has exited.
+
+    Pool's ``_drive_turn`` catches this distinctly from generic errors
+    and translates it into a typed ``SessionTerminated`` broadcast so
+    the client can offer auto-resume rather than displaying an opaque
+    "send_failed" string.
+
+    Carries a :class:`TerminationReason` so the pool layer can surface
+    the same reason it would have broadcast on its own (the reaper has
+    the same signal source — the receive loop's exit path).
+    """
+
+    def __init__(
+        self,
+        reason: TerminationReason,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(
+            detail or f"Session is no longer usable ({reason.value})"
+        )
+        self.reason = reason
+        self.detail = detail
 
 
 class BaseSessionManager(ABC):

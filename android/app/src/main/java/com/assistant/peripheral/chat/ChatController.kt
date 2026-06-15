@@ -167,6 +167,10 @@ class ChatController(
     val sessionStatus: StateFlow<String> =
         mirrorActive("idle") { it.sessionStatus }
 
+    /** Active-endpoint termination state, or null when the session is alive. */
+    val termination: StateFlow<TerminationState?> =
+        mirrorActive<TerminationState?>(null) { it.termination }
+
     // ─────────────────────────────────────────────────────────────────
     // Session cache
     // ─────────────────────────────────────────────────────────────────
@@ -383,6 +387,10 @@ class ChatController(
             is WebSocketEvent.SessionStarted -> {
                 b.currentSessionId.value = event.sessionId
                 b.sessionStatus.value = "idle"
+                // A fresh session in this bucket means any prior
+                // termination banner is stale.  Clear so the UI
+                // returns to the normal chat surface.
+                b.termination.value = null
                 if (endpoint == WebSocketEndpoint.ORCHESTRATOR) {
                     connectionController.onSessionStartedForOrchestrator()
                     // Inc 3.5: user-initiated switch converged — clear the
@@ -460,6 +468,30 @@ class ChatController(
                 // (too old, or referenced a stale stream).  Drop the
                 // checkpoint and let the existing REST refetch path in
                 // SessionStarted recover the missed messages.
+                val localId = b.currentLocalId.value
+                if (localId.isNotBlank()) {
+                    scope.launch { settingsRepository.clearResumeCheckpoint(localId) }
+                }
+            }
+
+            is WebSocketEvent.SessionTerminated -> {
+                // Typed terminal: backend told us this session is gone
+                // for an actionable reason.  Surface to the UI via the
+                // termination bucket flow so a banner can render the
+                // reason and offer "continue from disk" — clicking
+                // loads ``event.sdkSessionId`` into a fresh local
+                // session that resumes from the JSONL.
+                //
+                // We intentionally DO NOT clear ``b.messages`` — the
+                // user's optimistic prompt stays on screen so they can
+                // see what they typed before deciding what to do next.
+                b.termination.value = TerminationState(
+                    reason = event.reason,
+                    detail = event.detail,
+                    sdkSessionId = event.sdkSessionId,
+                )
+                b.sessionStatus.value = "disconnected"
+                // Drop the resume checkpoint — the stream id died.
                 val localId = b.currentLocalId.value
                 if (localId.isNotBlank()) {
                     scope.launch { settingsRepository.clearResumeCheckpoint(localId) }
@@ -808,6 +840,10 @@ class ChatController(
             val endpoint = if (isOrchestrator) WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
             val b = bucket(endpoint)
             val localIdForStart = liveLocalId ?: UUID.randomUUID().toString()
+            // Switching sessions in this bucket — any prior termination
+            // banner is for the session being replaced.  Clear so the
+            // new one starts with a clean surface.
+            b.termination.value = null
 
             val cached = sessionCache[sessionId]
             if (cached != null) {

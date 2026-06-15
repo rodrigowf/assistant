@@ -5,6 +5,20 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import java.util.UUID
 
 /**
+ * Snapshot of the backend's typed ``session_terminated`` event.
+ *
+ * Distinct from a generic Error — drives a recovery affordance in the
+ * UI that opens a fresh session resuming from [sdkSessionId] (the
+ * on-disk JSONL is intact).  ``reason`` mirrors
+ * ``manager.types.TerminationReason``.
+ */
+data class TerminationState(
+    val reason: String,
+    val detail: String?,
+    val sdkSessionId: String?,
+)
+
+/**
  * Per-endpoint chat state. Two instances live in [ChatController] — one for
  * the orchestrator WS, one for the agent WS — so events from one socket
  * never write into the other tab's UI state. That isolation is the core
@@ -45,4 +59,11 @@ internal class ChatStateBucket {
      * SessionStarted.sessionId on reconnect, which is not the JSONL key).
      */
     val pendingResumeSessionId = MutableStateFlow<String?>(null)
+    /**
+     * Set when the backend signals the underlying session is permanently
+     * gone (subprocess crashed, SSH transport closed, etc.).  Drives the
+     * termination banner with auto-resume affordance.  Cleared when a
+     * new session is opened in this bucket.
+     */
+    val termination = MutableStateFlow<TerminationState?>(null)
 }

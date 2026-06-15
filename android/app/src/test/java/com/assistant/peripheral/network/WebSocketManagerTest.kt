@@ -144,6 +144,39 @@ class WebSocketManagerTest {
     }
 
     @Test
+    fun `SessionTerminated carries reason, detail, and recovery sdk id`() {
+        // Typed terminal event replaces the legacy ``Error("send_failed")``
+        // for the dead-session case.  ``sdkSessionId`` lets the UI open a
+        // fresh local session resuming from the on-disk JSONL.
+        val ev = WebSocketEvent.SessionTerminated(
+            sessionId = "local-123",
+            reason = "subprocess_crashed",
+            detail = "Command failed with exit code 255",
+            sdkSessionId = "sdk-abc",
+        )
+
+        assertEquals("local-123", ev.sessionId)
+        assertEquals("subprocess_crashed", ev.reason)
+        assertEquals("Command failed with exit code 255", ev.detail)
+        assertEquals("sdk-abc", ev.sdkSessionId)
+    }
+
+    @Test
+    fun `SessionTerminated tolerates missing detail and sdk id`() {
+        // Backend may omit detail/sdk_session_id when not applicable
+        // (e.g. ``replaced`` or ``closed_by_user``).  UI hides the
+        // recovery button when ``sdkSessionId`` is null.
+        val ev = WebSocketEvent.SessionTerminated(
+            sessionId = "x",
+            reason = "closed_by_user",
+            detail = null,
+            sdkSessionId = null,
+        )
+        assertEquals(null, ev.detail)
+        assertEquals(null, ev.sdkSessionId)
+    }
+
+    @Test
     fun `Send message serializes correctly`() {
         val message = WebSocketMessage.Send("Hello, world!")
 

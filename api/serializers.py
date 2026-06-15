@@ -10,6 +10,7 @@ from manager.types import (
     PermissionRequest,
     PermissionResolved,
     SessionStalled,
+    SessionTerminated,
     TextComplete,
     TextDelta,
     ThinkingComplete,
@@ -86,6 +87,13 @@ def serialize_event(event: Event) -> dict[str, Any]:
             "decision": event.decision,
             "responder": event.responder,
             "message": event.message,
+        }
+    if isinstance(event, SessionTerminated):
+        return {
+            "type": "session_terminated",
+            "reason": event.reason.value,
+            "detail": event.detail,
+            "sdk_session_id": event.sdk_session_id,
         }
     return {"type": "unknown"}
 
