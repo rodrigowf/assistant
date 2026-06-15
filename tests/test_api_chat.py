@@ -70,6 +70,10 @@ def _make_pool(mock_sm, session_id="test-123"):
     pool.get = MagicMock(return_value=mock_sm)
     pool.interrupt = AsyncMock()
     pool.resolve_session_permission = AsyncMock(return_value=True)
+    # Resume-protocol helpers — sensible defaults for tests that don't
+    # care about reconnect-replay.  Specific tests override.
+    pool.resume_state_for = MagicMock(return_value=None)
+    pool.replay_for_subscriber = MagicMock(return_value=("ok", []))
 
     def _subscribe(sid, ws):
         subscribers.setdefault(sid, set()).add(ws)
@@ -329,3 +333,149 @@ class TestWebSocketChat:
             assert call_kwargs.kwargs.get("local_id") == "local-456"
             assert call_kwargs.kwargs.get("resume_sdk_id") == "old-sdk-123"
             assert call_kwargs.kwargs.get("fork") is True
+
+
+class TestWebSocketResumeProtocol:
+    """End-to-end tests for the (stream_id, seq) reconnect-replay protocol
+    at the WebSocket route layer.
+
+    These exercise ``_send_session_started`` — the envelope+replay batch
+    a client sees on ``start``.  The session-manager-level and pool-level
+    invariants are covered in ``test_session.py`` and ``test_pool_turn.py``
+    respectively; here we verify the wire format the frontends consume.
+    """
+
+    def test_session_started_carries_resume_state_when_pool_provides_one(self, pool_client):
+        """Fresh-create path: backend hands the frontend a stream_id +
+        next_seq immediately so it can start tracking seqs from here.
+        """
+        client, pool, _ = pool_client
+        pool.resume_state_for = MagicMock(
+            return_value={"stream_id": "test-123:170000", "next_seq": 0},
+        )
+
+        with client.websocket_connect("/api/sessions/chat") as ws:
+            ws.send_text(orjson.dumps({"type": "start", "local_id": "x"}).decode())
+            ws.receive_bytes()  # connecting
+            envelope = orjson.loads(ws.receive_bytes())
+
+            assert envelope["type"] == "session_started"
+            assert envelope["resume_state"] == {
+                "stream_id": "test-123:170000", "next_seq": 0,
+            }
+            assert "replay_overflow" not in envelope
+
+    def test_session_started_omits_resume_state_for_non_protocol_providers(self, pool_client):
+        """Providers without the resume protocol (Qwen, Gemini, etc.) get
+        a regular session_started envelope — no resume_state, no overflow.
+        Frontend treats those sessions as non-resumable.
+        """
+        client, pool, _ = pool_client
+        pool.resume_state_for = MagicMock(return_value=None)
+
+        with client.websocket_connect("/api/sessions/chat") as ws:
+            ws.send_text(orjson.dumps({"type": "start", "local_id": "x"}).decode())
+            ws.receive_bytes()  # connecting
+            envelope = orjson.loads(ws.receive_bytes())
+
+            assert envelope["type"] == "session_started"
+            assert "resume_state" not in envelope
+            assert "replay_overflow" not in envelope
+
+    def test_resume_with_matching_checkpoint_replays_missed_events(self, pool_client):
+        """Re-subscribe path: pool reports the session is already live and
+        the client has a checkpoint that matches.  Backend sends the
+        envelope followed by every missed event payload, in seq order.
+        """
+        client, pool, _ = pool_client
+        pool.has = MagicMock(return_value=True)
+        pool.resume_state_for = MagicMock(
+            return_value={"stream_id": "test-123:170000", "next_seq": 12},
+        )
+        pool.replay_for_subscriber = MagicMock(return_value=("ok", [
+            {"type": "text_delta", "text": "missed-1",
+             "seq": 10, "stream_id": "test-123:170000"},
+            {"type": "text_delta", "text": "missed-2",
+             "seq": 11, "stream_id": "test-123:170000"},
+        ]))
+
+        with client.websocket_connect("/api/sessions/chat") as ws:
+            ws.send_text(orjson.dumps({
+                "type": "start",
+                "local_id": "test-123",
+                "resume_from": {
+                    "stream_id": "test-123:170000",
+                    "seq": 9,
+                },
+            }).decode())
+
+            # Re-subscribe path skips the "connecting" status (it's only
+            # emitted on fresh create), so first message is session_started.
+            envelope = orjson.loads(ws.receive_bytes())
+            assert envelope["type"] == "session_started"
+            assert "replay_overflow" not in envelope
+
+            # Then the missed events stream in.
+            replay_0 = orjson.loads(ws.receive_bytes())
+            replay_1 = orjson.loads(ws.receive_bytes())
+            assert replay_0["text"] == "missed-1"
+            assert replay_0["seq"] == 10
+            assert replay_1["text"] == "missed-2"
+            assert replay_1["seq"] == 11
+
+            # And the backend was actually consulted with the right key.
+            pool.replay_for_subscriber.assert_called_with(
+                "test-123",
+                {"stream_id": "test-123:170000", "seq": 9},
+            )
+
+    def test_resume_with_overflow_signals_replay_overflow_and_no_events(self, pool_client):
+        """Checkpoint older than the buffer: backend signals overflow.
+        Frontend uses the flag to drop the WS-replay path and re-fetch
+        the full message tail via REST.
+        """
+        client, pool, _ = pool_client
+        pool.has = MagicMock(return_value=True)
+        pool.resume_state_for = MagicMock(
+            return_value={"stream_id": "test-123:170000", "next_seq": 500},
+        )
+        pool.replay_for_subscriber = MagicMock(return_value=("overflow", []))
+
+        with client.websocket_connect("/api/sessions/chat") as ws:
+            ws.send_text(orjson.dumps({
+                "type": "start",
+                "local_id": "test-123",
+                "resume_from": {
+                    "stream_id": "test-123:170000",
+                    "seq": 0,  # ancient
+                },
+            }).decode())
+
+            envelope = orjson.loads(ws.receive_bytes())
+            assert envelope["type"] == "session_started"
+            assert envelope["replay_overflow"] is True
+
+    def test_resume_with_stream_mismatch_signals_overflow_for_rest_refetch(self, pool_client):
+        """Checkpoint references a stale stream (backend restarted under
+        the client).  Same wire format as overflow — frontend goes to REST.
+        """
+        client, pool, _ = pool_client
+        pool.has = MagicMock(return_value=True)
+        pool.resume_state_for = MagicMock(
+            return_value={"stream_id": "test-123:NEW", "next_seq": 0},
+        )
+        pool.replay_for_subscriber = MagicMock(return_value=("mismatch", []))
+
+        with client.websocket_connect("/api/sessions/chat") as ws:
+            ws.send_text(orjson.dumps({
+                "type": "start",
+                "local_id": "test-123",
+                "resume_from": {
+                    "stream_id": "test-123:OLD",
+                    "seq": 5,
+                },
+            }).decode())
+
+            envelope = orjson.loads(ws.receive_bytes())
+            assert envelope["type"] == "session_started"
+            assert envelope["replay_overflow"] is True

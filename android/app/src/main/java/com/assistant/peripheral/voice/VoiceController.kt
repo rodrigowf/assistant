@@ -346,10 +346,15 @@ class VoiceController(
                 endpoint = WebSocketEndpoint.ORCHESTRATOR
             )
         } else {
-            webSocketManager.send(
-                WebSocketMessage.Start(localId = ev.localId, resumeSdkId = ev.sdkSessionId),
-                endpoint = WebSocketEndpoint.ORCHESTRATOR
-            )
+            // Resume protocol: delegate to ChatController.buildStartMessage so
+            // the persisted (stream_id, seq) checkpoint travels with the
+            // reconnect, letting the backend replay missed events.
+            scope.launch {
+                webSocketManager.send(
+                    chatController.buildStartMessage(ev.localId, ev.sdkSessionId),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR
+                )
+            }
         }
     }
 

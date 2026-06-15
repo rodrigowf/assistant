@@ -209,6 +209,16 @@ class WebSocketManager {
                 put("type", "start")
                 message.localId?.let { put("local_id", it) }
                 message.resumeSdkId?.let { put("resume_sdk_id", it) }
+                // Resume protocol: ask the backend to replay events newer
+                // than (streamId, seq) from this socket's last connection.
+                // See ``manager/claude/session.py`` ``replay_after``.
+                message.resumeFrom?.let { snapshot ->
+                    val resumeJson = JSONObject().apply {
+                        put("stream_id", snapshot.streamId)
+                        put("seq", snapshot.seq)
+                    }
+                    put("resume_from", resumeJson)
+                }
             }
             is WebSocketMessage.Stop -> JSONObject().apply {
                 put("type", "stop")
@@ -283,6 +293,26 @@ class WebSocketManager {
             val type = json.optString("type", "")
             fun emit(ev: WebSocketEvent) { _events.tryEmit(endpoint to ev) }
 
+            // Resume protocol: every event the backend broadcasts may
+            // carry ``seq`` + ``stream_id``.  Emit a separate
+            // ResumeCheckpoint event so ChatController can persist the
+            // pair without every typed event growing the same fields.
+            // Done BEFORE the type-specific handler so the checkpoint is
+            // observable even when the typed handler short-circuits.
+            run {
+                val streamId = json.optString("stream_id", "")
+                if (streamId.isNotEmpty() && json.has("seq")) {
+                    val seq = json.optInt("seq", -1)
+                    if (seq >= 0) {
+                        // sessionId may not be present on every event —
+                        // ChatController scopes the checkpoint to the
+                        // current session on its side.
+                        val sessionId = json.optString("session_id", "")
+                        emit(WebSocketEvent.ResumeCheckpoint(sessionId, streamId, seq))
+                    }
+                }
+            }
+
             when (type) {
                 // Heartbeat — backend sends {"type":"ping"} every 15s to
                 // keep the A300M's WiFi radio awake long enough for okhttp
@@ -303,8 +333,43 @@ class WebSocketManager {
                     // emitted session_started for the initiator.
                     val voiceInitiator = json.optBoolean("voice_initiator", true)
                     emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate, voiceInitiator))
+
+                    // Resume protocol: announce the backend's snapshot
+                    // so a fresh subscriber can seed its checkpoint.
+                    json.optJSONObject("resume_state")?.let { state ->
+                        val streamId = state.optString("stream_id", "")
+                        val nextSeq = state.optInt("next_seq", -1)
+                        if (streamId.isNotEmpty() && nextSeq >= 0) {
+                            emit(WebSocketEvent.ResumeStateAnnouncement(
+                                sessionId, streamId, nextSeq,
+                            ))
+                        }
+                    }
+                    if (json.optBoolean("replay_overflow", false)) {
+                        emit(WebSocketEvent.ReplayOverflow(sessionId))
+                    }
                 }
                 "session_stopped" -> emit(WebSocketEvent.SessionStopped)
+
+                // Typed terminal event — the backend told us this
+                // session is gone for an actionable reason.  Emitted
+                // BEFORE the legacy ``session_stopped`` so handlers
+                // can choose which one drives their UI.
+                "session_terminated" -> {
+                    val sessionId = json.optString("session_id", "")
+                    val reason = json.optString("reason", "")
+                    val detail = if (json.isNull("detail")) null else json.optString("detail", null)
+                    val sdkSessionId = if (json.isNull("sdk_session_id")) null
+                        else json.optString("sdk_session_id", null)
+                    if (reason.isNotEmpty()) {
+                        emit(WebSocketEvent.SessionTerminated(
+                            sessionId = sessionId,
+                            reason = reason,
+                            detail = detail,
+                            sdkSessionId = sdkSessionId,
+                        ))
+                    }
+                }
 
                 // Status updates
                 "status" -> emit(WebSocketEvent.Status(json.optString("status", "")))

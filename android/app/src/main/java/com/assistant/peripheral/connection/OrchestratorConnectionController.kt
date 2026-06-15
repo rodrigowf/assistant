@@ -267,7 +267,18 @@ class OrchestratorConnectionController(
                     return@launch
                 }
                 webSocketManager.send(
-                    WebSocketMessage.Start(localId = live.localId, resumeSdkId = live.sdkSessionId),
+                    // Resume protocol: include the persisted checkpoint so
+                    // the backend replays any events broadcast during the
+                    // disconnect.  See ``SettingsRepository.readResumeCheckpoint``.
+                    settingsRepository.readResumeCheckpoint(live.localId).let { ckpt ->
+                        WebSocketMessage.Start(
+                            localId = live.localId,
+                            resumeSdkId = live.sdkSessionId,
+                            resumeFrom = ckpt?.let {
+                                WebSocketMessage.ResumeCheckpointSnapshot(it.streamId, it.seq)
+                            },
+                        )
+                    },
                     endpoint = WebSocketEndpoint.ORCHESTRATOR
                 )
             } finally {

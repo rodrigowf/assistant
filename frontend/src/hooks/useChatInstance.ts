@@ -10,6 +10,12 @@ import type {
 } from "../types";
 import { useWebSocket } from "./useWebSocket";
 import { getMessagesPaginated } from "../api/rest";
+import {
+  checkpointFromEvent,
+  clearCheckpoint,
+  readCheckpoint,
+  writeCheckpoint,
+} from "../utils/checkpoint";
 
 // -------------------------------------------------------------------
 // State
@@ -39,6 +45,26 @@ export interface PendingPermission {
   toolInput: Record<string, unknown>;
 }
 
+/**
+ * Termination signal — set when the backend tells us the underlying
+ * session has died and offers an actionable recovery hint.  Distinct
+ * from the generic ``error`` field, which is for transient send
+ * failures the user can retry.  A non-null ``termination`` means
+ * "this session is gone forever; clicking 'recover' opens a fresh
+ * tab continuing from the same SDK JSONL".
+ */
+export interface TerminationState {
+  reason:
+    | "subprocess_crashed"
+    | "subprocess_lost"
+    | "closed_by_user"
+    | "replaced"
+    | "unreachable";
+  detail: string | null;
+  /** SDK session id to resume from in the recovery tab. */
+  sdkSessionId: string | null;
+}
+
 interface ChatState {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -54,6 +80,10 @@ interface ChatState {
   stall: StallState | null;
   /** Set when the SDK is awaiting a permission decision (modal is open). */
   pendingPermission: PendingPermission | null;
+  /** Set when the backend has signalled that the session is permanently
+   *  gone (subprocess crashed, SSH transport closed, etc.).  Drives the
+   *  termination banner which offers to open a fresh recovery tab. */
+  termination: TerminationState | null;
 }
 
 const INITIAL_STATE: ChatState = {
@@ -67,6 +97,7 @@ const INITIAL_STATE: ChatState = {
   contextWindow: null,
   stall: null,
   pendingPermission: null,
+  termination: null,
 };
 
 // -------------------------------------------------------------------
@@ -91,6 +122,7 @@ type Action =
   | { type: "STALL"; elapsedSeconds: number; toolName: string | null; toolUseId: string | null }
   | { type: "PERMISSION_REQUEST"; requestId: string; toolName: string; toolInput: Record<string, unknown> }
   | { type: "PERMISSION_RESOLVED"; requestId: string; decision: "allow" | "deny"; responder: string; message?: string | null }
+  | { type: "SESSION_TERMINATED"; termination: TerminationState }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
   | { type: "VOICE_ASSISTANT_DELTA"; text: string }
@@ -391,6 +423,19 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "ERROR":
       return { ...state, error: action.error };
 
+    case "SESSION_TERMINATED":
+      // Distinct from ERROR: signals the session is permanently gone
+      // (subprocess crashed, etc.) and the UI should offer auto-resume.
+      // Crucially we DO NOT touch state.messages — the optimistic user
+      // prompt the user just typed stays visible, so they can see what
+      // they sent and know to re-send into the recovery tab.  Status
+      // flips to "disconnected" so input affordances correctly disable.
+      return {
+        ...state,
+        termination: action.termination,
+        status: "disconnected",
+      };
+
     case "DISPLAY_MESSAGE":
       return {
         ...state,
@@ -465,6 +510,10 @@ export interface ChatInstance {
   error: string | null;
   /** Set when the backend reports a stall on the in-flight turn. */
   stall: StallInfo | null;
+  /** Set when the backend signals the session is permanently gone
+   *  (subprocess crashed, SSH transport closed, etc.).  Drives the
+   *  termination banner with the auto-resume affordance. */
+  termination: TerminationState | null;
   /** Set when the SDK is awaiting a permission decision (modal is open). */
   pendingPermission: PendingPermission | null;
   /** Resolve the open permission request. First call wins; later calls are
@@ -584,9 +633,56 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
   const pendingPermissionRef = useRef<PendingPermission | null>(null);
   pendingPermissionRef.current = state.pendingPermission;
 
+  // Refetch the JSONL message tail via REST. Called at init time and as
+  // the fallback when the backend signals ``replay_overflow`` (our WS
+  // checkpoint was too old for in-memory replay, so the JSONL on disk is
+  // the only authoritative source for the missed events).
+  const reloadHistoryFromRest = useCallback(async (): Promise<boolean> => {
+    const sdkId = resumeSdkIdRef.current;
+    if (!sdkId || skipHistory) return false;
+    try {
+      const page = await getMessagesPaginated(sdkId, 50);
+      dispatch({ type: "LOAD_HISTORY", messages: page.messages });
+      setHasMoreMessages(page.has_more);
+      paginationStartIndexRef.current = page.start_index;
+      return true;
+    } catch {
+      // Session may not exist on the backend yet (e.g. brand-new tab,
+      // or running on a remote backend that hasn't synced).
+      return false;
+    }
+  }, [skipHistory]);
+  const reloadHistoryFromRestRef = useRef(reloadHistoryFromRest);
+  reloadHistoryFromRestRef.current = reloadHistoryFromRest;
+
   const handleEvent = useCallback((event: ServerEvent) => {
+    // Resume protocol: persist the (seq, stream_id) carried on every
+    // wire event so a future reconnect can ask the backend to replay
+    // from this point.  No-op for events from non-protocol backends.
+    const checkpoint = checkpointFromEvent(event as unknown as Record<string, unknown>);
+    if (checkpoint) {
+      writeCheckpoint(localIdRef.current, checkpoint);
+    }
     switch (event.type) {
       case "session_started": {
+        // Resume protocol: backend's view of the current stream.  We
+        // seed our checkpoint to (next_seq - 1) so a brand-new tab
+        // immediately has the right "last seen" boundary even before
+        // it observes a live event.  On ``replay_overflow``, the
+        // backend has already given up on WS replay — drop our stale
+        // checkpoint and fall back to a full REST refetch.
+        if (event.replay_overflow) {
+          clearCheckpoint(localIdRef.current);
+          void reloadHistoryFromRestRef.current?.();
+        } else if (event.resume_state) {
+          const { stream_id, next_seq } = event.resume_state;
+          if (typeof next_seq === "number" && next_seq > 0) {
+            writeCheckpoint(localIdRef.current, {
+              stream_id,
+              seq: next_seq - 1,
+            });
+          }
+        }
         // Chat sessions carry the window directly; orchestrator nests it under
         // model_info. Either may be null/undefined — the reducer keeps the
         // previous value (or null → falls back to DEFAULT_CONTEXT_WINDOW).
@@ -689,6 +785,34 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       case "error":
         dispatch({ type: "ERROR", error: event.detail || event.error });
         break;
+      case "session_terminated":
+        // Typed terminal — the backend told us this session is gone.
+        // Show the banner immediately so the user understands why
+        // their last prompt isn't getting a response, and offer
+        // auto-resume via the SDK session id (the JSONL on disk is
+        // intact).  We DO NOT auto-close the tab: the user's
+        // optimistic prompt is still on screen and they need a chance
+        // to read the failure reason before navigating away.
+        //
+        // ``session_stopped`` follows this immediately for back-compat
+        // with older clients; we already handled the meaningful signal,
+        // so the stopped-case below becomes a no-op via mcpRestartingRef.
+        dispatch({
+          type: "SESSION_TERMINATED",
+          termination: {
+            reason: event.reason,
+            detail: event.detail ?? null,
+            sdkSessionId: event.sdk_session_id ?? null,
+          },
+        });
+        // Clear the resume checkpoint — the stream id died with the session.
+        // (No-op for sessions that never had one; the checkpoint util handles that.)
+        try {
+          clearCheckpoint(localIdRef.current);
+        } catch {
+          // best-effort cleanup
+        }
+        break;
       case "session_stopped":
         dispatch({ type: "STATUS", status: "disconnected" });
         // Don't close the tab if we're doing an MCP restart
@@ -737,6 +861,14 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     if (sdkId) {
       startMsg.resume_sdk_id = sdkId;
     }
+    // Resume protocol: if we have a checkpoint persisted from a prior
+    // connection of this tab, ask the backend to replay events newer
+    // than ``seq``.  Backend either streams them in order or responds
+    // with ``replay_overflow`` (handled in handleEvent → REST refetch).
+    const checkpoint = readCheckpoint(localIdRef.current);
+    if (checkpoint) {
+      startMsg.resume_from = checkpoint;
+    }
     pendingStartRef.current = null;
     wsSendRef.current?.(startMsg);
   }, []);
@@ -765,21 +897,9 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       setHasMoreMessages(false);
       paginationStartIndexRef.current = 0;
 
-      // Load history using the SDK session ID (JSONL filename)
-      const sdkId = resumeSdkIdRef.current;
-      if (sdkId && !skipHistory) {
-        try {
-          const page = await getMessagesPaginated(sdkId, 50);
-          if (cancelled) return;
-          dispatch({ type: "LOAD_HISTORY", messages: page.messages });
-          setHasMoreMessages(page.has_more);
-          paginationStartIndexRef.current = page.start_index;
-        } catch {
-          // Session may not exist yet (e.g. running on remote backend)
-        }
-      }
-
+      await reloadHistoryFromRest();
       if (cancelled) return;
+
       pendingStartRef.current = { resumeSdkId: resumeSdkIdRef.current };
       setWsActive(true);
     }
@@ -978,6 +1098,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     turns: state.turns,
     error: state.error,
     stall: state.stall,
+    termination: state.termination,
     pendingPermission: state.pendingPermission,
     respondToPermission,
     contextUsage,

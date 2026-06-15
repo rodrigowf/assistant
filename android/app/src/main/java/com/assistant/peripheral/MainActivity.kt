@@ -195,6 +195,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val sessionsLoading by viewModel.sessionsLoading.collectAsState()
     val currentSessionId by viewModel.currentSessionId.collectAsState()
     val sessionStatus by viewModel.sessionStatus.collectAsState()
+    val termination by viewModel.termination.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val voiceState by viewModel.voiceState.collectAsState()
@@ -464,6 +465,27 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         // StatusBar is chat-only since it reflects the current chat session;
         // VoiceControls already surfaces its own state during voice mode.
         if (currentRoute == Screen.Chat.route && !isVoiceActive) {
+            // Termination banner — shown when the backend signalled this
+            // session is permanently gone (subprocess crashed, SSH
+            // closed).  Distinct from a transient error: offers an
+            // actionable "continue from disk" affordance via the
+            // SDK session id (the JSONL on disk is intact).
+            termination?.let { term ->
+                com.assistant.peripheral.ui.screens.TerminationBanner(
+                    reason = term.reason,
+                    detail = term.detail,
+                    canRecover = !term.sdkSessionId.isNullOrBlank(),
+                    onRecover = {
+                        val sdkId = term.sdkSessionId
+                        if (!sdkId.isNullOrBlank()) {
+                            // Reopens the session in the same surface;
+                            // the new socket gets a fresh local_id and
+                            // resumes from the on-disk JSONL.
+                            viewModel.loadSession(sdkId, false, null)
+                        }
+                    },
+                )
+            }
             StatusBar(
                 connectionState = connectionState,
                 sessionStatus = sessionStatus,

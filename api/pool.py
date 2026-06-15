@@ -31,9 +31,9 @@ from starlette.websockets import WebSocket, WebSocketState
 
 from api.serializers import serialize_event
 from manager._proc import process_alive as _process_alive, looks_like
-from manager.base_session import BaseSessionManager
+from manager.base_session import BaseSessionManager, SessionDeadError
 from manager.config import ManagerConfig
-from manager.types import Event
+from manager.types import Event, TerminationReason
 
 
 def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
@@ -133,6 +133,13 @@ class SessionPool:
         # still want to keep an eye on for ``orphan_grace_seconds``.
         self._closed_session_pids: dict[str, tuple[int, float]] = {}
         self._reaper_task: asyncio.Task[None] | None = None
+        # Dead-session reaper — sweeps for SessionManagers whose receive
+        # loop has exited (subprocess crash, SSH transport closed mid-
+        # session) and removes them from the pool with a typed
+        # ``session_terminated`` broadcast.  Distinct from the orphan
+        # reaper above, which tracks subprocess PIDs.  See
+        # :meth:`_reap_dead_sessions_once` for the per-iteration body.
+        self._dead_session_reaper_task: asyncio.Task[None] | None = None
 
         # Session-owned in-flight turn task.  Decouples turn lifetime from
         # the WebSocket that initiated it: a page reload (or any momentary
@@ -296,7 +303,13 @@ class SessionPool:
 
         return lid
 
-    async def close(self, session_id: str) -> None:
+    async def close(
+        self,
+        session_id: str,
+        *,
+        reason: "TerminationReason | None" = None,
+        detail: str | None = None,
+    ) -> None:
         """Remove a session, notify subscribers, and clean up.
 
         Awaits ``sm.stop()`` so the SDK transport, the local ssh client (for
@@ -304,6 +317,17 @@ class SessionPool:
         deterministically.  Relying on Python GC is not enough: GC cannot run
         async cleanup, so the subprocess + SSH connection + remote children
         would otherwise leak across close/reopen cycles.
+
+        When *reason* is provided, an additional typed ``session_terminated``
+        event is broadcast BEFORE the legacy ``session_stopped`` envelope.
+        Clients that understand the typed event use it to render a
+        recovery affordance ("session crashed — open a fresh tab continuing
+        from disk"); older clients silently ignore it and act on the
+        legacy ``session_stopped`` as before.
+
+        ``reason=None`` preserves the original behaviour exactly — useful
+        for explicit close from a UI button where no typed broadcast is
+        warranted.  In practice every internal caller now passes one.
         """
         sm = self._sessions.pop(session_id, None)
         if sm is None:
@@ -320,7 +344,16 @@ class SessionPool:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Notify while subscribers/watchers are still registered
+        # Typed-first, legacy-second.  Both broadcasts go while
+        # subscribers are still registered so reconnecting clients in
+        # this window observe a coherent terminal pair.
+        if reason is not None:
+            await self._broadcast_session(session_id, {
+                "type": "session_terminated",
+                "reason": reason.value,
+                "detail": detail,
+                "sdk_session_id": sm.sdk_session_id,
+            })
         await self._broadcast_session(session_id, {"type": "session_stopped"})
         await self._notify_watchers({"type": "agent_session_closed", "session_id": session_id})
 
@@ -685,6 +718,102 @@ class SessionPool:
                         pid, sid,
                     )
 
+    # ------------------------------------------------------------------
+    # Dead-session reaper — distinct from the orphan-pid reaper above.
+    #
+    # A "dead" session is one whose underlying SessionManager receive
+    # loop has exited (subprocess crash, SSH transport closure, fatal
+    # SDK error) but the session is still in ``self._sessions`` because
+    # nothing else has triggered ``close()`` yet.  Without this reaper
+    # ``pool/live`` keeps reporting the session as ``streaming`` and
+    # any send() into it raises ``SessionDeadError`` immediately.
+    #
+    # The reaper detects this state via ``sm._receive_loop_done.is_set()``
+    # (set by the receive loop's finally clause) and pulls the session
+    # through ``close(reason=...)`` with the typed termination reason
+    # the manager flagged.
+    # ------------------------------------------------------------------
+
+    async def start_dead_session_reaper(
+        self,
+        *,
+        interval_seconds: float = 5.0,
+    ) -> None:
+        """Spawn the background dead-session sweeper.
+
+        Idempotent.  Default interval is 5s — short enough that a UI
+        polling ``pool/live`` shortly after the crash sees the truth
+        within a few seconds; long enough that the sweep cost is
+        negligible (a dict iteration + an attribute check per session).
+        """
+        if (
+            self._dead_session_reaper_task is not None
+            and not self._dead_session_reaper_task.done()
+        ):
+            return
+        self._dead_session_reaper_task = asyncio.create_task(
+            self._dead_session_reaper_loop(interval_seconds),
+            name="pool-dead-session-reaper",
+        )
+
+    async def stop_dead_session_reaper(self) -> None:
+        if self._dead_session_reaper_task is None:
+            return
+        self._dead_session_reaper_task.cancel()
+        try:
+            await self._dead_session_reaper_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._dead_session_reaper_task = None
+
+    async def _dead_session_reaper_loop(self, interval_seconds: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    await self._reap_dead_sessions_once()
+                except Exception:
+                    logger.exception("dead-session reaper iteration failed")
+        except asyncio.CancelledError:
+            raise
+
+    async def _reap_dead_sessions_once(self) -> None:
+        """Single pass: close every session whose receive loop has exited.
+
+        Reads ``_receive_loop_done`` (a typed signal set by the manager's
+        receive loop in its finally clause).  Pulls the termination
+        reason + detail off the manager so the broadcast carries the
+        same actionable info the in-flight send() would have raised as
+        :class:`SessionDeadError`.
+
+        ``close()`` already handles the per-session lock, in-flight turn
+        cancellation, subscriber broadcasts, and SDK teardown.
+        """
+        dead_ids: list[str] = []
+        for sid, sm in list(self._sessions.items()):
+            done_event = getattr(sm, "_receive_loop_done", None)
+            if done_event is not None and done_event.is_set():
+                dead_ids.append(sid)
+        for sid in dead_ids:
+            sm = self._sessions.get(sid)
+            if sm is None:
+                continue
+            reason = (
+                getattr(sm, "_termination_reason", None)
+                or TerminationReason.SUBPROCESS_CRASHED
+            )
+            detail = getattr(sm, "_termination_detail", None)
+            logger.warning(
+                "Dead-session reaper: closing %s (reason=%s, detail=%s)",
+                sid, reason.value, detail,
+            )
+            try:
+                await self.close(sid, reason=reason, detail=detail)
+            except Exception:
+                logger.exception(
+                    "Dead-session reaper: close() failed for %s", sid,
+                )
+
     @property
     def orchestrator_subscriber_count(self) -> int:
         return len(self._orchestrator_subs)
@@ -724,7 +853,7 @@ class SessionPool:
                 exclude=source_ws,
             )
             async for event in sm.send(text):
-                payload = serialize_event(event)
+                payload = self._wrap_payload(sm, serialize_event(event))
                 await self._broadcast_session(session_id, payload)
                 if payload.get("type") in ("permission_request", "permission_resolved"):
                     # Mirror to the orchestrator so its UI can show a matching
@@ -869,6 +998,27 @@ class SessionPool:
                     f"({exc.elapsed_seconds:.0f}s). Try again in a moment."
                 ),
             })
+        except SessionDeadError as exc:
+            # Session's receive loop has exited (subprocess crashed, SSH
+            # transport died, fatal SDK error).  Distinct from a generic
+            # ``send_failed``: the same session is permanently dead, so
+            # the client should NOT retry — it should offer to open a
+            # fresh tab resuming from disk (the JSONL is intact).
+            #
+            # Close the session synchronously so subsequent ``pool/live``
+            # polls reflect reality immediately, rather than waiting for
+            # the dead-session reaper's next sweep (~5s).  ``close()``'s
+            # typed broadcast carries the same reason the manager flagged.
+            logger.warning(
+                "Session-owned turn for %s hit dead session (reason=%s)",
+                session_id, exc.reason.value,
+            )
+            try:
+                await self.close(session_id, reason=exc.reason, detail=exc.detail)
+            except Exception:
+                logger.exception(
+                    "Failed to close dead session %s during turn", session_id,
+                )
         except Exception as exc:
             logger.exception(
                 "Session-owned turn for %s raised; broadcasting error",
@@ -913,6 +1063,111 @@ class SessionPool:
         except (asyncio.CancelledError, Exception):
             pass
         return True
+
+    # ------------------------------------------------------------------
+    # Resume protocol — wrap broadcasts with (seq, stream_id) so a
+    # reconnecting WS can resume from a checkpoint without losing events.
+    # See ``manager/claude/session.py``'s ``replay_after`` for the matching
+    # backend logic and ``frontend/src/utils/checkpoint.ts`` for the client.
+    # ------------------------------------------------------------------
+
+    def _wrap_payload(
+        self,
+        sm: BaseSessionManager,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach resume-protocol metadata to a broadcast payload.
+
+        Reads the seq the session just yielded (set inside ``sm.send`` in
+        the same coroutine — no await intervenes) and the session's
+        current stream id.  Either may be missing for providers that
+        don't support the protocol (Qwen, Gemini); in that case the
+        payload is returned unchanged and the frontend treats this
+        session as non-resumable (the protocol is purely additive).
+        """
+        stream_id = getattr(sm, "stream_id", None)
+        seq = getattr(sm, "last_yielded_seq", None)
+        if stream_id is None or seq is None:
+            return payload
+        # Don't overwrite if a caller already filled these (defensive —
+        # the replay path stamps its own seqs in :meth:`replay_for_subscriber`).
+        payload.setdefault("seq", seq)
+        payload.setdefault("stream_id", stream_id)
+        return payload
+
+    def resume_state_for(self, session_id: str) -> dict[str, Any] | None:
+        """Snapshot of a session's resume-protocol state, or None.
+
+        ``{"stream_id": str, "next_seq": int}``.  Returned to the
+        frontend in ``session_started`` so a fresh subscriber (no
+        prior checkpoint) immediately learns the stream identity and
+        can start tracking seqs from this point forward.
+        """
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            return None
+        stream_id = getattr(sm, "stream_id", None)
+        if stream_id is None:
+            return None
+        # ``_next_seq`` is the seq the *next* dispatch will use; the
+        # last delivered seq is one less.  Hand the frontend the
+        # next-seq directly — it represents "the boundary above which
+        # nothing has been delivered yet", which is the right thing
+        # to compare future seqs against.
+        next_seq = getattr(sm, "_next_seq", 0)
+        return {"stream_id": stream_id, "next_seq": next_seq}
+
+    def replay_for_subscriber(
+        self,
+        session_id: str,
+        resume_from: dict[str, Any] | None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Build the resume batch for a (re)connecting subscriber.
+
+        Returns ``(status, wire_payloads)``:
+
+        * ``"ok"``       — ``wire_payloads`` are serialized events the
+                           caller can send to the WS in order.  Empty
+                           if the subscriber is current.
+        * ``"overflow"`` — checkpoint is older than the buffer; caller
+                           must REST-refetch.  ``wire_payloads`` empty.
+        * ``"mismatch"`` — checkpoint references a stale stream;
+                           caller must REST-refetch.  ``wire_payloads`` empty.
+        * ``"unsupported"`` — provider doesn't implement the protocol
+                           (no ``replay_after``).  Treated as ``"ok"``
+                           with no replay; old behavior preserved.
+
+        ``resume_from`` is the dict the client sent in the ``start``
+        handshake; ``None`` means "no checkpoint, no replay needed".
+        """
+        sm = self._sessions.get(session_id)
+        if sm is None:
+            return "ok", []
+        replay = getattr(sm, "replay_after", None)
+        if replay is None:
+            return "unsupported", []
+        if resume_from is None:
+            return "ok", []
+
+        stream_id = resume_from.get("stream_id")
+        after_seq = resume_from.get("seq")
+        if not isinstance(stream_id, str) or not isinstance(after_seq, int):
+            # Malformed handshake — treat as no checkpoint rather than
+            # erroring; the frontend will receive an empty replay and
+            # behave as a fresh subscriber.
+            return "ok", []
+
+        status, sequenced = replay(stream_id, after_seq)
+        if status != "ok":
+            return status, []
+
+        payloads: list[dict[str, Any]] = []
+        for seq, event in sequenced:
+            wire = serialize_event(event)
+            wire["seq"] = seq
+            wire["stream_id"] = sm.stream_id
+            payloads.append(wire)
+        return "ok", payloads
 
     # ------------------------------------------------------------------
     # Internal helpers

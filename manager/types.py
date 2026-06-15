@@ -139,6 +139,67 @@ class SessionStalled(Event):
     last_tool_use_id: str | None = None
 
 
+class TerminationReason(str, Enum):
+    """Why a session was removed from the pool.
+
+    Surfaced to clients in the :class:`SessionTerminated` event so they
+    can render context-appropriate UI and decide whether to offer an
+    auto-resume affordance.
+    """
+
+    #: The SDK receive loop raised a fatal exception (e.g. the bundled
+    #: ``claude`` subprocess exited unexpectedly, SSH transport died,
+    #: SDK parse error).  Almost always recoverable by opening a new
+    #: session that resumes from the same SDK session id — the JSONL on
+    #: disk is intact.
+    SUBPROCESS_CRASHED = "subprocess_crashed"
+
+    #: The receive loop drained ``receive_messages()`` without an
+    #: exception, but no terminal ``ResultMessage`` arrived first.  The
+    #: subprocess shut itself down cleanly mid-turn — typically because
+    #: the SSH connection closed.  Same recovery as ``SUBPROCESS_CRASHED``.
+    SUBPROCESS_LOST = "subprocess_lost"
+
+    #: An explicit ``pool.close(session_id)`` call — usually because the
+    #: user clicked Close or the orchestrator decided to retire it.
+    CLOSED_BY_USER = "closed_by_user"
+
+    #: A new session with the same ``local_id`` was created.  The old
+    #: instance was retired so the new one could take its place.
+    REPLACED = "replaced"
+
+    #: The pre-start reachability check failed (e.g. SSH host
+    #: unreachable).  No subprocess was ever spawned.  Recovery
+    #: requires bringing the host back online.
+    UNREACHABLE = "unreachable"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTerminated(Event):
+    """Emitted exactly once when a session leaves the pool.
+
+    Replaces the legacy generic ``error: send_failed`` for the
+    session-death case.  Carries enough metadata for the client to:
+
+    * tell the user *why* the session ended,
+    * decide whether automatic recovery is appropriate (it almost
+      always is for ``SUBPROCESS_*`` reasons — the JSONL is intact
+      and a fresh session can resume from the same ``sdk_session_id``),
+    * suppress the optimistic "retry" affordances that would only
+      result in the same failure.
+
+    Symmetric counterpart to ``session_started`` — exactly one of each
+    per session lifecycle, no exceptions.
+    """
+
+    reason: TerminationReason
+    detail: str | None = None
+    #: SDK session id at termination time, if known.  The client uses
+    #: this to open a fresh local session resuming from the on-disk
+    #: JSONL (the canonical record survives the in-memory crash).
+    sdk_session_id: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Session metadata — used by SessionStore
 # ---------------------------------------------------------------------------

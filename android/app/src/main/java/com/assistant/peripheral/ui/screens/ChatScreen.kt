@@ -70,25 +70,58 @@ fun ChatScreen(
         }
     }
 
-    // Load more messages when scrolling to top
-    LaunchedEffect(isAtTop, hasMoreMessages, isLoadingMoreMessages) {
-        if (isAtTop && hasMoreMessages && !isLoadingMoreMessages && messages.isNotEmpty()) {
-            onLoadMoreMessages()
+    // Per-session initial-scroll guard. Without this, the LazyColumn starts
+    // at index 0 (isAtTop = true) when a session opens and the load-more
+    // effect fires before the scroll-to-bottom effect has a chance to run.
+    // That prepends a page of older messages, keeps the list pinned at the
+    // top, and loops until the entire history is pulled in.
+    //
+    // We track the "session identity" as the id of the *first* message in
+    // the list, then snapshot it whenever the initial scroll completes. The
+    // guard only resets when the first id changes *unexpectedly* — i.e. not
+    // as the result of a load-more prepend (which is when isLoadingMore is
+    // true) and not equal to the snapshot we took on first scroll.
+    val firstMessageId = messages.firstOrNull()?.id
+    var hasInitialScrollCompleted by remember { mutableStateOf(false) }
+    var lastKnownFirstId by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(firstMessageId, isLoadingMoreMessages) {
+        if (firstMessageId == null) {
+            hasInitialScrollCompleted = false
+            lastKnownFirstId = null
+            return@LaunchedEffect
+        }
+        // If we're in the middle of a load-more, the first-id change is
+        // expected; do not invalidate the guard.
+        if (isLoadingMoreMessages) return@LaunchedEffect
+        // If the first-id changed and it doesn't match what we snapshotted
+        // on the last initial-scroll, we've switched sessions.
+        if (lastKnownFirstId != null && lastKnownFirstId != firstMessageId) {
+            hasInitialScrollCompleted = false
         }
     }
 
-    // Remember last message count to detect new messages
-    var lastMessageCount by remember { mutableStateOf(messages.size) }
+    // Scroll to bottom on initial load (per session) and when new messages
+    // arrive while the user is at the bottom. The initial jump is instant
+    // (scrollToItem, not animateScrollToItem) so the load-more guard flips
+    // before the layout reports isAtTop = true.
+    LaunchedEffect(messages.size, messages.lastOrNull()?.content, hasInitialScrollCompleted) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        if (!hasInitialScrollCompleted) {
+            listState.scrollToItem(messages.size - 1)
+            lastKnownFirstId = messages.firstOrNull()?.id
+            hasInitialScrollCompleted = true
+        } else if (isAtBottom) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
+    }
 
-    // Scroll to bottom on initial load or when messages change AND user is at bottom
-    LaunchedEffect(messages.size, messages.lastOrNull()?.content) {
-        if (messages.isNotEmpty()) {
-            // If new message added and user is at bottom, scroll to bottom
-            // Also scroll on first load (lastMessageCount was 0)
-            if (lastMessageCount == 0 || (messages.size > lastMessageCount && isAtBottom)) {
-                listState.animateScrollToItem(messages.size - 1)
-            }
-            lastMessageCount = messages.size
+    // Load more messages when scrolling to top — but only after the initial
+    // scroll-to-bottom has landed, otherwise the first frame (which starts
+    // at index 0) would auto-trigger pagination.
+    LaunchedEffect(isAtTop, hasMoreMessages, isLoadingMoreMessages, hasInitialScrollCompleted) {
+        if (hasInitialScrollCompleted && isAtTop && hasMoreMessages && !isLoadingMoreMessages && messages.isNotEmpty()) {
+            onLoadMoreMessages()
         }
     }
 

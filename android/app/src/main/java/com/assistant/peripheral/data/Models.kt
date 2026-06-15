@@ -218,16 +218,97 @@ sealed class WebSocketEvent {
 
     // Compaction
     data class CompactComplete(val summary: String) : WebSocketEvent()
+
+    /**
+     * Resume-protocol marker: emitted alongside any wire event that
+     * carries ``seq`` + ``stream_id``.  ChatController persists the pair
+     * via [com.assistant.peripheral.settings.SettingsRepository] so a
+     * reconnecting socket can ask the backend to replay missed events.
+     *
+     * Decoupled from the typed event for the same reason the web
+     * frontend uses a checkpoint utility: every event type would
+     * otherwise need its own seq/streamId fields, doubling the
+     * data-class surface for purely cross-cutting metadata.
+     */
+    data class ResumeCheckpoint(
+        val sessionId: String,
+        val streamId: String,
+        val seq: Int,
+    ) : WebSocketEvent()
+
+    /**
+     * Resume-protocol: backend's ``session_started`` envelope carries a
+     * snapshot of the current ``(stream_id, next_seq)`` so a fresh
+     * subscriber can seed its checkpoint from this moment forward.
+     *
+     * Emitted in addition to [SessionStarted] when the envelope
+     * contains a ``resume_state``.  Decoupled to keep [SessionStarted]
+     * focused on the lifecycle signal.
+     */
+    data class ResumeStateAnnouncement(
+        val sessionId: String,
+        val streamId: String,
+        val nextSeq: Int,
+    ) : WebSocketEvent()
+
+    /**
+     * Resume-protocol: backend couldn't satisfy our ``resume_from``
+     * checkpoint (it was older than the buffer, or referenced a stale
+     * stream).  Frontend should drop the checkpoint and refetch the
+     * JSONL tail via REST.
+     */
+    data class ReplayOverflow(val sessionId: String) : WebSocketEvent()
+
+    /**
+     * Typed terminal event — emitted exactly once when a session is
+     * removed from the pool with an actionable reason.  Replaces the
+     * legacy generic ``Error("send_failed", ...)`` for the dead-session
+     * case so the UI can offer auto-resume rather than a confusing
+     * retry that would only fail the same way.
+     *
+     * Mirrors ``manager.types.TerminationReason`` on the backend.
+     * Always followed by a [SessionStopped] for back-compat with old
+     * clients; new clients act on this and ignore the stop.
+     */
+    data class SessionTerminated(
+        val sessionId: String,
+        /** One of: "subprocess_crashed", "subprocess_lost",
+         *  "closed_by_user", "replaced", "unreachable". */
+        val reason: String,
+        /** Human-readable detail (e.g. "exit code 255"). */
+        val detail: String?,
+        /** SDK session id of the dead session.  Open a fresh local
+         *  session with this id to resume from the on-disk JSONL. */
+        val sdkSessionId: String?,
+    ) : WebSocketEvent()
 }
 
 /**
  * Message to send to the WebSocket (matches client→server types from API).
  */
 sealed class WebSocketMessage {
+    /**
+     * Resume-protocol checkpoint sent in the ``start`` handshake.
+     * Backend either replays events newer than [seq] within [streamId],
+     * or — if the checkpoint is stale — sends ``replay_overflow`` so the
+     * client falls back to a full REST refetch.
+     */
+    data class ResumeCheckpointSnapshot(
+        val streamId: String,
+        val seq: Int,
+    )
+
     // Session management
     data class Start(
         val localId: String? = null,
-        val resumeSdkId: String? = null
+        val resumeSdkId: String? = null,
+        /**
+         * Optional resume-protocol checkpoint.  When non-null, the
+         * backend will replay buffered events with ``seq > seq`` in the
+         * same [ResumeCheckpointSnapshot.streamId].  See
+         * ``manager/claude/session.py``'s ``replay_after``.
+         */
+        val resumeFrom: ResumeCheckpointSnapshot? = null,
     ) : WebSocketMessage()
     object Stop : WebSocketMessage()
 
