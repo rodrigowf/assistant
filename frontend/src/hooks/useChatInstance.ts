@@ -45,6 +45,26 @@ export interface PendingPermission {
   toolInput: Record<string, unknown>;
 }
 
+/**
+ * Termination signal — set when the backend tells us the underlying
+ * session has died and offers an actionable recovery hint.  Distinct
+ * from the generic ``error`` field, which is for transient send
+ * failures the user can retry.  A non-null ``termination`` means
+ * "this session is gone forever; clicking 'recover' opens a fresh
+ * tab continuing from the same SDK JSONL".
+ */
+export interface TerminationState {
+  reason:
+    | "subprocess_crashed"
+    | "subprocess_lost"
+    | "closed_by_user"
+    | "replaced"
+    | "unreachable";
+  detail: string | null;
+  /** SDK session id to resume from in the recovery tab. */
+  sdkSessionId: string | null;
+}
+
 interface ChatState {
   messages: ChatMessage[];
   status: SessionStatus;
@@ -60,6 +80,10 @@ interface ChatState {
   stall: StallState | null;
   /** Set when the SDK is awaiting a permission decision (modal is open). */
   pendingPermission: PendingPermission | null;
+  /** Set when the backend has signalled that the session is permanently
+   *  gone (subprocess crashed, SSH transport closed, etc.).  Drives the
+   *  termination banner which offers to open a fresh recovery tab. */
+  termination: TerminationState | null;
 }
 
 const INITIAL_STATE: ChatState = {
@@ -73,6 +97,7 @@ const INITIAL_STATE: ChatState = {
   contextWindow: null,
   stall: null,
   pendingPermission: null,
+  termination: null,
 };
 
 // -------------------------------------------------------------------
@@ -97,6 +122,7 @@ type Action =
   | { type: "STALL"; elapsedSeconds: number; toolName: string | null; toolUseId: string | null }
   | { type: "PERMISSION_REQUEST"; requestId: string; toolName: string; toolInput: Record<string, unknown> }
   | { type: "PERMISSION_RESOLVED"; requestId: string; decision: "allow" | "deny"; responder: string; message?: string | null }
+  | { type: "SESSION_TERMINATED"; termination: TerminationState }
   | { type: "ERROR"; error: string }
   | { type: "DISPLAY_MESSAGE"; role: "user" | "assistant"; text: string }
   | { type: "VOICE_ASSISTANT_DELTA"; text: string }
@@ -397,6 +423,19 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "ERROR":
       return { ...state, error: action.error };
 
+    case "SESSION_TERMINATED":
+      // Distinct from ERROR: signals the session is permanently gone
+      // (subprocess crashed, etc.) and the UI should offer auto-resume.
+      // Crucially we DO NOT touch state.messages — the optimistic user
+      // prompt the user just typed stays visible, so they can see what
+      // they sent and know to re-send into the recovery tab.  Status
+      // flips to "disconnected" so input affordances correctly disable.
+      return {
+        ...state,
+        termination: action.termination,
+        status: "disconnected",
+      };
+
     case "DISPLAY_MESSAGE":
       return {
         ...state,
@@ -471,6 +510,10 @@ export interface ChatInstance {
   error: string | null;
   /** Set when the backend reports a stall on the in-flight turn. */
   stall: StallInfo | null;
+  /** Set when the backend signals the session is permanently gone
+   *  (subprocess crashed, SSH transport closed, etc.).  Drives the
+   *  termination banner with the auto-resume affordance. */
+  termination: TerminationState | null;
   /** Set when the SDK is awaiting a permission decision (modal is open). */
   pendingPermission: PendingPermission | null;
   /** Resolve the open permission request. First call wins; later calls are
@@ -741,6 +784,34 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
         break;
       case "error":
         dispatch({ type: "ERROR", error: event.detail || event.error });
+        break;
+      case "session_terminated":
+        // Typed terminal — the backend told us this session is gone.
+        // Show the banner immediately so the user understands why
+        // their last prompt isn't getting a response, and offer
+        // auto-resume via the SDK session id (the JSONL on disk is
+        // intact).  We DO NOT auto-close the tab: the user's
+        // optimistic prompt is still on screen and they need a chance
+        // to read the failure reason before navigating away.
+        //
+        // ``session_stopped`` follows this immediately for back-compat
+        // with older clients; we already handled the meaningful signal,
+        // so the stopped-case below becomes a no-op via mcpRestartingRef.
+        dispatch({
+          type: "SESSION_TERMINATED",
+          termination: {
+            reason: event.reason,
+            detail: event.detail ?? null,
+            sdkSessionId: event.sdk_session_id ?? null,
+          },
+        });
+        // Clear the resume checkpoint — the stream id died with the session.
+        // (No-op for sessions that never had one; the checkpoint util handles that.)
+        try {
+          clearCheckpoint(localIdRef.current);
+        } catch {
+          // best-effort cleanup
+        }
         break;
       case "session_stopped":
         dispatch({ type: "STATUS", status: "disconnected" });
@@ -1027,6 +1098,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
     turns: state.turns,
     error: state.error,
     stall: state.stall,
+    termination: state.termination,
     pendingPermission: state.pendingPermission,
     respondToPermission,
     contextUsage,

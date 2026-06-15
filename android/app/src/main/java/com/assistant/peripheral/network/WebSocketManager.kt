@@ -351,6 +351,26 @@ class WebSocketManager {
                 }
                 "session_stopped" -> emit(WebSocketEvent.SessionStopped)
 
+                // Typed terminal event — the backend told us this
+                // session is gone for an actionable reason.  Emitted
+                // BEFORE the legacy ``session_stopped`` so handlers
+                // can choose which one drives their UI.
+                "session_terminated" -> {
+                    val sessionId = json.optString("session_id", "")
+                    val reason = json.optString("reason", "")
+                    val detail = if (json.isNull("detail")) null else json.optString("detail", null)
+                    val sdkSessionId = if (json.isNull("sdk_session_id")) null
+                        else json.optString("sdk_session_id", null)
+                    if (reason.isNotEmpty()) {
+                        emit(WebSocketEvent.SessionTerminated(
+                            sessionId = sessionId,
+                            reason = reason,
+                            detail = detail,
+                            sdkSessionId = sdkSessionId,
+                        ))
+                    }
+                }
+
                 // Status updates
                 "status" -> emit(WebSocketEvent.Status(json.optString("status", "")))
 

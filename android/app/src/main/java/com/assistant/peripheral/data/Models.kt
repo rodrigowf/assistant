@@ -258,6 +258,29 @@ sealed class WebSocketEvent {
      * JSONL tail via REST.
      */
     data class ReplayOverflow(val sessionId: String) : WebSocketEvent()
+
+    /**
+     * Typed terminal event — emitted exactly once when a session is
+     * removed from the pool with an actionable reason.  Replaces the
+     * legacy generic ``Error("send_failed", ...)`` for the dead-session
+     * case so the UI can offer auto-resume rather than a confusing
+     * retry that would only fail the same way.
+     *
+     * Mirrors ``manager.types.TerminationReason`` on the backend.
+     * Always followed by a [SessionStopped] for back-compat with old
+     * clients; new clients act on this and ignore the stop.
+     */
+    data class SessionTerminated(
+        val sessionId: String,
+        /** One of: "subprocess_crashed", "subprocess_lost",
+         *  "closed_by_user", "replaced", "unreachable". */
+        val reason: String,
+        /** Human-readable detail (e.g. "exit code 255"). */
+        val detail: String?,
+        /** SDK session id of the dead session.  Open a fresh local
+         *  session with this id to resume from the on-disk JSONL. */
+        val sdkSessionId: String?,
+    ) : WebSocketEvent()
 }
 
 /**

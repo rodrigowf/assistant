@@ -152,6 +152,31 @@ export type ServerEvent =
       replay_overflow?: boolean;
     } & ResumeProtocolFields)
   | ({ type: "session_stopped" } & ResumeProtocolFields)
+  | ({
+      /**
+       * Typed terminal event — emitted exactly once when a session is
+       * removed from the pool with an actionable reason.  Replaces the
+       * legacy ``error: send_failed`` for the dead-session case so the
+       * UI can offer auto-resume rather than a generic retry.
+       *
+       * The matching ``session_stopped`` is broadcast immediately after
+       * this for backwards compatibility — clients should consume
+       * whichever they handle first and ignore the other.
+       */
+      type: "session_terminated";
+      /** Matches Python ``manager.types.TerminationReason``. */
+      reason:
+        | "subprocess_crashed"
+        | "subprocess_lost"
+        | "closed_by_user"
+        | "replaced"
+        | "unreachable";
+      /** Human-readable detail — surfaced verbatim in the banner. */
+      detail?: string | null;
+      /** SDK session id the dead session was tracking.  Used to open a
+       *  fresh local session that resumes from the same on-disk JSONL. */
+      sdk_session_id?: string | null;
+    } & ResumeProtocolFields)
   | ({ type: "text_delta"; text: string } & ResumeProtocolFields)
   | ({ type: "text_complete"; text: string } & ResumeProtocolFields)
   | ({ type: "thinking_delta"; text: string } & ResumeProtocolFields)

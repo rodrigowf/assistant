@@ -1367,6 +1367,174 @@ class TestSessionManagerResumeProtocol:
             session_mod._REPLAY_BUFFER_SIZE = original
 
 
+class TestSessionManagerSessionDeath:
+    """Tests for the session-death recovery path.
+
+    A real Claude session can die in two ways the wrapper has to handle
+    gracefully:
+
+    1. ``receive_messages()`` raises — e.g. the SDK reports
+       ``Command failed with exit code 255`` when the SSH transport
+       closes mid-session.  This is the case Rodrigo hit on 2026-06-15.
+    2. ``receive_messages()`` returns normally without a terminal
+       ``ResultMessage``.  Rare but happens when the subprocess shuts
+       itself down cleanly mid-turn.
+
+    Both must:
+      * set ``self._status = SessionStatus.DISCONNECTED`` so the pool's
+        ``list_sessions`` reports the truth,
+      * mark ``_receive_loop_done`` so the pool's reaper and any
+        subsequent ``send()`` observe the dead state,
+      * flag a typed ``_termination_reason`` so the pool's broadcast
+        carries an actionable signal.
+    """
+
+    @staticmethod
+    def _make_client_that_crashes_after_init(error_message: str):
+        """Mock client whose receive_messages raises after the init msg."""
+        from claude_agent_sdk import SystemMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.interrupt = AsyncMock()
+        client.query = AsyncMock()
+        client.get_server_info = AsyncMock(return_value={"session_id": "s1"})
+
+        async def _receive_messages():
+            yield init_msg
+            raise Exception(error_message)
+        client.receive_messages = _receive_messages
+        return client
+
+    @staticmethod
+    def _make_client_that_ends_cleanly_after_init():
+        """Mock client whose receive_messages returns without a result."""
+        from claude_agent_sdk import SystemMessage
+
+        init_msg = SystemMessage(subtype="init", data={"session_id": "s1"})
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.interrupt = AsyncMock()
+        client.query = AsyncMock()
+        client.get_server_info = AsyncMock(return_value={"session_id": "s1"})
+
+        async def _receive_messages():
+            yield init_msg
+            # End of iterator — clean exhaustion, no exception.
+        client.receive_messages = _receive_messages
+        return client
+
+    @pytest.mark.asyncio
+    async def test_receive_loop_crash_flips_status_to_disconnected(self):
+        """The exact failure mode from 2026-06-15: SSH transport closes
+        (exit code 255), receive loop crashes, status must reflect reality.
+        Before the fix, status stayed STREAMING / TOOL_USE forever.
+        """
+        client = self._make_client_that_crashes_after_init(
+            "Command failed with exit code 255 (exit code: 255)",
+        )
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            # Wait for the receive loop to observe the crash.
+            from manager.types import SessionStatus
+            for _ in range(100):
+                if sm.status == SessionStatus.DISCONNECTED:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert sm.status == SessionStatus.DISCONNECTED
+            assert sm._receive_loop_done.is_set()
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_receive_loop_crash_sets_termination_reason(self):
+        """The typed reason + detail must be available to the pool's
+        reaper and ``SessionDeadError`` consumers.
+        """
+        from manager.types import TerminationReason
+
+        client = self._make_client_that_crashes_after_init(
+            "Command failed with exit code 255",
+        )
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            for _ in range(100):
+                if sm._receive_loop_done.is_set():
+                    break
+                await asyncio.sleep(0.01)
+
+            assert sm._termination_reason == TerminationReason.SUBPROCESS_CRASHED
+            assert "255" in (sm._termination_detail or "")
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_receive_loop_clean_exit_flags_subprocess_lost(self):
+        """Distinct reason for the no-exception drain case so the client
+        can tell the user "subprocess shut down mid-session" rather than
+        "subprocess crashed".  Same UI affordance (offer auto-resume),
+        but accurate language matters for trust.
+        """
+        from manager.types import TerminationReason
+
+        client = self._make_client_that_ends_cleanly_after_init()
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            for _ in range(100):
+                if sm._receive_loop_done.is_set():
+                    break
+                await asyncio.sleep(0.01)
+
+            assert sm._termination_reason == TerminationReason.SUBPROCESS_LOST
+
+            await sm.stop()
+
+    @pytest.mark.asyncio
+    async def test_send_after_receive_loop_exits_raises_session_dead_error(self):
+        """The whole point of the typed error: callers that try one
+        more send after the crash get a structured signal — not a
+        ``RuntimeError`` string — so the pool can translate it into a
+        ``session_terminated`` broadcast.
+        """
+        from manager.base_session import SessionDeadError
+        from manager.types import TerminationReason
+
+        client = self._make_client_that_crashes_after_init(
+            "Command failed with exit code 255",
+        )
+
+        with patch("manager.claude.session.ClaudeSDKClient", return_value=client):
+            sm = SessionManager()
+            await sm.start()
+
+            for _ in range(100):
+                if sm._receive_loop_done.is_set():
+                    break
+                await asyncio.sleep(0.01)
+
+            with pytest.raises(SessionDeadError) as exc_info:
+                async for _ in sm.send("hi"):
+                    pass
+
+            assert exc_info.value.reason == TerminationReason.SUBPROCESS_CRASHED
+            assert "255" in (exc_info.value.detail or "")
+
+            await sm.stop()
+
+
 class TestSessionManagerCostTracking:
     @pytest.mark.asyncio
     async def test_cost_accumulates(self):

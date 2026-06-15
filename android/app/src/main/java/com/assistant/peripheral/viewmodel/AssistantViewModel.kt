@@ -121,6 +121,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val messages: StateFlow<List<ChatMessage>> = chatController.messages
     val hasMoreMessages: StateFlow<Boolean> = chatController.hasMoreMessages
     val sessionStatus: StateFlow<String> = chatController.sessionStatus
+    /** Set when the backend signalled the session is dead (subprocess
+     *  crashed, SSH transport closed, etc.).  Null when the session is alive. */
+    val termination: StateFlow<com.assistant.peripheral.chat.TerminationState?> =
+        chatController.termination
     val isLoadingMoreMessages: StateFlow<Boolean> = chatController.isLoadingMoreMessages
 
     val voiceState: StateFlow<VoiceState> = voiceController.voiceState

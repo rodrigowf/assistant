@@ -31,9 +31,9 @@ from starlette.websockets import WebSocket, WebSocketState
 
 from api.serializers import serialize_event
 from manager._proc import process_alive as _process_alive, looks_like
-from manager.base_session import BaseSessionManager
+from manager.base_session import BaseSessionManager, SessionDeadError
 from manager.config import ManagerConfig
-from manager.types import Event
+from manager.types import Event, TerminationReason
 
 
 def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
@@ -133,6 +133,13 @@ class SessionPool:
         # still want to keep an eye on for ``orphan_grace_seconds``.
         self._closed_session_pids: dict[str, tuple[int, float]] = {}
         self._reaper_task: asyncio.Task[None] | None = None
+        # Dead-session reaper — sweeps for SessionManagers whose receive
+        # loop has exited (subprocess crash, SSH transport closed mid-
+        # session) and removes them from the pool with a typed
+        # ``session_terminated`` broadcast.  Distinct from the orphan
+        # reaper above, which tracks subprocess PIDs.  See
+        # :meth:`_reap_dead_sessions_once` for the per-iteration body.
+        self._dead_session_reaper_task: asyncio.Task[None] | None = None
 
         # Session-owned in-flight turn task.  Decouples turn lifetime from
         # the WebSocket that initiated it: a page reload (or any momentary
@@ -296,7 +303,13 @@ class SessionPool:
 
         return lid
 
-    async def close(self, session_id: str) -> None:
+    async def close(
+        self,
+        session_id: str,
+        *,
+        reason: "TerminationReason | None" = None,
+        detail: str | None = None,
+    ) -> None:
         """Remove a session, notify subscribers, and clean up.
 
         Awaits ``sm.stop()`` so the SDK transport, the local ssh client (for
@@ -304,6 +317,17 @@ class SessionPool:
         deterministically.  Relying on Python GC is not enough: GC cannot run
         async cleanup, so the subprocess + SSH connection + remote children
         would otherwise leak across close/reopen cycles.
+
+        When *reason* is provided, an additional typed ``session_terminated``
+        event is broadcast BEFORE the legacy ``session_stopped`` envelope.
+        Clients that understand the typed event use it to render a
+        recovery affordance ("session crashed — open a fresh tab continuing
+        from disk"); older clients silently ignore it and act on the
+        legacy ``session_stopped`` as before.
+
+        ``reason=None`` preserves the original behaviour exactly — useful
+        for explicit close from a UI button where no typed broadcast is
+        warranted.  In practice every internal caller now passes one.
         """
         sm = self._sessions.pop(session_id, None)
         if sm is None:
@@ -320,7 +344,16 @@ class SessionPool:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # Notify while subscribers/watchers are still registered
+        # Typed-first, legacy-second.  Both broadcasts go while
+        # subscribers are still registered so reconnecting clients in
+        # this window observe a coherent terminal pair.
+        if reason is not None:
+            await self._broadcast_session(session_id, {
+                "type": "session_terminated",
+                "reason": reason.value,
+                "detail": detail,
+                "sdk_session_id": sm.sdk_session_id,
+            })
         await self._broadcast_session(session_id, {"type": "session_stopped"})
         await self._notify_watchers({"type": "agent_session_closed", "session_id": session_id})
 
@@ -685,6 +718,102 @@ class SessionPool:
                         pid, sid,
                     )
 
+    # ------------------------------------------------------------------
+    # Dead-session reaper — distinct from the orphan-pid reaper above.
+    #
+    # A "dead" session is one whose underlying SessionManager receive
+    # loop has exited (subprocess crash, SSH transport closure, fatal
+    # SDK error) but the session is still in ``self._sessions`` because
+    # nothing else has triggered ``close()`` yet.  Without this reaper
+    # ``pool/live`` keeps reporting the session as ``streaming`` and
+    # any send() into it raises ``SessionDeadError`` immediately.
+    #
+    # The reaper detects this state via ``sm._receive_loop_done.is_set()``
+    # (set by the receive loop's finally clause) and pulls the session
+    # through ``close(reason=...)`` with the typed termination reason
+    # the manager flagged.
+    # ------------------------------------------------------------------
+
+    async def start_dead_session_reaper(
+        self,
+        *,
+        interval_seconds: float = 5.0,
+    ) -> None:
+        """Spawn the background dead-session sweeper.
+
+        Idempotent.  Default interval is 5s — short enough that a UI
+        polling ``pool/live`` shortly after the crash sees the truth
+        within a few seconds; long enough that the sweep cost is
+        negligible (a dict iteration + an attribute check per session).
+        """
+        if (
+            self._dead_session_reaper_task is not None
+            and not self._dead_session_reaper_task.done()
+        ):
+            return
+        self._dead_session_reaper_task = asyncio.create_task(
+            self._dead_session_reaper_loop(interval_seconds),
+            name="pool-dead-session-reaper",
+        )
+
+    async def stop_dead_session_reaper(self) -> None:
+        if self._dead_session_reaper_task is None:
+            return
+        self._dead_session_reaper_task.cancel()
+        try:
+            await self._dead_session_reaper_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._dead_session_reaper_task = None
+
+    async def _dead_session_reaper_loop(self, interval_seconds: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    await self._reap_dead_sessions_once()
+                except Exception:
+                    logger.exception("dead-session reaper iteration failed")
+        except asyncio.CancelledError:
+            raise
+
+    async def _reap_dead_sessions_once(self) -> None:
+        """Single pass: close every session whose receive loop has exited.
+
+        Reads ``_receive_loop_done`` (a typed signal set by the manager's
+        receive loop in its finally clause).  Pulls the termination
+        reason + detail off the manager so the broadcast carries the
+        same actionable info the in-flight send() would have raised as
+        :class:`SessionDeadError`.
+
+        ``close()`` already handles the per-session lock, in-flight turn
+        cancellation, subscriber broadcasts, and SDK teardown.
+        """
+        dead_ids: list[str] = []
+        for sid, sm in list(self._sessions.items()):
+            done_event = getattr(sm, "_receive_loop_done", None)
+            if done_event is not None and done_event.is_set():
+                dead_ids.append(sid)
+        for sid in dead_ids:
+            sm = self._sessions.get(sid)
+            if sm is None:
+                continue
+            reason = (
+                getattr(sm, "_termination_reason", None)
+                or TerminationReason.SUBPROCESS_CRASHED
+            )
+            detail = getattr(sm, "_termination_detail", None)
+            logger.warning(
+                "Dead-session reaper: closing %s (reason=%s, detail=%s)",
+                sid, reason.value, detail,
+            )
+            try:
+                await self.close(sid, reason=reason, detail=detail)
+            except Exception:
+                logger.exception(
+                    "Dead-session reaper: close() failed for %s", sid,
+                )
+
     @property
     def orchestrator_subscriber_count(self) -> int:
         return len(self._orchestrator_subs)
@@ -869,6 +998,27 @@ class SessionPool:
                     f"({exc.elapsed_seconds:.0f}s). Try again in a moment."
                 ),
             })
+        except SessionDeadError as exc:
+            # Session's receive loop has exited (subprocess crashed, SSH
+            # transport died, fatal SDK error).  Distinct from a generic
+            # ``send_failed``: the same session is permanently dead, so
+            # the client should NOT retry — it should offer to open a
+            # fresh tab resuming from disk (the JSONL is intact).
+            #
+            # Close the session synchronously so subsequent ``pool/live``
+            # polls reflect reality immediately, rather than waiting for
+            # the dead-session reaper's next sweep (~5s).  ``close()``'s
+            # typed broadcast carries the same reason the manager flagged.
+            logger.warning(
+                "Session-owned turn for %s hit dead session (reason=%s)",
+                session_id, exc.reason.value,
+            )
+            try:
+                await self.close(session_id, reason=exc.reason, detail=exc.detail)
+            except Exception:
+                logger.exception(
+                    "Failed to close dead session %s during turn", session_id,
+                )
         except Exception as exc:
             logger.exception(
                 "Session-owned turn for %s raised; broadcasting error",

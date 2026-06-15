@@ -137,7 +137,7 @@ from claude_agent_sdk.types import (
 
 from typing import NamedTuple
 
-from ..base_session import BaseSessionManager, TurnAbandoned
+from ..base_session import BaseSessionManager, SessionDeadError, TurnAbandoned
 from ..config import ManagerConfig
 from ..types import (
     CompactComplete,
@@ -145,6 +145,7 @@ from ..types import (
     PermissionRequest,
     PermissionResolved,
     SessionStatus,
+    TerminationReason,
     TextComplete,
     TextDelta,
     SessionStalled,
@@ -345,6 +346,11 @@ class ClaudeSessionManager(BaseSessionManager):
         # See the design note in ``_receive_loop`` for why.
         self._receive_task: asyncio.Task[None] | None = None
         self._receive_loop_done: asyncio.Event = asyncio.Event()
+        # Set by the receive loop when it exits — typed signal for the
+        # pool's reaper and for the ``SessionDeadError`` raised by
+        # subsequent ``send()`` calls.  None until termination is observed.
+        self._termination_reason: TerminationReason | None = None
+        self._termination_detail: str | None = None
         # Bounded replay ring of ``(seq, event)`` pairs so a reconnecting
         # WS can catch up on activity that happened while it was offline.
         # Each event the receive loop dispatches gets a monotonic ``seq``
@@ -596,7 +602,15 @@ class ClaudeSessionManager(BaseSessionManager):
             raise RuntimeError("SessionManager is not connected — call start() first")
 
         if self._receive_loop_done.is_set():
-            raise RuntimeError("Session receive loop has exited — session is dead")
+            # The receive loop has exited (subprocess crash, SSH transport
+            # closed, fatal SDK error).  Raise a typed error so the pool's
+            # ``_drive_turn`` can translate it into a ``session_terminated``
+            # broadcast with an actionable recovery hint, rather than a
+            # generic ``send_failed`` the client can't act on.
+            raise SessionDeadError(
+                reason=self._termination_reason or TerminationReason.SUBPROCESS_CRASHED,
+                detail=self._termination_detail,
+            )
 
         # Register an inbox the receive loop will deliver events into. The
         # base class shares this same attribute with the ``can_use_tool``
@@ -742,23 +756,63 @@ class ClaudeSessionManager(BaseSessionManager):
                         self._local_id,
                     )
         except asyncio.CancelledError:
+            # Receive loop being cancelled is part of the normal shutdown
+            # path triggered by ``stop()``.  Don't mark it as a death
+            # condition — the lifecycle task is already handling the
+            # teardown.  We still set _receive_loop_done in the finally
+            # so any pending send() can observe the shutdown.
             raise
-        except Exception:
-            # The loop crashed.  Mark the session as effectively dead so
-            # subsequent send() calls fail fast instead of hanging on an
-            # inbox that nothing will ever fill.  The lifecycle task's
-            # disconnect path will run as normal when stop() is called.
+        except Exception as exc:
+            # The loop crashed.  Two common causes seen in production:
+            #
+            #   1. ``Command failed with exit code 255`` — the SSH transport
+            #      to a remote ``claude`` died (laptop suspended, network
+            #      blip, remote process killed).  SDK surfaces this as a
+            #      ``Fatal error in message reader`` via the
+            #      ``message.get("error")`` path inside ``query.receive_messages``.
+            #   2. SDK parse errors on truly novel message shapes the
+            #      patched parser couldn't ignore.
+            #
+            # Either way, the session can no longer produce events.  Flag
+            # the termination reason + detail so the pool's reaper and the
+            # ``SessionDeadError`` path can surface it to the client.
             logger.exception(
                 "receive_loop for session %s crashed — session is no longer usable",
                 self._local_id,
             )
+            self._termination_reason = TerminationReason.SUBPROCESS_CRASHED
+            self._termination_detail = str(exc) or type(exc).__name__
+        else:
+            # ``receive_messages()`` returned without raising.  That means
+            # the SDK iterator drained — typically because the subprocess
+            # exited cleanly mid-session (e.g. the SSH connection closed).
+            # Distinct from a crash: no exception, but also no more events.
+            if self._termination_reason is None:
+                self._termination_reason = TerminationReason.SUBPROCESS_LOST
+                self._termination_detail = (
+                    "SDK receive iterator ended without a terminal ResultMessage"
+                )
         finally:
+            # Order matters: set the done event BEFORE flipping status, so
+            # any awaiter polling ``is_active`` after observing the event
+            # sees a coherent state.
             self._receive_loop_done.set()
-            # Unblock any send() waiting on an inbox that won't ever be fed.
+            # Status flip — pool/live now correctly reports the session
+            # as no longer producing events.  Replaces the prior design
+            # where status stayed at STREAMING/TOOL_USE forever after a
+            # crash, with no observable signal that the session was dead.
+            self._status = SessionStatus.DISCONNECTED
+            # Wake the lifecycle task so it runs the disconnect path
+            # (SDK transport close, SIGKILL of the remote subprocess).
+            # If stop() was the original trigger, this is a no-op.
+            self._stop_requested.set()
+            # Unblock any send() currently waiting on the inbox — we'll
+            # never produce another event, so a pending get() would hang
+            # forever.  ``send()`` checks for a SessionDeadError marker;
+            # we also emit a synthetic TurnComplete so consumers that
+            # only check for TurnComplete also unblock cleanly.
             inbox = self._event_inbox
             if inbox is not None:
-                # A TurnComplete with no cost/usage signals "the turn ended,
-                # even if not cleanly".  send() will yield it and exit.
                 try:
                     inbox.put_nowait(TurnComplete(
                         cost=None, usage={}, num_turns=0,

@@ -29,7 +29,7 @@ reference the Claude side, the SDK is never imported at all.
 """
 
 from .auth import AuthManager
-from .base_session import BaseSessionManager, TurnAbandoned
+from .base_session import BaseSessionManager, SessionDeadError, TurnAbandoned
 from .config import ManagerConfig
 from .store import SessionStore
 from .types import (
@@ -42,6 +42,8 @@ from .types import (
     SessionInfo,
     SessionStalled,
     SessionStatus,
+    SessionTerminated,
+    TerminationReason,
     TextComplete,
     TextDelta,
     ThinkingComplete,
@@ -103,6 +105,7 @@ __all__ = [
     "TurnAbandoned",  # shared base — catch this to handle both providers
     "SessionAbandoned",  # lazy: Claude-specific subclass
     "QwenAbandoned",  # lazy: Qwen-specific subclass
+    "SessionDeadError",  # send() into a session whose receive loop has exited
     # Event types
     "Event",
     "TextDelta",
@@ -116,6 +119,8 @@ __all__ = [
     "PermissionRequest",
     "PermissionResolved",
     "SessionStalled",
+    "SessionTerminated",
+    "TerminationReason",
     # Data types
     "SessionInfo",
     "SessionDetail",

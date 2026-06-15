@@ -14,9 +14,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from api.pool import SessionPool
+from manager.base_session import SessionDeadError
 from manager.claude.session import SessionAbandoned
 from manager.types import (
     SessionStatus,
+    TerminationReason,
     TextDelta,
     TextComplete,
     TurnComplete,
@@ -38,6 +40,12 @@ def _stub_session_manager(events: list, *, abandon_first: bool = False):
     sm.subprocess_pid = None
     sm.is_active = True
     sm.pending_permission_ids = MagicMock(return_value=[])
+    # Real (unset) Event so the dead-session reaper's is_set() check
+    # correctly classifies the stub as healthy.  Without this, MagicMock
+    # auto-spawns a truthy attribute that the reaper would mistake for
+    # a terminated receive loop.
+    _alive_event = asyncio.Event()
+    sm._receive_loop_done = _alive_event
 
     call_count = {"n": 0}
 
@@ -485,3 +493,223 @@ def test_wrap_payload_no_op_when_session_lacks_protocol():
     assert "seq" not in out
     assert "stream_id" not in out
     assert out is payload  # same object, no copy
+
+
+# ---------------------------------------------------------------------------
+# Session death recovery
+#
+# Symmetric to the resume-protocol tests above: the pool detects when a
+# SessionManager's receive loop has exited (SSH transport closed,
+# subprocess crashed, fatal SDK error) and propagates the typed
+# termination reason both to WebSocket subscribers and to any in-flight
+# ``send()``.
+# ---------------------------------------------------------------------------
+
+
+def _dead_session_manager(
+    *,
+    reason: TerminationReason = TerminationReason.SUBPROCESS_CRASHED,
+    detail: str = "Command failed with exit code 255",
+):
+    """Stub SessionManager whose receive loop is already marked done.
+
+    Mirrors the post-crash state of a real Claude session: the
+    ``_receive_loop_done`` event is set and the termination metadata
+    fields are populated.
+    """
+    sm = MagicMock()
+    sm.local_id = "dead-session"
+    sm.session_id = "dead-session"
+    sm.sdk_session_id = "sdk-dead"
+    sm.status = SessionStatus.DISCONNECTED
+    sm.subprocess_pid = None
+    sm.is_active = False
+    sm.stream_id = None
+    sm.last_yielded_seq = None
+    sm.pending_permission_ids = MagicMock(return_value=[])
+
+    # _receive_loop_done is a real asyncio.Event so the reaper's
+    # is_set() check sees the truthy value MagicMock would obscure.
+    done_event = asyncio.Event()
+    done_event.set()
+    sm._receive_loop_done = done_event
+
+    sm._termination_reason = reason
+    sm._termination_detail = detail
+
+    async def _stop():
+        return None
+    sm.stop = _stop
+
+    async def _interrupt():
+        return None
+    sm.interrupt = _interrupt
+
+    sm.set_pid_callbacks = MagicMock()
+    return sm
+
+
+@pytest.mark.asyncio
+async def test_dead_session_reaper_evicts_session_with_done_receive_loop():
+    """A session whose ``_receive_loop_done`` is set gets pulled through
+    ``close()`` on the next reaper sweep, with the typed reason it flagged.
+    """
+    pool = SessionPool()
+    sm = _dead_session_manager(
+        reason=TerminationReason.SUBPROCESS_CRASHED,
+        detail="exit code 255",
+    )
+    _install(pool, sm)
+
+    assert sm.local_id in pool._sessions
+    await pool._reap_dead_sessions_once()
+    assert sm.local_id not in pool._sessions
+
+
+@pytest.mark.asyncio
+async def test_dead_session_reaper_skips_healthy_sessions():
+    """A session whose receive loop is still running is left alone."""
+    pool = SessionPool()
+    sm = _stub_session_manager([
+        TurnComplete(cost=0.0, num_turns=1, session_id="sdk-test"),
+    ])
+    # Healthy: no _receive_loop_done attribute at all (the legacy
+    # MagicMock from _stub_session_manager doesn't add it).  Also
+    # covers the defensive ``getattr(..., None)`` path.
+    _install(pool, sm)
+
+    await pool._reap_dead_sessions_once()
+
+    assert sm.local_id in pool._sessions
+
+
+@pytest.mark.asyncio
+async def test_close_with_reason_broadcasts_typed_session_terminated():
+    """``close(reason=...)`` emits ``session_terminated`` BEFORE the
+    legacy ``session_stopped``, so older clients still get the latter
+    while new clients can act on the former.
+    """
+    pool = SessionPool()
+    sm = _dead_session_manager(
+        reason=TerminationReason.SUBPROCESS_CRASHED,
+        detail="exit code 255",
+    )
+    _install(pool, sm)
+
+    received: list[dict] = []
+    ws = MagicMock()
+    ws.client_state = __import__(
+        "starlette.websockets", fromlist=["WebSocketState"],
+    ).WebSocketState.CONNECTED
+
+    async def _capture(data):
+        import orjson as _orjson
+        received.append(_orjson.loads(data))
+    ws.send_bytes = _capture
+
+    pool._subscribers[sm.local_id].add(ws)
+
+    await pool.close(
+        sm.local_id,
+        reason=TerminationReason.SUBPROCESS_CRASHED,
+        detail="exit code 255",
+    )
+
+    types_in_order = [m.get("type") for m in received]
+    assert types_in_order == ["session_terminated", "session_stopped"]
+    terminated = received[0]
+    assert terminated["reason"] == "subprocess_crashed"
+    assert terminated["detail"] == "exit code 255"
+    assert terminated["sdk_session_id"] == "sdk-dead"
+
+
+@pytest.mark.asyncio
+async def test_close_without_reason_preserves_legacy_envelope_only():
+    """Backwards-compat: callers that don't pass a reason still get
+    exactly the old behaviour — ``session_stopped`` alone.
+    """
+    pool = SessionPool()
+    sm = _dead_session_manager()
+    _install(pool, sm)
+
+    received: list[dict] = []
+    ws = MagicMock()
+    ws.client_state = __import__(
+        "starlette.websockets", fromlist=["WebSocketState"],
+    ).WebSocketState.CONNECTED
+
+    async def _capture(data):
+        import orjson as _orjson
+        received.append(_orjson.loads(data))
+    ws.send_bytes = _capture
+
+    pool._subscribers[sm.local_id].add(ws)
+
+    await pool.close(sm.local_id)
+
+    assert [m.get("type") for m in received] == ["session_stopped"]
+
+
+def _dead_send_session_manager(
+    *,
+    reason: TerminationReason = TerminationReason.SUBPROCESS_CRASHED,
+    detail: str = "exit code 255",
+):
+    """Stub where ``send()`` raises ``SessionDeadError`` — modelling
+    the post-receive-loop-crash state where the client tries to send
+    one more message before the reaper has caught up.
+    """
+    sm = _dead_session_manager(reason=reason, detail=detail)
+    # Override send to raise the typed error.
+    async def _send(text):
+        raise SessionDeadError(reason=reason, detail=detail)
+        # Keep the function an async generator for type compat:
+        if False:  # pragma: no cover
+            yield
+    sm.send = _send
+    return sm
+
+
+@pytest.mark.asyncio
+async def test_drive_turn_catches_session_dead_error_and_closes_with_typed_event():
+    """When the in-flight ``send()`` raises ``SessionDeadError``,
+    ``_drive_turn`` does NOT broadcast the generic ``send_failed``.
+    Instead it closes the session with the typed reason so the client
+    receives ``session_terminated`` and can recover.
+    """
+    pool = SessionPool()
+    sm = _dead_send_session_manager(
+        reason=TerminationReason.SUBPROCESS_CRASHED,
+        detail="exit code 255 — ssh closed",
+    )
+    _install(pool, sm)
+
+    received: list[dict] = []
+    ws = MagicMock()
+    ws.client_state = __import__(
+        "starlette.websockets", fromlist=["WebSocketState"],
+    ).WebSocketState.CONNECTED
+
+    async def _capture(data):
+        import orjson as _orjson
+        received.append(_orjson.loads(data))
+    ws.send_bytes = _capture
+
+    pool._subscribers[sm.local_id].add(ws)
+
+    await pool.start_turn(sm.local_id, "hi")
+    # Allow the spawned turn task to run + close path to drain.
+    for _ in range(20):
+        if sm.local_id not in pool._sessions:
+            break
+        await asyncio.sleep(0.01)
+
+    assert sm.local_id not in pool._sessions, "dead session should be evicted"
+
+    types_seen = [m.get("type") for m in received]
+    assert "session_terminated" in types_seen, types_seen
+    assert "send_failed" not in [m.get("error") for m in received]
+
+    terminated = next(m for m in received if m["type"] == "session_terminated")
+    assert terminated["reason"] == "subprocess_crashed"
+    assert "ssh closed" in (terminated.get("detail") or "")

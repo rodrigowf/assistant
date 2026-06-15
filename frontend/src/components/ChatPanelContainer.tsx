@@ -165,6 +165,7 @@ function OrchestratorChatPanel({
       turns={instance.turns}
       error={instance.error}
       stall={instance.stall}
+      termination={instance.termination}
       pendingPermission={instance.pendingPermission}
       onRespondToPermission={instance.respondToPermission}
       onSend={instance.send}
@@ -380,6 +381,13 @@ export function ChatPanelContainer({
                 turns={inst.turns}
                 error={inst.error}
                 stall={inst.stall}
+                termination={inst.termination}
+                onRecoverFromTermination={(sdkSessionId) => {
+                  // Open a fresh tab resuming from the same on-disk
+                  // JSONL.  The dead session is already evicted from
+                  // the pool — no need to close it again.
+                  openTab(generateUUID(), tab.title, false, sdkSessionId);
+                }}
                 pendingPermission={inst.pendingPermission}
                 onRespondToPermission={inst.respondToPermission}
                 onSend={inst.send}

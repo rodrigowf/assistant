@@ -2000,6 +2000,48 @@ pre.field-value {
   background: rgba(214, 158, 46, 0.18);
 }
 
+/* Termination banner — distinct from .error-banner (transient errors)
+   and .stall-banner (slow/stuck-but-recoverable). This one signals the
+   session is permanently gone and offers an actionable recovery. */
+.termination-banner {
+  padding: 10px 16px;
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: 0.85rem;
+  border-top: 1px solid rgba(224, 92, 92, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.termination-banner-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.4;
+}
+
+.termination-banner-text strong {
+  display: inline-block;
+  margin-right: 4px;
+}
+
+.termination-banner-button {
+  padding: 6px 14px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.termination-banner-button:hover {
+  background: rgba(224, 92, 92, 0.16);
+}
+
 /* ============================================================
    Auth gate
    ============================================================ */
