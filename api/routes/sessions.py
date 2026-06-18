@@ -384,6 +384,62 @@ def fork_session(
     return {"session_id": new_id}
 
 
+@router.post("/inject", status_code=200)
+async def inject_message(
+    body: dict,
+    pool: SessionPool = Depends(get_pool),
+):
+    """Inject a user message into a live pool session as if it were typed
+    in the chat tab.
+
+    Body accepts either ``local_id`` directly, or ``sdk_session_id`` which
+    is resolved to a local_id via the pool's reverse map.
+
+    Used by out-of-band tools (e.g. the gender-vid1 editor page) that
+    need to push a structured payload back to the parent Claude Code
+    session without going through the chat WebSocket. Drives the same
+    ``pool.start_turn`` path the chat endpoint uses, so the message
+    appears in the session's JSONL and broadcasts to every subscribed
+    WebSocket (including the live chat tab).
+    """
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, detail="text (non-empty string) is required")
+
+    local_id = body.get("local_id")
+    sdk_session_id = body.get("sdk_session_id")
+
+    if not local_id and sdk_session_id:
+        local_id = pool.find_by_sdk_id(sdk_session_id)
+        if not local_id:
+            raise HTTPException(
+                404,
+                detail=(
+                    f"No live pool session for sdk_session_id={sdk_session_id!r}. "
+                    "Pass local_id directly, or open the session first."
+                ),
+            )
+
+    if not local_id:
+        raise HTTPException(
+            400, detail="local_id or sdk_session_id is required",
+        )
+
+    if not pool.has(local_id):
+        raise HTTPException(
+            404, detail=f"No live pool session with local_id={local_id!r}",
+        )
+
+    try:
+        await pool.start_turn(local_id, text)
+    except ValueError as e:
+        raise HTTPException(404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(500, detail=f"start_turn failed: {e}")
+
+    return {"ok": True, "local_id": local_id}
+
+
 @router.post("/{local_id}/close", status_code=204)
 async def close_pool_session(
     local_id: str,
