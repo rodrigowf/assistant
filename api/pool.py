@@ -23,8 +23,9 @@ import asyncio
 import logging
 import random
 import uuid as _uuid
+from collections import deque
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, NamedTuple
 
 import orjson
 from starlette.websockets import WebSocket, WebSocketState
@@ -34,6 +35,18 @@ from manager._proc import process_alive as _process_alive, looks_like
 from manager.base_session import BaseSessionManager, SessionDeadError
 from manager.config import ManagerConfig
 from manager.types import Event, TerminationReason
+
+
+class _PendingPrompt(NamedTuple):
+    """A user message queued behind the in-flight turn.
+
+    ``source_ws`` is passed to ``pool.send`` so the originating client
+    doesn't get its own ``user_message`` event echoed back.  ``None``
+    means the prompt came from an out-of-band source (REST /inject
+    endpoint, orchestrator tool) with no WS to suppress.
+    """
+    text: str
+    source_ws: WebSocket | None
 
 
 def _session_manager_for(config: ManagerConfig, **kwargs) -> BaseSessionManager:
@@ -148,6 +161,15 @@ class SessionPool:
         # Keyed by session_id; absent / done means "no turn running".
         # See start_turn() / cancel_turn() for the public API.
         self._turn_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # Pending user prompts queued behind an active turn.  Drained by
+        # _drive_turn on each TurnComplete (see send_or_queue() for the
+        # check-or-enqueue logic).  Mutations are guarded by
+        # ``_pending_locks[session_id]`` — a separate, cheap lock from the
+        # per-session send-lock so a WS handler can append without
+        # blocking on the live turn.
+        self._pending_prompts: dict[str, deque[_PendingPrompt]] = {}
+        self._pending_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Agent session lifecycle
@@ -269,6 +291,8 @@ class SessionPool:
         self._sessions[lid] = sm
         self._subscribers[lid] = set()
         self._locks[lid] = asyncio.Lock()
+        self._pending_prompts[lid] = deque()
+        self._pending_locks[lid] = asyncio.Lock()
         # Track the session subprocess pid for the orphan reaper.
         #
         # Two paths converge here:
@@ -359,6 +383,8 @@ class SessionPool:
 
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
+        self._pending_prompts.pop(session_id, None)
+        self._pending_locks.pop(session_id, None)
 
         # Hand the pid(s) off to the closed-session shadow map so the
         # reaper has a grace window to verify the subprocess actually
@@ -929,6 +955,12 @@ class SessionPool:
         prior cancel_turn, and atomic against the rare race where two
         WSes send prompts to the same session simultaneously.
 
+        ``start_turn`` is the **destructive** entry point: it is for
+        explicit "stop and replace" actions like slash commands or the
+        legacy interrupt-on-send flow.  Routine "user typed a chat
+        message" sends go through :meth:`send_or_queue` instead, which
+        queues behind the in-flight turn rather than interrupting.
+
         Returns once the task is created.  Errors during the turn are
         logged and broadcast to subscribers; they do NOT propagate to
         the caller.
@@ -947,6 +979,64 @@ class SessionPool:
         )
         self._turn_tasks[session_id] = task
 
+    async def send_or_queue(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        source_ws: WebSocket | None = None,
+    ) -> bool:
+        """Send *text* if the session is idle; queue it behind the
+        in-flight turn if not.
+
+        Routine WS chat sends use this instead of :meth:`start_turn` so
+        a user typing mid-turn doesn't interrupt the running response —
+        matches the VS Code Claude extension's behavior of appending to
+        the CLI's input queue.  The pending queue drains automatically
+        inside :meth:`_drive_turn` after each TurnComplete.
+
+        When the prompt is queued (rather than dispatched immediately),
+        broadcasts a ``user_message`` event so subscribers see the
+        queued text in the chat tab right away — by the time the
+        eventual ``sm.send()`` for this prompt runs, ``pool.send`` will
+        suppress the duplicate echo via ``exclude=source_ws``.
+
+        Returns ``True`` if the prompt started a new turn, ``False`` if
+        it was queued behind an existing one.
+        """
+        if session_id not in self._sessions:
+            raise ValueError(f"No session with ID {session_id}")
+
+        # Take the pending-lock first so the race
+        #   send_or_queue: sees turn running, about to enqueue
+        #   _drive_turn:   pops empty queue, exits
+        #   send_or_queue: enqueues -> orphan prompt
+        # cannot happen — _drive_turn's drain holds this same lock for
+        # its check-and-pop.
+        async with self._pending_locks[session_id]:
+            task = self._turn_tasks.get(session_id)
+            if task is None or task.done():
+                # No turn in flight — spawn a fresh driver.  start_turn
+                # would race with us here (it pre-cancels any task it
+                # finds), so inline the spawn under the lock.
+                self._turn_tasks[session_id] = asyncio.create_task(
+                    self._drive_turn(session_id, text, source_ws),
+                    name=f"turn-{session_id[:8]}",
+                )
+                return True
+
+            # Turn is running: enqueue.  Broadcast immediately so the
+            # chat tab shows the queued user message right away.
+            self._pending_prompts[session_id].append(
+                _PendingPrompt(text=text, source_ws=source_ws)
+            )
+            await self._broadcast_session(
+                session_id,
+                {"type": "user_message", "text": text, "queued": True},
+                exclude=source_ws,
+            )
+            return False
+
     async def _drive_turn(
         self,
         session_id: str,
@@ -955,18 +1045,21 @@ class SessionPool:
     ) -> None:
         """Body of the session-owned turn task.
 
-        Iterates ``self.send()`` (the existing async-gen API that handles
-        per-session locking, broadcasting, and orchestrator mirroring) and
-        catches everything so a stray exception doesn't show up as
-        ``Task exception was never retrieved`` in the logs.  Subscribers
-        already see the events via the broadcast inside ``send()``; this
-        loop just consumes the iterator to completion.
+        Drives one user message through ``self.send()``, then drains any
+        prompts queued behind it via ``send_or_queue`` — the queue makes
+        the chat UX match the VS Code extension's "type while running"
+        behavior without forcing concurrent ``sm.send()`` calls.  The
+        bundled CLI processes user messages in submission order, so
+        sequential ``send()`` calls (one per queued prompt) yield the
+        same per-turn event streams in the right order.
 
-        Owns the TurnAbandoned retry: if the upstream request never
+        Subscribers see events via the broadcast inside ``send()``; this
+        loop just consumes each turn's iterator to completion.
+
+        Owns the TurnAbandoned retry: if an upstream request never
         produced any messages (TCP path silently wedged), interrupt the
-        wedged turn and retry once.  This logic used to live in
-        ``api.routes.chat._handle_send`` — moved here because the WS task
-        no longer owns the iteration and so couldn't observe the exception.
+        wedged turn and retry once.  Retry budget is per-turn, not
+        shared across queued prompts.
 
         ``TurnAbandoned`` is the provider-agnostic base for both Claude's
         ``SessionAbandoned`` and Qwen's ``QwenAbandoned``, so a single
@@ -981,13 +1074,16 @@ class SessionPool:
         """
         from manager.base_session import TurnAbandoned
 
-        async def _stream_once() -> None:
-            async for _event in self.send(session_id, text, source_ws=source_ws):
+        async def _stream_once(prompt: str, ws: WebSocket | None) -> None:
+            async for _event in self.send(session_id, prompt, source_ws=ws):
                 pass
 
-        try:
+        async def _drive_one(prompt: str, ws: WebSocket | None) -> None:
+            """Run one user message through send() with the TurnAbandoned
+            retry budget.  Raises CancelledError if the task is cancelled
+            mid-turn; other exceptions propagate to the outer handler."""
             try:
-                await _stream_once()
+                await _stream_once(prompt, ws)
             except TurnAbandoned as exc:
                 logger.warning(
                     "Turn abandoned for session %s after %.0fs; retrying once",
@@ -1002,7 +1098,23 @@ class SessionPool:
                 except Exception:
                     logger.exception("Failed to interrupt abandoned turn for %s", session_id)
                 await asyncio.sleep(1.0)
-                await _stream_once()
+                await _stream_once(prompt, ws)
+
+        try:
+            await _drive_one(text, source_ws)
+            # Drain queued follow-ups.  The pending queue is only
+            # populated by send_or_queue() while this task was
+            # running; pop-and-run under the pending lock so a late
+            # WS arrival doesn't slip a prompt in after we observe
+            # an empty queue but before the task exits (a fresh
+            # send_or_queue would then start a brand new turn task).
+            while True:
+                async with self._pending_locks[session_id]:
+                    queue = self._pending_prompts.get(session_id)
+                    if not queue:
+                        break
+                    next_prompt = queue.popleft()
+                await _drive_one(next_prompt.text, next_prompt.source_ws)
         except asyncio.CancelledError:
             raise
         except TurnAbandoned as exc:
@@ -1048,7 +1160,7 @@ class SessionPool:
                 logger.exception("Failed to broadcast send_failed for %s", session_id)
 
     async def cancel_turn(self, session_id: str) -> bool:
-        """Stop the in-flight turn for *session_id*.
+        """Stop the in-flight turn for *session_id* AND drop queued prompts.
 
         Sends an SDK interrupt (so the bundled ``claude`` subprocess
         actually halts the current request — cancelling the asyncio task
@@ -1057,7 +1169,20 @@ class SessionPool:
         released, drain task torn down, finally blocks run) before they
         proceed.  Returns True if a turn was actually cancelled, False
         if no turn was running.
+
+        Also flushes any prompts queued by :meth:`send_or_queue` for
+        this session — explicit "Stop" means "stop everything you were
+        going to do for me", not just "stop the current turn and run
+        the queued ones".
         """
+        pending = self._pending_prompts.get(session_id)
+        if pending is not None:
+            # Cheap synchronous clear; the per-session pending lock is
+            # only contended by send_or_queue + _drive_turn's drain, and
+            # in either case dropping our pending queue right now is
+            # the correct destructive action.
+            pending.clear()
+
         task = self._turn_tasks.get(session_id)
         if task is None or task.done():
             return False

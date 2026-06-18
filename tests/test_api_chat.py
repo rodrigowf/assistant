@@ -120,6 +120,20 @@ def _make_pool(mock_sm, session_id="test-123"):
         turn_tasks[sid] = asyncio.create_task(_drive(sid, text, source_ws))
     pool.start_turn = AsyncMock(side_effect=_start_turn)
 
+    async def _send_or_queue(sid, text, *, source_ws=None):
+        # Test mock: simple "spawn if idle, else fire-and-forget another
+        # drive in parallel".  Production code queues serially behind
+        # the in-flight turn; the mock approximates "the message lands
+        # and the user sees its events" which is what the WS test
+        # asserts.  See test_pool_turn.py for the real queueing semantics.
+        task = turn_tasks.get(sid)
+        if task is None or task.done():
+            turn_tasks[sid] = asyncio.create_task(_drive(sid, text, source_ws))
+            return True
+        asyncio.create_task(_drive(sid, text, source_ws))
+        return False
+    pool.send_or_queue = AsyncMock(side_effect=_send_or_queue)
+
     pool.has_active_turn = MagicMock(
         side_effect=lambda sid: sid in turn_tasks and not turn_tasks[sid].done()
     )

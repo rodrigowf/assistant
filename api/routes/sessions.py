@@ -398,9 +398,10 @@ async def inject_message(
     Used by out-of-band tools (e.g. the gender-vid1 editor page) that
     need to push a structured payload back to the parent Claude Code
     session without going through the chat WebSocket. Drives the same
-    ``pool.start_turn`` path the chat endpoint uses, so the message
+    ``pool.send_or_queue`` path the chat endpoint uses, so the message
     appears in the session's JSONL and broadcasts to every subscribed
-    WebSocket (including the live chat tab).
+    WebSocket (including the live chat tab) — and queues behind any
+    in-flight turn rather than interrupting it.
     """
     text = body.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -431,11 +432,11 @@ async def inject_message(
         )
 
     try:
-        await pool.start_turn(local_id, text)
+        await pool.send_or_queue(local_id, text)
     except ValueError as e:
         raise HTTPException(404, detail=str(e))
     except Exception as e:
-        raise HTTPException(500, detail=f"start_turn failed: {e}")
+        raise HTTPException(500, detail=f"send_or_queue failed: {e}")
 
     return {"ok": True, "local_id": local_id}
 

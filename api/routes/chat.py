@@ -172,13 +172,17 @@ async def chat_ws(ws: WebSocket):
                             message=text_payload,
                             responder="user",
                         )
-                # start_turn handles the "interrupt + new" semantics
-                # internally (cancels any in-flight turn first), so we
-                # don't need to call cancel_turn here.
+                # send_or_queue starts a fresh turn if the session is
+                # idle, or queues behind the in-flight turn if one is
+                # running.  This matches the VS Code Claude extension's
+                # "type-while-running" behavior — the queued prompt is
+                # picked up by _drive_turn as soon as the current
+                # TurnComplete arrives.  Explicit interrupts still go
+                # through msg_type == "interrupt" below.
                 try:
-                    await pool.start_turn(session_id, text_payload, source_ws=ws)
+                    await pool.send_or_queue(session_id, text_payload, source_ws=ws)
                 except Exception as e:
-                    logger.exception("start_turn failed for session %s", session_id)
+                    logger.exception("send_or_queue failed for session %s", session_id)
                     await ws.send_bytes(orjson.dumps({
                         "type": "error", "error": "send_failed",
                         "detail": str(e),

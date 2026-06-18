@@ -54,6 +54,52 @@ def _healthy_loop_target(deadline: float, settle: float) -> None:
     asyncio.run(main())
 
 
+def _degraded_loop_target(
+    interval: float,
+    deadline: float,
+    degraded_latency: float,
+    degraded_strikes: int,
+) -> None:
+    """Subprocess target: start a watchdog, then schedule a callback that
+    monopolizes the loop for longer than ``degraded_latency`` on every
+    iteration — fast enough to ack the heartbeat (so liveness passes)
+    but slow enough that callback latency stays above the degraded
+    threshold consistently.  Should exit with code 1 once degradation is
+    detected.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from manager.loop_watchdog import start_loop_watchdog
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        start_loop_watchdog(
+            loop,
+            interval_seconds=interval,
+            deadline_seconds=deadline,
+            degraded_latency_seconds=degraded_latency,
+            degraded_consecutive_strikes=degraded_strikes,
+        )
+
+        # CPU-bound callback that chains itself via call_soon — directly
+        # mimics anyio's _deliver_cancellation retry-forever pattern.
+        # Each hog() iteration burns long enough to GUARANTEE that any
+        # heartbeat ping queued during it sees a latency well above the
+        # degraded threshold (block 3x threshold gives ~10x headroom over
+        # measurement jitter).
+        block_for = degraded_latency * 3.0
+
+        def hog() -> None:
+            end = time.time() + block_for
+            while time.time() < end:
+                pass
+            loop.call_soon(hog)
+
+        loop.call_soon(hog)
+        await asyncio.sleep(deadline * 20)  # Should be interrupted by os._exit
+
+    asyncio.run(main())
+
+
 @pytest.mark.timeout(15)
 def test_watchdog_fires_on_wedged_loop() -> None:
     """If the loop stops servicing callbacks past the deadline, the watchdog
@@ -76,6 +122,33 @@ def test_watchdog_quiet_on_healthy_loop() -> None:
     proc.join(timeout=10)
     assert proc.exitcode == 0, (
         f"watchdog erroneously fired on healthy loop (exit={proc.exitcode})"
+    )
+
+
+@pytest.mark.timeout(30)
+def test_watchdog_fires_on_degraded_loop() -> None:
+    """A loop that's alive (callbacks DO execute) but pinned by a runaway
+    callback that monopolizes most of every tick should be detected via
+    sustained-latency strikes and force a restart.  This is the failure
+    mode the original liveness-only check missed when anyio's
+    _deliver_cancellation pinned uvicorn at 112% CPU (claude-agent-sdk
+    #378 pre-fix)."""
+    ctx = multiprocessing.get_context("spawn")
+    # interval 0.2s, deadline 2.0s (so liveness check passes; deadline
+    # doubles as the warmup pre-probe sleep), latency threshold 0.3s,
+    # 3 strikes — degraded loop should fire within ~5s after the
+    # warmup window.
+    proc = ctx.Process(
+        target=_degraded_loop_target,
+        args=(0.2, 2.0, 0.3, 3),
+    )
+    proc.start()
+    proc.join(timeout=25)
+    assert proc.exitcode is not None, (
+        "watchdog did not fire on degraded loop — process still running"
+    )
+    assert proc.exitcode != 0, (
+        f"expected non-zero exit on degraded loop, got {proc.exitcode}"
     )
 
 
