@@ -35,6 +35,7 @@ export function StatusBar({ status, connectionState, cost, turns }: Props) {
 function formatStatus(s: SessionStatus): string {
   switch (s) {
     case "connecting": return "Connecting...";
+    case "processing": return "Processing";
     case "streaming": return "Streaming";
     case "thinking": return "Thinking";
     case "tool_use": return "Using tool";

@@ -1164,6 +1164,19 @@ class ClaudeSessionManager(BaseSessionManager):
                     content = block.content
                     if isinstance(content, list):
                         content = json.dumps(content)
+                    # Some claude-cli versions emit placeholder ToolResultBlocks
+                    # *inside* the assistant message — empty tool_use_id +
+                    # empty content — alongside the matching ToolUse blocks.
+                    # The real result lands later via a UserMessage carrying
+                    # ``tool_use_result``. Forwarding the placeholder
+                    # broadcasts a ``tool_result`` with empty tool_use_id
+                    # and empty output, which the frontend can't match to
+                    # the running tool block — visible bug: live Bash tool
+                    # cards never show their output. Skip placeholders;
+                    # the UserMessage branch below still delivers the real
+                    # result.
+                    if not block.tool_use_id and not content:
+                        continue
                     yield ToolResult(
                         tool_use_id=block.tool_use_id,
                         output=content or "",

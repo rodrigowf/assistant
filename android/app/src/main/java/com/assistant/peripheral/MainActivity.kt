@@ -489,7 +489,6 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             StatusBar(
                 connectionState = connectionState,
                 sessionStatus = sessionStatus,
-                onInterrupt = viewModel::interrupt
             )
             com.assistant.peripheral.ui.screens.ChatInputBar(
                 inputText = chatInputText,
@@ -500,11 +499,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         chatInputText = ""
                     }
                 },
+                onInterrupt = viewModel::interrupt,
                 isRecording = isRecording,
                 onStartRecording = viewModel::startRecording,
                 onStopRecording = viewModel::stopRecording,
                 isConnected = connectionState is com.assistant.peripheral.data.ConnectionState.Connected,
-                isStreaming = sessionStatus == "streaming" || sessionStatus == "tool_use",
+                isStreaming = sessionStatus in listOf("streaming", "tool_use", "thinking", "processing"),
                 voiceState = voiceState,
                 onStartVoice = viewModel::startVoiceSession,
                 onStopVoice = viewModel::stopVoiceSession,

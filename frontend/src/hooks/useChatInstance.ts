@@ -234,6 +234,11 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "USER_MESSAGE":
       return {
         ...state,
+        // Optimistic flip — backend broadcasts the same status from
+        // ``api.pool.send`` immediately after accepting the prompt, so
+        // this just covers the WS round-trip. The next typed event
+        // (TEXT_DELTA / THINKING_DELTA / TOOL_USE) commits the phase.
+        status: "processing",
         messages: [
           ...state.messages,
           {

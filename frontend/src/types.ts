@@ -250,6 +250,7 @@ export type MessageBlock =
 export type SessionStatus =
   | "connecting"
   | "idle"
+  | "processing"
   | "streaming"
   | "thinking"
   | "tool_use"

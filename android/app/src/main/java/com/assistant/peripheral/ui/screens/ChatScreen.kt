@@ -101,11 +101,28 @@ fun ChatScreen(
         }
     }
 
-    // Scroll to bottom on initial load (per session) and when new messages
-    // arrive while the user is at the bottom. The initial jump is instant
-    // (scrollToItem, not animateScrollToItem) so the load-more guard flips
-    // before the layout reports isAtTop = true.
-    LaunchedEffect(messages.size, messages.lastOrNull()?.content, hasInitialScrollCompleted) {
+    // Cheap signal that changes on every streaming delta — the last
+    // message's block count + the trailing block's char length. The
+    // previous key (messages.lastOrNull()?.content) is dead for assistant
+    // messages because the reducer only mutates `blocks`, never
+    // `content`, so streaming deltas never re-triggered the scroll
+    // effect and the view stayed pinned at whatever index the initial
+    // jump landed on.
+    val lastMessageTailSignal = remember(messages) {
+        val last = messages.lastOrNull() ?: return@remember 0
+        val tailLen = when (val tail = last.blocks.lastOrNull()) {
+            is MessageBlock.Text -> tail.text.length
+            is MessageBlock.Thinking -> tail.text.length
+            else -> 0
+        }
+        last.blocks.size * 1_000_003 + tailLen
+    }
+
+    // Scroll to bottom on initial load (per session) and when new content
+    // arrives while the user is already at the bottom. The initial jump is
+    // instant (scrollToItem, not animateScrollToItem) so the load-more
+    // guard flips before the layout reports isAtTop = true.
+    LaunchedEffect(messages.size, lastMessageTailSignal, hasInitialScrollCompleted) {
         if (messages.isEmpty()) return@LaunchedEffect
         if (!hasInitialScrollCompleted) {
             listState.scrollToItem(messages.size - 1)
@@ -552,9 +569,25 @@ private fun ThinkingBlock(block: MessageBlock.Thinking) {
 
 @Composable
 private fun ToolUseBlock(block: MessageBlock.ToolUse) {
+    val toolName = normalizeToolName(block.toolName)
+    // Dispatch specialized renderers, mirroring the web frontend
+    // (frontend/src/components/ToolUseBlock.tsx): Task + TodoWrite render
+    // always-expanded; Bash uses a dedicated header that shows description
+    // + truncated command preview. Everything else falls through to the
+    // generic collapsible renderer below.
+    when (toolName) {
+        "TodoWrite" -> { TodoWriteBlock(block); return }
+        "Task" -> { TaskBlock(block); return }
+        "Bash" -> { BashBlock(block); return }
+    }
+
+    GenericToolUseBlock(block, toolName)
+}
+
+@Composable
+private fun GenericToolUseBlock(block: MessageBlock.ToolUse, toolName: String) {
     var expanded by remember { mutableStateOf(false) }
 
-    val toolName = normalizeToolName(block.toolName)
     val category = getToolCategory(toolName)
     val toolColor = ToolPalette.colorFor(category, block.isError)
     val toolBg = ToolPalette.backgroundFor(category, block.isError)
@@ -721,7 +754,7 @@ private fun ToolBlockExpandedContent(block: MessageBlock.ToolUse) {
             val outputScroll = rememberScrollState()
             val resultText = block.result
             val (display, isPlaceholder) = when {
-                resultText == null -> "(no output)" to true
+                resultText == null -> (if (block.isComplete) "(no output)" else "(running...)") to true
                 resultText.isEmpty() -> "(empty)" to true
                 else -> resultText to false
             }
@@ -738,6 +771,376 @@ private fun ToolBlockExpandedContent(block: MessageBlock.ToolUse) {
                     .horizontalScroll(outputScroll)
                     .padding(8.dp)
             )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Specialized tool renderers (mirroring frontend/src/components/ToolUseBlock.tsx)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared header row used by the specialized renderers (TodoWrite / Task / Bash).
+ * Mirrors the generic header in [GenericToolUseBlock] minus the expand toggle —
+ * each specialised block decides on its own whether it can collapse.
+ */
+@Composable
+private fun ToolHeader(
+    block: MessageBlock.ToolUse,
+    toolName: String,
+    label: String,
+    trailing: @Composable (() -> Unit)? = null,
+) {
+    val category = getToolCategory(toolName)
+    val toolColor = ToolPalette.colorFor(category, block.isError)
+    Row(
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = getToolIcon(toolName, block.isError, block.isComplete),
+            contentDescription = null,
+            modifier = Modifier.size(15.dp),
+            tint = toolColor
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium.copy(
+                fontFamily = FontFamily.Monospace,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+                fontSize = 12.sp
+            ),
+            color = toolColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        when {
+            block.isExecuting -> {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    strokeWidth = 2.dp,
+                    color = toolColor
+                )
+            }
+            block.isComplete -> {
+                Row(
+                    modifier = Modifier
+                        .background(
+                            color = if (block.isError) MaterialTheme.colorScheme.errorContainer
+                                    else MaterialTheme.colorScheme.tertiaryContainer,
+                            shape = RoundedCornerShape(5.dp)
+                        )
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = if (block.isError) Icons.Default.Error else Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        modifier = Modifier.size(10.dp),
+                        tint = if (block.isError) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.tertiary
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = if (block.isError) "error" else "done",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontSize = 9.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.W600
+                        ),
+                        color = if (block.isError) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.tertiary
+                    )
+                }
+            }
+        }
+        trailing?.invoke()
+    }
+}
+
+/**
+ * Container that draws the left border + tinted background used by every
+ * tool-block variant. Click goes to the optional [onClick] (collapsible
+ * tools use it; always-expanded tools pass null).
+ */
+@Composable
+private fun ToolBlockContainer(
+    toolName: String,
+    isError: Boolean,
+    onClick: (() -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val category = getToolCategory(toolName)
+    val toolColor = ToolPalette.colorFor(category, isError)
+    val toolBg = ToolPalette.backgroundFor(category, isError)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .drawBehind {
+                drawLine(
+                    color = toolColor,
+                    start = Offset(0f, 0f),
+                    end = Offset(0f, size.height),
+                    strokeWidth = 2.dp.toPx()
+                )
+            }
+            .background(
+                color = toolBg,
+                shape = RoundedCornerShape(topEnd = 8.dp, bottomEnd = 8.dp)
+            )
+            .let { if (onClick != null) it.clickable { onClick() } else it },
+        content = content,
+    )
+}
+
+/**
+ * Single tool-result body. Renders the captured output or a placeholder.
+ */
+@Composable
+private fun ToolOutputSection(result: String?) {
+    Text(
+        text = "Output",
+        style = MaterialTheme.typography.labelSmall.copy(
+            fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+            fontSize = 10.sp,
+            letterSpacing = 0.4.sp
+        ),
+        color = MdColors.textMuted,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
+    Surface(
+        shape = RoundedCornerShape(4.dp),
+        color = MdColors.bgElevated,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        val scroll = rememberScrollState()
+        val (display, isPlaceholder) = when {
+            result == null -> "(running...)" to true
+            result.isEmpty() -> "(empty)" to true
+            else -> result to false
+        }
+        Text(
+            text = display,
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                fontStyle = if (isPlaceholder) FontStyle.Italic else FontStyle.Normal
+            ),
+            color = if (isPlaceholder) MdColors.textMuted else MdColors.text,
+            modifier = Modifier
+                .horizontalScroll(scroll)
+                .padding(8.dp)
+        )
+    }
+}
+
+/**
+ * TodoWrite — always expanded, formatted checklist with status indicators.
+ * Mirrors [TodoWriteBlock] in the web ToolUseBlock.tsx.
+ */
+@Composable
+private fun TodoWriteBlock(block: MessageBlock.ToolUse) {
+    val todosRaw = block.toolInput["todos"] as? List<*> ?: emptyList<Any?>()
+    ToolBlockContainer(toolName = "TodoWrite", isError = block.isError) {
+        ToolHeader(block, toolName = "TodoWrite", label = "Update todos")
+        Column(
+            modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            if (todosRaw.isEmpty()) {
+                Text(
+                    text = "(no todos)",
+                    style = MaterialTheme.typography.bodySmall.copy(fontStyle = FontStyle.Italic),
+                    color = MdColors.textMuted
+                )
+                return@Column
+            }
+            for (item in todosRaw) {
+                val todo = item as? Map<*, *> ?: continue
+                val status = todo["status"]?.toString() ?: "pending"
+                val content = todo["content"]?.toString() ?: ""
+                val activeForm = todo["activeForm"]?.toString()
+                val text = if (status == "in_progress" && !activeForm.isNullOrBlank()) activeForm else content
+                Row(verticalAlignment = Alignment.Top) {
+                    val (icon, tint) = when (status) {
+                        "completed" -> Icons.Default.CheckCircle to MaterialTheme.colorScheme.tertiary
+                        "in_progress" -> Icons.Default.MoreHoriz to ToolPalette.colorFor(ToolCategory.TODO, false)
+                        else -> Icons.Default.RadioButtonUnchecked to MdColors.textMuted
+                    }
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = status,
+                        modifier = Modifier.size(14.dp).padding(top = 2.dp),
+                        tint = tint
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = text,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
+                            textDecoration = if (status == "completed")
+                                androidx.compose.ui.text.style.TextDecoration.LineThrough
+                            else null,
+                        ),
+                        color = if (status == "completed") MdColors.textMuted else MdColors.text,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Task — always expanded, shows the subagent prompt + type, plus the
+ * output once it lands. Mirrors [TaskBlock] in the web ToolUseBlock.tsx.
+ */
+@Composable
+private fun TaskBlock(block: MessageBlock.ToolUse) {
+    val description = block.toolInput["description"]?.toString()
+    val prompt = block.toolInput["prompt"]?.toString()
+    val subagentType = block.toolInput["subagent_type"]?.toString()
+    val label = description?.let { "Task: $it" } ?: "Task"
+    ToolBlockContainer(toolName = "Task", isError = block.isError) {
+        ToolHeader(block, toolName = "Task", label = label)
+        Column(modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 10.dp)) {
+            if (!subagentType.isNullOrBlank()) {
+                Row {
+                    Text(
+                        text = "Agent",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+                            fontSize = 10.sp
+                        ),
+                        color = MdColors.textMuted
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = subagentType,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp
+                        ),
+                        color = MdColors.text
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+            if (!prompt.isNullOrBlank()) {
+                Text(
+                    text = "Prompt",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.W600,
+                        fontSize = 10.sp
+                    ),
+                    color = MdColors.textMuted,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = MdColors.bgElevated,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = prompt,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        ),
+                        color = MdColors.text,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+            ToolOutputSection(block.result)
+        }
+    }
+}
+
+/**
+ * Bash — collapsible header with description + truncated command preview.
+ * Expanded view shows full command + output. Mirrors [BashBlock] in the
+ * web ToolUseBlock.tsx.
+ */
+private const val BASH_PREVIEW_LINES = 5
+
+@Composable
+private fun BashBlock(block: MessageBlock.ToolUse) {
+    var expanded by remember { mutableStateOf(false) }
+    val command = block.toolInput["command"]?.toString() ?: ""
+    val description = block.toolInput["description"]?.toString()
+    val commandLines = command.split("\n")
+    val isMultiLine = commandLines.size > 1
+    val isTruncated = commandLines.size > BASH_PREVIEW_LINES
+    val previewCommand = if (isTruncated)
+        commandLines.take(BASH_PREVIEW_LINES).joinToString("\n")
+    else command
+
+    ToolBlockContainer(
+        toolName = "Bash",
+        isError = block.isError,
+        onClick = { expanded = !expanded },
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+            // Header row: icon + (description or first line of command) + status + arrow
+            val headerLabel = description ?: (if (isMultiLine) commandLines.first() else command).ifEmpty { "Bash" }
+            ToolHeader(
+                block,
+                toolName = "Bash",
+                label = headerLabel,
+                trailing = {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (expanded) "▼" else "▶",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MdColors.textMuted,
+                        fontSize = 10.sp
+                    )
+                }
+            )
+            // Command preview (only shown when description was the label —
+            // otherwise the command is already in the label).
+            if (description != null && command.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = MdColors.bgElevated,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    val scroll = rememberScrollState()
+                    val displayed = if (expanded) command else previewCommand
+                    Text(
+                        text = displayed,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        ),
+                        color = MdColors.text,
+                        maxLines = if (expanded) Int.MAX_VALUE else BASH_PREVIEW_LINES,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .horizontalScroll(scroll)
+                            .padding(8.dp)
+                    )
+                }
+                if (!expanded && isTruncated) {
+                    Text(
+                        text = "... (${commandLines.size - BASH_PREVIEW_LINES} more lines)",
+                        style = MaterialTheme.typography.labelSmall.copy(fontStyle = FontStyle.Italic),
+                        color = MdColors.textMuted,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+            if (expanded) {
+                Spacer(Modifier.height(8.dp))
+                ToolOutputSection(block.result)
+            }
         }
     }
 }
@@ -821,6 +1224,7 @@ fun ChatInputBar(
     inputText: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onInterrupt: () -> Unit,
     isRecording: Boolean,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit,
@@ -853,6 +1257,9 @@ fun ChatInputBar(
                 Spacer(modifier = Modifier.width(8.dp))
             }
 
+            // Text input — always enabled while connected so the user can
+            // queue a follow-up message while the agent is still streaming
+            // (matches the web frontend's contract).
             OutlinedTextField(
                 value = inputText,
                 onValueChange = onInputChange,
@@ -860,9 +1267,9 @@ fun ChatInputBar(
                 placeholder = { Text("Type a message...") },
                 singleLine = false,
                 maxLines = 4,
-                enabled = isConnected && !isRecording && !isStreaming,
+                enabled = isConnected && !isRecording,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                keyboardActions = KeyboardActions(onSend = { if (!isStreaming) onSend() }),
                 shape = RoundedCornerShape(24.dp)
             )
 
@@ -893,26 +1300,44 @@ fun ChatInputBar(
                 Spacer(modifier = Modifier.width(4.dp))
             }
 
-            // Send button
-            IconButton(
-                onClick = onSend,
-                enabled = isConnected && inputText.isNotBlank() && !isRecording && !isStreaming,
-                modifier = Modifier
-                    .size(48.dp)
-                    .clip(CircleShape)
-                    .background(
-                        if (isConnected && inputText.isNotBlank() && !isRecording && !isStreaming) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
-                        }
+            // Send / Stop button — Stop replaces Send while the agent is
+            // streaming, mirroring the web frontend.
+            if (isStreaming) {
+                IconButton(
+                    onClick = onInterrupt,
+                    enabled = isConnected,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.error)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Stop,
+                        contentDescription = "Stop",
+                        tint = MaterialTheme.colorScheme.onError
                     )
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Send,
-                    contentDescription = "Send",
-                    tint = MaterialTheme.colorScheme.onPrimary
-                )
+                }
+            } else {
+                IconButton(
+                    onClick = onSend,
+                    enabled = isConnected && inputText.isNotBlank() && !isRecording,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (isConnected && inputText.isNotBlank() && !isRecording) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
+                            }
+                        )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Send,
+                        contentDescription = "Send",
+                        tint = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
             }
         }
     }

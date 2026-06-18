@@ -138,6 +138,17 @@ class ChatController(
     private val _isOrchestratorSession = MutableStateFlow(false)
     val isOrchestratorSession: StateFlow<Boolean> = _isOrchestratorSession.asStateFlow()
 
+    /**
+     * True once the user has explicitly chosen a session bucket — either
+     * loading an agent session from History, opening / creating an
+     * orchestrator session, etc. While this is false the connection
+     * probe's ``OrchestratorAdopted`` event may auto-select orchestrator
+     * (default behaviour on first connect); once true we never flip the
+     * bucket on a mere reconnect — the user's choice wins. Reset by
+     * ``onServerUrlChanged`` only.
+     */
+    private val userPickedBucket = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private val _isLoadingMoreMessages = MutableStateFlow(false)
     val isLoadingMoreMessages: StateFlow<Boolean> = _isLoadingMoreMessages.asStateFlow()
 
@@ -324,7 +335,15 @@ class ChatController(
             is ConnectionEvent.OrchestratorAdopted -> {
                 orchBucket.currentLocalId.value = ev.localId
                 orchBucket.pendingResumeSessionId.value = ev.sdkSessionId
-                _isOrchestratorSession.value = true
+                // Don't yank the user away from a session they explicitly
+                // opened (e.g. an agent session from History). The probe's
+                // adoption is bookkeeping — it readies the orchestrator
+                // bucket so when the user *does* switch to it the right
+                // session loads. We only auto-select orchestrator on
+                // first connect, before the user has picked a bucket.
+                if (!userPickedBucket.get()) {
+                    _isOrchestratorSession.value = true
+                }
             }
             is ConnectionEvent.NoOrchestratorFound -> {
                 orchBucket.pendingResumeSessionId.value = null
@@ -332,6 +351,7 @@ class ChatController(
             }
             is ConnectionEvent.NewSessionAdopted -> {
                 _isOrchestratorSession.value = true
+                userPickedBucket.set(true)
                 scope.launch { settingsRepository.persistOrchestratorLocalId(orchBucket.currentLocalId.value) }
                 sendStartWithCheckpoint(
                     endpoint = WebSocketEndpoint.ORCHESTRATOR,
@@ -777,13 +797,45 @@ class ChatController(
             content = text,
             blocks = listOf(MessageBlock.Text(text))
         )
-        activeBucket().messages.update { it + userMessage }
+        val b = activeBucket()
+        b.messages.update { it + userMessage }
+        // Optimistic local flip to "processing" so the bar updates
+        // instantly even before the WS round-trip lands. Backend
+        // broadcasts the same status moments later (api.pool.send),
+        // which is idempotent — the Status event handler will set
+        // it again, and the next typed event re-flips to the
+        // committed phase (streaming/thinking/tool_use).
+        b.sessionStatus.value = "processing"
         webSocketManager.send(WebSocketMessage.Send(text), endpoint = currentEndpoint())
     }
 
     fun interrupt() {
         webSocketManager.send(WebSocketMessage.Interrupt, endpoint = currentEndpoint())
         activeBucket().sessionStatus.value = "interrupted"
+    }
+
+    /**
+     * Called from MainActivity.onResume — even when the WS is still
+     * nominally Connected (e.g. brief background), re-send Start on
+     * any endpoint that has a loaded session. The backend treats a
+     * Start with a known local_id as a resubscribe, which triggers
+     * ``replay_for_subscriber`` to stream any events we missed while
+     * the OS didn't deliver WS frames (Doze, radio sleep, app
+     * paused). With a fresh resume checkpoint it's effectively a
+     * no-op when nothing changed.
+     */
+    fun resyncOnResume() {
+        for ((endpoint, b) in buckets) {
+            if (!webSocketManager.isConnected(endpoint)) continue
+            val localId = b.currentLocalId.value
+            if (localId.isBlank()) continue
+            val resumeSdkId = b.lastResumeSdkId ?: continue
+            sendStartWithCheckpoint(
+                endpoint = endpoint,
+                localId = localId,
+                resumeSdkId = resumeSdkId,
+            )
+        }
     }
 
     fun compact() {
@@ -872,6 +924,7 @@ class ChatController(
                 b.messages.value = cached.messages
                 b.currentLocalId.value = localIdForStart
                 _isOrchestratorSession.value = cached.isOrchestrator
+                userPickedBucket.set(true)
                 if (isOrchestrator) connectionController.setNoActiveOrchestrator(false)
 
                 openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
@@ -888,6 +941,7 @@ class ChatController(
                 b.messages.value = paginated.messages
                 b.currentLocalId.value = localIdForStart
                 _isOrchestratorSession.value = isOrchestrator
+                userPickedBucket.set(true)
                 if (isOrchestrator) connectionController.setNoActiveOrchestrator(false)
 
                 openSessionOnEndpoint(endpoint, localIdForStart, sessionId)
@@ -997,6 +1051,7 @@ class ChatController(
         scope.launch { settingsRepository.persistOrchestratorLocalId(b.currentLocalId.value) }
 
         _isOrchestratorSession.value = true
+        userPickedBucket.set(true)
 
         if (webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
             webSocketManager.send(WebSocketMessage.Stop, endpoint = WebSocketEndpoint.ORCHESTRATOR)
@@ -1351,6 +1406,7 @@ class ChatController(
         _liveSessionIds.value = emptySet()
         _sdkToLocalId.value = emptyMap()
         _isOrchestratorSession.value = false
+        userPickedBucket.set(false)
         sessionCache.clear()
         pendingAgentResume = null
         for (b in buckets.values) {

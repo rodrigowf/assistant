@@ -223,6 +223,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun reconnectIfNeeded() {
         connectionController.reconnectIfNeeded(chatController.orchestratorCurrentLocalId())
+        // Even when the WS is still nominally Connected (brief background,
+        // foreground before keepalive timeout), the OS may have buffered
+        // or dropped WS frames while the app was paused. Force a Start
+        // re-subscribe on every loaded session so the backend replays
+        // anything we missed via the resume protocol.
+        chatController.resyncOnResume()
     }
 
     // ─────────────────────────────────────────────────────────────────

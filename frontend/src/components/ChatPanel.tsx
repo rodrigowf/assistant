@@ -125,7 +125,7 @@ export function ChatPanel({
   supportsAudio,
   onOpenSessionConfig,
 }: Props) {
-  const isStreaming = status === "streaming" || status === "thinking" || status === "tool_use";
+  const isStreaming = status === "streaming" || status === "thinking" || status === "tool_use" || status === "processing";
   const voiceActive = voiceStatus && voiceStatus !== "off" && voiceStatus !== "error";
 
   return (

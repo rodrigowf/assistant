@@ -852,6 +852,21 @@ class SessionPool:
                 {"type": "user_message", "text": text},
                 exclude=source_ws,
             )
+            # Tell every subscriber the turn has been accepted and the
+            # SDK is now working on it. Without this, the UI sits on
+            # the previous "idle" / "Ready" label until the SDK emits
+            # its first typed event (text/thinking/tool_use) — on a
+            # slow first token that gap can run multiple seconds and
+            # the user thinks the message never landed. ``processing``
+            # is intentionally coarser than streaming/thinking/tool_use:
+            # we don't yet know which phase the model picked, only
+            # that we accepted the prompt and the SDK is running. The
+            # next typed event re-flips the client's status to the
+            # right phase via the existing handlers.
+            await self._broadcast_session(
+                session_id,
+                {"type": "status", "status": "processing"},
+            )
             async for event in sm.send(text):
                 payload = self._wrap_payload(sm, serialize_event(event))
                 await self._broadcast_session(session_id, payload)
