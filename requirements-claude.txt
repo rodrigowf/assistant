@@ -5,9 +5,13 @@
 # does NOT change what's imported at backend startup — the SDK is only
 # loaded the first time a Claude session is created.
 
-# Floor bumped 2026-05-18 so we automatically pick up an upstream fix
-# for claude-agent-sdk#378 (Query.close() can pin the event loop at
-# 100% CPU via anyio's _deliver_cancellation busy-loop) if/when one
-# ships.  Our manager/claude/session.py also monkey-patches Query.close
-# defensively — the pin is just a safety net for new installs.
-claude-agent-sdk>=0.1.29
+# Floor bumped 2026-06-18 to 0.1.81, the last 0.1.x release.  0.1.51 (PR
+# #746) replaced anyio.TaskGroup in Query with asyncio.create_task,
+# fixing the cross-task __aexit__ wedge that pinned the event loop via
+# anyio's _deliver_cancellation retry loop (claude-agent-sdk#378). 0.1.40
+# made the SDK skip unknown message types instead of raising.  Both
+# upstream fixes let us delete two defensive monkey-patches that used
+# to live in manager/claude/session.py.  The 0.2.x branch has breaking
+# changes (MCP background-connect default, TodoWrite → Task tools);
+# evaluated separately.
+claude-agent-sdk>=0.1.81,<0.2

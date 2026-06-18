@@ -80,13 +80,20 @@ def test_watchdog_quiet_on_healthy_loop() -> None:
 
 
 @pytest.mark.timeout(5)
-def test_query_close_patched_to_bound_aexit() -> None:
-    """Importing manager.claude.session must monkey-patch the SDK's
-    Query.close() with the bounded variant (claude-agent-sdk#378 defense)."""
-    # Trigger import (idempotent if already loaded).
-    import manager.claude.session  # noqa: F401
+def test_sdk_query_no_longer_uses_anyio_taskgroup() -> None:
+    """Sanity: the installed claude-agent-sdk must be ≥0.1.51, where PR #746
+    replaced ``anyio.TaskGroup`` in ``Query`` with ``asyncio.create_task``.
+    The TaskGroup was the source of the cross-task ``__aexit__`` wedge that
+    pinned the event loop via anyio's ``_deliver_cancellation`` retry loop
+    (claude-agent-sdk#378). If a regression downgrades the SDK and this
+    test starts failing, restore the monkey-patch in manager/claude/session.py
+    until the floor is bumped again."""
+    import inspect
+
     from claude_agent_sdk._internal import query as q
 
-    assert getattr(q.Query.close, "_bounded_patched", False), (
-        "Query.close() was not patched — anyio busy-loop defense is missing"
+    close_src = inspect.getsource(q.Query.close)
+    assert "self._tg" not in close_src and "TaskGroup" not in close_src, (
+        "Query.close() still references anyio.TaskGroup — SDK is too old "
+        "(need ≥0.1.81 per requirements-claude.txt)"
     )
