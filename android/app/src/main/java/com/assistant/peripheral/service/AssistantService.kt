@@ -101,6 +101,7 @@ class AssistantService : Service() {
         private const val PREF_TALK_WORD = "turn_talk_word"
         private const val PREF_WAKE_WORD = "realtime_wake_word"
         private const val PREF_WAKE_MIC_GAIN = "wake_word_mic_gain"
+        private const val PREF_WAKE_CONF_THRESHOLD = "wake_word_confidence_threshold"
 
         // Inc 8 removed `WATCHDOG_INTERVAL_MS` (was `2 * 60 * 60 * 1000L`).
         // The 2-hour periodic rebuild has been replaced by a NO_SPEECH-error-
@@ -226,12 +227,20 @@ class AssistantService : Service() {
         // Naming (Detour 3 / plan §0.5):
         //   talkWord = turn-based single voice message phrase (push-to-talk style)
         //   wakeWord = realtime WebRTC voice conversation phrase
-        fun updateWakeWord(context: Context, enabled: Boolean, talkWord: String, wakeWord: String, wakeWordMicGain: Float) {
+        fun updateWakeWord(
+            context: Context,
+            enabled: Boolean,
+            talkWord: String,
+            wakeWord: String,
+            wakeWordMicGain: Float,
+            wakeWordConfidenceThreshold: Float,
+        ) {
             val intent = Intent(context, AssistantService::class.java).apply {
                 putExtra(EXTRA_ENABLE_WAKE_WORD, enabled)
                 putExtra(EXTRA_TALK_WORD, talkWord)
                 putExtra(EXTRA_WAKE_WORD, wakeWord)
                 putExtra("wake_word_mic_gain", wakeWordMicGain)
+                putExtra("wake_word_confidence_threshold", wakeWordConfidenceThreshold)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -322,6 +331,7 @@ class AssistantService : Service() {
     private var lastWakeWord: String = "wake up"
     private var lastEnabled: Boolean = false
     private var lastWakeMicGain: Float = 1.0f
+    private var lastWakeConfThreshold: Float = 0.0f
 
     // Inc 3 dedupe: last `startWakeWord` (key, monotonic-clock timestamp)
     // — used by `shouldDedupeWakeStart` to suppress duplicate intents
@@ -363,11 +373,13 @@ class AssistantService : Service() {
         val talkWord = prefs.getString(PREF_TALK_WORD, "my friend") ?: "my friend"
         val wakeWord = prefs.getString(PREF_WAKE_WORD, "wake up") ?: "wake up"
         val wakeMicGain = prefs.getFloat(PREF_WAKE_MIC_GAIN, 1.0f)
+        val wakeConfThreshold = prefs.getFloat(PREF_WAKE_CONF_THRESHOLD, 0.0f)
         // Sync in-memory cache
         lastEnabled = enabled
         lastTalkWord = talkWord
         lastWakeWord = wakeWord
         lastWakeMicGain = wakeMicGain
+        lastWakeConfThreshold = wakeConfThreshold
 
         if (!enabled) return
 
@@ -483,19 +495,25 @@ class AssistantService : Service() {
                 val talkWord = intent.getStringExtra(EXTRA_TALK_WORD) ?: "my friend"
                 val wakeWord = intent.getStringExtra(EXTRA_WAKE_WORD) ?: "wake up"
                 val wakeMicGain = intent.getFloatExtra("wake_word_mic_gain", lastWakeMicGain)
+                val wakeConfThreshold = intent.getFloatExtra(
+                    "wake_word_confidence_threshold",
+                    lastWakeConfThreshold,
+                )
                 // Persist config to SharedPreferences so it survives process death.
                 prefs.edit()
                     .putBoolean(PREF_ENABLED, enableWakeWord)
                     .putString(PREF_TALK_WORD, talkWord)
                     .putString(PREF_WAKE_WORD, wakeWord)
                     .putFloat(PREF_WAKE_MIC_GAIN, wakeMicGain)
+                    .putFloat(PREF_WAKE_CONF_THRESHOLD, wakeConfThreshold)
                     .apply()
                 lastEnabled = enableWakeWord
                 lastTalkWord = talkWord
                 lastWakeWord = wakeWord
                 lastWakeMicGain = wakeMicGain
+                lastWakeConfThreshold = wakeConfThreshold
                 if (enableWakeWord) {
-                    startWakeWord(talkWord, wakeWord, wakeMicGain)
+                    startWakeWord(talkWord, wakeWord, wakeMicGain, wakeConfThreshold)
                 } else {
                     stopWakeWord()
                 }
@@ -507,13 +525,15 @@ class AssistantService : Service() {
             val talkWord = prefs.getString(PREF_TALK_WORD, "my friend") ?: "my friend"
             val wakeWord = prefs.getString(PREF_WAKE_WORD, "wake up") ?: "wake up"
             val wakeMicGain = prefs.getFloat(PREF_WAKE_MIC_GAIN, 1.0f)
+            val wakeConfThreshold = prefs.getFloat(PREF_WAKE_CONF_THRESHOLD, 0.0f)
             lastEnabled = enabled
             lastTalkWord = talkWord
             lastWakeWord = wakeWord
             lastWakeMicGain = wakeMicGain
-            Log.d(TAG, "Sticky restart — restored config from prefs: enabled=$enabled, talk=\"$talkWord\", wake=\"$wakeWord\", gain=$wakeMicGain")
+            lastWakeConfThreshold = wakeConfThreshold
+            Log.d(TAG, "Sticky restart — restored config from prefs: enabled=$enabled, talk=\"$talkWord\", wake=\"$wakeWord\", gain=$wakeMicGain, conf=$wakeConfThreshold")
             if (enabled) {
-                startWakeWord(talkWord, wakeWord, wakeMicGain)
+                startWakeWord(talkWord, wakeWord, wakeMicGain, wakeConfThreshold)
             }
         }
 
@@ -539,7 +559,16 @@ class AssistantService : Service() {
         Log.d(TAG, "Service destroyed")
     }
 
-    private fun startWakeWord(talkWord: String, wakeWord: String, micGain: Float = lastWakeMicGain) {
+    private fun startWakeWord(
+        talkWord: String,
+        wakeWord: String,
+        micGain: Float = lastWakeMicGain,
+        confidenceThreshold: Float = lastWakeConfThreshold,
+    ) {
+        // Dedupe key intentionally excludes confidenceThreshold: a slider tweak
+        // should trigger a real restart even within the 3s window. Inc 3's
+        // dedupe target is Android intent redelivery / sticky-restart races on
+        // the (talk, wake, gain) tuple — confidence changes are user actions.
         val key = Triple(talkWord, wakeWord, micGain)
         val nowMs = SystemClock.elapsedRealtime()
         if (shouldDedupeWakeStart(key, nowMs, lastStartKey, lastStartAtMs)) {
@@ -549,9 +578,11 @@ class AssistantService : Service() {
         lastStartKey = key
         lastStartAtMs = nowMs
         wakeWordDetector?.stop()
-        wakeWordDetector = WakeWordDetector(this, talkWord, wakeWord, micGain)
+        wakeWordDetector = WakeWordDetector(
+            this, talkWord, wakeWord, micGain, confidenceThreshold,
+        )
         wakeWordDetector?.start()
-        Log.d(TAG, "Wake word detection started — talk: \"$talkWord\", wake: \"$wakeWord\", gain=$micGain")
+        Log.d(TAG, "Wake word detection started — talk: \"$talkWord\", wake: \"$wakeWord\", gain=$micGain, conf=$confidenceThreshold")
     }
 
     private fun stopWakeWord() {

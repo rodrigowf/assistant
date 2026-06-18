@@ -224,6 +224,147 @@ class VoskEngineParityTest {
     }
 
     // -------------------------------------------------------------------------
+    // minConfForPhrase — confidence extraction from setWords(true) JSON
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `minConfForPhraseReturnsNullWhenResultArrayMissing`() {
+        // Plain final without setWords(true): no `result` field.
+        val json = """{"text": "wake up"}"""
+        assertNull(VoskWakeWordEngine.minConfForPhrase(json, "wake up"))
+    }
+
+    @Test
+    fun `minConfForPhraseReturnsMinAcrossMatchedWords`() {
+        val json = """{
+            "result":[
+                {"word":"wake","start":1.2,"end":1.5,"conf":0.87},
+                {"word":"up","start":1.5,"end":1.7,"conf":0.42}
+            ],
+            "text":"wake up"
+        }""".trimIndent()
+        val conf = VoskWakeWordEngine.minConfForPhrase(json, "wake up")
+        assertEquals(0.42, conf!!, 1e-6)
+    }
+
+    @Test
+    fun `minConfForPhraseTolerantToLeadingTrailingTokens`() {
+        // Vosk's grammar can prepend [unk] or trailing speech around the phrase.
+        val json = """{
+            "result":[
+                {"word":"[unk]","start":0.5,"end":1.1,"conf":0.30},
+                {"word":"wake","start":1.2,"end":1.5,"conf":0.71},
+                {"word":"up","start":1.5,"end":1.7,"conf":0.65},
+                {"word":"please","start":1.8,"end":2.1,"conf":0.20}
+            ],
+            "text":"[unk] wake up please"
+        }""".trimIndent()
+        val conf = VoskWakeWordEngine.minConfForPhrase(json, "wake up")
+        // 0.20 from "please" must NOT pull the score down — it's outside the
+        // matched phrase. Min of {0.71, 0.65} = 0.65.
+        assertEquals(0.65, conf!!, 1e-6)
+    }
+
+    @Test
+    fun `minConfForPhraseReturnsNullWhenPhraseWordsNotPresent`() {
+        val json = """{
+            "result":[
+                {"word":"hello","start":0.5,"end":1.0,"conf":0.9}
+            ],
+            "text":"hello"
+        }""".trimIndent()
+        assertNull(VoskWakeWordEngine.minConfForPhrase(json, "wake up"))
+    }
+
+    @Test
+    fun `minConfForPhraseReturnsNullWhenConfMissing`() {
+        // Defensive: if Vosk for some reason emits a result without conf,
+        // we shouldn't pretend we got a score.
+        val json = """{
+            "result":[
+                {"word":"wake","start":1.2,"end":1.5},
+                {"word":"up","start":1.5,"end":1.7,"conf":0.7}
+            ],
+            "text":"wake up"
+        }""".trimIndent()
+        assertNull(VoskWakeWordEngine.minConfForPhrase(json, "wake up"))
+    }
+
+    // -------------------------------------------------------------------------
+    // findMatchWithConfidence — finals-only matching with floor
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `findMatchWithConfidenceAcceptsAboveThreshold`() {
+        val json = """{
+            "result":[
+                {"word":"wake","conf":0.85},
+                {"word":"up","conf":0.70}
+            ],
+            "text":"wake up"
+        }""".trimIndent()
+        val m = VoskWakeWordEngine.findMatchWithConfidence(
+            json, talkVariants = listOf("my friend"), wakeVariants = listOf("wake up"),
+            threshold = 0.50,
+        )
+        assertEquals(true, m?.accepted)
+        assertEquals(true, m?.isRealtime)
+        assertEquals(0.70, m?.minConfidence ?: -1.0, 1e-6)
+    }
+
+    @Test
+    fun `findMatchWithConfidenceRejectsBelowThreshold`() {
+        val json = """{
+            "result":[
+                {"word":"wake","conf":0.45},
+                {"word":"up","conf":0.30}
+            ],
+            "text":"wake up"
+        }""".trimIndent()
+        val m = VoskWakeWordEngine.findMatchWithConfidence(
+            json, talkVariants = listOf("my friend"), wakeVariants = listOf("wake up"),
+            threshold = 0.50,
+        )
+        // Non-null so the caller can log the rejection diagnostically,
+        // but accepted = false so the broadcast doesn't fire.
+        assertFalse(m == null)
+        assertFalse(m!!.accepted)
+        assertEquals("wake up", m.matchedVariant)
+    }
+
+    @Test
+    fun `findMatchWithConfidenceRejectsWhenScoresMissing`() {
+        // Defensive: setWords(true) failed at construction → no `result`
+        // array → we shouldn't fire on a substring match. Caller logs and
+        // skips. (See `minConfForPhrase` returning null in this case.)
+        val json = """{"text": "wake up"}"""
+        val m = VoskWakeWordEngine.findMatchWithConfidence(
+            json, talkVariants = listOf("my friend"), wakeVariants = listOf("wake up"),
+            threshold = 0.50,
+        )
+        assertFalse(m == null)
+        assertFalse(m!!.accepted)
+        assertNull(m.minConfidence)
+    }
+
+    @Test
+    fun `findMatchWithConfidenceReturnsNullWhenNoPhraseMatches`() {
+        val json = """{
+            "result":[
+                {"word":"good","conf":0.9},
+                {"word":"morning","conf":0.8}
+            ],
+            "text":"good morning"
+        }""".trimIndent()
+        assertNull(
+            VoskWakeWordEngine.findMatchWithConfidence(
+                json, talkVariants = listOf("my friend"), wakeVariants = listOf("wake up"),
+                threshold = 0.50,
+            )
+        )
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

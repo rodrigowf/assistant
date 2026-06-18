@@ -379,6 +379,12 @@ data class AppSettings(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,            // 0.0 to 1.5, where 1.0 is normal (voice session only)
     val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for the wake-word detector (umbrella, both phrase types)
+    // Minimum Vosk per-word confidence (min across matched phrase words) for a
+    // wake/talk match to be accepted. 0.0 = off (current behaviour: accept any
+    // partial-or-final string match). When > 0.0, only Vosk finals are
+    // considered and the worst-scoring word in the matched phrase must be at
+    // or above this threshold; otherwise the match is rejected and logged.
+    val wakeWordConfidenceThreshold: Float = 0.0f,
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
     val audioOutput: AudioOutput = AudioOutput.AUTO,  // where voice session audio is routed; AUTO lets the OS pick

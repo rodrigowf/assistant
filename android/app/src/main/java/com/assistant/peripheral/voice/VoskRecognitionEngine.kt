@@ -40,6 +40,10 @@ internal class VoskRecognitionEngine(
     private val wakeVariants: List<String>,
     private val callbacks: RecognitionCallbacks,
     private val sampleRate: Float = 16_000f,
+    // 0.0 = legacy behaviour (substring match on partial OR final, no floor).
+    // > 0.0 = finals-only with min-per-word `conf` ≥ this value. See
+    // `VoskWakeWordEngine.feed` for the full semantics.
+    private val confidenceThreshold: Float = 0f,
 ) : WakeWordRecognitionEngine {
 
     companion object {
@@ -116,6 +120,7 @@ internal class VoskRecognitionEngine(
                 sampleRate = sampleRate,
                 talkVariants = talkVariants,
                 wakeVariants = wakeVariants,
+                confidenceThreshold = confidenceThreshold.toDouble(),
             ).also { feeder = it }
 
             // 1) Feed the pre-buffer FIRST. This is the entire architectural
@@ -130,10 +135,18 @@ internal class VoskRecognitionEngine(
                     val m = cycleFeeder.feed(frame, frame.size)
                     totalFrames += frame.size
                     if (m != null) {
+                        if (!m.accepted) {
+                            Log.d(
+                                TAG,
+                                "Vosk match in pre-buffer REJECTED (conf=${m.minConfidence} < threshold=$confidenceThreshold): " +
+                                    "\"${m.matchedVariant}\" in \"${m.rawText}\"",
+                            )
+                            continue
+                        }
                         Log.d(
                             TAG,
                             "Vosk match in pre-buffer: \"${m.matchedVariant}\" " +
-                                "(realtime=${m.isRealtime}) in \"${m.rawText}\"",
+                                "(realtime=${m.isRealtime}, conf=${m.minConfidence}) in \"${m.rawText}\"",
                         )
                         return@withContext RecognitionResult.Matched(
                             matchedPhrase = m.matchedVariant,
@@ -178,10 +191,20 @@ internal class VoskRecognitionEngine(
                     }
                     val match = cycleFeeder.feed(buffer, read)
                     if (match != null) {
+                        if (!match.accepted) {
+                            Log.d(
+                                TAG,
+                                "Vosk match REJECTED (conf=${match.minConfidence} < threshold=$confidenceThreshold): " +
+                                    "\"${match.matchedVariant}\" in \"${match.rawText}\"",
+                            )
+                            // Keep listening — the feeder already reset on this
+                            // final, so the next loop iteration starts fresh.
+                            continue
+                        }
                         Log.d(
                             TAG,
                             "Vosk match: \"${match.matchedVariant}\" " +
-                                "(realtime=${match.isRealtime}) in \"${match.rawText}\"",
+                                "(realtime=${match.isRealtime}, conf=${match.minConfidence}) in \"${match.rawText}\"",
                         )
                         return@withContext RecognitionResult.Matched(
                             matchedPhrase = match.matchedVariant,

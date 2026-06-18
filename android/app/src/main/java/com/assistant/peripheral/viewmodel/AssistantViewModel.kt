@@ -333,6 +333,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch { settingsRepository.updateWakeWordMicGainLevel(level) }
     }
 
+    fun updateWakeWordConfidenceThreshold(threshold: Float) {
+        viewModelScope.launch { settingsRepository.updateWakeWordConfidenceThreshold(threshold) }
+    }
+
     fun updateAudioOutput(output: AudioOutput) {
         viewModelScope.launch { settingsRepository.updateAudioOutput(output) }
     }

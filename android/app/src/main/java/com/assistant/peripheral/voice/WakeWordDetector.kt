@@ -59,6 +59,12 @@ class WakeWordDetector(
     private val talkWord: String,
     private val wakeWord: String = "", // empty = disabled
     private val micGain: Float = 1.0f, // scales RMS threshold
+    // Vosk-only: minimum per-word confidence (min across matched phrase words)
+    // for a match to be accepted. 0.0 = off (substring match on partial OR
+    // final result, the legacy behaviour). When > 0.0 the Vosk engine flips to
+    // finals-only matching and applies the floor. SR engine ignores this knob
+    // (Google STT doesn't expose per-word confidence).
+    private val confidenceThreshold: Float = 0.0f,
 ) {
     companion object {
         private const val TAG = "WakeWordDetector"
@@ -310,12 +316,13 @@ class WakeWordDetector(
             null
         }
         val resolved = if (model != null) {
-            Log.d(TAG, "Engine selected: Vosk (model loaded)")
+            Log.d(TAG, "Engine selected: Vosk (model loaded, confThreshold=$confidenceThreshold)")
             VoskRecognitionEngine(
                 model = model,
                 talkVariants = talkVariants,
                 wakeVariants = wakeVariants,
                 callbacks = recognitionCallbacks,
+                confidenceThreshold = confidenceThreshold,
             )
         } else {
             Log.d(TAG, "Engine selected: SpeechRecognizer (Vosk unavailable)")

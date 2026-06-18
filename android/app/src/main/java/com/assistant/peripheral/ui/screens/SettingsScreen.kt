@@ -40,6 +40,7 @@ fun SettingsScreen(
     onUpdateAutoConnect: (Boolean) -> Unit,
     onUpdateMicGainLevel: (Float) -> Unit,
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
+    onUpdateWakeWordConfidenceThreshold: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateAudioOutput: (AudioOutput) -> Unit,
@@ -103,6 +104,7 @@ fun SettingsScreen(
                 onUpdateAutoConnect = onUpdateAutoConnect,
                 onUpdateMicGainLevel = onUpdateMicGainLevel,
                 onUpdateWakeWordMicGainLevel = onUpdateWakeWordMicGainLevel,
+                onUpdateWakeWordConfidenceThreshold = onUpdateWakeWordConfidenceThreshold,
                 onUpdateSpeakerVolumeLevel = onUpdateSpeakerVolumeLevel,
                 onUpdateEchoDuckingGain = onUpdateEchoDuckingGain,
                 onUpdateAudioOutput = onUpdateAudioOutput,
@@ -145,6 +147,7 @@ private fun AppSettingsTabContent(
     onUpdateAutoConnect: (Boolean) -> Unit,
     onUpdateMicGainLevel: (Float) -> Unit,
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
+    onUpdateWakeWordConfidenceThreshold: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateAudioOutput: (AudioOutput) -> Unit,
@@ -501,6 +504,27 @@ private fun AppSettingsTabContent(
                             defaultValue = 100f,
                             supporting = "Higher = easier to trigger (independent of voice session gain)",
                             onCommit = { onUpdateWakeWordMicGainLevel(it / 100f) }
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Confidence steps: Off (0) plus 0.30..0.90 in 0.05 jumps.
+                        // < 0.30 isn't a useful floor (real matches sit at 0.6+);
+                        // > 0.90 would reject nearly everything.
+                        val confSteps = listOf(0f) + (30..90 step 5).map { it.toFloat() }
+                        val confDefaultIndex = confSteps.indexOf(0f).toFloat()
+                        LevelSlider(
+                            icon = Icons.Default.VerifiedUser,
+                            title = "Wake Word Confidence",
+                            value = settings.wakeWordConfidenceThreshold * 100f,
+                            steps = confSteps,
+                            defaultIndex = confDefaultIndex,
+                            formatValue = { v ->
+                                if (v <= 0f) "Off" else "${v.roundToInt()}%"
+                            },
+                            defaultValue = 0f,
+                            supporting = "Off = legacy (any partial match fires). Higher = fewer false triggers but adds ~0.5s latency and may need clearer speech.",
+                            onCommit = { onUpdateWakeWordConfidenceThreshold(it / 100f) }
                         )
 
                         Spacer(modifier = Modifier.height(4.dp))
