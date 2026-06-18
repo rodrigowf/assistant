@@ -60,6 +60,15 @@ internal class ChatStateBucket {
      */
     val pendingResumeSessionId = MutableStateFlow<String?>(null)
     /**
+     * The original SDK/JSONL id this bucket's session was opened with —
+     * preserved across mid-session WS reconnects so the Start message
+     * can carry a stable ``resume_sdk_id``.  Distinct from [jsonlSessionId]
+     * (which gets overwritten by the backend echoing local_id back on
+     * re-subscribe) and from [pendingResumeSessionId] (which is cleared
+     * after the first SessionStarted handles it).
+     */
+    var lastResumeSdkId: String? = null
+    /**
      * Set when the backend signals the underlying session is permanently
      * gone (subprocess crashed, SSH transport closed, etc.).  Drives the
      * termination banner with auto-resume affordance.  Cleared when a

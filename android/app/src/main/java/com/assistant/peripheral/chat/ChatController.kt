@@ -368,13 +368,31 @@ class ChatController(
         when (event) {
             is WebSocketEvent.Connected -> {
                 if (endpoint == WebSocketEndpoint.AGENT) {
-                    pendingAgentResume?.let { pending ->
+                    val pending = pendingAgentResume
+                    if (pending != null) {
                         pendingAgentResume = null
                         sendStartWithCheckpoint(
                             endpoint = WebSocketEndpoint.AGENT,
                             localId = pending.localId,
                             resumeSdkId = pending.resumeSdkId,
                         )
+                    } else {
+                        // Mid-session reconnect (e.g. okhttp closed the WS
+                        // with "keepalive ping timeout" while a turn was in
+                        // flight). The backend requires a Start message to
+                        // re-subscribe this socket to the pool — without it
+                        // the WS stays idle and every event broadcast during
+                        // the gap is dropped. Re-send Start from the bucket
+                        // so the resume checkpoint replays missed events.
+                        val agentLocalId = b.currentLocalId.value
+                        val resumeSdkId = b.lastResumeSdkId
+                        if (agentLocalId.isNotBlank() && resumeSdkId != null) {
+                            sendStartWithCheckpoint(
+                                endpoint = WebSocketEndpoint.AGENT,
+                                localId = agentLocalId,
+                                resumeSdkId = resumeSdkId,
+                            )
+                        }
                     }
                     return
                 }
@@ -817,6 +835,7 @@ class ChatController(
                     b.currentSessionIdForPagination = null
                     b.hasMoreMessages.value = false
                     b.currentLocalId.value = UUID.randomUUID().toString()
+                    b.lastResumeSdkId = null
                     if (ep == WebSocketEndpoint.ORCHESTRATOR) {
                         settingsRepository.clearOrchestratorLocalId()
                         _isOrchestratorSession.value = false
@@ -887,6 +906,11 @@ class ChatController(
         localId: String,
         resumeSdkId: String
     ) {
+        // Track the SDK id at the bucket level so a mid-session WS reconnect
+        // can re-send Start with the correct ``resume_sdk_id`` even after
+        // ``pendingAgentResume`` / ``pendingResumeSessionId`` have been
+        // consumed by the first SessionStarted.
+        bucket(endpoint).lastResumeSdkId = resumeSdkId
         if (webSocketManager.isConnected(endpoint)) {
             webSocketManager.send(
                 buildStartMessage(localId = localId, resumeSdkId = resumeSdkId),
@@ -1225,6 +1249,7 @@ class ChatController(
                     b.currentSessionIdForPagination = null
                     b.hasMoreMessages.value = false
                     b.jsonlSessionId = null
+                    b.lastResumeSdkId = null
                 }
             }
             sessionCache.remove(sessionId)
@@ -1334,6 +1359,7 @@ class ChatController(
             b.currentLocalId.value = UUID.randomUUID().toString()
             b.pendingResumeSessionId.value = null
             b.jsonlSessionId = null
+            b.lastResumeSdkId = null
             b.hasMoreMessages.value = false
             b.currentSessionIdForPagination = null
             b.paginationStartIndex = 0
