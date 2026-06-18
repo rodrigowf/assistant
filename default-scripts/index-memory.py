@@ -19,6 +19,7 @@ Examples:
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -136,6 +137,15 @@ def index_history(reset: bool = False) -> None:
                 # Use session ID as filename
                 md_path = temp_dir / f"{jsonl_path.stem}.md"
                 md_path.write_text(f"# Session: {jsonl_path.stem}\n\n{text}")
+                # Mirror the source JSONL's mtime onto the .md so embed.py's
+                # mtime-skip detects unchanged sessions. Without this every
+                # re-extraction would look "new" (mtime = now) and force a
+                # full re-embed of the whole history corpus.
+                try:
+                    src = jsonl_path.stat()
+                    os.utime(md_path, (src.st_atime, src.st_mtime))
+                except OSError:
+                    pass
 
         # Index the temp directory
         if any(temp_dir.iterdir()):

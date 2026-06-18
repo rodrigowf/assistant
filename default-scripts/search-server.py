@@ -87,6 +87,12 @@ SOCKET_PATH = INDEX_DIR / ".search-server.sock"
 
 HNSW_METADATA = {"hnsw:space": "cosine", "hnsw:sync_threshold": 200}
 
+# sentence-transformers batches its internal forward() pass in groups of
+# this many texts. Default 32 keeps a single encode_many request from
+# pinning the CPU for minutes on a large input — between batches the GIL
+# releases, letting concurrent search queries get a slice.
+ENCODE_BATCH = 32
+
 
 # ── stdio helpers ────────────────────────────────────────────────────────────
 
@@ -168,14 +174,16 @@ class IndexServer:
             except Exception as e:
                 return {"count": None, "error": f"{type(e).__name__}: {e}"}
         if cmd == "encode":
-            emb = self.model.encode([request["text"]])[0].tolist()
+            emb = self.model.encode([request["text"]], batch_size=ENCODE_BATCH)[0].tolist()
             return {"embedding": emb, "error": None}
         if cmd == "encode_many":
             texts = request["texts"]
-            embs = [v.tolist() for v in self.model.encode(texts)] if texts else []
+            embs = [v.tolist() for v in self.model.encode(texts, batch_size=ENCODE_BATCH)] if texts else []
             return {"embeddings": embs, "error": None}
         if cmd == "get_by_file":
             return self._get_by_file(request["collection"], request["file_path"])
+        if cmd == "get_meta_by_file":
+            return self._get_meta_by_file(request["collection"], request["file_path"])
         if cmd == "add_chunks":
             return self._add_chunks(request["collection"], request["chunks"])
         if cmd == "delete_ids":
@@ -201,6 +209,18 @@ class IndexServer:
             res = col.get(include=["metadatas"])
             ids = [i for i, m in zip(res["ids"], res["metadatas"]) if m.get("file_path") == file_path]
             return {"ids": ids, "error": None}
+
+    def _get_meta_by_file(self, name: str, file_path: str) -> dict:
+        """Return one metadata dict for any chunk matching file_path, or
+        null if none. Used by embed.py to detect unchanged files via
+        stored mtime and skip re-embedding."""
+        col = self.get_or_create_collection(name)
+        try:
+            res = col.get(where={"file_path": file_path}, include=["metadatas"], limit=1)
+            metas = res.get("metadatas") or []
+            return {"meta": metas[0] if metas else None, "error": None}
+        except Exception as e:
+            return {"meta": None, "error": f"{type(e).__name__}: {e}"}
 
     def _add_chunks(self, name: str, chunks: list) -> dict:
         with self._write_lock:

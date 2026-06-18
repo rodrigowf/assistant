@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     memory_task = asyncio.create_task(memory_watcher.run())
     app.state.memory_watcher = memory_watcher
 
-    history_indexer = HistoryIndexer(project_path, interval_seconds=120)
+    history_indexer = HistoryIndexer(project_path, interval_seconds=600)
     history_task = asyncio.create_task(history_indexer.run())
     app.state.history_indexer = history_indexer
 

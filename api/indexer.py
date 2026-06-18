@@ -119,7 +119,7 @@ class HistoryIndexer:
     Only re-indexes when session files have changed since the last run.
     """
 
-    def __init__(self, project_dir: Path, interval_seconds: int = 120):
+    def __init__(self, project_dir: Path, interval_seconds: int = 600):
         self._project_dir = project_dir.resolve()
         self._interval = interval_seconds
         self._running = True

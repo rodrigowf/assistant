@@ -88,6 +88,11 @@ def chunk_file(filepath, chunk_size=10, overlap=3):
         print(f"  Skipping {filepath}: {e}", file=sys.stderr)
         return []
 
+    try:
+        mtime = filepath.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
     lines = text.splitlines()
     if not lines:
         return []
@@ -111,6 +116,7 @@ def chunk_file(filepath, chunk_size=10, overlap=3):
                     "start_line": i + 1,
                     "end_line": end,
                     "file_name": filepath.name,
+                    "mtime": mtime,
                 },
             })
 
@@ -160,8 +166,24 @@ def index_path(path, collection_name="memory", chunk_size=10, overlap=3):
     print(f"[embed] mode={facade.mode}", file=sys.stderr)
 
     total_chunks = 0
+    skipped = 0
     with facade:
         for filepath in files:
+            try:
+                file_mtime = filepath.stat().st_mtime
+            except OSError:
+                file_mtime = None
+
+            # Skip files whose mtime matches the stored mtime on any
+            # existing chunk. Saves a full re-chunk + re-embed of
+            # unchanged content — the dominant cost when the indexer
+            # runs over the whole corpus on a tick.
+            if file_mtime is not None:
+                existing_meta = facade.get_meta_by_file(collection_name, str(filepath))
+                if existing_meta and existing_meta.get("mtime") == file_mtime:
+                    skipped += 1
+                    continue
+
             # Remove old chunks for this file before re-indexing
             old_ids = facade.get_by_file(collection_name, str(filepath))
             if old_ids:
@@ -188,7 +210,7 @@ def index_path(path, collection_name="memory", chunk_size=10, overlap=3):
             total_chunks += len(chunks)
             print(f"  Indexed {filepath} ({len(chunks)} chunks)")
 
-    print(f"\nTotal: {len(files)} files, {total_chunks} chunks in '{collection_name}'")
+    print(f"\nTotal: {len(files)} files, {total_chunks} chunks indexed, {skipped} unchanged in '{collection_name}'")
 
 
 def _delete_file_chunks(collection, file_path):

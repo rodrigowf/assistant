@@ -212,6 +212,21 @@ class IndexFacade:
             res = col.get(include=["metadatas"])
             return [i for i, m in zip(res["ids"], res["metadatas"]) if m.get("file_path") == file_path]
 
+    def get_meta_by_file(self, collection: str, file_path: str) -> dict | None:
+        """Return one metadata dict for any chunk matching file_path, or
+        None if no chunks exist. Used by the embed pipeline to detect
+        unchanged files via stored mtime and skip re-embedding."""
+        if self._client:
+            r = self._client.call({"command": "get_meta_by_file", "collection": collection, "file_path": file_path})
+            return r.get("meta")
+        col = self._direct_collection(collection)
+        try:
+            res = col.get(where={"file_path": file_path}, include=["metadatas"], limit=1)
+            metas = res.get("metadatas") or []
+            return metas[0] if metas else None
+        except Exception:
+            return None
+
     # — Write operations —
 
     def add_chunks(self, collection: str, chunks: list[dict]) -> int:
