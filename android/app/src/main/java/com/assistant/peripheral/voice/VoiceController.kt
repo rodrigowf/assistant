@@ -444,6 +444,31 @@ class VoiceController(
     // Public ops — push-to-talk + voice session lifecycle
     // ─────────────────────────────────────────────────────────────────
 
+    /**
+     * Synchronously flip user-visible "starting recording" state. Called
+     * from the wake-word callback BEFORE [startRecording] so the UI shows
+     * the recording indicator the instant the talk phrase is detected,
+     * instead of after `audioRecorder.startRecording()` returns. If the
+     * actual `startRecording` later fails (mic busy etc.), it sets
+     * `_isRecording.value = false` and the user sees a system message.
+     */
+    fun markRecordingStarting() {
+        _isRecording.value = true
+    }
+
+    /**
+     * Synchronously flip the voice session into [VoiceState.Connecting]
+     * so the UI ("Connecting..." in VoiceButton, the chat status pill)
+     * lights up the instant the wake phrase is detected — instead of
+     * after the orchestrator WS round-trip completes via
+     * `OpenAIVoiceProvider`/`WebSocketPcmProvider`'s own state flip. Pure
+     * UI-acknowledgement; the real session-build keeps running through
+     * [startVoiceSession].
+     */
+    fun markVoiceConnecting() {
+        _voiceState.value = VoiceState.Connecting
+    }
+
     fun startRecording() {
         scope.launch {
             val success = audioRecorder.startRecording()

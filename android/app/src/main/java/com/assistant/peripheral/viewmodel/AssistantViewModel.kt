@@ -277,6 +277,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun stopRecording() = voiceController.stopRecording()
     fun startVoiceSession() = voiceController.startVoiceSession()
     fun stopVoiceSession() = voiceController.stopVoiceSession()
+    fun markRecordingStarting() = voiceController.markRecordingStarting()
+    fun markVoiceConnecting() = voiceController.markVoiceConnecting()
     fun toggleMute() = voiceController.toggleMute()
 
     fun isBluetoothAudioAvailable(): Boolean = voiceController.isBluetoothAudioAvailable()
@@ -369,6 +371,84 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateSystemConfig(patch: ConfigPatch) = systemConfigController.updateSystemConfig(patch)
     fun dismissVoiceModelAutoCorrected() = systemConfigController.dismissVoiceModelAutoCorrected()
     fun toggleMcp(name: String) = systemConfigController.toggleMcp(name)
+
+    /**
+     * Immediate ack cue when the wake phrase ("wake up …") fires. Two-tone
+     * rising chirp (660 → 880 Hz, ~200 ms) — distinct enough from the
+     * reconnect beep that the user can tell them apart by ear. Played the
+     * instant the broadcast arrives, before any of the slower handoff work
+     * (orchestrator WS, WebRTC setup) starts — that's the whole point of
+     * the user-feedback layer.
+     */
+    fun playWakeWordAckBeep() {
+        playTones(listOf(660.0, 880.0), toneMs = 90, gapMs = 30, amplitude = 0.45)
+    }
+
+    /**
+     * Immediate ack cue when the talk phrase ("my friend …") fires. Single
+     * lower tone (440 Hz, ~150 ms). Asymmetric vs. the wake beep on purpose
+     * so push-to-talk vs. wake-the-assistant are audibly distinguishable.
+     */
+    fun playTalkWordAckBeep() {
+        playTones(listOf(440.0), toneMs = 150, gapMs = 0, amplitude = 0.45)
+    }
+
+    private fun playTones(
+        freqsHz: List<Double>,
+        toneMs: Int,
+        gapMs: Int,
+        amplitude: Double,
+    ) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val sr = 22050
+                val toneFrames = sr * toneMs / 1000
+                val gapFrames = sr * gapMs / 1000
+                val totalFrames = toneFrames * freqsHz.size + gapFrames * (freqsHz.size - 1).coerceAtLeast(0)
+                val pcm = ShortArray(totalFrames)
+                val fadeFrames = sr * 15 / 1000
+                var offset = 0
+                for (freq in freqsHz) {
+                    val twoPiF = 2.0 * Math.PI * freq
+                    for (i in 0 until toneFrames) {
+                        val env = when {
+                            i < fadeFrames -> i.toDouble() / fadeFrames
+                            i > toneFrames - fadeFrames -> (toneFrames - i).toDouble() / fadeFrames
+                            else -> 1.0
+                        }
+                        val sample = (Math.sin(twoPiF * i / sr) * env * amplitude * Short.MAX_VALUE).toInt()
+                        pcm[offset + i] = sample.toShort()
+                    }
+                    offset += toneFrames + gapFrames
+                }
+                val bufSize = AudioTrack.getMinBufferSize(
+                    sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                ).coerceAtLeast(totalFrames * 2)
+                @Suppress("DEPRECATION")
+                val track = AudioTrack(
+                    AudioManager.STREAM_MUSIC,
+                    sr,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufSize,
+                    AudioTrack.MODE_STATIC,
+                )
+                if (track.state != AudioTrack.STATE_INITIALIZED) {
+                    Log.w(TAG, "playTones: AudioTrack init failed state=${track.state}")
+                    track.release()
+                    return@launch
+                }
+                track.write(pcm, 0, totalFrames)
+                track.play()
+                val playMs = (totalFrames * 1000L) / sr
+                kotlinx.coroutines.delay(playMs + 80)
+                try { track.stop() } catch (_: Exception) {}
+                track.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "playTones failed: ${e.message}", e)
+            }
+        }
+    }
 
     /**
      * Two-tone reconnect cue (~300ms) on STREAM_MUSIC so it's audible while

@@ -224,6 +224,11 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val coroutineScope = rememberCoroutineScope()
     DisposableEffect(Unit) {
         activity.onTalkWordDetected = {
+            // Immediate user feedback BEFORE the async work — so the user
+            // knows their phrase was heard during the ~0.3–0.5s confidence-gate
+            // latency + the AudioRecorder.startRecording() time.
+            viewModel.playTalkWordAckBeep()
+            viewModel.markRecordingStarting()
             // Navigate to chat so the user sees the recording UI
             navController.navigate(Screen.Chat.route) {
                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
@@ -246,6 +251,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     // Wire wake-word detection: start a realtime WebRTC voice conversation.
     DisposableEffect(Unit) {
         activity.onWakeWordDetected = {
+            // Immediate user feedback BEFORE the async work — beep + state
+            // flip happen synchronously so the user sees "Connecting..." the
+            // instant the phrase is detected, instead of after the
+            // orchestrator WS round-trip + WebRTC handshake completes.
+            viewModel.playWakeWordAckBeep()
+            viewModel.markVoiceConnecting()
             navController.navigate(Screen.Chat.route) {
                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
                 launchSingleTop = true
