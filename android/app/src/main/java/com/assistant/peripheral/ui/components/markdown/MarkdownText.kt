@@ -67,47 +67,50 @@ fun MarkdownText(
 private fun buildInlineString(spans: List<MdInline>): Pair<AnnotatedString, Boolean> {
     var hasLinks = false
     val annotated = buildAnnotatedString {
-        spans.forEach { span ->
-            when (span) {
-                is MdInline.Text -> append(span.text)
-                is MdInline.Bold -> {
-                    withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = MdColors.textBright)) {
-                        append(span.text)
+        fun render(nodes: List<MdInline>) {
+            nodes.forEach { span ->
+                when (span) {
+                    is MdInline.Text -> append(span.text)
+                    is MdInline.Bold -> {
+                        withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = MdColors.textBright)) {
+                            render(span.children)
+                        }
                     }
-                }
-                is MdInline.Italic -> {
-                    withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                        append(span.text)
+                    is MdInline.Italic -> {
+                        withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
+                            render(span.children)
+                        }
                     }
-                }
-                is MdInline.BoldItalic -> {
-                    withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, color = MdColors.textBright)) {
-                        append(span.text)
+                    is MdInline.BoldItalic -> {
+                        withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic, color = MdColors.textBright)) {
+                            render(span.children)
+                        }
                     }
-                }
-                is MdInline.Code -> {
-                    withStyle(SpanStyle(
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.sp,
-                        color = MdColors.textBright,
-                        background = MdColors.inlineCodeBg
-                    )) {
-                        append("\u00A0${span.text}\u00A0")
+                    is MdInline.Code -> {
+                        withStyle(SpanStyle(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp,
+                            color = MdColors.textBright,
+                            background = MdColors.inlineCodeBg
+                        )) {
+                            append("\u00A0${span.text}\u00A0")
+                        }
                     }
-                }
-                is MdInline.Link -> {
-                    hasLinks = true
-                    pushStringAnnotation(tag = "URL", annotation = span.url)
-                    withStyle(SpanStyle(
-                        color = MdColors.accent,
-                        textDecoration = TextDecoration.Underline
-                    )) {
-                        append(span.text)
+                    is MdInline.Link -> {
+                        hasLinks = true
+                        pushStringAnnotation(tag = "URL", annotation = span.url)
+                        withStyle(SpanStyle(
+                            color = MdColors.accent,
+                            textDecoration = TextDecoration.Underline
+                        )) {
+                            render(span.children)
+                        }
+                        pop()
                     }
-                    pop()
                 }
             }
         }
+        render(spans)
     }
     return annotated to hasLinks
 }

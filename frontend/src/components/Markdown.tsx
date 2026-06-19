@@ -13,6 +13,19 @@ export function Markdown({ content }: Props) {
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
+        a({ href, children, ...props }) {
+          return (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="md-link"
+              {...props}
+            >
+              {children}
+            </a>
+          );
+        },
         code({ className, children, ...props }) {
           const match = /language-(\w+)/.exec(className || "");
           const code = String(children).replace(/\n$/, "");

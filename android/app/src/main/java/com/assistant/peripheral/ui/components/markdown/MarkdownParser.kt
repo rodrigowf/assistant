@@ -23,11 +23,14 @@ sealed class MdBlock {
 
 sealed class MdInline {
     data class Text(val text: String) : MdInline()
-    data class Bold(val text: String) : MdInline()
-    data class Italic(val text: String) : MdInline()
-    data class BoldItalic(val text: String) : MdInline()
+    // Emphasis variants hold nested inline children so a link (or code, or
+    // nested emphasis) inside bold/italic stays a first-class node — see the
+    // 2026-06-18 fix for "links inside **bold** not clickable on Android".
+    data class Bold(val children: List<MdInline>) : MdInline()
+    data class Italic(val children: List<MdInline>) : MdInline()
+    data class BoldItalic(val children: List<MdInline>) : MdInline()
     data class Code(val text: String) : MdInline()
-    data class Link(val text: String, val url: String) : MdInline()
+    data class Link(val children: List<MdInline>, val url: String) : MdInline()
 }
 
 // ── Block parser ─────────────────────────────────────────────────────────────
@@ -196,16 +199,18 @@ fun parseInline(text: String): List<MdInline> {
             result.add(MdInline.Text(remaining.substring(0, match.range.first)))
         }
 
-        // Determine which group matched
+        // Determine which group matched. For emphasis types we recursively
+        // parse the inner content so `**[label](url)**` produces
+        // Bold(children=[Link(...)]) instead of Bold(text="[label](url)").
         when {
-            match.groups[1] != null -> result.add(MdInline.BoldItalic(match.groups[1]!!.value))
-            match.groups[2] != null -> result.add(MdInline.Bold(match.groups[2]!!.value))
-            match.groups[3] != null -> result.add(MdInline.Bold(match.groups[3]!!.value))
-            match.groups[4] != null -> result.add(MdInline.Italic(match.groups[4]!!.value))
-            match.groups[5] != null -> result.add(MdInline.Italic(match.groups[5]!!.value))
+            match.groups[1] != null -> result.add(MdInline.BoldItalic(parseInline(match.groups[1]!!.value)))
+            match.groups[2] != null -> result.add(MdInline.Bold(parseInline(match.groups[2]!!.value)))
+            match.groups[3] != null -> result.add(MdInline.Bold(parseInline(match.groups[3]!!.value)))
+            match.groups[4] != null -> result.add(MdInline.Italic(parseInline(match.groups[4]!!.value)))
+            match.groups[5] != null -> result.add(MdInline.Italic(parseInline(match.groups[5]!!.value)))
             match.groups[6] != null -> result.add(MdInline.Code(match.groups[6]!!.value))
             match.groups[7] != null -> result.add(
-                MdInline.Link(match.groups[7]!!.value, match.groups[8]!!.value)
+                MdInline.Link(parseInline(match.groups[7]!!.value), match.groups[8]!!.value)
             )
         }
 
