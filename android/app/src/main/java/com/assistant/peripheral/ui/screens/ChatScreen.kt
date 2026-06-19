@@ -122,14 +122,22 @@ fun ChatScreen(
     // arrives while the user is already at the bottom. The initial jump is
     // instant (scrollToItem, not animateScrollToItem) so the load-more
     // guard flips before the layout reports isAtTop = true.
+    //
+    // `scrollOffset = Int.MAX_VALUE` aligns the *bottom* of the last item
+    // with the *bottom* of the viewport (Compose clamps the offset to
+    // (lastItem.size - viewport.height)). The naive `scrollToItem(N-1)`
+    // aligns the *top* of the last item with the *top* of the viewport,
+    // which for tall assistant turns (lots of tool blocks) parks the
+    // viewport at the start of the assistant's reply, hiding everything
+    // streamed after it.
     LaunchedEffect(messages.size, lastMessageTailSignal, hasInitialScrollCompleted) {
         if (messages.isEmpty()) return@LaunchedEffect
         if (!hasInitialScrollCompleted) {
-            listState.scrollToItem(messages.size - 1)
+            listState.scrollToItem(messages.size - 1, scrollOffset = Int.MAX_VALUE)
             lastKnownFirstId = messages.firstOrNull()?.id
             hasInitialScrollCompleted = true
         } else if (isAtBottom) {
-            listState.animateScrollToItem(messages.size - 1)
+            listState.animateScrollToItem(messages.size - 1, scrollOffset = Int.MAX_VALUE)
         }
     }
 
@@ -202,7 +210,7 @@ fun ChatScreen(
                 SmallFloatingActionButton(
                     onClick = {
                         coroutineScope.launch {
-                            listState.animateScrollToItem(messages.size - 1)
+                            listState.animateScrollToItem(messages.size - 1, scrollOffset = Int.MAX_VALUE)
                         }
                     },
                     containerColor = MaterialTheme.colorScheme.primaryContainer,

@@ -48,90 +48,10 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
-from claude_agent_sdk.types import StreamEvent
-
-# Monkey-patch the SDK's message parser to handle unknown message types gracefully
-# instead of raising an exception (e.g., rate_limit_event is not handled by the SDK)
-def _patch_sdk_message_parser():
-    """Patch SDK to ignore unknown message types instead of crashing."""
-    try:
-        from claude_agent_sdk._internal import message_parser
-        original_parse = message_parser.parse_message
-
-        def patched_parse(data):
-            try:
-                return original_parse(data)
-            except Exception as e:
-                if "Unknown message type" in str(e):
-                    # Return None for unknown types - we'll filter these out
-                    logger.debug("Ignoring unknown message type: %s", data.get("type", "unknown"))
-                    return None
-                raise
-
-        message_parser.parse_message = patched_parse
-        logger.debug("SDK message parser patched for unknown message type handling")
-    except Exception as e:
-        logger.warning("Could not patch SDK message parser: %s", e)
-
-_patch_sdk_message_parser()
-
-
-# Monkey-patch Query.close() to bound the task-group __aexit__ wait.
-#
-# Upstream bug: claude-agent-sdk's `Query.close()` does
-#     self._tg.cancel_scope.cancel()
-#     await self._tg.__aexit__(None, None, None)   # NO TIMEOUT
-# If any child task in the SDK's anyio task group can't be cancelled cleanly
-# (e.g. parked in asyncio.Condition which suppresses CancelledError until it
-# can re-acquire its lock), anyio's _deliver_cancellation reschedules itself
-# via call_soon forever and pins the event loop at 100% CPU.  Every other
-# coroutine on the same loop is starved — websockets, HTTP, SDK readers.
-# Recovering requires killing the process.
-#
-# See:  https://github.com/anthropics/claude-agent-sdk-python/issues/378
-#       https://github.com/agronholm/anyio/issues/695
-#
-# We wrap the __aexit__ in anyio.fail_after(5.0) so a wedged task group can
-# leak (rare, isolated) instead of taking the whole event loop with it.
-def _patch_sdk_query_close():
-    """Bound Query.close()'s task-group teardown so a stuck SDK task can't
-    pin the event loop forever (upstream bug, see comment above)."""
-    try:
-        from contextlib import suppress
-
-        import anyio
-        from claude_agent_sdk._internal import query as _query_mod
-
-        if getattr(_query_mod.Query.close, "_bounded_patched", False):
-            return
-
-        async def close_bounded(self) -> None:
-            self._closed = True
-            if self._tg:
-                self._tg.cancel_scope.cancel()
-                with suppress(anyio.get_cancelled_exc_class()):
-                    try:
-                        with anyio.fail_after(5.0):
-                            await self._tg.__aexit__(None, None, None)
-                    except TimeoutError:
-                        logger.warning(
-                            "SDK Query task-group cleanup timed out after 5s "
-                            "(suspected anyio cancel-scope busy-loop); detaching"
-                        )
-            await self.transport.close()
-
-        close_bounded._bounded_patched = True  # type: ignore[attr-defined]
-        _query_mod.Query.close = close_bounded
-        logger.debug("SDK Query.close() patched with bounded task-group teardown")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not patch SDK Query.close(): %s", exc)
-
-_patch_sdk_query_close()
-
-
 from claude_agent_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
+    StreamEvent,
     ToolPermissionContext,
 )
 

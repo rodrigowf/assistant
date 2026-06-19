@@ -69,10 +69,13 @@ def _install(pool: SessionPool, sm) -> None:
     """Inject a session into the pool without going through pool.create()
     (which would spawn a real SDK subprocess).  Mimics what create() does
     for bookkeeping minus the SessionManager.start() call."""
+    from collections import deque
     sid = sm.local_id
     pool._sessions[sid] = sm
     pool._subscribers[sid] = set()
     pool._locks[sid] = asyncio.Lock()
+    pool._pending_prompts[sid] = deque()
+    pool._pending_locks[sid] = asyncio.Lock()
 
 
 @pytest.mark.asyncio
@@ -140,6 +143,149 @@ async def test_start_turn_replaces_in_flight_turn():
         "first turn should have been cancelled, not allowed to finish"
     # Second turn completed.
     assert pool.has_active_turn("test-session") is False
+
+
+@pytest.mark.asyncio
+async def test_send_or_queue_starts_turn_when_idle():
+    """When no turn is running, send_or_queue spawns a fresh driver task
+    — equivalent to start_turn but without the destructive precancel."""
+    pool = SessionPool()
+    sm = _stub_session_manager([
+        TextDelta(text="hi"),
+        TurnComplete(cost=0.0, num_turns=1, session_id="sdk-test"),
+    ])
+    _install(pool, sm)
+
+    started_new = await pool.send_or_queue("test-session", "hello")
+    assert started_new is True
+    assert pool.has_active_turn("test-session") is True
+
+    # Drain so the task finishes cleanly.
+    await asyncio.sleep(0.1)
+    assert pool.has_active_turn("test-session") is False
+
+
+@pytest.mark.asyncio
+async def test_send_or_queue_appends_to_queue_while_turn_running():
+    """When a turn is in flight, send_or_queue must NOT interrupt — it
+    appends to the pending queue and the prompt is consumed by
+    _drive_turn after the current TurnComplete.  This is the bug-fix
+    behavior: VS Code-style "type while running"."""
+    pool = SessionPool()
+    sends_received: list[str] = []
+    started_first = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _send(text):
+        sends_received.append(text)
+        if text == "first":
+            started_first.set()
+            await release_first.wait()
+        yield TextDelta(text=f"out-{text}")
+        yield TurnComplete(cost=0.0, num_turns=1, session_id="sdk-test")
+
+    sm = _stub_session_manager([])
+    sm.send = _send
+    _install(pool, sm)
+
+    # Kick off first turn — will wedge until release_first fires.
+    await pool.start_turn("test-session", "first")
+    await started_first.wait()
+
+    # Queue two more while first is in flight.
+    started_new = await pool.send_or_queue("test-session", "second")
+    assert started_new is False, "should have queued, not started new turn"
+    started_new = await pool.send_or_queue("test-session", "third")
+    assert started_new is False, "should have queued, not started new turn"
+
+    # Only "first" has been sent so far — queue is buffered until first
+    # TurnComplete.
+    assert sends_received == ["first"], (
+        f"expected only ['first'] sent so far, got {sends_received}"
+    )
+
+    # Release the first turn — drain should consume "second" then "third".
+    release_first.set()
+    await asyncio.sleep(0.2)
+
+    assert sends_received == ["first", "second", "third"], (
+        f"queued prompts not drained in order: {sends_received}"
+    )
+    assert pool.has_active_turn("test-session") is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_turn_flushes_pending_queue():
+    """Explicit cancel (Stop button) must drop queued prompts — the user
+    said "stop", not "stop the current one and run the queued ones"."""
+    pool = SessionPool()
+    sends_received: list[str] = []
+    started_first = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _send(text):
+        sends_received.append(text)
+        if text == "first":
+            started_first.set()
+            await release_first.wait()
+        yield TurnComplete(cost=0.0, num_turns=1, session_id="sdk-test")
+
+    sm = _stub_session_manager([])
+    sm.send = _send
+    _install(pool, sm)
+
+    await pool.start_turn("test-session", "first")
+    await started_first.wait()
+
+    await pool.send_or_queue("test-session", "should-be-dropped-1")
+    await pool.send_or_queue("test-session", "should-be-dropped-2")
+    assert len(pool._pending_prompts["test-session"]) == 2
+
+    release_first.set()  # let cancel_turn proceed past interrupt()
+    cancelled = await pool.cancel_turn("test-session")
+    assert cancelled is True
+    assert len(pool._pending_prompts["test-session"]) == 0, (
+        "cancel_turn must flush pending queue"
+    )
+
+    # Verify the queued prompts were never sent.
+    await asyncio.sleep(0.1)
+    assert sends_received == ["first"], (
+        f"queued prompts must not run after cancel: {sends_received}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_or_queue_drain_race_no_orphan_prompt():
+    """Regression: send_or_queue + _drive_turn drain must hold the same
+    pending_lock so a prompt can't land in the queue after the drain
+    observes it empty but before the task exits.  Without the lock, the
+    prompt would sit forever with no driver."""
+    pool = SessionPool()
+    sends_received: list[str] = []
+
+    # First send finishes instantly so the drain loop observes an empty
+    # queue and exits; we then need to verify a follow-up send_or_queue
+    # spawns a NEW driver rather than orphaning the prompt.
+    async def _send(text):
+        sends_received.append(text)
+        yield TurnComplete(cost=0.0, num_turns=1, session_id="sdk-test")
+
+    sm = _stub_session_manager([])
+    sm.send = _send
+    _install(pool, sm)
+
+    await pool.start_turn("test-session", "first")
+    # Let the first turn fully complete.
+    await asyncio.sleep(0.1)
+    assert pool.has_active_turn("test-session") is False
+
+    # Now send_or_queue when idle — must spawn fresh, not stash in queue.
+    started_new = await pool.send_or_queue("test-session", "second")
+    assert started_new is True
+
+    await asyncio.sleep(0.1)
+    assert sends_received == ["first", "second"]
 
 
 @pytest.mark.asyncio
