@@ -435,6 +435,21 @@ def resolve_voice_target(
             if entry["id"] == model:
                 selected = entry
                 break
+    if selected is None and model:
+        # Unknown model ID (e.g. a live-discovered model not yet in the
+        # static registry). Accept it rather than silently falling back to
+        # the default — use the provider's first static entry as a template
+        # for voices/languages so the rest of the resolution logic works.
+        template = next((e for e in entries if e.get("default")), entries[0])
+        selected = {
+            "id": model,
+            "label": model,
+            "voice": template["voice"],
+            "voices": template["voices"],
+            "transcription_languages": template["transcription_languages"],
+            "default_transcription_language": template["default_transcription_language"],
+            "default": False,
+        }
     if selected is None:
         for entry in entries:
             if entry.get("default"):
