@@ -54,25 +54,28 @@ def truncate_voice_tool_output(output: str) -> str:
     clipped = output[:VOICE_TOOL_OUTPUT_MAX_CHARS]
 
     # Try to extract resumption hint from a read_file JSON payload.
-    hint = ""
+    suffix = "[output truncated — too large for realtime voice.]"
     try:
         import json as _json
         parsed = _json.loads(output)
         if isinstance(parsed, dict) and "total_lines" in parsed:
             total = parsed["total_lines"]
-            # Count lines already included in the clipped content section.
+            start = parsed.get("start_line", 1)
             content_so_far = parsed.get("content", "")
-            clipped_content = content_so_far[:max(0, VOICE_TOOL_OUTPUT_MAX_CHARS - (len(output) - len(content_so_far)))]
-            lines_shown = clipped_content.count("\n") + 1
-            next_line = (parsed.get("start_line", 1) - 1) + lines_shown + 1
-            hint = (
-                f" Call read_file with start_line={next_line} to continue"
-                f" (file has {total} lines total)."
+            # How many chars of content fit inside the cap.
+            overhead = len(output) - len(content_so_far)
+            clipped_content = content_so_far[:max(0, VOICE_TOOL_OUTPUT_MAX_CHARS - overhead)]
+            last_line = start + clipped_content.count("\n")
+            next_line = last_line + 1
+            suffix = (
+                f"[output truncated — showing lines {start} to {last_line} "
+                f"from {total} total. "
+                f"Call read_file with start_line={next_line} to continue.]"
             )
     except Exception:
         pass
 
-    return clipped + f"\n\n[output truncated — too large for realtime voice.{hint}]"
+    return clipped + f"\n\n{suffix}"
 
 
 class BaseVoiceProvider(ABC):
