@@ -392,14 +392,30 @@ def get_provider_class(provider: str) -> type[BaseVoiceProvider]:
 
 
 def get_model_entry(provider: str, model: str) -> VoiceModelEntry:
-    """Return the registered model entry, raising ValueError on unknown id."""
+    """Return the registered model entry for the given provider+model.
+
+    For live-discovered model IDs not in the static registry (e.g.
+    gpt-realtime-2 returned by the OpenAI /v1/models endpoint), a
+    synthetic entry is built from the provider's default template so
+    session instantiation can proceed without a static entry.
+    """
     entries = VOICE_MODELS.get(provider, [])
     for entry in entries:
         if entry["id"] == model:
             return entry
+    if entries:
+        template = next((e for e in entries if e.get("default")), entries[0])
+        return {
+            "id": model,
+            "label": model,
+            "voice": template["voice"],
+            "voices": template["voices"],
+            "transcription_languages": template["transcription_languages"],
+            "default_transcription_language": template["default_transcription_language"],
+            "default": False,
+        }
     raise ValueError(
-        f"Unknown model {model!r} for provider {provider!r}. "
-        f"Available: {[e['id'] for e in entries]}"
+        f"No models registered for provider {provider!r}."
     )
 
 
