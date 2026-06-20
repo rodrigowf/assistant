@@ -59,6 +59,7 @@ from orchestrator import voice_vad
 from orchestrator.providers.voice_base import (
     BaseVoiceProvider,
     ToolCallAccumulator,
+    truncate_voice_tool_output,
 )
 from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from orchestrator.types import (
@@ -471,7 +472,7 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, ToolCallAccumulator, abc.ABC):
                 "functionResponses": [{
                     "id": call_id,
                     "name": name,
-                    "response": {"output": output},
+                    "response": {"output": truncate_voice_tool_output(output)},
                 }],
             },
         }]

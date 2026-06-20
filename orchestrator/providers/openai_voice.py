@@ -26,6 +26,7 @@ import httpx
 from orchestrator.providers.voice_base import (
     BaseVoiceProvider,
     ToolCallAccumulator,
+    truncate_voice_tool_output,
 )
 from orchestrator.voice_errors import VoiceError, VoiceErrorCategory
 from orchestrator.types import (
@@ -286,7 +287,7 @@ class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
                 "item": {
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": output,
+                    "output": truncate_voice_tool_output(output),
                 },
             },
             {"type": "response.create"},

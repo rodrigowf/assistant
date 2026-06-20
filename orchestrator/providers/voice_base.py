@@ -34,6 +34,47 @@ from orchestrator.types import OrchestratorEvent
 from orchestrator.voice_errors import VoiceError
 
 
+# Realtime APIs (OpenAI, Qwen, Gemini) all reject function_call_output
+# payloads above roughly 15–16 KB.  We cap at 8 000 chars — enough for
+# most search/read results while leaving headroom for protocol framing.
+VOICE_TOOL_OUTPUT_MAX_CHARS = 8_000
+
+
+def truncate_voice_tool_output(output: str) -> str:
+    """Clip ``output`` to ``VOICE_TOOL_OUTPUT_MAX_CHARS`` if needed.
+
+    When the output is JSON from ``read_file`` (has ``total_lines`` /
+    ``end_line``), the truncation suffix tells the model exactly which
+    ``start_line`` to pass on the next ``read_file`` call.  For all
+    other tools a generic "output truncated" marker is appended.
+    """
+    if len(output) <= VOICE_TOOL_OUTPUT_MAX_CHARS:
+        return output
+
+    clipped = output[:VOICE_TOOL_OUTPUT_MAX_CHARS]
+
+    # Try to extract resumption hint from a read_file JSON payload.
+    hint = ""
+    try:
+        import json as _json
+        parsed = _json.loads(output)
+        if isinstance(parsed, dict) and "total_lines" in parsed:
+            total = parsed["total_lines"]
+            # Count lines already included in the clipped content section.
+            content_so_far = parsed.get("content", "")
+            clipped_content = content_so_far[:max(0, VOICE_TOOL_OUTPUT_MAX_CHARS - (len(output) - len(content_so_far)))]
+            lines_shown = clipped_content.count("\n") + 1
+            next_line = (parsed.get("start_line", 1) - 1) + lines_shown + 1
+            hint = (
+                f" Call read_file with start_line={next_line} to continue"
+                f" (file has {total} lines total)."
+            )
+    except Exception:
+        pass
+
+    return clipped + f"\n\n[output truncated — too large for realtime voice.{hint}]"
+
+
 class BaseVoiceProvider(ABC):
     """Provider-agnostic contract for realtime voice backends.
 

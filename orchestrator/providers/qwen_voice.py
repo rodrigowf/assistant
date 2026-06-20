@@ -38,6 +38,7 @@ import websockets
 from orchestrator.providers.voice_base import (
     BaseVoiceProvider,
     ToolCallAccumulator,
+    truncate_voice_tool_output,
 )
 from orchestrator.types import (
     ErrorEvent,
@@ -389,7 +390,7 @@ class QwenVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
                 "item": {
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": _sanitize_for_qwen(output),
+                    "output": _sanitize_for_qwen(truncate_voice_tool_output(output)),
                 },
             },
             {"type": "response.create"},
