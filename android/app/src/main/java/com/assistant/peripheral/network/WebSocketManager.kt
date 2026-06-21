@@ -328,10 +328,14 @@ class WebSocketManager {
                     val sessionId = json.optString("session_id", "")
                     val voice = json.optBoolean("voice", false)
                     val voiceUpdate = json.optJSONObject("voice_session_update")?.let { jsonObjectToMap(it) }
-                    // Default to true for backward-compat with older
-                    // backends that don't send the flag — they only
-                    // emitted session_started for the initiator.
-                    val voiceInitiator = json.optBoolean("voice_initiator", true)
+                    // Default to false — a missing flag means we don't know
+                    // who initiated, so we conservatively treat this device
+                    // as a non-initiator. Older backends only sent
+                    // session_started to the initiator, so in practice the
+                    // flag is always present; defaulting true was wrong because
+                    // it caused every reconnecting device to attempt to open
+                    // its own voice provider transport.
+                    val voiceInitiator = json.optBoolean("voice_initiator", false)
                     emit(WebSocketEvent.SessionStarted(sessionId, voice, voiceUpdate, voiceInitiator))
 
                     // Resume protocol: announce the backend's snapshot

@@ -256,11 +256,9 @@ class OrchestratorConnectionControllerParityTest {
             advanceTimeBy(401)
             runCurrent()
             assertEquals(2, poolCalls.get())
-            // Now an OrchestratorAdopted should follow, then Reconnected.
+            // Cold-start first connect: only OrchestratorAdopted emitted (no Reconnected).
             val ev = awaitItem()
             assertTrue("expected OrchestratorAdopted, got $ev", ev is ConnectionEvent.OrchestratorAdopted)
-            val ev2 = awaitItem()
-            assertTrue("expected Reconnected, got $ev2", ev2 is ConnectionEvent.Reconnected)
             cancelAndIgnoreRemainingEvents()
         }
         assertEquals(false, ctrl.noActiveOrchestrator.value)
@@ -317,26 +315,33 @@ class OrchestratorConnectionControllerParityTest {
 
     // -----------------------------------------------------------------
     // 4. VoiceContinuityReconnectParity — Reconnected event is emitted
+    //    only on WS-drop reconnects, NOT on the first cold-start connect
     // -----------------------------------------------------------------
 
     @Test
-    fun `voice continuity — Connected probe with a found orchestrator emits BOTH OrchestratorAdopted AND Reconnected`() = runTest {
+    fun `voice continuity — cold-start connect emits ONLY OrchestratorAdopted, WS-drop reconnect emits BOTH`() = runTest {
         val (ctrl, _) = controller(this, livePool = listOf(sampleOrchestrator))
 
         ctrl.events.test {
+            // First connect (cold start): only OrchestratorAdopted, no Reconnected.
+            ctrl.onWsConnected()
+            advanceUntilIdle()
+            val cold = awaitItem()
+            assertTrue("cold-start should emit OrchestratorAdopted, was $cold",
+                cold is ConnectionEvent.OrchestratorAdopted)
+            assertEquals(sampleOrchestrator.localId, (cold as ConnectionEvent.OrchestratorAdopted).localId)
+            assertEquals(sampleOrchestrator.sdkSessionId, cold.sdkSessionId)
+
+            // Second connect (WS-drop reconnect): OrchestratorAdopted AND Reconnected.
+            // Order matters: bucket fields must settle BEFORE voice sends voice_start.
             ctrl.onWsConnected()
             advanceUntilIdle()
             val first = awaitItem()
             val second = awaitItem()
-            // Order matters: bucket fields (OrchestratorAdopted) must be
-            // settled BEFORE the voice subsystem sends voice_start
-            // (Reconnected) so the WS message carries the right local_id.
             assertTrue("first emission should be OrchestratorAdopted, was $first",
                 first is ConnectionEvent.OrchestratorAdopted)
             assertTrue("second emission should be Reconnected, was $second",
                 second is ConnectionEvent.Reconnected)
-            assertEquals(sampleOrchestrator.localId, (first as ConnectionEvent.OrchestratorAdopted).localId)
-            assertEquals(sampleOrchestrator.sdkSessionId, first.sdkSessionId)
             assertEquals(sampleOrchestrator.localId, (second as ConnectionEvent.Reconnected).localId)
             assertEquals(sampleOrchestrator.sdkSessionId, second.sdkSessionId)
             cancelAndIgnoreRemainingEvents()

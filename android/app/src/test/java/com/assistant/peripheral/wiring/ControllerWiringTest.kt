@@ -314,12 +314,14 @@ class ControllerWiringTest {
         // is a synchronous subscribe that guarantees subscription is in
         // place before onWsConnected emits.
         connection2.events.test {
+            // First connect (cold start) — only OrchestratorAdopted.
             connection2.onWsConnected()
-            // Drain the two expected events (OrchestratorAdopted +
-            // Reconnected). The connection parity test owns the contract
-            // on order/content; we just keep the collector alive.
-            awaitItem()
-            awaitItem()
+            awaitItem()  // OrchestratorAdopted
+            // Second connect (WS-drop reconnect) — OrchestratorAdopted + Reconnected.
+            // VoiceController's Reconnected subscription fires on this second call.
+            connection2.onWsConnected()
+            awaitItem()  // OrchestratorAdopted
+            awaitItem()  // Reconnected
             cancelAndIgnoreRemainingEvents()
         }
         advanceUntilIdle()

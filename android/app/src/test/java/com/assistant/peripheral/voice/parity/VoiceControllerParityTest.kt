@@ -303,6 +303,21 @@ class VoiceControllerParityTest {
         cleanup()
     }
 
+    @Test
+    fun `WS disconnect mid-voice — clears activeVoiceConfig so reconnect cannot auto-restart voice`() = runTest {
+        val (ctrl, _) = controller(this)
+        ctrl.setActiveVoiceConfigForTest(sampleVoiceConfig)
+        assertNotNull(ctrl.activeVoiceConfigForTest)
+
+        ctrl.handleVoiceWebSocketEventForTest(WebSocketEvent.Disconnected)
+        advanceUntilIdle()
+
+        // Must be cleared — prevents handleReconnectedEvent from sending voice_start
+        // on the next Reconnected event without explicit user action.
+        assertNull("activeVoiceConfig must be cleared on WS disconnect", ctrl.activeVoiceConfigForTest)
+        cleanup()
+    }
+
     // ===================================================================
     // 3. VoiceManagerRebuildGateParity
     // ===================================================================

@@ -315,6 +315,18 @@ class VoiceController(
                 chatController.finalizeStreamingForVoiceEnd()
                 finalizeVoiceStop()
             }
+            is WebSocketEvent.Disconnected -> {
+                // WS dropped — clear the active voice config so that the
+                // Reconnected event (emitted by OrchestratorConnectionController
+                // on genuine WS-drop reconnects) doesn't re-arm voice_start for
+                // a session that was never active in this process. The voice
+                // subsystem treats the reconnect as a clean slate; the user must
+                // press Start or say the wake word to re-enter voice mode.
+                if (activeVoiceConfig != null) {
+                    Log.i(TAG, "WS disconnected mid-voice — clearing activeVoiceConfig to prevent auto-restart")
+                    activeVoiceConfig = null
+                }
+            }
             else -> {
                 // Non-voice events handled by ChatController.
             }

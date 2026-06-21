@@ -130,6 +130,15 @@ class OrchestratorConnectionController(
     // HEAD AssistantViewModel's `pendingNewSessionStart` field.
     private val pendingNewSessionStart = AtomicBoolean(false)
 
+    // True after the first successful onWsConnected() completes. The first
+    // connection is a cold-start probe (app open / first connect after server
+    // discovery) — emitting Reconnected there would trigger VoiceController's
+    // voice-rearming path even though the user never started a voice session
+    // in this process. Only subsequent connects (WS drop + reconnect) should
+    // emit Reconnected so the voice continuity branch can re-arm a genuinely
+    // in-progress session.
+    private val initialConnectionDone = AtomicBoolean(false)
+
     // ─────────────────────────────────────────────────────────────────
     // Connect / disconnect / reconnect
     // ─────────────────────────────────────────────────────────────────
@@ -196,7 +205,16 @@ class OrchestratorConnectionController(
                 settingsRepository.persistOrchestratorLocalId(existing.localId)
                 _noActiveOrchestrator.value = false
                 _events.tryEmit(ConnectionEvent.OrchestratorAdopted(existing.localId, existing.sdkSessionId))
-                _events.tryEmit(ConnectionEvent.Reconnected(existing.localId, existing.sdkSessionId))
+                // Only emit Reconnected on genuine WS-drop reconnects — not on
+                // cold start. On cold start the voice subsystem has no active
+                // session in this process, so re-arming voice_start here would
+                // auto-start voice without any user action (and trigger the same
+                // problem on a second device that simply opens the conversation).
+                if (initialConnectionDone.get()) {
+                    _events.tryEmit(ConnectionEvent.Reconnected(existing.localId, existing.sdkSessionId))
+                } else {
+                    initialConnectionDone.set(true)
+                }
             } else {
                 _noActiveOrchestrator.value = true
                 _events.tryEmit(ConnectionEvent.NoOrchestratorFound)
@@ -335,6 +353,9 @@ class OrchestratorConnectionController(
      * ChatController at Inc 3).
      */
     fun teardownForServerUrlChange() {
+        // Treat a server URL change like a cold start — the next connect()
+        // goes to a different backend and has no in-process voice session.
+        initialConnectionDone.set(false)
         webSocketManager.disconnect()
         scope.launch { settingsRepository.clearOrchestratorLocalId() }
     }
