@@ -316,6 +316,17 @@ class BaseVoiceProvider(ABC):
         """
         return True
 
+    def mark_response_create_sent(self) -> None:
+        """Optimistically advance gating state at ``response.create`` dispatch.
+
+        WebRTC providers (notably OpenAI) need this because the upstream's
+        ``response.created`` event arrives one round-trip after the send;
+        without an optimistic flip, a concurrent dispatch on a parallel
+        tool result would see ``should_gate_event`` return False and
+        collide. Default: no-op for providers whose gating doesn't depend
+        on the active-response window.
+        """
+
     def should_close_after_event(self, event: dict[str, Any]) -> bool:
         """Decide whether the relay should proactively close the upstream WS.
 

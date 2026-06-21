@@ -1,0 +1,252 @@
+"""Tests for the WebRTC ``response.create`` dispatch-gate.
+
+OpenAI Realtime rejects a second ``response.create`` while the first
+response is in flight with ``conversation_already_has_active_response``,
+which surfaces in the UI as a "Voice error" bubble and silences the
+agent. When the agent fires N tools concurrently, each tool result
+produces its own ``conversation.item.create`` + ``response.create``
+pair; without coordination, the 2nd+ collide.
+
+The fix is two-layered:
+
+  - Provider tracks ``_response_active`` via ``on_inbound_event`` (set
+    on ``response.created``, cleared on terminal ``response.done`` /
+    cancelled / failed).
+  - Dispatch layer (``api/routes/orchestrator._dispatch_voice_commands``)
+    consults ``provider.should_gate_event`` per command. Gated frames
+    go into a per-session single-slot queue; the inbound-event mirror
+    drains the slot once the provider reports ``gate_cleared``.
+
+These tests pin both layers.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from api.routes.orchestrator import (
+    _dispatch_voice_commands,
+    _drain_deferred_response_create,
+)
+from orchestrator.config import OrchestratorConfig
+from orchestrator.providers.openai_voice import OpenAIVoiceProvider
+from orchestrator.session import OrchestratorSession
+
+
+def _make_session(tmp_path: Path) -> OrchestratorSession:
+    config = OrchestratorConfig(
+        project_dir=str(tmp_path),
+        memory_path=str(tmp_path / "mem.md"),
+    )
+    session = OrchestratorSession(config=config, context={}, voice=True)
+    session._voice_provider = OpenAIVoiceProvider()
+    return session
+
+
+class _Pool:
+    """Minimal SessionPool stand-in capturing broadcast payloads."""
+
+    def __init__(self) -> None:
+        self.broadcasts: list[dict] = []
+
+    async def broadcast_orchestrator(self, payload: dict) -> None:
+        self.broadcasts.append(payload)
+
+
+# ---------- Provider-level gating ---------------------------------------
+
+
+def test_openai_provider_gates_response_create_when_active():
+    p = OpenAIVoiceProvider()
+    # No response in flight → not gated.
+    assert p.should_gate_event({"type": "response.create"}) is False
+    # Inbound response.created sets the flag.
+    p.on_inbound_event({"type": "response.created"})
+    assert p.should_gate_event({"type": "response.create"}) is True
+    # Other frame types are never gated.
+    assert p.should_gate_event({"type": "conversation.item.create"}) is False
+    # Terminal event clears the flag.
+    p.on_inbound_event({"type": "response.done"})
+    assert p.should_gate_event({"type": "response.create"}) is False
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    ["response.done", "response.cancelled", "response.failed"],
+)
+def test_openai_provider_gate_clears_on_all_terminal_events(terminal):
+    p = OpenAIVoiceProvider()
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+    p.on_inbound_event({"type": terminal})
+    assert p.gate_cleared() is True
+
+
+def test_openai_provider_mark_response_create_sent_flips_optimistically():
+    """The dispatch-time hook must flip the gate before the round-trip."""
+    p = OpenAIVoiceProvider()
+    assert p.gate_cleared() is True
+    p.mark_response_create_sent()
+    assert p.gate_cleared() is False
+    # Eventual response.created from upstream is a no-op (already True).
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+    p.on_inbound_event({"type": "response.done"})
+    assert p.gate_cleared() is True
+
+
+# ---------- Dispatch-layer behaviour -------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ships_response_create_when_gate_clear(tmp_path):
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    await _dispatch_voice_commands(
+        pool, session,
+        [
+            {"type": "conversation.item.create", "item": {}},
+            {"type": "response.create"},
+        ],
+    )
+    # Both frames went out to the frontend.
+    types = [b["command"]["type"] for b in pool.broadcasts]
+    assert types == ["conversation.item.create", "response.create"]
+    # The provider's gate flipped optimistically — a follow-up
+    # dispatch on this same session must now defer.
+    assert session.voice_provider.gate_cleared() is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defers_response_create_when_gate_active(tmp_path):
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    # Simulate the first tool's response.create already in flight upstream.
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+
+    await _dispatch_voice_commands(
+        pool, session,
+        [
+            {"type": "conversation.item.create", "item": {"call_id": "t2"}},
+            {"type": "response.create"},
+        ],
+    )
+    # item.create still ships immediately — it doesn't conflict.
+    types = [b["command"]["type"] for b in pool.broadcasts]
+    assert types == ["conversation.item.create"]
+    # response.create parked in the single-slot deferred queue.
+    assert session._deferred_response_create == {"type": "response.create"}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_coalesces_multiple_deferred_response_creates(tmp_path):
+    """Three parallel tools → three response.creates → exactly one queued."""
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+
+    # Tool 2, 3, 4 all complete while tool 1's response is still in flight.
+    for call_id in ("t2", "t3", "t4"):
+        await _dispatch_voice_commands(
+            pool, session,
+            [
+                {"type": "conversation.item.create", "item": {"call_id": call_id}},
+                {"type": "response.create"},
+            ],
+        )
+    # All three item.creates shipped.
+    item_creates = [
+        b for b in pool.broadcasts
+        if b["command"]["type"] == "conversation.item.create"
+    ]
+    assert len(item_creates) == 3
+    # Zero response.creates shipped during the active window.
+    response_creates = [
+        b for b in pool.broadcasts if b["command"]["type"] == "response.create"
+    ]
+    assert response_creates == []
+    # Single-slot queue holds exactly one (latest writes win, but all
+    # response.creates here are identical no-arg frames).
+    assert session._deferred_response_create == {"type": "response.create"}
+
+
+@pytest.mark.asyncio
+async def test_drain_ships_deferred_response_create_after_terminal(tmp_path):
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    # Park a deferred response.create.
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session,
+        [{"type": "response.create"}],
+    )
+    assert session._deferred_response_create is not None
+
+    # Simulate the upstream completing the in-flight response — the
+    # provider clears its flag, then the drain should ship the parked frame.
+    session.voice_provider.on_inbound_event({"type": "response.done"})
+    await _drain_deferred_response_create(pool, session)
+
+    response_creates = [
+        b for b in pool.broadcasts if b["command"]["type"] == "response.create"
+    ]
+    assert len(response_creates) == 1
+    # Slot drained.
+    assert session._deferred_response_create is None
+    # Drain also flipped the gate optimistically so a concurrent
+    # dispatch can't ship a second response.create over the upstream.
+    assert session.voice_provider.gate_cleared() is False
+
+
+@pytest.mark.asyncio
+async def test_drain_is_noop_when_no_deferred_frame(tmp_path):
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    # Gate clear, slot empty — drain must not invent a response.create.
+    await _drain_deferred_response_create(pool, session)
+    assert pool.broadcasts == []
+
+
+@pytest.mark.asyncio
+async def test_drain_is_noop_when_gate_still_active(tmp_path):
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session,
+        [{"type": "response.create"}],
+    )
+    assert session._deferred_response_create is not None
+    # No terminal event yet — drain must keep the slot held.
+    await _drain_deferred_response_create(pool, session)
+    assert session._deferred_response_create is not None
+    response_creates = [
+        b for b in pool.broadcasts if b["command"]["type"] == "response.create"
+    ]
+    assert response_creates == []
+
+
+@pytest.mark.asyncio
+async def test_end_voice_clears_deferred_slot(tmp_path):
+    """A re-armed voice session must not inherit a stale parked frame."""
+    from orchestrator.session import VoiceLifecycle
+
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session,
+        [{"type": "response.create"}],
+    )
+    assert session._deferred_response_create is not None
+
+    # Push the session past IDLE so end_voice runs its teardown body
+    # instead of short-circuiting on the fast-path.
+    session._voice_state = VoiceLifecycle.ACTIVE
+    # Stub the broadcast hook invoked from end_voice.
+    session._broadcast_voice_lifecycle = AsyncMock()
+    await session.end_voice("test")
+    assert session._deferred_response_create is None

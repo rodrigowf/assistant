@@ -77,6 +77,8 @@ def _voice_start_lock_for(local_id: str) -> asyncio.Lock:
     return lock
 
 
+
+
 async def _safe_send_bytes(ws: WebSocket, payload: bytes) -> bool:
     """Send to a client WS, swallowing the post-close race.
 
@@ -1187,6 +1189,11 @@ async def _handle_voice_event(
 
         commands = await session.process_voice_event(event)
         await _dispatch_voice_commands(pool, session, commands)
+        # After processing the inbound event, the provider's gate state
+        # may have advanced (e.g. ``response.done`` just flipped
+        # ``_response_active`` False). Try draining a parked
+        # ``response.create`` so a queued post-tool reply ships now.
+        await _drain_deferred_response_create(pool, session)
     except Exception as e:
         logger.exception("Voice event processing failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
@@ -1203,6 +1210,16 @@ async def _dispatch_voice_commands(
     provider, so commands need to round-trip through the orchestrator WS
     as ``voice_command`` payloads. For WS providers, the backend relay
     holds the upstream connection and sends them directly.
+
+    For WebRTC providers we additionally consult the provider's gating
+    hooks. When N tools complete concurrently each pair (``item.create``
+    + ``response.create``) is dispatched independently; OpenAI rejects
+    the 2nd+ ``response.create`` while a response is in flight. A gated
+    ``response.create`` is parked in the session's single-slot deferred
+    queue (collapsing N into 1 is the intended wire pattern: submit all
+    function-call outputs, then ask for one response over them) and
+    drained from the inbound-event mirror once the in-flight response
+    terminates.
     """
     if session.needs_voice_relay:
         for cmd in commands:
@@ -1210,9 +1227,83 @@ async def _dispatch_voice_commands(
                 await session.send_voice_event_upstream(cmd)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to forward voice command upstream")
-    else:
-        for cmd in commands:
-            await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+        return
+
+    provider = session.voice_provider
+    for cmd in commands:
+        # ``response.create`` needs gate coordination so concurrent
+        # parallel-tool dispatches don't race two sends past the check.
+        # All other frames (item.create, etc.) bypass — they don't
+        # conflict with the gate and locking them would serialize every
+        # parallel-tool dispatch needlessly.
+        if provider is not None and cmd.get("type") == "response.create":
+            send_cmd: dict | None = None
+            async with session._deferred_response_lock:
+                if provider.should_gate_event(cmd):
+                    # Single-slot — newer frame supersedes any earlier one.
+                    # Multiple deferred ``response.create``s are semantically
+                    # one (no payload, no ordering), so we keep just the latest.
+                    session._deferred_response_create = cmd
+                    logger.info(
+                        "voice_command_deferred session=%s type=%s reason=provider_gate",
+                        session.local_id,
+                        cmd.get("type"),
+                    )
+                else:
+                    # Optimistically flip the provider's active-response
+                    # flag inside the lock. The upstream's ``response.created``
+                    # mirror is one round-trip away — without this flip a
+                    # concurrent dispatch on a parallel tool would see the
+                    # gate as still clear and collide. We send the broadcast
+                    # outside the lock to avoid holding it across WS I/O.
+                    provider.mark_response_create_sent()
+                    send_cmd = cmd
+            if send_cmd is not None:
+                await pool.broadcast_orchestrator({"type": "voice_command", "command": send_cmd})
+            continue
+        await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+
+
+async def _drain_deferred_response_create(
+    pool: SessionPool,
+    session: OrchestratorSession,
+) -> None:
+    """Ship a parked ``response.create`` if the provider gate has cleared.
+
+    Called from the inbound-event mirror after ``provider.on_inbound_event``
+    has had a chance to advance the gating state machine. Cheap when there
+    is nothing to drain (lock + None check); silent when the provider has
+    been torn down between the deferral and the drain.
+    """
+    provider = session.voice_provider
+    if provider is None:
+        return
+    if not provider.gate_cleared():
+        return
+    deferred: dict | None = None
+    async with session._deferred_response_lock:
+        slot = session._deferred_response_create
+        if slot is None:
+            return
+        # Re-check the gate under the lock — a concurrent dispatch could
+        # have shipped a fresh ``response.create`` between the outer
+        # ``gate_cleared`` check and the lock acquire, flipping the
+        # provider back to active.
+        if not provider.gate_cleared():
+            return
+        session._deferred_response_create = None
+        # Flip the gate optimistically here for the same reason as in
+        # ``_dispatch_voice_commands``: a concurrent dispatch acquiring
+        # the lock right after ours releases must observe the gate as
+        # active so it defers instead of colliding on the upstream.
+        provider.mark_response_create_sent()
+        deferred = slot
+        logger.info(
+            "voice_command_drain session=%s type=%s",
+            session.local_id,
+            deferred.get("type"),
+        )
+    await pool.broadcast_orchestrator({"type": "voice_command", "command": deferred})
 
 
 def _tool_result_is_error(output: str) -> bool:

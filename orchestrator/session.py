@@ -230,6 +230,19 @@ class OrchestratorSession:
         # registry default" (currently Vertex).
         self._voice_endpoint: str | None = voice_endpoint
         self._voice_relay = None  # Set lazily for websocket providers
+        # Single-slot queue for WebRTC ``response.create`` frames the
+        # provider gated (e.g. OpenAI rejects concurrent ``response.create``
+        # with ``conversation_already_has_active_response``). The dispatch
+        # layer (``api/routes/orchestrator._dispatch_voice_commands``) writes
+        # here when ``provider.should_gate_event`` returns True, and the
+        # event mirror (``_on_event_for_frontend``) drains here once the
+        # provider reports ``gate_cleared`` after seeing the terminal
+        # ``response.done`` / ``response.cancelled`` / ``response.failed``.
+        # Coalescing N parallel-tool ``response.create`` frames into one is
+        # exactly the wire behaviour OpenAI expects: submit all
+        # ``function_call_output`` items, then ask for one response over them.
+        self._deferred_response_create: dict | None = None
+        self._deferred_response_lock: asyncio.Lock = asyncio.Lock()
         self._history_summary: str | None = None
         self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
 
@@ -1122,6 +1135,9 @@ class OrchestratorSession:
         #    audio recorder, the provider handle. No zombie behaviour.
         self._voice_provider = None
         self._voice = False
+        # Drop any in-flight gated frame so the next voice session doesn't
+        # inherit a stale ``response.create`` from the prior connection.
+        self._deferred_response_create = None
 
         async with self._voice_lock:
             if self._voice_state == VoiceLifecycle.ENDING:
@@ -1475,6 +1491,13 @@ class OrchestratorSession:
 
         if inject:
             await provider.inject_event(event)
+            # WebRTC path: events arrive here via the route layer's
+            # ``_handle_voice_event`` (mirrored from the browser data
+            # channel), so the provider's gating state machine must be
+            # advanced here. For WS providers ``inject=False`` and the
+            # relay has already called ``on_inbound_event`` — calling it
+            # again would double-count terminal events.
+            provider.on_inbound_event(event)
 
         # Delegate JSONL persistence to the per-session persister.
         # The persister owns the staged transcript buffers and the

@@ -88,6 +88,13 @@ class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         self._transcription_language = transcription_language
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._current_transcript: str = ""
+        # Tracks whether a ``response.created`` has fired without a matching
+        # terminal event. OpenAI rejects ``response.create`` while another
+        # response is in flight with ``conversation_already_has_active_response``,
+        # so the dispatch layer consults this via ``should_gate_event`` to
+        # defer parallel-tool ``response.create`` frames into a single-slot
+        # queue that drains when the active response completes.
+        self._response_active: bool = False
 
     # --- identity ---------------------------------------------------------
 
@@ -272,6 +279,52 @@ class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         if method_name is None:
             return None
         return getattr(self, method_name)(raw_event)
+
+    # --- response-active gating (parallel tool calls) ---------------------
+    #
+    # The agent can fire several tools concurrently; each tool result
+    # produces a ``conversation.item.create`` + ``response.create`` pair.
+    # OpenAI rejects the second ``response.create`` with
+    # ``conversation_already_has_active_response`` and the model never
+    # speaks. We track the active-response window from upstream events
+    # here, and the dispatch layer (api/routes/orchestrator.py
+    # ``_dispatch_voice_commands``) consults this gate before sending
+    # ``response.create`` frames, deferring any conflicts into a
+    # single-slot queue that drains once the in-flight response completes.
+
+    _RESPONSE_TERMINAL_TYPES = frozenset({
+        "response.done",
+        "response.cancelled",
+        "response.failed",
+    })
+
+    def should_gate_event(self, event: dict[str, Any]) -> bool:
+        """Defer ``response.create`` while another response is in flight."""
+        return event.get("type") == "response.create" and self._response_active
+
+    def on_inbound_event(self, event: dict[str, Any]) -> None:
+        """Track the active-response window from upstream events."""
+        evt_type = event.get("type", "")
+        if evt_type == "response.created":
+            self._response_active = True
+        elif evt_type in self._RESPONSE_TERMINAL_TYPES:
+            self._response_active = False
+
+    def gate_cleared(self) -> bool:
+        """True once no response is in flight, so a deferred frame can ship."""
+        return not self._response_active
+
+    def mark_response_create_sent(self) -> None:
+        """Optimistically flip the active-response flag at dispatch time.
+
+        The upstream's ``response.created`` event arrives some round-trip
+        later; until then ``should_gate_event`` would return False and a
+        concurrent dispatch could ship a second ``response.create`` that
+        collides with this one on the upstream. Flipping the flag at send
+        time closes that window. The eventual ``response.created`` is a
+        no-op (already True); the terminal event clears it as usual.
+        """
+        self._response_active = True
 
     # --- command formatters ----------------------------------------------
 
