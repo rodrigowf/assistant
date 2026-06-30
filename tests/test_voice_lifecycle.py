@@ -226,6 +226,44 @@ class TestEndVoiceCanonical:
         assert s.voice_state is VoiceLifecycle.ENDED
 
     @pytest.mark.asyncio
+    async def test_end_voice_cleans_up_webrtc_session_stuck_in_idle(self):
+        """Regression: WebRTC providers (OpenAI) never call
+        ``start_voice_relay`` because ``needs_voice_relay`` is False, so
+        ``_voice_state`` stayed at IDLE for the entire active session.
+        The original IDLE-shortcircuit then prevented ``end_voice`` from
+        running cleanup — ``_voice = True`` and ``_voice_provider`` were
+        retained for the lifetime of the process. Symptom: every new
+        subscriber received ``voice:true`` + ``voice_status:summarizing``
+        in their ``session_started`` payload, and clients flipped UI to
+        "Preparing conversation..." without any user action.
+
+        Fix: ``end_voice`` only fast-bails on IDLE when ``_voice`` is
+        also False (the genuine text-mode case). When ``_voice=True``
+        but state is still IDLE, run the full cleanup.
+        """
+        pool = MagicMock()
+        pool.broadcast_orchestrator = AsyncMock()
+        s = _make_session(voice=True, pool=pool)
+        # WebRTC session: voice=True, provider attached, NO relay (the
+        # OpenAI WebRTC path doesn't open an upstream WS), state still IDLE.
+        provider = _stub_provider(frames=[])  # OpenAI returns []
+        s._voice_provider = provider
+        s._voice_relay = None
+        assert s.voice_state is VoiceLifecycle.IDLE
+        assert s._voice is True
+
+        await s.end_voice("user_stop")
+
+        # State advanced to ENDED, _voice flipped False, provider released.
+        assert s.voice_state is VoiceLifecycle.ENDED
+        assert s._voice is False
+        assert s._voice_provider is None
+        assert s._voice_end_reason == "user_stop"
+        # Broadcasts fired so the frontends can clear their UI.
+        types = [c.args[0]["type"] for c in pool.broadcast_orchestrator.await_args_list]
+        assert types == ["voice_ending", "voice_ended", "voice_stopped"]
+
+    @pytest.mark.asyncio
     async def test_end_voice_tolerates_shutdown_frame_timeout(self):
         """A hung send_shutdown_frames must not block the close path."""
         pool = MagicMock()

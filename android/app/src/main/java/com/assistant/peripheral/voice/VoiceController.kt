@@ -280,6 +280,24 @@ class VoiceController(
                         voiceManager?.handleBackendCommand(update)
                     }
                 }
+                // If the backend says voice is NOT active on this session
+                // but we're stuck in a pre-start state (Summarizing /
+                // Connecting) from a prior backend broadcast — most often
+                // the ghost-voice case where the OrchestratorSession's
+                // `_voice=True` survived without an active connection and
+                // the client mirrored the stale `voice_status:summarizing`
+                // forever — clear our local UI back to Off. Only act on
+                // non-active sessions: a real voice session (`voice=true`)
+                // legitimately keeps us in Summarizing until the provider
+                // starts. Delegated to VoiceManager because that's where
+                // the `_state` flow lives; the controller mirrors it.
+                if (!event.voice) {
+                    val s = _voiceState.value
+                    if (s == VoiceState.Summarizing || s == VoiceState.Connecting) {
+                        Log.i(TAG, "session_started voice=false while UI was $s — clearing pre-start state")
+                        voiceManager?.clearPreStartState()
+                    }
+                }
             }
             is WebSocketEvent.VoiceVadState -> {
                 _vadState.value = event.state

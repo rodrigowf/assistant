@@ -1049,7 +1049,19 @@ class OrchestratorSession:
         # Fast path: no voice session ever started — nothing to tear down,
         # no broadcasts, no state churn. Text-mode ``stop()`` calls land
         # here and exit immediately.
-        if self._voice_state == VoiceLifecycle.IDLE:
+        #
+        # WebRTC providers (OpenAI) historically never transitioned out of
+        # IDLE because ``start_voice_relay`` is a no-op for them (the
+        # frontend owns the peer connection, no upstream WS to drive).
+        # That meant the IDLE-shortcircuit prevented cleanup of
+        # ``_voice = True`` + ``_voice_provider`` for the entire lifetime
+        # of the process: ``is_voice`` stayed True forever, every new
+        # subscriber received ``voice:true`` + ``voice_status:summarizing``
+        # in their ``session_started`` payload, and clients flipped UI to
+        # "Preparing conversation..." without any user voice action.
+        # Treat ``_voice == True`` as proof that voice WAS started even
+        # when the lifecycle is still IDLE so the teardown runs.
+        if self._voice_state == VoiceLifecycle.IDLE and not self._voice:
             return
         # Already ended — second caller observes the terminal state.
         if self._voice_state == VoiceLifecycle.ENDED:

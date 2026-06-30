@@ -192,6 +192,24 @@ class VoiceManager(
         currentProvider?.handleProviderEvent(event)
     }
 
+    /**
+     * Drop a stuck pre-start state (Summarizing / Connecting) that we
+     * arrived in by mirroring a backend ``voice_status`` broadcast
+     * without ever starting a provider. The VoiceController calls this
+     * on ``session_started`` payloads where the backend reports
+     * ``voice=false`` — i.e. the authoritative server view is that
+     * voice is NOT active on this session, but we're showing
+     * "Preparing conversation..." in the UI. Only clears when no
+     * provider is active so a real in-flight session is never disturbed.
+     */
+    fun clearPreStartState() {
+        if (currentProvider != null) return
+        val s = _state.value
+        if (s == VoiceState.Summarizing || s == VoiceState.Connecting) {
+            _state.value = VoiceState.Off
+        }
+    }
+
     // --- Lifecycle --------------------------------------------------------
 
     /**
