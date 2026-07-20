@@ -192,6 +192,21 @@ async def orchestrator_ws(ws: WebSocket):
                     continue
                 await _handle_send(pool, session, msg.get("text", ""))
 
+            elif msg_type == "inject_text":
+                # Deliver a shared file-link / text as a user turn. In text
+                # mode this is an ordinary send. In voice mode it's a SILENT
+                # inject — the text joins the live conversation as context
+                # without a ``response.create`` interrupting the call. Both
+                # persist a user turn to JSONL. Used by the Android share
+                # sheet + in-conversation upload button.
+                if session is None:
+                    await _safe_send_bytes(ws, orjson.dumps({
+                        "type": "error", "error": "not_started",
+                        "detail": "Send a 'start' message first",
+                    }))
+                    continue
+                await _handle_inject_text(pool, session, msg.get("text", ""))
+
             elif msg_type == "send_audio":
                 if session is None:
                     await _safe_send_bytes(ws, orjson.dumps({
@@ -1005,6 +1020,51 @@ async def _handle_send(
     except Exception as e:
         logger.exception("Orchestrator send failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "send_failed", "detail": str(e)})
+
+
+async def _handle_inject_text(
+    pool: SessionPool, session: OrchestratorSession, text: str,
+) -> None:
+    """Deliver a shared file-link / text into the orchestrator conversation.
+
+    - **Text mode** → identical to a typed message: run a full agent turn.
+    - **Voice mode (live call)** → SILENT inject. The text is persisted as a
+      user turn and pushed into the live provider conversation via
+      ``conversation.item.create`` (no ``response.create``), so it becomes
+      context the model reads on its next turn without interrupting the call.
+      Dispatched upstream for WS providers (Qwen/Gemini) or as a
+      ``voice_command`` for WebRTC (OpenAI). We also broadcast a ``user_message``
+      so every subscribed chat UI shows the shared item immediately.
+    """
+    if not text:
+        return
+
+    if not session.is_voice:
+        await _handle_send(pool, session, text)
+        return
+
+    try:
+        commands = session.build_silent_text_inject(text)
+        # Surface the shared text in the chat transcript on every subscriber.
+        await pool.broadcast_orchestrator({
+            "type": "user_message",
+            "text": text,
+            "source": "shared_inject",
+        })
+        if session.needs_voice_relay:
+            for cmd in commands:
+                try:
+                    await session.send_voice_event_upstream(cmd)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to forward shared-text inject upstream")
+        else:
+            for cmd in commands:
+                await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+    except Exception as e:
+        logger.exception("Orchestrator inject_text failed")
+        await pool.broadcast_orchestrator({
+            "type": "error", "error": "inject_text_failed", "detail": str(e),
+        })
 
 
 async def _handle_send_audio(

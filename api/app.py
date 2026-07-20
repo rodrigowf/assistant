@@ -21,7 +21,7 @@ from manager.store import SessionStore
 from .connections import ConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
 from .pool import SessionPool
-from .routes import agents, auth, chat, config, debug, mcp, orchestrator, sessions, skills, voice
+from .routes import agents, auth, chat, config, debug, mcp, orchestrator, sessions, skills, uploads, voice
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +162,7 @@ def create_app() -> FastAPI:
     app.include_router(config.router)
     app.include_router(skills.router)
     app.include_router(agents.router)
+    app.include_router(uploads.router)
     app.include_router(debug.router)
 
     # index.html must never be cached — it's the bootstrap that points to
@@ -214,6 +215,23 @@ def create_app() -> FastAPI:
             ):
                 return FileResponse(candidate)
             raise HTTPException(status_code=404)
+
+    # Uploads directory (context/uploads/ — files shared from peripherals).
+    # Exposed at /uploads/<path> so a link to an uploaded file resolves on the
+    # local network. Written by POST /api/uploads (api/routes/uploads.py).
+    # Registered before the SPA catch-all so /uploads never falls through.
+    @app.get("/uploads/{full_path:path}")
+    async def serve_upload(full_path: str):
+        if not full_path:
+            raise HTTPException(status_code=404)
+        # Resolve fresh each request — the directory may be created lazily by
+        # the first upload after startup, so a snapshot taken here at boot
+        # could be stale/None.
+        uploads_root = (project_root / "context" / "uploads").resolve()
+        candidate = (project_root / "context" / "uploads" / full_path).resolve()
+        if candidate.is_relative_to(uploads_root) and candidate.is_file():
+            return FileResponse(candidate)
+        raise HTTPException(status_code=404)
 
     # Memory directory mount: /memory/<path> → context/memory/<path>.
     # Exposes the structured memory wiki over the local network so a

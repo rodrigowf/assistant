@@ -477,6 +477,22 @@ class GeminiVoiceProviderBase(BaseVoiceProvider, ToolCallAccumulator, abc.ABC):
             },
         }]
 
+    def format_text_input(self, text: str) -> list[dict[str, Any]]:
+        """Add a user text turn to the live Gemini session WITHOUT prompting a reply.
+
+        Gemini frames client text as ``clientContent.turns``. Setting
+        ``turnComplete: false`` appends the turn to the conversation but does
+        NOT signal end-of-turn, so the model folds it into context rather than
+        responding immediately — the silent-inject contract shared-file uploads
+        want. Contrast ``format_tool_result`` which does expect a reply.
+        """
+        return [{
+            "clientContent": {
+                "turns": [{"role": "user", "parts": [{"text": text}]}],
+                "turnComplete": False,
+            },
+        }]
+
     def format_session_config(
         self,
         system: str,

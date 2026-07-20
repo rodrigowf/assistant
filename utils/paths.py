@@ -43,6 +43,17 @@ def get_public_dir() -> Path:
     return get_context_dir() / "public"
 
 
+def get_uploads_dir() -> Path:
+    """Get the uploads directory (files shared/uploaded from peripherals).
+
+    Served over HTTP at ``/uploads/<path>`` by the backend so a link to an
+    uploaded file resolves on the local network (see ``api/app.py``). Distinct
+    from ``public/`` — uploads are user-shared payloads handed to the
+    orchestrator, not framework-served static assets.
+    """
+    return get_context_dir() / "uploads"
+
+
 def get_sessions_dir() -> Path:
     """Get the sessions directory (Claude JSONL files live at context/ root)."""
     return get_context_dir()

@@ -153,6 +153,31 @@ class BaseVoiceProvider(ABC):
         as ``voice_command`` payloads to forward to the provider.
         """
 
+    def format_text_input(self, text: str) -> list[dict[str, Any]]:
+        """Build the provider commands that add a user *text* turn to the live
+        conversation WITHOUT triggering a spoken response.
+
+        Used when a file/text is shared into a session that is mid-voice-call:
+        the payload becomes part of the conversation context (the model sees it
+        on its next turn) but the assistant is not interrupted to react. Hence
+        no trailing ``response.create`` — contrast with
+        :meth:`format_tool_result`.
+
+        The default here is the OpenAI-realtime wire shape, which Qwen's
+        DashScope realtime API also accepts. Gemini overrides this (its Bidi
+        protocol frames client text differently).
+        """
+        return [
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        ]
+
     @abstractmethod
     def format_session_config(
         self,

@@ -1665,6 +1665,35 @@ class OrchestratorSession:
             async for event in self._run_agent(effective_prompt):
                 yield event
 
+    def build_silent_text_inject(self, text: str) -> list[dict[str, Any]]:
+        """Persist a shared-text user turn and return silent-inject voice commands.
+
+        Voice mode only. Used when a file link or text is shared into a session
+        that is mid-call: the text is added to the live conversation as a user
+        turn WITHOUT a ``response.create``, so the model folds it into context
+        instead of being interrupted to speak (the "inject silently" contract).
+
+        Persists a JSONL user entry (tagged ``shared_inject`` so the record
+        reflects that this arrived out-of-band, not typed) and returns the
+        provider-formatted commands for the route layer to dispatch — via
+        ``voice_command`` (WebRTC) or upstream (WS relay).
+
+        Returns an empty list if there is no active voice provider (nothing to
+        inject into); the JSONL turn is still written so the transcript is
+        complete.
+        """
+        if text:
+            self._writer.append({
+                "type": "user",
+                "message": {"role": "user", "content": text},
+                "source": "shared_inject",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        provider = self._voice_provider
+        if provider is None or not text:
+            return []
+        return provider.format_text_input(text)
+
     async def send_audio(
         self,
         audio_data: bytes | str,
