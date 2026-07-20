@@ -229,6 +229,12 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // re-subscribe on every loaded session so the backend replays
         // anything we missed via the resume protocol.
         chatController.resyncOnResume()
+        // Safety refresh of the session list on foreground: pool-watcher
+        // pushes (agent_session_opened/closed) keep it live while connected,
+        // but if the orchestrator WS was down during the background window we
+        // may have missed some — refetch so returning to the app always shows
+        // the true pool state.
+        chatController.forceRefreshSessions()
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -334,6 +340,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun interrupt() = chatController.interrupt()
     fun compact() = chatController.compact()
     fun refreshSessions() = chatController.refreshSessions()
+    /** Force a session-list refresh past the debounce (screen-entry / foreground safety). */
+    fun forceRefreshSessions() = chatController.forceRefreshSessions()
     fun closeSession(sessionId: String) = chatController.closeSession(sessionId)
     fun loadSession(sessionId: String, isOrchestrator: Boolean = false, liveLocalId: String? = null) =
         chatController.loadSession(sessionId, isOrchestrator, liveLocalId)

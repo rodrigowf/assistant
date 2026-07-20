@@ -127,6 +127,25 @@ sealed class WebSocketEvent {
      */
     data class UserMessage(val text: String) : WebSocketEvent()
 
+    /**
+     * Pool-watcher push: a session was opened anywhere (this or another client).
+     * Broadcast to every orchestrator WS (auto-registered as a watcher), so it
+     * lets the app keep its session list + live badges current in real time
+     * instead of only on manual refresh. [isOrchestrator] distinguishes the
+     * orchestrator session from regular agent sessions.
+     */
+    data class AgentSessionOpened(
+        val sessionId: String,
+        val sdkSessionId: String?,
+        val isOrchestrator: Boolean,
+    ) : WebSocketEvent()
+
+    /** Pool-watcher push: a session was closed anywhere. See [AgentSessionOpened]. */
+    data class AgentSessionClosed(
+        val sessionId: String,
+        val isOrchestrator: Boolean,
+    ) : WebSocketEvent()
+
     // Tool events
     data class ToolUse(
         val toolUseId: String,

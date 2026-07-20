@@ -574,6 +574,16 @@ class ChatController(
                 }
             }
 
+            is WebSocketEvent.AgentSessionOpened,
+            is WebSocketEvent.AgentSessionClosed -> {
+                // A session opened/closed anywhere (this or another client).
+                // Refresh so the History list + live badges track the pool in
+                // real time. Force past the debounce — a cross-client change is
+                // exactly what the debounce must not swallow. Cheap: two REST
+                // GETs, coalesced against a concurrent refresh.
+                forceRefreshSessions()
+            }
+
             is WebSocketEvent.MessageStart -> {
                 b.streamingMessageId = event.messageId
                 val newMessage = ChatMessage(
@@ -1007,6 +1017,18 @@ class ChatController(
             _sessions.value = sessionList.sortedByDescending { it.lastActivity }
             _sessionsLoading.value = false
         }
+    }
+
+    /**
+     * Refresh the session list + live pool, bypassing the debounce. Used for
+     * pool-watcher pushes and screen-entry/foreground safety refreshes where a
+     * stale list is the exact thing we're fixing — the 500 ms debounce (tuned
+     * to coalesce rapid own-action bursts) must not swallow a cross-client
+     * change. Still coalesced against itself: [refreshSessions] runs the fetch.
+     */
+    fun forceRefreshSessions() {
+        lastRefreshTime = 0L
+        refreshSessions()
     }
 
     fun closeSession(sessionId: String) {

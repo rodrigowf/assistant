@@ -457,6 +457,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 }
 
                 composable(Screen.Sessions.route) {
+                    // Safety refresh on entering History: pool-watcher pushes
+                    // keep the list live while the orchestrator WS is connected,
+                    // but a forced refetch here guarantees the true pool state
+                    // whenever the user opens the list (covers a missed-push
+                    // window, e.g. WS was down). Fires once per navigation.
+                    LaunchedEffect(Unit) { viewModel.forceRefreshSessions() }
                     SessionsScreen(
                         sessions = sessions,
                         currentSessionId = currentSessionId,

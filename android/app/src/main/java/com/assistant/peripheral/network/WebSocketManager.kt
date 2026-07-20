@@ -382,6 +382,24 @@ class WebSocketManager {
                 // Backend-originated user turn (shared file link / text).
                 "user_message" -> emit(WebSocketEvent.UserMessage(json.optString("text", "")))
 
+                // Pool-watcher pushes — a session opened/closed anywhere.
+                // Arrive on the orchestrator socket (auto-registered watcher);
+                // drive a live session-list refresh so cross-client changes
+                // show up without a manual refresh.
+                "agent_session_opened" -> emit(
+                    WebSocketEvent.AgentSessionOpened(
+                        sessionId = json.optString("session_id", ""),
+                        sdkSessionId = json.optString("sdk_session_id", "").ifEmpty { null },
+                        isOrchestrator = json.optBoolean("is_orchestrator", false),
+                    )
+                )
+                "agent_session_closed" -> emit(
+                    WebSocketEvent.AgentSessionClosed(
+                        sessionId = json.optString("session_id", ""),
+                        isOrchestrator = json.optBoolean("is_orchestrator", false),
+                    )
+                )
+
                 // Status updates
                 "status" -> emit(WebSocketEvent.Status(json.optString("status", "")))
 

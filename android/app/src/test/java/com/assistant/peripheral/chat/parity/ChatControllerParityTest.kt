@@ -568,6 +568,86 @@ class ChatControllerParityTest {
         cleanup()
     }
 
+    // =================================================================
+    // Pool-watcher pushes drive a live session-list refresh
+    // =================================================================
+
+    @Test
+    fun `agent_session_opened refreshes the live session list`() = runTest {
+        val fakes = FakeApiDeps()
+        fakes.listSessionsResponse = listOf(
+            SessionInfo(
+                sessionId = "sdk-1", localId = "loc-1", title = "New one",
+                startedAt = "", lastActivity = "2026-07-20T10:00:00",
+                messageCount = 1, isOrchestrator = false, provider = "claude"
+            )
+        )
+        fakes.livePoolResponse = listOf(
+            LiveSession(localId = "loc-1", sdkSessionId = "sdk-1", status = "idle", isOrchestrator = false, title = "New one")
+        )
+        val ctrl = controller(this, fakes)
+        // Nothing loaded yet.
+        assertTrue(ctrl.sessions.value.isEmpty())
+
+        ctrl.handleWebSocketEvent(
+            WebSocketEndpoint.ORCHESTRATOR,
+            WebSocketEvent.AgentSessionOpened("loc-1", "sdk-1", isOrchestrator = false)
+        )
+        advanceUntilIdle()
+
+        // The push forced a refetch: list + live badge now reflect the pool.
+        assertEquals(1, ctrl.sessions.value.size)
+        assertEquals("sdk-1", ctrl.sessions.value[0].sessionId)
+        assertTrue(ctrl.liveSessionIds.value.contains("sdk-1"))
+        cleanup()
+    }
+
+    @Test
+    fun `agent_session_closed refreshes and drops the stale live badge`() = runTest {
+        val fakes = FakeApiDeps()
+        // First refresh: one live session.
+        fakes.livePoolResponse = listOf(
+            LiveSession(localId = "loc-1", sdkSessionId = "sdk-1", status = "idle", isOrchestrator = false, title = "x")
+        )
+        val ctrl = controller(this, fakes)
+        ctrl.refreshSessions()
+        advanceUntilIdle()
+        assertTrue(ctrl.liveSessionIds.value.contains("sdk-1"))
+
+        // Session closed elsewhere → pool now empty; a close push must force a
+        // refetch past the debounce so the badge clears immediately.
+        fakes.livePoolResponse = emptyList()
+        ctrl.handleWebSocketEvent(
+            WebSocketEndpoint.ORCHESTRATOR,
+            WebSocketEvent.AgentSessionClosed("loc-1", isOrchestrator = false)
+        )
+        advanceUntilIdle()
+
+        assertFalse(ctrl.liveSessionIds.value.contains("sdk-1"))
+        cleanup()
+    }
+
+    @Test
+    fun `forceRefreshSessions bypasses the debounce`() = runTest {
+        val fakes = FakeApiDeps()
+        fakes.livePoolResponse = listOf(
+            LiveSession(localId = "l", sdkSessionId = "s", status = "idle", isOrchestrator = false, title = "")
+        )
+        val ctrl = controller(this, fakes)
+        // First refresh sets lastRefreshTime; a second plain refresh within the
+        // debounce window is suppressed, but forceRefreshSessions is not.
+        ctrl.refreshSessions()
+        advanceUntilIdle()
+        fakes.livePoolResponse = emptyList()
+        ctrl.refreshSessions()  // debounced — no-op
+        advanceUntilIdle()
+        assertTrue("plain refresh should be debounced", ctrl.liveSessionIds.value.contains("s"))
+        ctrl.forceRefreshSessions()  // bypasses
+        advanceUntilIdle()
+        assertFalse("force refresh should have refetched empty pool", ctrl.liveSessionIds.value.contains("s"))
+        cleanup()
+    }
+
     @Test
     fun `reconcileOrchestrator — drift while orchestrator visible adopts and reloads pool session`() = runTest {
         val fakes = FakeApiDeps()
