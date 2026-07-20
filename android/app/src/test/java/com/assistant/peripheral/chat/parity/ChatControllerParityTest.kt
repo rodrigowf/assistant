@@ -542,6 +542,33 @@ class ChatControllerParityTest {
     }
 
     @Test
+    fun `user_message event renders a user bubble in the target bucket`() = runTest {
+        val ctrl = controller(this)
+        ctrl.handleWebSocketEvent(
+            WebSocketEndpoint.ORCHESTRATOR,
+            WebSocketEvent.UserMessage("[shared file] a.png (1.0 KB, image/png) — /uploads/x-a.png")
+        )
+        advanceUntilIdle()
+
+        val msgs = ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR).messages.value
+        assertEquals(1, msgs.size)
+        assertEquals(MessageRole.USER, msgs[0].role)
+        assertTrue(msgs[0].content.startsWith("[shared file]"))
+        // Isolation: agent bucket untouched.
+        assertTrue(ctrl.bucketFor(WebSocketEndpoint.AGENT).messages.value.isEmpty())
+        cleanup()
+    }
+
+    @Test
+    fun `user_message with blank text is ignored`() = runTest {
+        val ctrl = controller(this)
+        ctrl.handleWebSocketEvent(WebSocketEndpoint.ORCHESTRATOR, WebSocketEvent.UserMessage("  "))
+        advanceUntilIdle()
+        assertTrue(ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR).messages.value.isEmpty())
+        cleanup()
+    }
+
+    @Test
     fun `reconcileOrchestrator — drift while orchestrator visible adopts and reloads pool session`() = runTest {
         val fakes = FakeApiDeps()
         fakes.paginatedResponse = PaginatedMessages(

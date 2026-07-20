@@ -1241,7 +1241,8 @@ fun ChatInputBar(
     voiceState: VoiceState,
     onStartVoice: () -> Unit,
     onStopVoice: () -> Unit,
-    isOrchestratorSession: Boolean
+    isOrchestratorSession: Boolean,
+    onUploadFile: (() -> Unit)? = null
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1263,6 +1264,29 @@ fun ChatInputBar(
                     modifier = Modifier.size(48.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
+
+                // Upload / attach a file into the orchestrator conversation.
+                // Enabled whenever connected — uploading works even mid-voice
+                // (the backend injects the link silently). Only shown for the
+                // orchestrator, which is the session the share targets.
+                if (onUploadFile != null) {
+                    IconButton(
+                        onClick = onUploadFile,
+                        enabled = isConnected,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AttachFile,
+                            contentDescription = "Upload file",
+                            tint = if (isConnected) MaterialTheme.colorScheme.onSurfaceVariant
+                                   else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
             }
 
             // Text input — always enabled while connected so the user can

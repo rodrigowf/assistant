@@ -120,6 +120,13 @@ sealed class WebSocketEvent {
     data class MessageStart(val messageId: String) : WebSocketEvent()
     object MessageEnd : WebSocketEvent()
 
+    /**
+     * A backend-originated user turn (e.g. a shared file link / text injected
+     * from another device or the share sheet). Broadcast so every subscribed
+     * client renders it as a user bubble even though this client didn't type it.
+     */
+    data class UserMessage(val text: String) : WebSocketEvent()
+
     // Tool events
     data class ToolUse(
         val toolUseId: String,
@@ -335,6 +342,13 @@ sealed class WebSocketMessage {
     // Chat messages
     data class Send(val text: String) : WebSocketMessage()
     data class SendAudio(val audioBase64: String, val format: String = "wav", val text: String? = null) : WebSocketMessage()
+    /**
+     * Deliver a shared file-link / text as a user turn. In text mode the
+     * backend runs a full agent turn; during a live voice call it's a SILENT
+     * inject (added to the conversation as context, no spoken response). Used
+     * by the share sheet + in-conversation upload button.
+     */
+    data class InjectText(val text: String) : WebSocketMessage()
 
     // Control
     object Interrupt : WebSocketMessage()

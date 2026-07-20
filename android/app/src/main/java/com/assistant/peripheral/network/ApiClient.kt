@@ -339,6 +339,56 @@ class ApiClient(private val baseUrl: String) {
         }
     }
 
+    /**
+     * Upload a file to ``POST /api/uploads`` (multipart). Returns the parsed
+     * metadata the backend writes for the stored file, or null on failure.
+     *
+     * The bytes are read by the caller (from a content:// URI) so this stays a
+     * pure network call — no Android ``ContentResolver`` dependency here.
+     *
+     * @param bytes the full file contents
+     * @param filename client filename (backend sanitizes + timestamp-prefixes it)
+     * @param contentType MIME type, defaults to octet-stream
+     */
+    suspend fun uploadFile(
+        bytes: ByteArray,
+        filename: String,
+        contentType: String = "application/octet-stream",
+    ): UploadResult? = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/uploads")
+            Log.d(TAG, "POST $url (${bytes.size} bytes, $filename)")
+
+            val fileBody = okhttp3.RequestBody.create(
+                contentType.toMediaTypeOrNull(),
+                bytes,
+            )
+            val multipart = okhttp3.MultipartBody.Builder()
+                .setType(okhttp3.MultipartBody.FORM)
+                .addFormDataPart("file", filename, fileBody)
+                .build()
+
+            val request = Request.Builder().url(url).post(multipart).build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.e(TAG, "uploadFile failed: ${response.code}")
+                return@withContext null
+            }
+            val body = response.body?.string() ?: return@withContext null
+            val json = JSONObject(body)
+            UploadResult(
+                filename = json.optString("filename", filename),
+                path = json.optString("path", ""),
+                url = json.optString("url", ""),
+                size = json.optLong("size", bytes.size.toLong()),
+                contentType = json.optString("content_type", contentType),
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "uploadFile error: ${e.message}", e)
+            null
+        }
+    }
+
     /** Back-compat alias. Returns just the OpenAI ephemeral token + TTL. */
     suspend fun getVoiceToken(): VoiceTokenResponse? {
         val info = startVoiceSession() ?: return null
@@ -1008,6 +1058,19 @@ class ApiClient(private val baseUrl: String) {
         )
     }
 }
+
+/**
+ * Result of a successful ``POST /api/uploads``. [url] is the network path the
+ * file is reachable at (``/uploads/<name>``); [path] is the absolute on-disk
+ * path for the orchestrator's filesystem tools.
+ */
+data class UploadResult(
+    val filename: String,
+    val path: String,
+    val url: String,
+    val size: Long,
+    val contentType: String,
+)
 
 /**
  * Voice token response from the server.

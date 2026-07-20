@@ -436,6 +436,15 @@ class ChatController(
                     // `orchestrator_active` falls through to the recovery
                     // path instead of opening a stale conflict dialog.
                     intendedOrchestratorLocalId.set(null)
+                    // Flush any shared file/text that arrived while the
+                    // orchestrator WS was still down (share sheet opened the app).
+                    pendingSharedInject?.let { queued ->
+                        pendingSharedInject = null
+                        webSocketManager.send(
+                            WebSocketMessage.InjectText(queued),
+                            endpoint = WebSocketEndpoint.ORCHESTRATOR,
+                        )
+                    }
                 }
 
                 // Track the true JSONL session ID for voice resume. On
@@ -547,6 +556,22 @@ class ChatController(
             is WebSocketEvent.Disconnected -> {
                 b.streamingMessageId = null
                 b.sessionStatus.value = "disconnected"
+            }
+
+            is WebSocketEvent.UserMessage -> {
+                // A user turn the backend injected (shared file link / text
+                // from the share sheet, upload button, or another device).
+                // Render it as a user bubble; the streaming assistant reply (if
+                // any) arrives via the normal MessageStart/TextDelta path.
+                if (event.text.isNotBlank()) {
+                    b.messages.update {
+                        it + ChatMessage(
+                            role = MessageRole.USER,
+                            content = event.text,
+                            blocks = listOf(MessageBlock.Text(event.text)),
+                        )
+                    }
+                }
             }
 
             is WebSocketEvent.MessageStart -> {
@@ -808,6 +833,59 @@ class ChatController(
         b.sessionStatus.value = "processing"
         webSocketManager.send(WebSocketMessage.Send(text), endpoint = currentEndpoint())
     }
+
+    /**
+     * Deliver a shared file-link / text into the orchestrator conversation as
+     * a user turn. Targets the orchestrator endpoint regardless of which bucket
+     * is currently on screen (a share can arrive while an agent session is
+     * visible). The backend decides text-turn vs silent voice-inject.
+     *
+     * Reconciles against the pool first so the message lands on the session the
+     * backend actually has open, then ensures the orchestrator WS is connected
+     * (opening it if needed) before sending. Optimistically renders the user
+     * bubble only when the orchestrator is the visible bucket — otherwise the
+     * message still sends but stays off the current (agent) screen; the
+     * backend's user_message broadcast will surface it when the user switches.
+     */
+    fun injectSharedText(text: String, onNeedsConnect: () -> Unit) {
+        if (text.isBlank()) return
+        scope.launch {
+            // Correct any drift so we target the real live orchestrator.
+            val live = getLivePool().firstOrNull { it.isOrchestrator }
+            val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
+            if (live != null && orchBucket.currentLocalId.value != live.localId) {
+                orchBucket.currentLocalId.value = live.localId
+                settingsRepository.persistOrchestratorLocalId(live.localId)
+            }
+
+            if (_isOrchestratorSession.value) {
+                orchBucket.messages.update {
+                    it + ChatMessage(
+                        role = MessageRole.USER,
+                        content = text,
+                        blocks = listOf(MessageBlock.Text(text)),
+                    )
+                }
+            }
+
+            if (webSocketManager.isConnected(WebSocketEndpoint.ORCHESTRATOR)) {
+                webSocketManager.send(
+                    WebSocketMessage.InjectText(text),
+                    endpoint = WebSocketEndpoint.ORCHESTRATOR,
+                )
+            } else {
+                // Not connected — queue the inject and open the orchestrator WS.
+                // The connect probe adopts the live orchestrator (or reports
+                // none); the orchestrator SessionStarted handler flushes the
+                // queued inject once the socket is subscribed.
+                pendingSharedInject = text
+                onNeedsConnect()
+            }
+        }
+    }
+
+    /** Shared text queued while the orchestrator WS was down; flushed on orchestrator SessionStarted. */
+    private var pendingSharedInject: String? = null
 
     fun interrupt() {
         webSocketManager.send(WebSocketMessage.Interrupt, endpoint = currentEndpoint())

@@ -236,6 +236,101 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     // ─────────────────────────────────────────────────────────────────
 
     fun sendMessage(text: String) = chatController.sendMessage(text)
+
+    // ─────────────────────────────────────────────────────────────────
+    // Share / upload into the orchestrator conversation.
+    //
+    // Both entry points (the in-conversation upload button and the system
+    // share sheet) funnel here. Text goes straight in as an inject; files are
+    // uploaded to context/uploads first, then their link + metadata is injected
+    // so the orchestrator can decide what to do. The inject lands as a normal
+    // text turn, or — during a live voice call — as a silent context add.
+    // ─────────────────────────────────────────────────────────────────
+
+    /** A one-shot toast surfaced to the UI for share/upload feedback. */
+    val shareToast: SharedFlow<String> get() = _shareToast
+    private val _shareToast = MutableSharedFlow<String>(extraBufferCapacity = 4)
+
+    /** Share plain text into the orchestrator conversation. */
+    fun shareText(text: String, extraSubject: String? = null) {
+        val trimmed = text.trim()
+        if (trimmed.isBlank()) return
+        val header = extraSubject?.takeIf { it.isNotBlank() }?.let { "[shared text] $it" }
+            ?: "[shared text]"
+        chatController.injectSharedText("$header\n$trimmed", onNeedsConnect = { connect() })
+    }
+
+    /**
+     * Upload a shared/picked file to the backend, then inject its link +
+     * metadata into the orchestrator conversation. [subject] carries any
+     * accompanying title/subject from the share intent.
+     */
+    fun shareFile(uri: android.net.Uri, subject: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val client = apiClient
+            if (client == null) {
+                _shareToast.tryEmit("Not connected — can't upload yet.")
+                return@launch
+            }
+            val resolver = getApplication<Application>().contentResolver
+            val (name, mime) = resolveFileMeta(uri)
+            val bytes = try {
+                resolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (e: Exception) {
+                Log.e(TAG, "shareFile: read failed", e)
+                null
+            }
+            if (bytes == null) {
+                _shareToast.tryEmit("Couldn't read the shared file.")
+                return@launch
+            }
+            val result = client.uploadFile(bytes, name, mime)
+            if (result == null) {
+                _shareToast.tryEmit("Upload failed.")
+                return@launch
+            }
+            val message = buildString {
+                append("[shared file] ")
+                append(result.filename)
+                append(" (")
+                append(humanSize(result.size))
+                append(", ")
+                append(result.contentType)
+                append(") — ")
+                append(result.url)
+                subject?.takeIf { it.isNotBlank() }?.let { append("\nNote: ").append(it) }
+                append("\nLocal path: ").append(result.path)
+            }
+            chatController.injectSharedText(message, onNeedsConnect = { connect() })
+            _shareToast.tryEmit("Shared ${result.filename}.")
+        }
+    }
+
+    /** Resolve a display name + MIME for a content:// (or file://) URI. */
+    private fun resolveFileMeta(uri: android.net.Uri): Pair<String, String> {
+        val resolver = getApplication<Application>().contentResolver
+        val mime = resolver.getType(uri) ?: "application/octet-stream"
+        var name = uri.lastPathSegment ?: "upload"
+        try {
+            resolver.query(uri, null, null, null, null)?.use { cursor ->
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && cursor.moveToFirst()) {
+                    cursor.getString(idx)?.let { name = it }
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "resolveFileMeta: query failed, using fallback name", e)
+        }
+        return name to mime
+    }
+
+    private fun humanSize(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(java.util.Locale.US, "%.1f KB", kb)
+        val mb = kb / 1024.0
+        return String.format(java.util.Locale.US, "%.1f MB", mb)
+    }
     fun interrupt() = chatController.interrupt()
     fun compact() = chatController.compact()
     fun refreshSessions() = chatController.refreshSessions()

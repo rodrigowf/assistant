@@ -252,6 +252,10 @@ class WebSocketManager {
                 put("type", "send")
                 put("text", message.text)
             }
+            is WebSocketMessage.InjectText -> JSONObject().apply {
+                put("type", "inject_text")
+                put("text", message.text)
+            }
             is WebSocketMessage.SendAudio -> JSONObject().apply {
                 put("type", "send_audio")
                 put("audio", message.audioBase64)
@@ -374,6 +378,9 @@ class WebSocketManager {
                         ))
                     }
                 }
+
+                // Backend-originated user turn (shared file link / text).
+                "user_message" -> emit(WebSocketEvent.UserMessage(json.optString("text", "")))
 
                 // Status updates
                 "status" -> emit(WebSocketEvent.Status(json.optString("status", "")))

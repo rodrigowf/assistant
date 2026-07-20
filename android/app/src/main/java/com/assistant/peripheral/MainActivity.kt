@@ -65,6 +65,37 @@ class MainActivity : ComponentActivity() {
     var onTalkWordDetected: (() -> Unit)? = null
     var onWakeWordDetected: (() -> Unit)? = null
 
+    /**
+     * A payload shared into the app via ACTION_SEND (share sheet). Observed by
+     * the AssistantApp composable, which dispatches it to the ViewModel
+     * (upload+inject for files, direct inject for text) and clears it. A
+     * StateFlow so a share arriving before the composable is ready (cold launch)
+     * isn't lost — the collector picks up whatever value is current.
+     */
+    val sharedPayload = kotlinx.coroutines.flow.MutableStateFlow<SharedPayload?>(null)
+
+    sealed class SharedPayload {
+        data class Text(val text: String, val subject: String?) : SharedPayload()
+        data class File(val uri: android.net.Uri, val subject: String?) : SharedPayload()
+    }
+
+    /** Parse an ACTION_SEND intent into a [SharedPayload], or null if it isn't one. */
+    private fun parseShareIntent(intent: Intent?): SharedPayload? {
+        if (intent?.action != Intent.ACTION_SEND) return null
+        val subject = intent.getStringExtra(Intent.EXTRA_SUBJECT)
+        val streamUri: android.net.Uri? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+        if (streamUri != null) return SharedPayload.File(streamUri, subject)
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        if (!text.isNullOrBlank()) return SharedPayload.Text(text, subject)
+        return null
+    }
+
     private val wakeWordReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
@@ -86,6 +117,10 @@ class MainActivity : ComponentActivity() {
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(wakeWordReceiver, filter)
 
+        // A share (ACTION_SEND) that cold-launched the app — stash it for the
+        // composable's collector to dispatch once the ViewModel is up.
+        parseShareIntent(intent)?.let { sharedPayload.value = it }
+
         setContent {
             val viewModel: AssistantViewModel = viewModel()
             val settings by viewModel.settings.collectAsState()
@@ -104,6 +139,8 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // A share arriving while the app is already running.
+        parseShareIntent(intent)?.let { sharedPayload.value = it }
         // Wake word fired while activity was already running (e.g. screen locked).
         // The activity is brought to front via FLAG_ACTIVITY_REORDER_TO_FRONT; we also
         // need to explicitly turn the screen on for pre-O devices (attribute alone isn't enough
@@ -218,6 +255,34 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         viewModel.toastMessage.collect { msg ->
             android.widget.Toast.makeText(toastContext, msg, android.widget.Toast.LENGTH_LONG).show()
         }
+    }
+    // Share/upload feedback toasts.
+    LaunchedEffect(Unit) {
+        viewModel.shareToast.collect { msg ->
+            android.widget.Toast.makeText(toastContext, msg, android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+    // File picker for the in-conversation upload button. GetContent returns a
+    // content:// URI the ViewModel reads + uploads. "*/*" so any file type can
+    // be shared into the orchestrator.
+    val uploadPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri: android.net.Uri? ->
+        uri?.let { viewModel.shareFile(it) }
+    }
+    // Dispatch a payload shared into the app via the system share sheet. Files
+    // upload then inject their link; text injects directly. Cleared after
+    // handling so a config change doesn't re-fire it.
+    val sharedPayload by activity.sharedPayload.collectAsState()
+    LaunchedEffect(sharedPayload) {
+        when (val payload = sharedPayload) {
+            is MainActivity.SharedPayload.Text ->
+                viewModel.shareText(payload.text, payload.subject)
+            is MainActivity.SharedPayload.File ->
+                viewModel.shareFile(payload.uri, payload.subject)
+            null -> {}
+        }
+        if (sharedPayload != null) activity.sharedPayload.value = null
     }
 
     // Wire talk-word detection: start a single turn-based voice message recording.
@@ -522,7 +587,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 voiceState = voiceState,
                 onStartVoice = viewModel::startVoiceSession,
                 onStopVoice = viewModel::stopVoiceSession,
-                isOrchestratorSession = isOrchestratorSession
+                isOrchestratorSession = isOrchestratorSession,
+                onUploadFile = { uploadPicker.launch("*/*") }
             )
         }
 
