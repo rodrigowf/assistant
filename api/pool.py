@@ -323,6 +323,7 @@ class SessionPool:
             "type": "agent_session_opened",
             "session_id": lid,
             "sdk_session_id": sm.sdk_session_id,
+            "is_orchestrator": False,
         })
 
         return lid
@@ -379,7 +380,11 @@ class SessionPool:
                 "sdk_session_id": sm.sdk_session_id,
             })
         await self._broadcast_session(session_id, {"type": "session_stopped"})
-        await self._notify_watchers({"type": "agent_session_closed", "session_id": session_id})
+        await self._notify_watchers({
+            "type": "agent_session_closed",
+            "session_id": session_id,
+            "is_orchestrator": False,
+        })
 
         self._subscribers.pop(session_id, None)
         self._locks.pop(session_id, None)
@@ -509,11 +514,25 @@ class SessionPool:
         """Return the active OrchestratorSession, or None."""
         return self._orchestrator
 
-    def set_orchestrator(self, session_id: str, session: Any) -> None:
-        """Register a freshly-started OrchestratorSession."""
+    async def set_orchestrator(self, session_id: str, session: Any) -> None:
+        """Register a freshly-started OrchestratorSession.
+
+        Notifies pool watchers with an ``agent_session_opened`` carrying
+        ``is_orchestrator: True`` so peripheral clients can refresh their live
+        list the moment the orchestrator appears — previously the orchestrator's
+        pool membership was invisible to watchers (only regular agent sessions
+        broadcast), so a session-list on another device stayed stale until a
+        manual refresh.
+        """
         self._orchestrator = session
         self._orchestrator_id = session_id
         self._orchestrator_subs = set()
+        await self._notify_watchers({
+            "type": "agent_session_opened",
+            "session_id": session_id,
+            "sdk_session_id": getattr(session, "jsonl_id", session_id),
+            "is_orchestrator": True,
+        })
 
     def subscribe_orchestrator(self, session_id: str, ws: WebSocket) -> bool:
         """Add a WebSocket subscriber to the active orchestrator.
@@ -562,6 +581,16 @@ class SessionPool:
         self._orchestrator = None
         self._orchestrator_id = None
         self._orchestrator_subs.clear()
+        # Tell pool watchers the orchestrator left the pool so their live list
+        # drops it immediately (mirrors the agent_session_closed regular
+        # sessions already emit). Guarded on local_id — a redundant stop with
+        # nothing registered shouldn't emit a phantom close.
+        if local_id is not None:
+            await self._notify_watchers({
+                "type": "agent_session_closed",
+                "session_id": local_id,
+                "is_orchestrator": True,
+            })
         if session is None or not hasattr(session, "stop"):
             return
         # Park the session in the stopping slot so a concurrent start

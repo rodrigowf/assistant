@@ -696,7 +696,7 @@ async def _handle_start(
         )
 
     _t_pool = time.monotonic()
-    pool.set_orchestrator(session_id, session)
+    await pool.set_orchestrator(session_id, session)
     pool.subscribe_orchestrator(session_id, ws)
     if voice:
         logger.info(

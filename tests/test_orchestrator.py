@@ -953,7 +953,8 @@ class TestSessionStoreOrchestrator:
 
 
 class TestSessionPoolOrchestrator:
-    def test_set_and_has_orchestrator(self):
+    @pytest.mark.asyncio
+    async def test_set_and_has_orchestrator(self):
         from api.pool import SessionPool
 
         pool = SessionPool()
@@ -961,18 +962,21 @@ class TestSessionPoolOrchestrator:
         assert pool.orchestrator_id is None
 
         mock_session = MagicMock()
-        pool.set_orchestrator("s1", mock_session)
+        mock_session.jsonl_id = "s1"
+        await pool.set_orchestrator("s1", mock_session)
         assert pool.has_orchestrator()
         assert pool.orchestrator_id == "s1"
         assert pool.get_orchestrator() is mock_session
 
-    def test_subscribe_orchestrator(self):
+    @pytest.mark.asyncio
+    async def test_subscribe_orchestrator(self):
         from api.pool import SessionPool
 
         pool = SessionPool()
         mock_ws = MagicMock()
         mock_session = MagicMock()
-        pool.set_orchestrator("s1", mock_session)
+        mock_session.jsonl_id = "s1"
+        await pool.set_orchestrator("s1", mock_session)
 
         assert pool.subscribe_orchestrator("s1", mock_ws) is True
         assert pool.orchestrator_subscriber_count == 1
@@ -993,7 +997,8 @@ class TestSessionPoolOrchestrator:
 
         pool = SessionPool()
         mock_session = AsyncMock()
-        pool.set_orchestrator("s1", mock_session)
+        mock_session.jsonl_id = "s1"
+        await pool.set_orchestrator("s1", mock_session)
 
         await pool.stop_orchestrator()
         assert not pool.has_orchestrator()
