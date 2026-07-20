@@ -836,7 +836,80 @@ class ChatController(
                 resumeSdkId = resumeSdkId,
             )
         }
+        // The pool is authoritatively single-orchestrator (api/pool.py). If the
+        // backend orchestrator changed while we were connected+idle (another
+        // device replaced it, a restart minted a new one), our persisted
+        // orchestrator local_id can drift from the pool's truth. Re-probe and
+        // correct so features that target "the open orchestrator" (upload /
+        // share) resolve to the session that actually exists on the server.
+        reconcileOrchestrator()
     }
+
+    /**
+     * Reconcile the orchestrator bucket's ``currentLocalId`` against the
+     * backend pool's single live orchestrator.
+     *
+     * The connect-time probe ([OrchestratorConnectionController.onWsConnected])
+     * already adopts the live orchestrator on a fresh handshake, and the
+     * conflict mediator ([requestLoadOrchestratorSession] et al.) reconciles on
+     * user-initiated opens. Neither covers the "already connected, orchestrator
+     * changed underneath us" case — the ``userPickedBucket`` guard deliberately
+     * won't re-select the bucket, but that must not leave us pointing at a
+     * ``local_id`` the pool no longer holds. This closes that gap.
+     *
+     * Behaviour:
+     *  - No live orchestrator, or ids already match → no-op.
+     *  - Drift while the orchestrator session is on screen → adopt the live id
+     *    and re-open it (Start with the live sdk id) so the UI follows the pool.
+     *  - Drift while an agent session is on screen → silently correct the
+     *    orchestrator bucket's id (+ persist) so a later switch is accurate; we
+     *    do NOT yank the user off their agent session.
+     *
+     * Safe to call repeatedly (foreground, post-connect). Best-effort — a pool
+     * fetch failure leaves state untouched.
+     */
+    fun reconcileOrchestrator() {
+        scope.launch {
+            val live = getLivePool().firstOrNull { it.isOrchestrator } ?: return@launch
+            val orchBucket = bucket(WebSocketEndpoint.ORCHESTRATOR)
+            if (orchBucket.currentLocalId.value == live.localId) return@launch
+
+            Log.i(
+                TAG,
+                "reconcileOrchestrator: drift detected " +
+                    "bucket=${orchBucket.currentLocalId.value} pool=${live.localId}; adopting pool id"
+            )
+
+            if (_isOrchestratorSession.value) {
+                // Orchestrator is the visible session — follow the pool so the
+                // user sees the conversation the backend actually has open.
+                // loadSession sets currentLocalId to liveLocalId on its own.
+                orchBucket.pendingResumeSessionId.value = live.sdkSessionId
+                loadSession(
+                    sessionId = live.sdkSessionId,
+                    isOrchestrator = true,
+                    liveLocalId = live.localId,
+                )
+            } else {
+                // Agent session visible — correct the orchestrator bucket id in
+                // place without disrupting what's on screen.
+                orchBucket.currentLocalId.value = live.localId
+            }
+            // Persist AFTER the in-memory correction so a suspension here (the
+            // DataStore write hops to Dispatchers.IO) never delays the
+            // observable state the callers of activeOrchestratorLocalId() read.
+            settingsRepository.persistOrchestratorLocalId(live.localId)
+        }
+    }
+
+    /**
+     * The trusted target for "the open orchestrator conversation" — the pool's
+     * live orchestrator local_id if the bucket has been reconciled to it, else
+     * the orchestrator bucket's current local_id. Upload / share resolve their
+     * destination through this so they never target a stale session.
+     */
+    fun activeOrchestratorLocalId(): String =
+        bucket(WebSocketEndpoint.ORCHESTRATOR).currentLocalId.value
 
     fun compact() {
         webSocketManager.send(WebSocketMessage.Compact, endpoint = currentEndpoint())

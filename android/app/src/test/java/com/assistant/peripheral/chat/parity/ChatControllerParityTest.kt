@@ -484,4 +484,86 @@ class ChatControllerParityTest {
         )
         cleanup()
     }
+
+    // =================================================================
+    // Extra: reconcileOrchestrator — pool drift correction
+    // =================================================================
+
+    @Test
+    fun `reconcileOrchestrator — no live orchestrator is a no-op`() = runTest {
+        val fakes = FakeApiDeps()
+        fakes.livePoolResponse = emptyList()
+        val ctrl = controller(this, fakes)
+        val orchBucket = ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR)
+        val before = orchBucket.currentLocalId.value
+
+        ctrl.reconcileOrchestrator()
+        advanceUntilIdle()
+
+        assertEquals("bucket id must be untouched when no live orchestrator", before, orchBucket.currentLocalId.value)
+        cleanup()
+    }
+
+    @Test
+    fun `reconcileOrchestrator — matching id is a no-op`() = runTest {
+        val fakes = FakeApiDeps()
+        val ctrl = controller(this, fakes)
+        val orchBucket = ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR)
+        val current = orchBucket.currentLocalId.value
+        fakes.livePoolResponse = listOf(
+            LiveSession(localId = current, sdkSessionId = "sdk-x", status = "idle", isOrchestrator = true, title = "")
+        )
+
+        ctrl.reconcileOrchestrator()
+        advanceUntilIdle()
+
+        assertEquals(current, orchBucket.currentLocalId.value)
+        assertEquals(current, ctrl.activeOrchestratorLocalId())
+        cleanup()
+    }
+
+    @Test
+    fun `reconcileOrchestrator — drift while agent visible corrects bucket id silently`() = runTest {
+        val fakes = FakeApiDeps()
+        val ctrl = controller(this, fakes)
+        val orchBucket = ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR)
+        // Agent session visible (isOrchestratorSession stays false by default).
+        fakes.livePoolResponse = listOf(
+            LiveSession(localId = "pool-local", sdkSessionId = "pool-sdk", status = "idle", isOrchestrator = true, title = "")
+        )
+
+        ctrl.reconcileOrchestrator()
+        advanceUntilIdle()
+
+        assertFalse("must not yank the user onto orchestrator", ctrl.isOrchestratorSession.value)
+        assertEquals("orchestrator bucket id corrected in place", "pool-local", orchBucket.currentLocalId.value)
+        assertEquals("pool-local", ctrl.activeOrchestratorLocalId())
+        cleanup()
+    }
+
+    @Test
+    fun `reconcileOrchestrator — drift while orchestrator visible adopts and reloads pool session`() = runTest {
+        val fakes = FakeApiDeps()
+        fakes.paginatedResponse = PaginatedMessages(
+            messages = listOf(ChatMessage(role = MessageRole.USER, content = "pooled")),
+            totalCount = 1, hasMore = false, startIndex = 0
+        )
+        val ctrl = controller(this, fakes)
+        // Make the orchestrator the visible session.
+        ctrl.handleConnectionEvent(ConnectionEvent.OrchestratorAdopted("stale-local", "stale-sdk"))
+        advanceUntilIdle()
+        assertTrue(ctrl.isOrchestratorSession.value)
+
+        // Pool now holds a different orchestrator.
+        fakes.livePoolResponse = listOf(
+            LiveSession(localId = "new-local", sdkSessionId = "new-sdk", status = "idle", isOrchestrator = true, title = "")
+        )
+        ctrl.reconcileOrchestrator()
+        advanceUntilIdle()
+
+        val orchBucket = ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR)
+        assertEquals("adopted pool local id", "new-local", orchBucket.currentLocalId.value)
+        assertEquals("new-local", ctrl.activeOrchestratorLocalId())
+        cleanup()
+    }
 }
