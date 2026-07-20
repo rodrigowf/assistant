@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { listPoolSessions } from "../api/rest";
 import { useTabsContext } from "../context/TabsContext";
 
@@ -24,31 +24,29 @@ export function useReconnectPoolSessions() {
   const openTabRef = useRef(openTab);
   openTabRef.current = openTab;
 
+  // Stable callback so callers (e.g. an app-level pool-watcher handler) can
+  // trigger a re-sync the moment a session opens on another client, instead of
+  // waiting for the next visibilitychange.
+  const syncPoolSessions = useCallback(() => {
+    listPoolSessions()
+      .then((sessions) => {
+        for (const s of sessions) {
+          if (isTabOpenRef.current(s.local_id)) continue;
+          const title = s.title || (s.is_orchestrator ? "Orchestrator" : "Session");
+          openTabRef.current(
+            s.local_id,
+            title,
+            s.is_orchestrator,
+            s.sdk_session_id ?? undefined,
+          );
+        }
+      })
+      .catch(() => {
+        // Backend not ready or no live sessions — silently ignore
+      });
+  }, []);
+
   useEffect(() => {
-    let cancelled = false;
-
-    function syncPoolSessions() {
-      listPoolSessions()
-        .then((sessions) => {
-          if (cancelled) return;
-          for (const s of sessions) {
-            // Don't open a tab that's already open
-            if (isTabOpenRef.current(s.local_id)) continue;
-
-            const title = s.title || (s.is_orchestrator ? "Orchestrator" : "Session");
-            openTabRef.current(
-              s.local_id,
-              title,
-              s.is_orchestrator,
-              s.sdk_session_id ?? undefined,
-            );
-          }
-        })
-        .catch(() => {
-          // Backend not ready or no live sessions — silently ignore
-        });
-    }
-
     // Sync on mount
     syncPoolSessions();
 
@@ -61,9 +59,9 @@ export function useReconnectPoolSessions() {
     document.addEventListener("visibilitychange", onVisibilityChange);
 
     return () => {
-      cancelled = true;
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Refs are stable — no deps needed
+  }, [syncPoolSessions]);
+
+  return { syncPoolSessions };
 }

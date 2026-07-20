@@ -202,12 +202,18 @@ function OrchestratorChatPanel({
 export function ChatPanelContainer({
   sessions,
   onSessionChange,
+  onPoolChanged,
   onMutationBusy,
 }: {
   /** Authoritative session list — used to resolve titles for tabs opened by
    *  the orchestrator (where we'd otherwise fall back to "Agent xxxxxxxx"). */
   sessions: SessionInfo[];
   onSessionChange: () => void;
+  /** A session opened/closed anywhere in the pool (watcher push). Refreshes the
+   *  sidebar list + re-syncs the live pool so cross-client changes show up
+   *  immediately. Distinct from onSessionChange (which only refreshes the list
+   *  on this client's own turn completions/mutations). */
+  onPoolChanged?: () => void;
   /** Called with a label while a longer mutation (rewind / fork) is in
    *  flight, then again with null when it finishes. Lets the app render a
    *  whole-viewport busy overlay so the user doesn't keep clicking. */
@@ -300,18 +306,22 @@ export function ChatPanelContainer({
         : undefined;
       const title = known?.title || `Agent ${agentSessionId.slice(0, 8)}`;
       openTab(agentSessionId, title, false, sdkSessionId);
-      // Kick the sidebar to pick up brand-new sessions that may already have
-      // a JSONL (resumed sessions land in the list immediately on next refresh).
-      onSessionChange();
+      // Refresh the sidebar list + re-sync the live pool so a session opened
+      // anywhere (this client's orchestrator OR another device) appears with a
+      // live badge immediately.
+      (onPoolChanged ?? onSessionChange)();
     },
-    [openTab, onSessionChange]
+    [openTab, onSessionChange, onPoolChanged]
   );
 
   const handleAgentSessionClosed = useCallback(
     (agentSessionId: string) => {
       closeTab(agentSessionId);
+      // A session closed anywhere — refresh so the sidebar drops it and any
+      // stale live badge clears without waiting for a tab-focus.
+      (onPoolChanged ?? onSessionChange)();
     },
-    [closeTab]
+    [closeTab, onSessionChange, onPoolChanged]
   );
 
   const handleSessionClosed = useCallback(

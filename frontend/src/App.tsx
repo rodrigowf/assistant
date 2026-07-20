@@ -16,7 +16,17 @@ import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
   const { sessions, deleting, duplicating, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
-  useReconnectPoolSessions();
+  const { syncPoolSessions } = useReconnectPoolSessions();
+
+  // A session opened/closed anywhere (pool-watcher push arriving on an
+  // orchestrator tab's WS). Refresh the sidebar history list AND re-sync the
+  // live pool so a session started on another client (Android, another
+  // browser) gets a tab + live badge immediately — not only on the next
+  // tab-focus. Closed sessions drop out of the list on the same refresh.
+  const handlePoolChanged = useCallback(() => {
+    refresh();
+    syncPoolSessions();
+  }, [refresh, syncPoolSessions]);
   // Mutation in flight from ChatPanelContainer (rewind / fork). Shown as a
   // whole-app spinner overlay so the user can't queue a second mutation
   // while the first is still talking to the backend + reopening tabs.
@@ -144,7 +154,7 @@ function AppContent() {
           </button>
           <TabBar sessions={sessions} onRename={renameSession} />
         </div>
-        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onMutationBusy={setChatMutationBusy} />
+        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onPoolChanged={handlePoolChanged} onMutationBusy={setChatMutationBusy} />
         {/* Config floats over everything — chat instances stay mounted */}
         <Suspense fallback={null}>
           <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />

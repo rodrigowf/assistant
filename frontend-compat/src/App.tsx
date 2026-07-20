@@ -15,7 +15,13 @@ import { generateUUID } from "@/utils/uuid";
 
 function AppContent() {
   const { sessions, deleting, duplicating, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
-  useReconnectPoolSessions();
+  const { syncPoolSessions } = useReconnectPoolSessions();
+  // Pool-watcher push (session opened/closed anywhere): refresh the sidebar +
+  // re-sync the live pool so cross-client changes show up immediately.
+  const handlePoolChanged = useCallback(() => {
+    refresh();
+    syncPoolSessions();
+  }, [refresh, syncPoolSessions]);
   const [chatMutationBusy, setChatMutationBusy] = useState<string | null>(null);
   const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
@@ -126,7 +132,7 @@ function AppContent() {
           </button>
           <TabBar sessions={sessions} onRename={renameSession} />
         </div>
-        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onMutationBusy={setChatMutationBusy} />
+        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onPoolChanged={handlePoolChanged} onMutationBusy={setChatMutationBusy} />
         <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />
       </main>
       {showOrchestratorModal && (
