@@ -88,10 +88,23 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         supports_vision=True,
         max_tokens=16384,
     ),
-    "gpt-4o-audio-preview": ModelInfo(
+    # Audio-capable chat models. OpenAI RENAMED the old `gpt-4o-audio-preview`
+    # to the `gpt-audio` family; `gpt-4o-audio-preview` now 404s for accounts
+    # provisioned after the rename (verified 2026-07-21 against this account:
+    # gpt-4o-audio-preview -> 404 model_not_found; gpt-audio / gpt-audio-mini ->
+    # OK with input_audio). Use `gpt-audio` for the voice/talk path.
+    "gpt-audio": ModelInfo(
         provider=Provider.OPENAI,
-        model_id="gpt-4o-audio-preview",
-        display_name="GPT-4o Audio",
+        model_id="gpt-audio",
+        display_name="GPT Audio 🔊",
+        supports_audio=True,
+        supports_vision=True,
+        max_tokens=16384,
+    ),
+    "gpt-audio-mini": ModelInfo(
+        provider=Provider.OPENAI,
+        model_id="gpt-audio-mini",
+        display_name="GPT Audio Mini 🔊",
         supports_audio=True,
         supports_vision=True,
         max_tokens=16384,
@@ -100,15 +113,7 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
         provider=Provider.OPENAI,
         model_id="gpt-4o-mini",
         display_name="GPT-4o Mini",
-        supports_audio=False,  # Use gpt-4o-mini-audio-preview for audio
-        supports_vision=True,
-        max_tokens=16384,
-    ),
-    "gpt-4o-mini-audio-preview": ModelInfo(
-        provider=Provider.OPENAI,
-        model_id="gpt-4o-mini-audio-preview",
-        display_name="GPT-4o Mini Audio",
-        supports_audio=True,
+        supports_audio=False,  # Use gpt-audio-mini for audio
         supports_vision=True,
         max_tokens=16384,
     ),
@@ -121,8 +126,15 @@ AVAILABLE_MODELS: dict[str, ModelInfo] = {
     ),
 }
 
-# Default model
-DEFAULT_MODEL_ID = "gpt-4o-audio-preview"
+# Default model — audio-capable so the voice/talk path works out of the box.
+# (Was gpt-4o-audio-preview, which 404s on accounts created after OpenAI's
+# rename to the gpt-audio family.)
+DEFAULT_MODEL_ID = "gpt-audio"
+
+# Model the session auto-switches to when it must handle audio input but the
+# active model can't (see OrchestratorSession._send_audio_inner). Single source
+# of truth so there's one place to change if the account's audio model changes.
+AUDIO_FALLBACK_MODEL_ID = "gpt-audio"
 
 
 def get_available_models() -> list[ModelInfo]:

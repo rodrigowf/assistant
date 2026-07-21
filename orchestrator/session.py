@@ -26,6 +26,7 @@ from utils.paths import get_sessions_dir
 from orchestrator.agent import OrchestratorAgent
 from orchestrator.audio_utils import convert_audio_to_wav
 from orchestrator.config import (
+    AUDIO_FALLBACK_MODEL_ID,
     AVAILABLE_MODELS,
     OrchestratorConfig,
     Provider,
@@ -1791,13 +1792,15 @@ class OrchestratorSession:
 
         if not self._config.supports_audio:
             # Switch to audio-capable model automatically.
-            # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview.
-            # If _voice=True, set_model() normally refuses — force the config directly instead.
+            # Note: gpt-4o does NOT support audio input — use the gpt-audio
+            # family (gpt-4o-audio-preview was renamed and 404s on newer
+            # accounts). If _voice=True, set_model() normally refuses — force
+            # the config directly instead.
             if self._voice:
-                self._config.set_model("gpt-4o-audio-preview")
+                self._config.set_model(AUDIO_FALLBACK_MODEL_ID)
                 if not self._config.supports_audio:
                     raise RuntimeError("No audio-capable model available")
-            elif not self.set_model("gpt-4o-audio-preview"):
+            elif not self.set_model(AUDIO_FALLBACK_MODEL_ID):
                 raise RuntimeError("No audio-capable model available")
 
         # Convert audio to OpenAI-supported format if needed (wav or mp3)

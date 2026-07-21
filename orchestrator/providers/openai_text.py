@@ -39,29 +39,41 @@ class OpenAIModel(str, Enum):
     """Supported OpenAI models for text/multimodal chat."""
 
     GPT_4O = "gpt-4o"
-    GPT_4O_AUDIO = "gpt-4o-audio-preview"  # Required for audio input
+    # `gpt-4o-audio-preview` was renamed by OpenAI to the `gpt-audio` family and
+    # now 404s on newer accounts; `gpt-audio` / `gpt-audio-mini` are the current
+    # audio-input chat models (verified 2026-07-21).
+    GPT_AUDIO = "gpt-audio"  # Audio input (current)
+    GPT_AUDIO_MINI = "gpt-audio-mini"  # Audio input (current, cheaper)
+    GPT_4O_AUDIO = "gpt-4o-audio-preview"  # Legacy audio (may 404 — kept for old accounts)
     GPT_4O_MINI = "gpt-4o-mini"
-    GPT_4O_MINI_AUDIO = "gpt-4o-mini-audio-preview"  # Required for audio input
+    GPT_4O_MINI_AUDIO = "gpt-4o-mini-audio-preview"  # Legacy audio
     GPT_4_TURBO = "gpt-4-turbo"
     GPT_4 = "gpt-4"
 
     @property
     def supports_audio(self) -> bool:
         """Whether this model supports audio input."""
-        return self in (OpenAIModel.GPT_4O_AUDIO, OpenAIModel.GPT_4O_MINI_AUDIO)
+        return self in (
+            OpenAIModel.GPT_AUDIO,
+            OpenAIModel.GPT_AUDIO_MINI,
+            OpenAIModel.GPT_4O_AUDIO,
+            OpenAIModel.GPT_4O_MINI_AUDIO,
+        )
 
     @property
     def supports_vision(self) -> bool:
         """Whether this model supports image input."""
         return self in (
             OpenAIModel.GPT_4O,
+            OpenAIModel.GPT_AUDIO,
+            OpenAIModel.GPT_AUDIO_MINI,
             OpenAIModel.GPT_4O_MINI,
             OpenAIModel.GPT_4_TURBO,
         )
 
 
-# Default model for the provider (use audio-preview for multimodal support)
-DEFAULT_MODEL = OpenAIModel.GPT_4O_AUDIO
+# Default model for the provider — current audio-capable model for multimodal.
+DEFAULT_MODEL = OpenAIModel.GPT_AUDIO
 DEFAULT_MAX_TOKENS = 8192
 
 

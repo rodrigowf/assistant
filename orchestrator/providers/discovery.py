@@ -80,10 +80,14 @@ _ANTHROPIC_TEXT_RE = re.compile(r"^claude-")
 # OpenAI text-class models we want to expose in the orchestrator dropdown.
 # We deliberately exclude image, embedding, tts, and dall-e families.
 _OPENAI_TEXT_RE = re.compile(
-    r"^(gpt-4|gpt-5|gpt-4o|chatgpt|o1|o3|o4)",
+    r"^(gpt-4|gpt-5|gpt-4o|gpt-audio|chatgpt|o1|o3|o4)",
 )
-_OPENAI_AUDIO_INPUT_RE = re.compile(r"audio-preview|audio$|gpt-4o-audio")
-_OPENAI_VISION_RE = re.compile(r"gpt-4o|gpt-4-turbo|gpt-4\.|gpt-5|chatgpt|o1|o3|o4")
+# Audio-INPUT chat models: the legacy *-audio-preview family plus the current
+# `gpt-audio` / `gpt-audio-mini` family (OpenAI's rename). `gpt-audio` ends in
+# "audio" (audio$) but `gpt-audio-mini` does not, so match the family prefix
+# explicitly.
+_OPENAI_AUDIO_INPUT_RE = re.compile(r"audio-preview|audio$|gpt-4o-audio|^gpt-audio")
+_OPENAI_VISION_RE = re.compile(r"gpt-4o|gpt-audio|gpt-4-turbo|gpt-4\.|gpt-5|chatgpt|o1|o3|o4")
 _OPENAI_REALTIME_RE = re.compile(r"realtime")
 
 _OPENAI_EXCLUDE_RE = re.compile(
