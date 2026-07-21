@@ -492,16 +492,10 @@ def _scripts_section(config: OrchestratorConfig) -> str:
 
     section = """## Running Scripts (`run_script`)
 
-Run an allowlisted script for **one self-contained action** (toggle a lamp, generate one image).
-Pass `script` = the exact `path:` from an allowlist entry and `args` = a list of strings. Only
-allowlisted scripts run; a non-zero `exit_code` or non-empty `stderr` means it failed — report it.
-
-**Not for tasks.** If it's open-ended, needs judgment or iteration, chains more than one call, or the
-script doesn't exist yet — delegate to a Claude session (`open_agent_session` + `send_to_agent_session`),
-don't stitch `run_script` calls together.
-
-**Curate the allowlist** (the file below) with `write_file`: add an entry when a session creates a new
-reusable script you'll want to trigger; update or remove entries as scripts change."""
+`run_script` runs ONE allowlisted script (`script`=exact `path:` from an entry, `args`=list of
+strings) for a single self-contained action. Non-zero `exit_code`/non-empty `stderr` = it failed.
+For anything open-ended, iterative, multi-call, or needing a script that doesn't exist yet, delegate
+to a Claude session instead. Curate the allowlist below with `write_file` as scripts are added/changed."""
 
     if registry_md:
         section += f"""
@@ -512,7 +506,7 @@ reusable script you'll want to trigger; update or remove entries as scripts chan
     else:
         section += """
 
-The allowlist (`context/memory/ORCHESTRATOR_SCRIPTS.md`) is empty or missing — add entries with `write_file`."""
+Allowlist (`context/memory/ORCHESTRATOR_SCRIPTS.md`) is empty — add entries with `write_file`."""
 
     return section
 
