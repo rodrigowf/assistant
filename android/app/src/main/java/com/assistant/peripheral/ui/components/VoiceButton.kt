@@ -146,6 +146,11 @@ fun VoiceButton(
             .alpha(if (remoteActive) 0.45f else 1f),
         contentAlignment = Alignment.Center
     ) {
+        // NOTE: use if/else, never an early `return@Box` — a Compose content
+        // lambda must emit a consistent group structure across recompositions.
+        // A conditional `return` here corrupted the composer's group stack and
+        // crashed with IndexOutOfBoundsException in Stack.pop when remoteActive
+        // flipped mid-session.
         if (remoteActive) {
             // Voice is live on another device — read-only indicator, no action.
             Icon(
@@ -154,9 +159,7 @@ fun VoiceButton(
                 tint = iconTint,
                 modifier = Modifier.size(26.dp)
             )
-            return@Box
-        }
-        when (voiceState) {
+        } else when (voiceState) {
             is VoiceState.Connecting,
             is VoiceState.Summarizing,
             is VoiceState.Ending -> {
