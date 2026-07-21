@@ -595,6 +595,19 @@ class VoiceController(
         _wakeConfirming.value = false
     }
 
+    /**
+     * Clear a stuck recording indicator. Called when a talk capture that
+     * already showed the recording UI (via [markRecordingStarting] on speech
+     * onset) is then REJECTED by the Whisper gate or aborted — the red
+     * stop-button must go back off. Without this, a rejected talk utterance
+     * (e.g. Whisper heard "hey my friend" but the variant is "hello my friend")
+     * left `_isRecording` stuck true and the record button showing forever.
+     */
+    fun clearRecording() {
+        _wakeConfirming.value = false
+        _isRecording.value = false
+    }
+
     fun startRecording() {
         scope.launch {
             val success = audioRecorder.startRecording()

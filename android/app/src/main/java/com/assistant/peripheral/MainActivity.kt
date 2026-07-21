@@ -375,7 +375,12 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             }
         }
         activity.onWakeConfirmFailed = { _ ->
-            viewModel.clearWakeConfirming()
+            // Clears BOTH the transient "confirming" indicator AND a recording
+            // stop-button that a talk capture may have already shown on speech
+            // onset. A rejected talk utterance previously left the red record
+            // button stuck on forever (clearWakeConfirming didn't touch
+            // _isRecording).
+            viewModel.clearRecording()
         }
         onDispose {
             activity.onWakeConfirming = null

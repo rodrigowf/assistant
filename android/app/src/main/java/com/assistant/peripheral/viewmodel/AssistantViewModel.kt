@@ -387,6 +387,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun markVoiceConnecting() = voiceController.markVoiceConnecting()
     fun markWakeConfirming() = voiceController.markWakeConfirming()
     fun clearWakeConfirming() = voiceController.clearWakeConfirming()
+
+    fun clearRecording() = voiceController.clearRecording()
     fun toggleMute() = voiceController.toggleMute()
 
     fun isBluetoothAudioAvailable(): Boolean = voiceController.isBluetoothAudioAvailable()
