@@ -654,7 +654,14 @@ class VoiceController(
      */
     fun sendCapturedVoiceMessage(base64Audio: String) {
         scope.launch {
+            // Clear BOTH indicators. The same-mic talk path re-raises
+            // ACTION_WAKE_CONFIRMING inside confirmMatchAudio just before a
+            // successful confirm, so _wakeConfirming is true here — if we only
+            // cleared _isRecording, the "Listening…" indicator would stay stuck
+            // on after a successful send (and block the UI from looking idle /
+            // re-armable). Clear it too.
             _isRecording.value = false
+            _wakeConfirming.value = false
             chatController.appendOrchestratorMessage(
                 ChatMessage(
                     role = MessageRole.USER,

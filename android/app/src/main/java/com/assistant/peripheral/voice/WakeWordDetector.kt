@@ -903,7 +903,7 @@ class WakeWordDetector(
                     fireMatchBroadcast(matched)
                 }
                 if (fullAudio != null) {
-                    val confirmed = confirmMatchAudio(fullAudio, isRealtime = false)
+                    val confirmed = confirmMatchAudio(fullAudio)
                     if (confirmed) {
                         sendTalkAudio(fullAudio)
                     } else {
@@ -1134,7 +1134,6 @@ class WakeWordDetector(
      */
     private suspend fun confirmMatchAudio(
         frames: List<ShortArray>,
-        isRealtime: Boolean,
     ): Boolean {
         val confirmer = whisperConfirmer ?: return true
         // Same speech-floor pre-gate as the realtime path: don't hand Whisper a
@@ -1150,9 +1149,15 @@ class WakeWordDetector(
             )
             return false
         }
-        LocalBroadcastManager.getInstance(context).sendBroadcast(
-            Intent(ACTION_WAKE_CONFIRMING).putExtra(EXTRA_IS_REALTIME, isRealtime),
-        )
+        // NOTE: do NOT raise ACTION_WAKE_CONFIRMING here. On the talk path the
+        // recording indicator is ALREADY showing (fired on speech onset inside
+        // captureTalkCommand), so "confirming" would just paint a second
+        // transient state on top of it — and because the confirmed-send path
+        // (sendTalkAudio → ACTION_TALK_MESSAGE_CAPTURED) doesn't clear
+        // _wakeConfirming, a *successful* talk send would leave "Listening…"
+        // stuck on forever (the exact wedge Rodrigo hit). The recording
+        // indicator is the correct UI for the whole talk confirm window; the
+        // rejection path already fires ACTION_WAKE_CONFIRM_FAILED to clear it.
         val result = confirmer.confirm(frames)
         if (!result.confirmed) {
             Log.d(TAG, "Whisper gate rejected talk utterance (failed=${result.failed}, heard=\"${result.transcript}\")")
