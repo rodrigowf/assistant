@@ -17,6 +17,10 @@ MAX_MEMORY_INDEX_CHARS = 40000
 # Shared memory index filename
 MEMORY_INDEX_FILENAME = "MEMORY.md"
 
+# Curated run_script allowlist filename (lives next to ORCHESTRATOR_MEMORY.md)
+SCRIPTS_FILENAME = "ORCHESTRATOR_SCRIPTS.md"
+MAX_SCRIPTS_CHARS = 12000
+
 
 # ---------------------------------------------------------------------------
 # MCP Configuration Loading
@@ -107,6 +111,31 @@ def _load_memory_index(config: OrchestratorConfig) -> str:
         return content
     except Exception:
         return "(failed to read memory index)"
+
+
+def _load_scripts_registry(config: OrchestratorConfig) -> str:
+    """Load the curated `ORCHESTRATOR_SCRIPTS.md` allowlist contents.
+
+    This is the same file the `run_script` tool parses for its allowlist, and
+    the same file the orchestrator curates itself with write_file. Injecting it
+    verbatim keeps the prompt's view and the tool's validation in sync.
+    """
+    memory_dir = Path(config.memory_path).parent if config.memory_path else None
+    if not memory_dir:
+        project_root = Path(__file__).resolve().parent.parent
+        memory_dir = project_root / "context" / "memory"
+
+    scripts_path = memory_dir / SCRIPTS_FILENAME
+    if not scripts_path.is_file():
+        return ""
+
+    try:
+        content = scripts_path.read_text(encoding="utf-8")
+        if len(content) > MAX_SCRIPTS_CHARS:
+            content = content[:MAX_SCRIPTS_CHARS] + "\n... (truncated)"
+        return content
+    except Exception:
+        return "(failed to read scripts registry)"
 
 
 def _load_private_memory(config: OrchestratorConfig) -> str:
@@ -453,6 +482,41 @@ This file is loaded **only** when you are running on the `{voice_provider_id}` r
     return section
 
 
+def _scripts_section(config: OrchestratorConfig) -> str:
+    """Build the run_script section: operating rules + the curated allowlist.
+
+    The allowlist body is the verbatim contents of `ORCHESTRATOR_SCRIPTS.md` —
+    the same file `run_script` validates against and that you curate yourself.
+    """
+    registry_md = _load_scripts_registry(config)
+
+    section = """## Running Scripts (`run_script`)
+
+Run an allowlisted script for **one self-contained action** (toggle a lamp, generate one image).
+Pass `script` = the exact `path:` from an allowlist entry and `args` = a list of strings. Only
+allowlisted scripts run; a non-zero `exit_code` or non-empty `stderr` means it failed — report it.
+
+**Not for tasks.** If it's open-ended, needs judgment or iteration, chains more than one call, or the
+script doesn't exist yet — delegate to a Claude session (`open_agent_session` + `send_to_agent_session`),
+don't stitch `run_script` calls together.
+
+**Curate the allowlist** (the file below) with `write_file`: add an entry when a session creates a new
+reusable script you'll want to trigger; update or remove entries as scripts change."""
+
+    if registry_md:
+        section += f"""
+
+```markdown
+{registry_md}
+```"""
+    else:
+        section += """
+
+The allowlist (`context/memory/ORCHESTRATOR_SCRIPTS.md`) is empty or missing — add entries with `write_file`."""
+
+    return section
+
+
 def _guidelines_section() -> str:
     """Build the operational guidelines section."""
     return """## Guidelines
@@ -605,6 +669,7 @@ def build_system_prompt(
         _active_sessions_section(context),
         _mcp_section(),
         _memory_section(config, voice_provider_id=voice_provider_id),
+        _scripts_section(config),
         _guidelines_section(),
         _history_section(recent_messages, history_summary),
     ]
