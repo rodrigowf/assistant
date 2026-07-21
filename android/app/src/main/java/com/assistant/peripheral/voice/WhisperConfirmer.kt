@@ -82,28 +82,14 @@ class WhisperConfirmer(
         if (transcript.failed) {
             return Result(confirmed = false, transcript = "", failed = true)
         }
-        // Whisper adds punctuation + casing ("Hello, my friend.") that bare
-        // variants ("hello my friend") don't have, so normalize both sides:
-        // lowercase, strip everything but letters/digits/spaces, collapse
-        // whitespace. Without this, punctuation between/after variant words
-        // breaks the substring match and rejects real detections.
-        val norm = normalize(transcript.text)
-        // Realtime-first precedence, same as VoskWakeWordEngine.findMatch.
-        wakeVariants.firstOrNull { norm.contains(normalize(it)) }?.let {
-            Log.d(TAG, "Whisper CONFIRMED wake \"$it\" in \"${transcript.text}\"")
-            return Result(confirmed = true, transcript = transcript.text, isRealtime = true)
+        val result = decide(transcript.text, talkVariants, wakeVariants)
+        if (result.confirmed) {
+            Log.d(TAG, "Whisper CONFIRMED (realtime=${result.isRealtime}) in \"${transcript.text}\"")
+        } else {
+            Log.d(TAG, "Whisper REJECTED \"${transcript.text}\"")
         }
-        talkVariants.firstOrNull { norm.contains(normalize(it)) }?.let {
-            Log.d(TAG, "Whisper CONFIRMED talk \"$it\" in \"${transcript.text}\"")
-            return Result(confirmed = true, transcript = transcript.text, isRealtime = false)
-        }
-        Log.d(TAG, "Whisper REJECTED — no variant in \"${transcript.text}\" (normalized: \"$norm\")")
-        return Result(confirmed = false, transcript = transcript.text)
+        return result
     }
-
-    /** Lowercase, drop non-alphanumerics (punctuation), collapse whitespace. */
-    private fun normalize(s: String): String =
-        s.lowercase().replace(Regex("[^a-z0-9\\s]"), " ").replace(Regex("\\s+"), " ").trim()
 
     private data class Transcription(val text: String, val failed: Boolean = false)
 
@@ -127,6 +113,12 @@ class WhisperConfirmer(
                     // little latency and avoids spurious language detection on
                     // a 1-2s clip.
                     .addFormDataPart("language", "en")
+                    // temperature=0 disables whisper-1's temperature-fallback
+                    // sampling, which is the main driver of hallucinated canned
+                    // phrases on near-silent/ambient clips. Greedy decoding is
+                    // both more deterministic and far less likely to invent a
+                    // wake phrase out of noise — exactly what a yes/no gate wants.
+                    .addFormDataPart("temperature", "0")
                     .build()
                 val request = Request.Builder()
                     .url(OPENAI_TRANSCRIPTIONS_URL)
@@ -165,11 +157,71 @@ class WhisperConfirmer(
 
     companion object {
         private const val TAG = "WhisperConfirmer"
+
+        /**
+         * Pure decision: given Whisper's transcript and the configured
+         * variants, decide whether a wake/talk word is present. Extracted so
+         * the matching + normalization + hallucination-guard logic is unit
+         * testable (the network call around it is not). Mirrors
+         * `VoskWakeWordEngine.findMatch`'s realtime-first precedence.
+         *
+         * Order of checks:
+         *  1. Normalize (lowercase, strip punctuation, collapse whitespace) so
+         *     Whisper's "Hello, my friend." matches the bare variant.
+         *  2. Reject if the WHOLE normalized transcript is a known whisper-1
+         *     silence-hallucination (exact equality — a real command that
+         *     merely contains such a word still passes).
+         *  3. Wake variants (realtime) first, then talk variants, by substring.
+         */
+        fun decide(
+            transcriptText: String,
+            talkVariants: List<String>,
+            wakeVariants: List<String>,
+        ): Result {
+            val norm = normalize(transcriptText)
+            if (norm in HALLUCINATION_BOILERPLATE) {
+                return Result(confirmed = false, transcript = transcriptText)
+            }
+            wakeVariants.firstOrNull { norm.contains(normalize(it)) }?.let {
+                return Result(confirmed = true, transcript = transcriptText, isRealtime = true)
+            }
+            talkVariants.firstOrNull { norm.contains(normalize(it)) }?.let {
+                return Result(confirmed = true, transcript = transcriptText, isRealtime = false)
+            }
+            return Result(confirmed = false, transcript = transcriptText)
+        }
+
+        /** Lowercase, drop non-alphanumerics (punctuation), collapse whitespace. */
+        fun normalize(s: String): String =
+            s.lowercase().replace(Regex("[^a-z0-9\\s]"), " ").replace(Regex("\\s+"), " ").trim()
         private const val OPENAI_TRANSCRIPTIONS_URL =
             "https://api.openai.com/v1/audio/transcriptions"
         // whisper-1 is the cheapest/fastest hosted transcription model and is
         // plenty for 1-2s keyword spotting. gpt-4o-transcribe is more accurate
         // but slower + pricier; not worth it for a yes/no gate.
         private const val WHISPER_MODEL = "whisper-1"
+
+        /**
+         * Normalized transcripts whisper-1 commonly hallucinates from silence
+         * or unintelligible noise. Matched by exact equality against the
+         * normalized transcript (see [normalize]), so only a transcript that is
+         * *entirely* boilerplate is dropped — a real command that happens to
+         * contain one of these words still passes. None overlaps a configured
+         * wake/talk variant ("wake up" / "my friend").
+         */
+        private val HALLUCINATION_BOILERPLATE = setOf(
+            "you",
+            "thank you",
+            "thank you very much",
+            "thanks for watching",
+            "thanks for watching the video",
+            "please subscribe",
+            "bye",
+            "bye bye",
+            "so",
+            "the",
+            "okay",
+            "i m sorry",
+        )
     }
 }

@@ -166,6 +166,21 @@ class WakeWordDetector(
         // (avoids clicks/pops).
         private const val ACTIVITY_HOLD_MS = 30L
 
+        // Speech-energy floor for the pre-Whisper gate. A phantom Vosk match
+        // (the constrained grammar snaps ambient noise/silence to "wake up" or
+        // "my friend") produces a captured clip whose loudest 200ms window
+        // still sits in the background/ambient band (RMS 4–30 on the A300M —
+        // see RMS_THRESHOLD note). A genuine spoken phrase always contains at
+        // least one window well above this (winMaxRms 35–82 measured). So if
+        // NO window in the captured clip crosses this floor, the "match" was
+        // noise — reject it WITHOUT spending a Whisper call. This is the first
+        // line of defence against the "opens for no reason, even in silence"
+        // false trigger: whisper-1 hallucinates canned phrases on near-silent
+        // clips, so we must not hand it silence in the first place. Set to the
+        // engine's own speech-started threshold (RMS_STARTED_THRESHOLD=30) so
+        // the two stages agree on what counts as speech.
+        private const val SPEECH_FLOOR_RMS = 30.0
+
         // After a successful wake word, pause before re-arming.
         private const val POST_WAKEWORD_DELAY_MS = 3000L
 
@@ -684,6 +699,35 @@ class WakeWordDetector(
         return sqrt(sum / count)
     }
 
+    /**
+     * Loudest per-frame RMS across a captured clip — the clip's peak energy.
+     * Used by the pre-Whisper speech-floor gate: a genuine spoken phrase has
+     * at least one loud frame, whereas a phantom Vosk match on silence/ambient
+     * noise stays uniformly quiet. Peak (not mean) so a short phrase inside a
+     * mostly-quiet 2s window isn't averaged away.
+     */
+    private fun peakFrameRms(frames: List<ShortArray>): Double {
+        var peak = 0.0
+        for (frame in frames) {
+            val r = computeRms(frame, frame.size)
+            if (r > peak) peak = r
+        }
+        return peak
+    }
+
+    /**
+     * True when the captured clip carries real speech energy (its peak frame
+     * RMS crosses [SPEECH_FLOOR_RMS]). When false, the Vosk match was almost
+     * certainly a constrained-grammar hallucination on silence/ambient noise —
+     * the caller should reject it WITHOUT calling Whisper (whisper-1 itself
+     * hallucinates canned phrases on near-silent audio, so silence must never
+     * reach it). Empty clip → not speech.
+     */
+    private fun clipHasSpeech(frames: List<ShortArray>): Boolean {
+        if (frames.isEmpty()) return false
+        return peakFrameRms(frames) >= SPEECH_FLOOR_RMS
+    }
+
     // -------------------------------------------------------------------------
     // Stage 2 — Recognition cycle (engine-driven)
     // -------------------------------------------------------------------------
@@ -893,6 +937,24 @@ class WakeWordDetector(
             Log.d(TAG, "No captured PCM (SR path?) — firing without Whisper confirmation")
             return true
         }
+        // Speech-floor pre-gate: a phantom Vosk match on silence/ambient noise
+        // is uniformly quiet. Reject it here — before the Whisper call — so we
+        // don't (a) waste a network round-trip on noise, or (b) feed whisper-1
+        // near-silent audio it would hallucinate a wake phrase into. This is
+        // the primary fix for "opens the conversation for no reason, even in
+        // silence": such triggers never carried speech energy.
+        if (!clipHasSpeech(match.capturedPcm)) {
+            Log.d(
+                TAG,
+                "Pre-Whisper gate: captured clip below speech floor " +
+                    "(peak=${peakFrameRms(match.capturedPcm).toInt()} < ${SPEECH_FLOOR_RMS.toInt()}) " +
+                    "— rejecting phantom \"${match.matchedPhrase}\" without Whisper",
+            )
+            LocalBroadcastManager.getInstance(context).sendBroadcast(
+                Intent(ACTION_WAKE_CONFIRM_FAILED).putExtra(EXTRA_IS_REALTIME, match.isRealtime),
+            )
+            return false
+        }
         // Announce the candidate so the UI shows "confirming…" during the gate.
         LocalBroadcastManager.getInstance(context).sendBroadcast(
             Intent(ACTION_WAKE_CONFIRMING).putExtra(EXTRA_IS_REALTIME, match.isRealtime),
@@ -1003,6 +1065,19 @@ class WakeWordDetector(
         isRealtime: Boolean,
     ): Boolean {
         val confirmer = whisperConfirmer ?: return true
+        // Same speech-floor pre-gate as the realtime path: don't hand Whisper a
+        // clip with no speech energy (a phantom talk-prefix trigger that
+        // captured only ambient noise). The onset-timeout in captureTalkCommand
+        // usually nulls these first, but guard here too so nothing silent ever
+        // reaches whisper-1.
+        if (!clipHasSpeech(frames)) {
+            Log.d(
+                TAG,
+                "Pre-Whisper gate (talk): captured clip below speech floor " +
+                    "(peak=${peakFrameRms(frames).toInt()} < ${SPEECH_FLOOR_RMS.toInt()}) — rejecting",
+            )
+            return false
+        }
         LocalBroadcastManager.getInstance(context).sendBroadcast(
             Intent(ACTION_WAKE_CONFIRMING).putExtra(EXTRA_IS_REALTIME, isRealtime),
         )
