@@ -124,6 +124,14 @@ class VoskWakeWordEngine(
         private const val TAG = "VoskWakeWordEngine"
 
         /**
+         * Minimum number of a talk variant's leading words that must appear in
+         * a Vosk partial before [findTalkPrefixMatch] fires. 2 rejects a lone
+         * stray "hello" from ambient noise while still firing on "hello my"
+         * during a natural one-breath "hello my friend <command>".
+         */
+        const val MIN_PREFIX_WORDS = 2
+
+        /**
          * Extract the spoken text from a Vosk result JSON. Vosk emits two
          * shapes:
          *   final:    {"text": "..."}     — committed transcription
@@ -185,10 +193,19 @@ class VoskWakeWordEngine(
          * wake variants are intentionally NOT prefix-matched (they hand off to
          * a live voice session, so a false early trigger is costlier).
          *
-         * Word-boundary aware: "hello" matches variant "hello my friend" (the
-         * variant's first word), but "hell" does not, and "help" does not.
+         * Word-boundary aware: "hello my" matches variant "hello my friend"
+         * (a 2-word leading run), but "hell" does not, and "help" does not.
          * Only fires on variants with MORE than one word (a single-word talk
          * variant is already matched fully by [findMatch]).
+         *
+         * Requires at least [MIN_PREFIX_WORDS] leading words of the variant
+         * before firing. A single stray word from ambient noise/music (a lone
+         * "hello") is NOT enough — this cuts the dominant false-trigger source
+         * without hurting the intended one-breath "hello my friend <command>"
+         * flow, where Vosk's partial naturally grows "hello" → "hello my" →
+         * "hello my friend" and fires at the 2-word mark. For a variant with
+         * fewer than [MIN_PREFIX_WORDS] words, the full run of its words is
+         * required (so a 2-word min never makes a 2-word variant unmatchable).
          */
         fun findTalkPrefixMatch(
             text: String,
@@ -199,10 +216,12 @@ class VoskWakeWordEngine(
             for (variant in talkVariants) {
                 val vWords = variant.split(Regex("\\s+")).filter { it.isNotEmpty() }
                 if (vWords.size <= 1) continue  // full match handles single words
-                // text must be a leading run of the variant's words, in order,
-                // and at least the first word must be present.
+                // Require a leading run of at least MIN_PREFIX_WORDS words (or
+                // the whole variant if it's shorter than that), matched in order.
+                val required = minOf(MIN_PREFIX_WORDS, vWords.size)
+                if (words.size < required) continue
                 val n = minOf(words.size, vWords.size)
-                var matches = n >= 1
+                var matches = true
                 for (i in 0 until n) if (words[i] != vWords[i]) { matches = false; break }
                 if (matches) {
                     return Match(matchedVariant = variant, isRealtime = false, rawText = text.trim())

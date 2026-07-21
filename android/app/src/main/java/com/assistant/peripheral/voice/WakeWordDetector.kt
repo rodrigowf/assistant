@@ -112,23 +112,43 @@ class WakeWordDetector(
         private const val COMMAND_SILENCE_MS = 1500L
 
         /**
-         * Silence threshold as a fraction of the voice/activity threshold
-         * (hysteresis). Audio must fall below voiceThreshold*this to count as
-         * silence, so ambient noise sitting near the activity level doesn't
-         * keep the capture open forever. 0.5 = "clearly quieter than speech".
+         * Absolute lower bound (gain-independent) on what counts as speech
+         * during command capture. A frame must be at/above BOTH the gain-scaled
+         * voice threshold AND this absolute floor to refresh the silence timer.
+         * This is the fix for the "capture never ends in a noisy room" runaway:
+         * the old relative-only silence threshold (voiceThreshold * 0.5 ≈ 31 at
+         * gain 1.1) sat below the ambient music floor (RMS 40–106 observed), so
+         * ambient pinned the timer forever. Kept equal to SPEECH_FLOOR_RMS (30)
+         * so the capture-end VAD agrees with the pre-Whisper speech-floor gate.
+         * (Literal, not a reference — const val can't forward-reference within
+         * the same companion object; SPEECH_FLOOR_RMS is declared below.)
          */
-        private const val COMMAND_SILENCE_RATIO = 0.5
+        private const val COMMAND_ABS_SPEECH_FLOOR = 30.0
+
+        /**
+         * A genuine speech onset must sustain voice-level audio for at least
+         * this long before we (a) show the recording UI and (b) commit to
+         * capturing a command. A single loud ambient frame (music beat, door
+         * slam) can cross the voice threshold once but won't sustain — so this
+         * is what stops the stop-button appearing "out of nowhere" on noise.
+         * Short enough (300ms) that a real spoken word clears it instantly.
+         */
+        private const val ONSET_SUSTAIN_MS = 300L
 
         /**
          * Hard cap on command length so a noisy room / never-ending speech
-         * can't record forever. Sends whatever was captured at the cap.
+         * can't record forever. Sends whatever was captured at the cap. Kept
+         * short so a false capture self-clears fast (the onset gate should
+         * catch phantoms first, but this is the backstop).
          */
-        private const val COMMAND_MAX_MS = 30_000L
+        private const val COMMAND_MAX_MS = 12_000L
 
         /**
-         * Speech must be detected (RMS above threshold) within this window
-         * after the talk-word, else we abort the capture (the user said the
-         * talk phrase but no command followed).
+         * A sustained speech onset must be detected within this window after
+         * the talk-word trigger, else we abort the capture WITHOUT showing any
+         * UI — the trigger was a phantom (stray ambient word) with no command
+         * following. Generous enough for a natural pause after "hello my
+         * friend" before the command.
          */
         private const val COMMAND_SPEECH_ONSET_TIMEOUT_MS = 4_000L
 
@@ -864,14 +884,24 @@ class WakeWordDetector(
         if (matched != null) {
             if (!matched.isRealtime && matched.capturedPcm.isNotEmpty()) {
                 // TALK path. Vosk fired early (possibly just on the phrase's
-                // opening word), so confirming NOW would only see "hello". Do
-                // the same-mic command capture FIRST — collecting the whole
-                // "hello my friend <command>" utterance — THEN confirm with
-                // Whisper over the FULL audio, and send only if the talk phrase
-                // is actually present. fireMatchBroadcast gives the instant UI
-                // ack (beep + recording indicator) before the capture.
-                fireMatchBroadcast(matched)
-                val fullAudio = captureTalkCommand(ar, matched.capturedPcm)
+                // opening word — or on a stray ambient word), so confirming NOW
+                // would only see "hello". Do the same-mic command capture FIRST
+                // — collecting the whole "hello my friend <command>" utterance —
+                // THEN confirm with Whisper over the FULL audio, and send only
+                // if the talk phrase is actually present.
+                //
+                // The recording-UI ack (beep + stop-button) is DEFERRED into
+                // captureTalkCommand: it fires only once real speech-level audio
+                // is observed. A phantom prefix trigger from ambient noise/music
+                // that never produces a genuine speech onset therefore shows NO
+                // stop-button at all — killing the "recording UI opens out of
+                // nowhere" false positive. If speech never arrives, capture
+                // returns null (onset timeout) and we clear silently.
+                val fullAudio = captureTalkCommand(ar, matched.capturedPcm) {
+                    // onSpeechOnset — the moment we know a human is actually
+                    // speaking. Beep + show the recording indicator now.
+                    fireMatchBroadcast(matched)
+                }
                 if (fullAudio != null) {
                     val confirmed = confirmMatchAudio(fullAudio, isRealtime = false)
                     if (confirmed) {
@@ -983,71 +1013,113 @@ class WakeWordDetector(
     }
 
     /**
-     * Capture the spoken command that follows a confirmed talk-word, on the
-     * SAME [audioRecord] the detector is already holding — no mic switch, so
-     * the wake phrase and command are one continuous stream. Ends on
-     * [COMMAND_SILENCE_MS] of sustained silence after speech began (VAD), or
+     * Capture the spoken command that follows a talk-word trigger, on the SAME
+     * [audioRecord] the detector is already holding — no mic switch, so the
+     * wake phrase and command are one continuous stream.
+     *
+     * The talk-word trigger is PERMISSIVE (a stray ambient word can fire the
+     * Vosk prefix match), so this method is also the false-positive gate for
+     * the *recording UI*: [onSpeechOnset] is invoked exactly once, only when a
+     * genuine, SUSTAINED speech onset is observed ([ONSET_SUSTAIN_MS] of audio
+     * at or above the voice threshold). The caller uses that callback to show
+     * the beep + stop-button. A phantom trigger from ambient noise/music that
+     * never produces a sustained onset therefore shows NO UI and returns null.
+     *
+     * Ends on [COMMAND_SILENCE_MS] of sustained silence after onset (VAD), or
      * at [COMMAND_MAX_MS]. Returns the full utterance ([wakePhrasePcm] pre-roll
      * + command) as PCM frames for the caller to Whisper-confirm + send, or
-     * null if no command was spoken (onset timeout) or the detector stopped.
+     * null if no genuine command was spoken (onset never confirmed) or the
+     * detector stopped.
      *
-     * Runs on the same IO coroutine as the silence monitor + Vosk recognition
-     * (called from runVoskRecognitionInline) — the mic stream is continuous
-     * from the wake phrase straight into the command, no gap.
+     * Silence semantics (the fix for the 30s runaway): a frame counts as
+     * "voice" only when it is at/above the gain-scaled [voiceThreshold] — real
+     * speech level. Loud ambient music that sits between the silence floor and
+     * the voice level no longer refreshes the silence timer, so the capture
+     * ends ~[COMMAND_SILENCE_MS] after the user actually stops talking even in
+     * a noisy room. (The previous relative-only silence threshold sat BELOW the
+     * ambient floor, so ambient pinned the timer forever.)
+     *
+     * Runs on the same IO coroutine as the silence monitor + Vosk recognition.
      */
     private suspend fun captureTalkCommand(
         audioRecord: AudioRecord,
         wakePhrasePcm: List<ShortArray>,
+        onSpeechOnset: () -> Unit,
     ): List<ShortArray>? = withContext(Dispatchers.IO) {
-        // Two thresholds with hysteresis:
-        //  - voiceThreshold (the activity level) marks "the user is speaking",
-        //    refreshing the silence timer.
-        //  - silenceThreshold is LOWER — audio must fall below THIS to count as
-        //    silence. Using the same level for both means ambient room noise
-        //    that sits right at the activity threshold never reads as silence,
-        //    so the capture never ends ("never stops listening").
+        // Real-speech level (gain-scaled). A frame at/above this is "voice";
+        // anything below is treated as non-speech for the purpose of ending
+        // capture. We deliberately do NOT use a lower relative silence floor
+        // here — that was the bug: ambient noise living above the low floor
+        // refreshed the timer forever. Voice-level hysteresis + the absolute
+        // floor below is what lets a genuine pause end the capture.
         val voiceThreshold =
             (if (micGain > 0f) RMS_THRESHOLD / micGain else RMS_THRESHOLD)
-        val silenceThreshold = voiceThreshold * COMMAND_SILENCE_RATIO
         val command = ArrayList<ShortArray>(wakePhrasePcm)  // pre-roll first
         val buffer = ShortArray(3200)  // 200ms at 16kHz
         val startedMs = System.currentTimeMillis()
-        var speechBegan = false
-        var lastVoiceMs = startedMs
+        var onsetFired = false                 // onSpeechOnset() called yet?
+        var sustainedVoiceMs = 0L              // run-length of consecutive voice audio
+        var lastVoiceMs = startedMs            // last frame at/above voiceThreshold
+        var prevFrameMs = startedMs
         var loggedRmsAtMs = 0L
 
-        Log.d(TAG, "Talk command capture started (same mic, voice≥${voiceThreshold.toInt()}, silence<${silenceThreshold.toInt()})")
+        Log.d(TAG, "Talk command capture started (same mic, voice≥${voiceThreshold.toInt()}, onset needs ${ONSET_SUSTAIN_MS}ms sustained)")
         while (isActive) {
             val now = System.currentTimeMillis()
             if (now - startedMs >= COMMAND_MAX_MS) {
                 Log.d(TAG, "Talk command hit max ${COMMAND_MAX_MS}ms — sending")
                 break
             }
-            if (!speechBegan && now - startedMs >= COMMAND_SPEECH_ONSET_TIMEOUT_MS) {
-                Log.d(TAG, "No command spoken within ${COMMAND_SPEECH_ONSET_TIMEOUT_MS}ms — aborting")
+            // Onset gate: if no sustained speech onset within the window, this
+            // was a phantom trigger — abort WITHOUT ever showing the UI.
+            if (!onsetFired && now - startedMs >= COMMAND_SPEECH_ONSET_TIMEOUT_MS) {
+                Log.d(TAG, "No sustained speech within ${COMMAND_SPEECH_ONSET_TIMEOUT_MS}ms — phantom trigger, aborting (no UI shown)")
                 return@withContext null
             }
             val read = audioRecord.read(buffer, 0, buffer.size)
             if (read <= 0) { delay(10L); continue }
             command.add(buffer.copyOf(read))
             val rms = computeRms(buffer, read)
-            // Diagnostic: log RMS ~2x/sec so we can see why silence does/doesn't trip.
+            val frameDtMs = now - prevFrameMs
+            prevFrameMs = now
+
+            val isVoice = rms >= voiceThreshold && rms >= COMMAND_ABS_SPEECH_FLOOR
+            if (isVoice) {
+                sustainedVoiceMs += frameDtMs
+                lastVoiceMs = now
+            } else {
+                sustainedVoiceMs = 0L
+            }
+
             if (now - loggedRmsAtMs >= 500) {
-                Log.d(TAG, "  cmd rms=${rms.toInt()} speechBegan=$speechBegan silenceFor=${if (speechBegan) now - lastVoiceMs else 0}ms")
+                Log.d(TAG, "  cmd rms=${rms.toInt()} voice=$isVoice onset=$onsetFired sustained=${sustainedVoiceMs}ms silenceFor=${if (onsetFired) now - lastVoiceMs else 0}ms")
                 loggedRmsAtMs = now
             }
-            // Speech begins once we cross the (higher) voice threshold.
-            if (rms >= voiceThreshold) speechBegan = true
-            // "Not silent" = above the (lower) silence threshold. Any such frame
-            // refreshes the timer; only a continuous run BELOW it ends capture.
-            if (rms >= silenceThreshold) {
+
+            // Confirm onset only after SUSTAINED voice — a single music spike
+            // (one loud frame) never reaches ONSET_SUSTAIN_MS, so it won't fire
+            // the recording UI. This is what stops the stop-button appearing
+            // "out of nowhere" on ambient noise.
+            if (!onsetFired && sustainedVoiceMs >= ONSET_SUSTAIN_MS) {
+                onsetFired = true
                 lastVoiceMs = now
-            } else if (speechBegan && now - lastVoiceMs >= COMMAND_SILENCE_MS) {
+                Log.d(TAG, "Talk command speech onset confirmed — showing recording UI")
+                onSpeechOnset()
+            }
+
+            // End on a genuine pause AFTER a confirmed onset.
+            if (onsetFired && now - lastVoiceMs >= COMMAND_SILENCE_MS) {
                 Log.d(TAG, "Command ended on ${COMMAND_SILENCE_MS}ms silence — sending")
                 break
             }
         }
         if (!isActive) return@withContext null
+        // Never fired onset (fell through via COMMAND_MAX_MS while still
+        // waiting) — treat as phantom, no UI was shown, nothing to send.
+        if (!onsetFired) {
+            Log.d(TAG, "Talk command ended with no confirmed onset — dropping (no UI shown)")
+            return@withContext null
+        }
 
         val totalSamples = command.sumOf { it.size }
         Log.d(TAG, "Talk command captured: ${totalSamples * 1000 / SAMPLE_RATE}ms — confirming")

@@ -181,26 +181,46 @@ class VoskEngineParityTest {
     // -------------------------------------------------------------------------
 
     @Test
-    fun `talkPrefixMatchesOpeningWord`() {
-        // Vosk stalls at "hello" mid-utterance; the prefix trigger fires there.
-        val m = VoskWakeWordEngine.findTalkPrefixMatch("hello", listOf("hello my friend"))
+    fun `talkPrefixRequiresTwoLeadingWords`() {
+        // A lone stray "hello" (ambient noise / music) must NOT fire — that was
+        // the dominant false-trigger source. The prefix trigger needs at least
+        // MIN_PREFIX_WORDS (2) leading words of the variant.
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("hello", listOf("hello my friend")))
+    }
+
+    @Test
+    fun `talkPrefixMatchesTwoLeadingWords`() {
+        // The one-breath flow: Vosk's partial grows "hello" -> "hello my" and
+        // fires at the 2-word mark, before the command words arrive.
+        val m = VoskWakeWordEngine.findTalkPrefixMatch("hello my", listOf("hello my friend"))
         assertEquals("hello my friend", m?.matchedVariant)
         assertEquals(false, m?.isRealtime)
     }
 
     @Test
-    fun `talkPrefixMatchesLeadingWords`() {
-        val m = VoskWakeWordEngine.findTalkPrefixMatch("hello my", listOf("hello my friend"))
+    fun `talkPrefixMatchesAllLeadingWords`() {
+        val m = VoskWakeWordEngine.findTalkPrefixMatch("hello my friend", listOf("hello my friend"))
         assertEquals("hello my friend", m?.matchedVariant)
     }
 
     @Test
+    fun `talkPrefixMatchesTwoWordVariantInFull`() {
+        // A 2-word variant requires both words (min(2, variantLen) = 2), so it
+        // still matches when fully present but not on its first word alone.
+        assertEquals(
+            "hey archie",
+            VoskWakeWordEngine.findTalkPrefixMatch("hey archie", listOf("hey archie"))?.matchedVariant,
+        )
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("hey", listOf("hey archie")))
+    }
+
+    @Test
     fun `talkPrefixRejectsWrongWord`() {
-        // "help" is not the opening word of "hello my friend".
-        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("help", listOf("hello my friend")))
+        // "help my" does not lead "hello my friend".
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("help my", listOf("hello my friend")))
         // A word that only partially resembles the first token must not match
         // (word-boundary aware, not character-prefix).
-        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("hell", listOf("hello my friend")))
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("hell my", listOf("hello my friend")))
     }
 
     @Test
