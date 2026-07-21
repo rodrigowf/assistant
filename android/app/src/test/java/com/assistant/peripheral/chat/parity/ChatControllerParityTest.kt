@@ -482,6 +482,40 @@ class ChatControllerParityTest {
             "isOrchestratorSession should flip true after OrchestratorAdopted",
             ctrl.isOrchestratorSession.value
         )
+        // Cold-start adoption must ARM a resume Start (lastResumeSdkId set) so
+        // the orchestrator's history actually loads — the bucket is put on
+        // screen immediately with no later "switch" event to trigger the load.
+        // Regression guard for the empty-chat-on-open bug.
+        assertEquals(
+            "OrchestratorAdopted on cold start must set lastResumeSdkId so a Start is sent and messages load",
+            "adopted-sdk",
+            orchBucket.lastResumeSdkId
+        )
+        cleanup()
+    }
+
+    @Test
+    fun `OrchestratorAdopted — does NOT auto-load when user already picked a bucket`() = runTest {
+        val ctrl = controller(this)
+        val orchBucket = ctrl.bucketFor(WebSocketEndpoint.ORCHESTRATOR)
+        // User opened an agent session from History first.
+        ctrl.markUserPickedBucketForTest()
+        ctrl.handleConnectionEvent(
+            ConnectionEvent.OrchestratorAdopted("adopted-local", "adopted-sdk")
+        )
+        advanceUntilIdle()
+        // Bucket is readied (bookkeeping) but we do NOT yank to orchestrator
+        // nor arm a Start — the user stays on their chosen session.
+        assertEquals("adopted-local", orchBucket.currentLocalId.value)
+        assertEquals("adopted-sdk", orchBucket.pendingResumeSessionId.value)
+        assertFalse(
+            "isOrchestratorSession must stay false when user already picked a bucket",
+            ctrl.isOrchestratorSession.value
+        )
+        assertNull(
+            "must NOT arm a Start when the user is on another session",
+            orchBucket.lastResumeSdkId
+        )
         cleanup()
     }
 

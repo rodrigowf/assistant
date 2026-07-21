@@ -203,6 +203,10 @@ class ChatController(
     private var pendingAgentResume: PendingAgentResume? = null
     internal val pendingAgentResumeForTest: PendingAgentResume? get() = pendingAgentResume
 
+    /** Test hook: simulate the user having explicitly opened a bucket (e.g. an
+     *  agent session from History) before a cold-start orchestrator probe fires. */
+    internal fun markUserPickedBucketForTest() { userPickedBucket.set(true) }
+
     // ─────────────────────────────────────────────────────────────────
     // Inc 3.5 — orchestrator session conflict mediation
     // ─────────────────────────────────────────────────────────────────
@@ -343,6 +347,21 @@ class ChatController(
                 // first connect, before the user has picked a bucket.
                 if (!userPickedBucket.get()) {
                     _isOrchestratorSession.value = true
+                    // Cold-start: the orchestrator bucket goes on screen
+                    // immediately (Chat is the start destination), so there is
+                    // no later "switch to orchestrator" event to trigger the
+                    // history load. Send the Start now so the backend replays
+                    // the session and `SessionStarted` fetches its messages —
+                    // otherwise the user stares at an empty chat even though a
+                    // live orchestrator exists in the pool. `lastResumeSdkId`
+                    // is set so a subsequent foreground resyncOnResume() also
+                    // re-subscribes this bucket correctly.
+                    orchBucket.lastResumeSdkId = ev.sdkSessionId
+                    sendStartWithCheckpoint(
+                        endpoint = WebSocketEndpoint.ORCHESTRATOR,
+                        localId = ev.localId,
+                        resumeSdkId = ev.sdkSessionId,
+                    )
                 }
             }
             is ConnectionEvent.NoOrchestratorFound -> {
