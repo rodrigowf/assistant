@@ -133,6 +133,15 @@ internal sealed class RecognitionResult {
         val isRealtime: Boolean,
         /** The raw recognizer output ("text" / "partial" / SR result string). */
         val rawText: String,
+        /**
+         * The exact PCM the recognizer consumed for this match (pre-buffer +
+         * recognition-window reads), one `ShortArray` per read, oldest first.
+         * The Whisper confirmation gate transcribes precisely these frames.
+         * Empty for engines that don't/can't hand back their audio (SR opens
+         * its own mic and never exposes the PCM) — an empty list means the
+         * gate can't run, which fail-closed treats as "reject".
+         */
+        val capturedPcm: List<ShortArray> = emptyList(),
     ) : RecognitionResult()
 
     /**

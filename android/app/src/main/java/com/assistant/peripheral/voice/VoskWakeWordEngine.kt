@@ -53,28 +53,12 @@ class VoskWakeWordEngine(
     sampleRate: Float = 16000f,
     private val talkVariants: List<String>,
     private val wakeVariants: List<String>,
-    // 0.0 (default) = legacy behaviour: partial-or-final substring match, no
-    // confidence floor — preserves the original sub-second latency profile.
-    // > 0.0 = finals-only matching with a per-word confidence floor. Vosk
-    // emits a per-word `conf` (0.0–1.0) when `setWords(true)`; we take the
-    // minimum over the matched phrase's words and reject the match if it
-    // falls below this threshold. Adds ~300–500 ms latency (we no longer
-    // fire on partials) but kills mid-utterance / ambient false positives.
-    private val confidenceThreshold: Double = 0.0,
 ) {
     private val recognizer: Recognizer = Recognizer(
         model,
         sampleRate,
         buildKeywordGrammar(talkVariants, wakeVariants),
-    ).also {
-        // setWords(true) makes Vosk include the per-word `result: [...]` array
-        // (with `word`, `start`, `end`, `conf`) in finalResult JSON. Cheap;
-        // we leave it on unconditionally so peekText/diagnostics work the
-        // same whether or not the confidence floor is active.
-        try { it.setWords(true) } catch (e: Throwable) {
-            Log.w(TAG, "Recognizer.setWords(true) failed: ${e.message}")
-        }
-    }
+    )
 
     @Volatile
     private var closed = false
@@ -83,19 +67,16 @@ class VoskWakeWordEngine(
      * Feed a chunk of PCM 16-bit mono samples at the engine's sample rate.
      * Returns a non-null [Match] if a configured variant is detected.
      *
-     * Two modes, selected by [confidenceThreshold] at construction:
-     *  - 0.0 (legacy): matches against partial OR final transcription via
-     *    substring contains.
-     *  - > 0.0: matches only against final transcription, and only when the
-     *    minimum per-word confidence across the matched phrase's words is at
-     *    or above the threshold. Sub-threshold matches are returned with
-     *    `accepted = false` for diagnostic logging by the caller — the caller
-     *    is responsible for ignoring rejected matches.
+     * Matches against partial OR final transcription via substring contains —
+     * fires on the earliest partial that carries the phrase, preserving the
+     * sub-second latency profile. False positives are now filtered downstream
+     * by a Whisper transcription confirmation gate (see
+     * `WakeWordDetector.confirmWithWhisper`), so this stage stays permissive
+     * and fast.
      *
-     * Side effect on accepted match: the recognizer is reset so the next
-     * call starts fresh — otherwise Vosk's accumulating partial would keep
-     * re-matching the same phrase across many calls, producing a stream of
-     * false re-triggers.
+     * Side effect on match: the recognizer is reset so the next call starts
+     * fresh — otherwise Vosk's accumulating partial would keep re-matching the
+     * same phrase across many calls, producing a stream of false re-triggers.
      *
      * `length` is the number of samples actually filled (per
      * `AudioRecord.read`'s contract — can be less than `buffer.size`).
@@ -103,28 +84,14 @@ class VoskWakeWordEngine(
     fun feed(buffer: ShortArray, length: Int): Match? {
         if (closed || length <= 0) return null
         val isFinal = recognizer.acceptWaveForm(buffer, length)
-        return if (confidenceThreshold > 0.0) {
-            if (!isFinal) return null
-            val json = recognizer.finalResult
-            val match = findMatchWithConfidence(
-                json, talkVariants, wakeVariants, confidenceThreshold,
-            ) ?: return null
-            // Reset on every final regardless of accept/reject — the audio
-            // window for this utterance is consumed either way.
-            try { recognizer.reset() } catch (e: Throwable) {
-                Log.w(TAG, "Recognizer reset failed: ${e.message}")
-            }
-            match
-        } else {
-            val json = if (isFinal) recognizer.finalResult else recognizer.partialResult
-            val text = extractText(json)
-            if (text.isBlank()) return null
-            val m = findMatch(text, talkVariants, wakeVariants) ?: return null
-            try { recognizer.reset() } catch (e: Throwable) {
-                Log.w(TAG, "Recognizer reset failed: ${e.message}")
-            }
-            m
+        val json = if (isFinal) recognizer.finalResult else recognizer.partialResult
+        val text = extractText(json)
+        if (text.isBlank()) return null
+        val m = findMatch(text, talkVariants, wakeVariants) ?: return null
+        try { recognizer.reset() } catch (e: Throwable) {
+            Log.w(TAG, "Recognizer reset failed: ${e.message}")
         }
+        return m
     }
 
     fun close() {
@@ -146,23 +113,11 @@ class VoskWakeWordEngine(
 
     /**
      * A wake-word/talk-word detection.
-     *
-     * - [accepted] is true when the caller should fire the broadcast. In the
-     *   legacy zero-threshold path this is always true. In the confidence
-     *   path it can be false: the match's phrase appeared in the final
-     *   transcript but the minimum per-word confidence was below the floor.
-     *   The caller logs the rejection diagnostically but otherwise ignores it.
-     * - [minConfidence] is the minimum `conf` across the matched phrase's
-     *   words, or `null` if Vosk didn't emit per-word confidences (legacy
-     *   substring path on partial result, or finalResult without a `result`
-     *   array).
      */
     data class Match(
         val matchedVariant: String,
         val isRealtime: Boolean,
         val rawText: String,
-        val accepted: Boolean = true,
-        val minConfidence: Double? = null,
     )
 
     companion object {
@@ -230,71 +185,6 @@ class VoskWakeWordEngine(
         ): String {
             val phrases = (talkVariants + wakeVariants).distinct() + "[unk]"
             return JSONArray(phrases).toString()
-        }
-
-        /**
-         * Confidence-aware match. Parses Vosk's `setWords(true)` final result
-         * JSON (with `result: [{word,start,end,conf}, …]`), runs the same
-         * realtime-first substring precedence as [findMatch], then computes
-         * the minimum per-word `conf` across the matched phrase's words and
-         * marks the [Match] as accepted/rejected against [threshold].
-         *
-         * Returns null if no phrase matches OR if Vosk's text is blank — the
-         * caller should treat null as "keep listening", and a non-null Match
-         * with `accepted = false` as "rejected, log it and reset". Matching
-         * but unscored words (missing `result` array, or `conf` absent)
-         * default to `minConfidence = null`; for safety those are treated as
-         * REJECTED when a threshold is in force (a final without per-word
-         * confidence shouldn't have happened with setWords(true), but if it
-         * does, declining to fire is the safer choice).
-         */
-        fun findMatchWithConfidence(
-            finalJson: String,
-            talkVariants: List<String>,
-            wakeVariants: List<String>,
-            threshold: Double,
-        ): Match? {
-            val text = extractText(finalJson)
-            if (text.isBlank()) return null
-            val base = findMatch(text, talkVariants, wakeVariants) ?: return null
-            val minConf = minConfForPhrase(finalJson, base.matchedVariant)
-            val accepted = minConf != null && minConf >= threshold
-            return base.copy(accepted = accepted, minConfidence = minConf)
-        }
-
-        /**
-         * Compute the minimum `conf` across the words of [phrase] inside
-         * Vosk's `result: [...]` array. Returns null if the JSON has no
-         * `result` array, the phrase's words can't be located in order, or
-         * any matched entry is missing `conf`.
-         *
-         * Matching strategy: tokenize [phrase] on whitespace, then walk the
-         * `result` array greedily looking for those tokens in order. This
-         * tolerates leading/trailing extra words in the final transcript
-         * (e.g. "[unk] wake up please" still scores the "wake"/"up" pair).
-         */
-        fun minConfForPhrase(finalJson: String, phrase: String): Double? {
-            if (finalJson.isBlank()) return null
-            val obj = try { JSONObject(finalJson) } catch (_: Throwable) { return null }
-            val result = obj.optJSONArray("result") ?: return null
-            val tokens = phrase.trim().lowercase().split(Regex("\\s+"))
-                .filter { it.isNotEmpty() }
-            if (tokens.isEmpty()) return null
-            var tokenIdx = 0
-            var minConf = Double.POSITIVE_INFINITY
-            for (i in 0 until result.length()) {
-                if (tokenIdx >= tokens.size) break
-                val entry = result.optJSONObject(i) ?: continue
-                val word = entry.optString("word", "").lowercase()
-                if (word == tokens[tokenIdx]) {
-                    if (!entry.has("conf")) return null
-                    val conf = entry.optDouble("conf", Double.NaN)
-                    if (conf.isNaN()) return null
-                    if (conf < minConf) minConf = conf
-                    tokenIdx++
-                }
-            }
-            return if (tokenIdx == tokens.size) minConf else null
         }
     }
 }

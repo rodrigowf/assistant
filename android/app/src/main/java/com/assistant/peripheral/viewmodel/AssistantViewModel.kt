@@ -133,6 +133,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val vadDurationMs: StateFlow<Long> = voiceController.vadDurationMs
     val isMuted: StateFlow<Boolean> = voiceController.isMuted
     val isRecording: StateFlow<Boolean> = voiceController.isRecording
+    val wakeConfirming: StateFlow<Boolean> = voiceController.wakeConfirming
 
     /**
      * One-shot transient toast strings for the UI. Merged from chat +
@@ -382,6 +383,8 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     fun stopVoiceSession() = voiceController.stopVoiceSession()
     fun markRecordingStarting() = voiceController.markRecordingStarting()
     fun markVoiceConnecting() = voiceController.markVoiceConnecting()
+    fun markWakeConfirming() = voiceController.markWakeConfirming()
+    fun clearWakeConfirming() = voiceController.clearWakeConfirming()
     fun toggleMute() = voiceController.toggleMute()
 
     fun isBluetoothAudioAvailable(): Boolean = voiceController.isBluetoothAudioAvailable()
@@ -436,10 +439,6 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun updateWakeWordMicGainLevel(level: Float) {
         viewModelScope.launch { settingsRepository.updateWakeWordMicGainLevel(level) }
-    }
-
-    fun updateWakeWordConfidenceThreshold(threshold: Float) {
-        viewModelScope.launch { settingsRepository.updateWakeWordConfidenceThreshold(threshold) }
     }
 
     fun updateAudioOutput(output: AudioOutput) {

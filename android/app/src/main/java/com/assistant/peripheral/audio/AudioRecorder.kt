@@ -157,7 +157,7 @@ class AudioRecorder(
         Log.d(TAG, "Recording stopped, ${pcmData.size} bytes captured")
 
         // Convert PCM to WAV
-        val wavData = pcmToWav(pcmData)
+        val wavData = WavUtils.pcmToWav(pcmData, SAMPLE_RATE)
         return Base64.encodeToString(wavData, Base64.NO_WRAP)
     }
 
@@ -188,88 +188,4 @@ class AudioRecorder(
         scope.cancel()
     }
 
-    /**
-     * Convert PCM data to WAV format.
-     */
-    private fun pcmToWav(pcmData: ByteArray): ByteArray {
-        val totalDataLen = pcmData.size + 36
-        val totalAudioLen = pcmData.size
-        val channels = 1
-        val byteRate = SAMPLE_RATE * channels * 2
-
-        val header = ByteArray(44)
-
-        // RIFF header
-        header[0] = 'R'.code.toByte()
-        header[1] = 'I'.code.toByte()
-        header[2] = 'F'.code.toByte()
-        header[3] = 'F'.code.toByte()
-
-        // File size - 8
-        header[4] = (totalDataLen and 0xff).toByte()
-        header[5] = ((totalDataLen shr 8) and 0xff).toByte()
-        header[6] = ((totalDataLen shr 16) and 0xff).toByte()
-        header[7] = ((totalDataLen shr 24) and 0xff).toByte()
-
-        // WAVE header
-        header[8] = 'W'.code.toByte()
-        header[9] = 'A'.code.toByte()
-        header[10] = 'V'.code.toByte()
-        header[11] = 'E'.code.toByte()
-
-        // fmt chunk
-        header[12] = 'f'.code.toByte()
-        header[13] = 'm'.code.toByte()
-        header[14] = 't'.code.toByte()
-        header[15] = ' '.code.toByte()
-
-        // Subchunk1 size (16 for PCM)
-        header[16] = 16
-        header[17] = 0
-        header[18] = 0
-        header[19] = 0
-
-        // Audio format (1 = PCM)
-        header[20] = 1
-        header[21] = 0
-
-        // Number of channels
-        header[22] = channels.toByte()
-        header[23] = 0
-
-        // Sample rate
-        header[24] = (SAMPLE_RATE and 0xff).toByte()
-        header[25] = ((SAMPLE_RATE shr 8) and 0xff).toByte()
-        header[26] = ((SAMPLE_RATE shr 16) and 0xff).toByte()
-        header[27] = ((SAMPLE_RATE shr 24) and 0xff).toByte()
-
-        // Byte rate
-        header[28] = (byteRate and 0xff).toByte()
-        header[29] = ((byteRate shr 8) and 0xff).toByte()
-        header[30] = ((byteRate shr 16) and 0xff).toByte()
-        header[31] = ((byteRate shr 24) and 0xff).toByte()
-
-        // Block align
-        header[32] = (channels * 2).toByte()
-        header[33] = 0
-
-        // Bits per sample
-        header[34] = 16
-        header[35] = 0
-
-        // data chunk
-        header[36] = 'd'.code.toByte()
-        header[37] = 'a'.code.toByte()
-        header[38] = 't'.code.toByte()
-        header[39] = 'a'.code.toByte()
-
-        // Data size
-        header[40] = (totalAudioLen and 0xff).toByte()
-        header[41] = ((totalAudioLen shr 8) and 0xff).toByte()
-        header[42] = ((totalAudioLen shr 16) and 0xff).toByte()
-        header[43] = ((totalAudioLen shr 24) and 0xff).toByte()
-
-        // Combine header and PCM data
-        return header + pcmData
-    }
 }

@@ -340,6 +340,34 @@ class ApiClient(private val baseUrl: String) {
     }
 
     /**
+     * Fetch the backend's OpenAI API key from ``GET /api/config/openai-key``.
+     *
+     * The wake-word Whisper confirmation calls OpenAI's transcription endpoint
+     * directly (lowest latency), which needs the raw key — the app has none of
+     * its own. The key lives only in the backend's ``context/.env``; this pulls
+     * it over the LAN (same trust model as the voice-session ephemeral token).
+     * Caller is responsible for caching; returns null on any failure.
+     */
+    suspend fun fetchOpenAiKey(): String? = withContext(Dispatchers.IO) {
+        try {
+            val url = buildHttpUrl("/api/config/openai-key")
+            val request = Request.Builder().url(url).get().build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) {
+                Log.e(TAG, "fetchOpenAiKey failed: ${response.code}")
+                return@withContext null
+            }
+            val body = response.body?.string() ?: return@withContext null
+            val key = JSONObject(body).optString("api_key", "").ifEmpty { null }
+            if (key == null) Log.e(TAG, "fetchOpenAiKey: no api_key in response")
+            key
+        } catch (e: Exception) {
+            Log.e(TAG, "fetchOpenAiKey error: ${e.message}", e)
+            null
+        }
+    }
+
+    /**
      * Upload a file to ``POST /api/uploads`` (multipart). Returns the parsed
      * metadata the backend writes for the stored file, or null on failure.
      *

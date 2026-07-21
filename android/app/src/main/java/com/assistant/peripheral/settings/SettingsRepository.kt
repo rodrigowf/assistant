@@ -235,10 +235,6 @@ class SettingsRepository(
         dataStore.edit { it[WAKE_WORD_MIC_GAIN_LEVEL] = level.coerceIn(0.0f, 1.5f) }
     }
 
-    suspend fun updateWakeWordConfidenceThreshold(threshold: Float) {
-        dataStore.edit { it[WAKE_WORD_CONFIDENCE_THRESHOLD] = threshold.coerceIn(0.0f, 1.0f) }
-    }
-
     suspend fun updateAudioOutput(output: AudioOutput) {
         dataStore.edit { it[AUDIO_OUTPUT] = output.name }
     }
@@ -300,7 +296,6 @@ class SettingsRepository(
         },
         micGainLevel = this[MIC_GAIN_LEVEL] ?: 1.0f,
         wakeWordMicGainLevel = this[WAKE_WORD_MIC_GAIN_LEVEL] ?: 1.0f,
-        wakeWordConfidenceThreshold = this[WAKE_WORD_CONFIDENCE_THRESHOLD] ?: 0.0f,
         speakerVolumeLevel = this[SPEAKER_VOLUME_LEVEL] ?: 1.0f,
         echoDuckingGain = this[ECHO_DUCKING_GAIN] ?: AppSettings().echoDuckingGain,
         audioOutput = AudioOutput.fromString(this[AUDIO_OUTPUT]),
@@ -334,7 +329,6 @@ class SettingsRepository(
         private val THEME_MODE = stringPreferencesKey("theme_mode")
         private val MIC_GAIN_LEVEL = floatPreferencesKey("mic_gain_level")
         private val WAKE_WORD_MIC_GAIN_LEVEL = floatPreferencesKey("wake_word_mic_gain_level")
-        private val WAKE_WORD_CONFIDENCE_THRESHOLD = floatPreferencesKey("wake_word_confidence_threshold")
         private val SPEAKER_VOLUME_LEVEL = floatPreferencesKey("speaker_volume_level")
         private val ECHO_DUCKING_GAIN = floatPreferencesKey("echo_ducking_gain")
         private val AUDIO_OUTPUT = stringPreferencesKey("audio_output")

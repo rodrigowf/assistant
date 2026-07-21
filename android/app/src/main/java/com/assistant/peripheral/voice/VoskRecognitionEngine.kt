@@ -40,10 +40,6 @@ internal class VoskRecognitionEngine(
     private val wakeVariants: List<String>,
     private val callbacks: RecognitionCallbacks,
     private val sampleRate: Float = 16_000f,
-    // 0.0 = legacy behaviour (substring match on partial OR final, no floor).
-    // > 0.0 = finals-only with min-per-word `conf` ≥ this value. See
-    // `VoskWakeWordEngine.feed` for the full semantics.
-    private val confidenceThreshold: Float = 0f,
 ) : WakeWordRecognitionEngine {
 
     companion object {
@@ -64,6 +60,14 @@ internal class VoskRecognitionEngine(
          * the way SR does).
          */
         private const val RMS_STARTED_THRESHOLD = 30.0
+
+        /**
+         * How much audio to keep capturing AFTER Vosk's (possibly mid-word)
+         * partial match, so the Whisper confirmation gate hears the complete
+         * phrase. 400ms comfortably covers the tail of "wake up" / "my friend"
+         * once the leading edge already triggered.
+         */
+        private const val MATCH_TAIL_MS = 400L
     }
 
     /**
@@ -120,8 +124,13 @@ internal class VoskRecognitionEngine(
                 sampleRate = sampleRate,
                 talkVariants = talkVariants,
                 wakeVariants = wakeVariants,
-                confidenceThreshold = confidenceThreshold.toDouble(),
             ).also { feeder = it }
+
+            // Every frame Vosk consumes this cycle, oldest first — pre-buffer
+            // then live reads. On a match this is handed back verbatim to the
+            // Whisper confirmation gate so it transcribes exactly what Vosk
+            // flagged (defensively copied — the live `buffer` is reused).
+            val captured = ArrayList<ShortArray>(preBuffer.size + 8)
 
             // 1) Feed the pre-buffer FIRST. This is the entire architectural
             //    point of switching off SpeechRecognizer: the silence monitor
@@ -132,27 +141,16 @@ internal class VoskRecognitionEngine(
             if (preBuffer.isNotEmpty()) {
                 var totalFrames = 0
                 for (frame in preBuffer) {
+                    captured.add(frame)
                     val m = cycleFeeder.feed(frame, frame.size)
                     totalFrames += frame.size
                     if (m != null) {
-                        if (!m.accepted) {
-                            Log.d(
-                                TAG,
-                                "Vosk match in pre-buffer REJECTED (conf=${m.minConfidence} < threshold=$confidenceThreshold): " +
-                                    "\"${m.matchedVariant}\" in \"${m.rawText}\"",
-                            )
-                            continue
-                        }
                         Log.d(
                             TAG,
                             "Vosk match in pre-buffer: \"${m.matchedVariant}\" " +
-                                "(realtime=${m.isRealtime}, conf=${m.minConfidence}) in \"${m.rawText}\"",
+                                "(realtime=${m.isRealtime}) in \"${m.rawText}\"",
                         )
-                        return@withContext RecognitionResult.Matched(
-                            matchedPhrase = m.matchedVariant,
-                            isRealtime = m.isRealtime,
-                            rawText = m.rawText,
-                        )
+                        return@withContext matchedResult(m, audioRecord, captured)
                     }
                 }
                 Log.d(TAG, "Pre-buffer fed: $totalFrames samples " +
@@ -185,32 +183,20 @@ internal class VoskRecognitionEngine(
                         delay(10L)
                         continue
                     }
+                    val frame = buffer.copyOf(read)
+                    captured.add(frame)
                     if (!firedStarted && rms(buffer, read) >= RMS_STARTED_THRESHOLD) {
                         firedStarted = true
                         callbacks.onRecognitionStarted()
                     }
                     val match = cycleFeeder.feed(buffer, read)
                     if (match != null) {
-                        if (!match.accepted) {
-                            Log.d(
-                                TAG,
-                                "Vosk match REJECTED (conf=${match.minConfidence} < threshold=$confidenceThreshold): " +
-                                    "\"${match.matchedVariant}\" in \"${match.rawText}\"",
-                            )
-                            // Keep listening — the feeder already reset on this
-                            // final, so the next loop iteration starts fresh.
-                            continue
-                        }
                         Log.d(
                             TAG,
                             "Vosk match: \"${match.matchedVariant}\" " +
-                                "(realtime=${match.isRealtime}, conf=${match.minConfidence}) in \"${match.rawText}\"",
+                                "(realtime=${match.isRealtime}) in \"${match.rawText}\"",
                         )
-                        return@withContext RecognitionResult.Matched(
-                            matchedPhrase = match.matchedVariant,
-                            isRealtime = match.isRealtime,
-                            rawText = match.rawText,
-                        )
+                        return@withContext matchedResult(match, audioRecord, captured)
                     }
                     // Track partials between feeds for diagnostic logging.
                     val partial = cycleFeeder.peekText()
@@ -224,6 +210,43 @@ internal class VoskRecognitionEngine(
                 closeFeeder()
             }
         }
+    }
+
+    /**
+     * Package a Vosk match into a [RecognitionResult.Matched], first reading a
+     * short tail of audio past the trigger so the Whisper confirmation gate
+     * hears the full phrase.
+     *
+     * Vosk fires on the earliest *partial* that contains the phrase, which can
+     * land mid-word ("wake u…"). Whisper transcribing only up to that instant
+     * might miss the tail and reject a real wake word. So we keep reading for
+     * [MATCH_TAIL_MS] more, appending to [captured], before handing it off.
+     * This runs off the same shared AudioRecord and adds only a few hundred ms.
+     */
+    private suspend fun matchedResult(
+        match: VoskWakeWordEngine.Match,
+        audioRecord: AudioRecord,
+        captured: MutableList<ShortArray>,
+    ): RecognitionResult {
+        val tailBuffer = ShortArray(3200)  // 200ms at 16kHz
+        val tailEnd = System.currentTimeMillis() + MATCH_TAIL_MS
+        while (!cancelled && System.currentTimeMillis() < tailEnd) {
+            val read = audioRecord.read(tailBuffer, 0, tailBuffer.size)
+            if (read <= 0) { delay(10L); continue }
+            captured.add(tailBuffer.copyOf(read))
+        }
+        val totalSamples = captured.sumOf { it.size }
+        Log.d(
+            TAG,
+            "Captured ${captured.size} frames / $totalSamples samples " +
+                "(${totalSamples * 1000 / sampleRate.toInt()}ms) for Whisper confirmation",
+        )
+        return RecognitionResult.Matched(
+            matchedPhrase = match.matchedVariant,
+            isRealtime = match.isRealtime,
+            rawText = match.rawText,
+            capturedPcm = captured.toList(),
+        )
     }
 
     override suspend fun tearDown() {

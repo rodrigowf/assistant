@@ -133,6 +133,16 @@ class VoiceController(
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
+    /**
+     * True while a raw wake/talk detection is being confirmed by Whisper —
+     * i.e. between the Vosk match and the confirmed/rejected verdict. Drives a
+     * transient "Listening…" indicator so the user gets instant feedback during
+     * the ~0.3–0.8s gate. Cleared on confirm (the real recording/connecting
+     * state takes over) or on reject (false positive — flashes and vanishes).
+     */
+    private val _wakeConfirming = MutableStateFlow(false)
+    val wakeConfirming: StateFlow<Boolean> = _wakeConfirming.asStateFlow()
+
     private val _toastMessage = MutableSharedFlow<String>(extraBufferCapacity = 8)
     /**
      * Toast channel — voice routing-fallback messages emit here. Inc 7
@@ -483,6 +493,7 @@ class VoiceController(
      * `_isRecording.value = false` and the user sees a system message.
      */
     fun markRecordingStarting() {
+        _wakeConfirming.value = false
         _isRecording.value = true
     }
 
@@ -496,7 +507,23 @@ class VoiceController(
      * [startVoiceSession].
      */
     fun markVoiceConnecting() {
+        _wakeConfirming.value = false
         _voiceState.value = VoiceState.Connecting
+    }
+
+    /**
+     * A wake/talk phrase was detected locally and is being confirmed by
+     * Whisper. Flip the transient indicator on. Followed by exactly one of:
+     * a real detection callback (which flips recording/connecting on and this
+     * off) or [clearWakeConfirming] (rejection).
+     */
+    fun markWakeConfirming() {
+        _wakeConfirming.value = true
+    }
+
+    /** Clear the transient confirming indicator (confirmed or rejected). */
+    fun clearWakeConfirming() {
+        _wakeConfirming.value = false
     }
 
     fun startRecording() {

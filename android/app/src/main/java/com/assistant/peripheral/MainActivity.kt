@@ -65,6 +65,12 @@ class MainActivity : ComponentActivity() {
     var onTalkWordDetected: (() -> Unit)? = null
     var onWakeWordDetected: (() -> Unit)? = null
 
+    // Whisper-confirmation lifecycle (fires between a raw Vosk match and the
+    // confirmed/rejected outcome). `isRealtime` tells the UI which trigger
+    // is being confirmed so it can show the right transient indicator.
+    var onWakeConfirming: ((isRealtime: Boolean) -> Unit)? = null
+    var onWakeConfirmFailed: ((isRealtime: Boolean) -> Unit)? = null
+
     /**
      * A payload shared into the app via ACTION_SEND (share sheet). Observed by
      * the AssistantApp composable, which dispatches it to the ViewModel
@@ -101,6 +107,14 @@ class MainActivity : ComponentActivity() {
             when (intent?.action) {
                 WakeWordDetector.ACTION_TALK_WORD_DETECTED -> onTalkWordDetected?.invoke()
                 WakeWordDetector.ACTION_WAKE_WORD_DETECTED -> onWakeWordDetected?.invoke()
+                WakeWordDetector.ACTION_WAKE_CONFIRMING ->
+                    onWakeConfirming?.invoke(
+                        intent.getBooleanExtra(WakeWordDetector.EXTRA_IS_REALTIME, false),
+                    )
+                WakeWordDetector.ACTION_WAKE_CONFIRM_FAILED ->
+                    onWakeConfirmFailed?.invoke(
+                        intent.getBooleanExtra(WakeWordDetector.EXTRA_IS_REALTIME, false),
+                    )
             }
         }
     }
@@ -114,6 +128,8 @@ class MainActivity : ComponentActivity() {
         val filter = IntentFilter().apply {
             addAction(WakeWordDetector.ACTION_TALK_WORD_DETECTED)
             addAction(WakeWordDetector.ACTION_WAKE_WORD_DETECTED)
+            addAction(WakeWordDetector.ACTION_WAKE_CONFIRMING)
+            addAction(WakeWordDetector.ACTION_WAKE_CONFIRM_FAILED)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(wakeWordReceiver, filter)
 
@@ -234,6 +250,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val sessionStatus by viewModel.sessionStatus.collectAsState()
     val termination by viewModel.termination.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
+    val wakeConfirming by viewModel.wakeConfirming.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val voiceState by viewModel.voiceState.collectAsState()
     val vadState by viewModel.vadState.collectAsState()
@@ -332,6 +349,30 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         onDispose { activity.onWakeWordDetected = null }
     }
 
+    // Wire the Whisper-confirmation lifecycle. A raw Vosk match first fires
+    // "confirming" (transient "Listening…" indicator + a foreground nav so the
+    // user sees it), then resolves to a real detection callback (above) or a
+    // rejection that just clears the indicator.
+    DisposableEffect(Unit) {
+        activity.onWakeConfirming = { _ ->
+            viewModel.markWakeConfirming()
+            // Surface the chat screen so the transient indicator is visible even
+            // if the phrase turns out to be a false positive that never starts.
+            navController.navigate(Screen.Chat.route) {
+                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                launchSingleTop = true
+                restoreState = true
+            }
+        }
+        activity.onWakeConfirmFailed = { _ ->
+            viewModel.clearWakeConfirming()
+        }
+        onDispose {
+            activity.onWakeConfirming = null
+            activity.onWakeConfirmFailed = null
+        }
+    }
+
     // Auto-connect or auto-scan on launch
     LaunchedEffect(Unit) {
         val defaultUrl = com.assistant.peripheral.data.AppSettings().serverUrl
@@ -361,7 +402,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         settings.talkWord,
         settings.wakeWord,
         settings.wakeWordMicGainLevel,
-        settings.wakeWordConfidenceThreshold,
+        settings.serverUrl,
     ) {
         AssistantService.updateWakeWord(
             activity,
@@ -369,7 +410,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             settings.talkWord,
             settings.wakeWord,
             settings.wakeWordMicGainLevel,
-            settings.wakeWordConfidenceThreshold,
+            settings.serverUrl,
         )
     }
 
@@ -515,7 +556,6 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         onUpdateAutoConnect = viewModel::updateAutoConnect,
                         onUpdateMicGainLevel = viewModel::updateMicGainLevel,
                         onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
-                        onUpdateWakeWordConfidenceThreshold = viewModel::updateWakeWordConfidenceThreshold,
                         onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
                         onUpdateEchoDuckingGain = viewModel::updateEchoDuckingGain,
                         onUpdateAudioOutput = viewModel::updateAudioOutput,
@@ -575,6 +615,35 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 connectionState = connectionState,
                 sessionStatus = sessionStatus,
             )
+            // Transient "heard you, confirming…" banner while the Whisper gate
+            // runs. Flashes briefly on false positives, then vanishes; on a
+            // real detection the recording/connecting UI takes over.
+            if (wakeConfirming) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                ) {
+                    androidx.compose.foundation.layout.Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                        androidx.compose.foundation.layout.Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Listening…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                }
+            }
             com.assistant.peripheral.ui.screens.ChatInputBar(
                 inputText = chatInputText,
                 onInputChange = { chatInputText = it },

@@ -59,17 +59,35 @@ class WakeWordDetector(
     private val talkWord: String,
     private val wakeWord: String = "", // empty = disabled
     private val micGain: Float = 1.0f, // scales RMS threshold
-    // Vosk-only: minimum per-word confidence (min across matched phrase words)
-    // for a match to be accepted. 0.0 = off (substring match on partial OR
-    // final result, the legacy behaviour). When > 0.0 the Vosk engine flips to
-    // finals-only matching and applies the floor. SR engine ignores this knob
-    // (Google STT doesn't expose per-word confidence).
-    private val confidenceThreshold: Float = 0.0f,
+    // Backend base URL (ws://host:port). Used to fetch the OpenAI key for the
+    // Whisper confirmation gate. Blank disables confirmation (fail-open — the
+    // detector fires on the raw Vosk match). Normally always set.
+    private val serverUrl: String = "",
 ) {
     companion object {
         private const val TAG = "WakeWordDetector"
         const val ACTION_TALK_WORD_DETECTED = "com.assistant.peripheral.TURN_TALK_WORD_DETECTED"
         const val ACTION_WAKE_WORD_DETECTED = "com.assistant.peripheral.REALTIME_WAKE_WORD_DETECTED"
+
+        /**
+         * Fired the instant Vosk flags a candidate — BEFORE the Whisper
+         * confirmation round-trip. Drives the transient "heard something,
+         * confirming…" UI so the user gets instant feedback during the
+         * ~0.3–0.8s gate. Always followed by exactly one of:
+         * ACTION_*_WORD_DETECTED (confirmed) or ACTION_WAKE_CONFIRM_FAILED
+         * (rejected / gate error).
+         */
+        const val ACTION_WAKE_CONFIRMING = "com.assistant.peripheral.WAKE_CONFIRMING"
+
+        /**
+         * Fired when the Whisper gate rejects a candidate (or errors, since we
+         * fail closed). The UI clears the transient confirming indicator; no
+         * session/recording starts. `isRealtime` is passed as a boolean extra
+         * so the UI can clear the matching indicator.
+         */
+        const val ACTION_WAKE_CONFIRM_FAILED = "com.assistant.peripheral.WAKE_CONFIRM_FAILED"
+
+        const val EXTRA_IS_REALTIME = "is_realtime"
 
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
@@ -295,6 +313,24 @@ class WakeWordDetector(
     @Volatile
     private var engine: WakeWordRecognitionEngine? = null
 
+    /**
+     * Whisper confirmation gate. Lazily built on first match so a detector
+     * that never fires costs nothing. Null when [serverUrl] is blank — then
+     * matches fire unconfirmed (fail-open on a misconfigured detector).
+     */
+    private val whisperConfirmer: WhisperConfirmer? by lazy {
+        if (serverUrl.isBlank()) {
+            Log.w(TAG, "No serverUrl — Whisper confirmation disabled (firing unconfirmed)")
+            null
+        } else {
+            WhisperConfirmer(
+                apiClient = com.assistant.peripheral.network.ApiClient(serverUrl),
+                talkVariants = talkVariants,
+                wakeVariants = wakeVariants,
+            )
+        }
+    }
+
     private fun srEngine(): WakeWordRecognitionEngine = SpeechRecognizerEngine(
         context = context,
         talkVariants = talkVariants,
@@ -316,13 +352,12 @@ class WakeWordDetector(
             null
         }
         val resolved = if (model != null) {
-            Log.d(TAG, "Engine selected: Vosk (model loaded, confThreshold=$confidenceThreshold)")
+            Log.d(TAG, "Engine selected: Vosk (model loaded)")
             VoskRecognitionEngine(
                 model = model,
                 talkVariants = talkVariants,
                 wakeVariants = wakeVariants,
                 callbacks = recognitionCallbacks,
-                confidenceThreshold = confidenceThreshold,
             )
         } else {
             Log.d(TAG, "Engine selected: SpeechRecognizer (Vosk unavailable)")
@@ -653,12 +688,21 @@ class WakeWordDetector(
         if (state is WakeWordState.Recognizing) state = WakeWordState.Idle
 
         val matched = result as? RecognitionResult.Matched
+        // Whisper confirmation gate: a raw Vosk match is only a candidate. We
+        // transcribe the exact flagged audio and fire only if a real wake/talk
+        // variant is present. `confirmed` stays true for the unconfigured /
+        // disabled path (fail-open) and for the SR fallback (no captured PCM).
+        var confirmed = false
         if (matched != null) {
-            fireMatchBroadcast(matched)
+            confirmed = confirmMatch(matched)
+            if (confirmed) fireMatchBroadcast(matched)
         }
 
         val restartDelay = when {
             matched != null -> {
+                // Both confirmed and rejected matches consumed the utterance;
+                // apply the post-wakeword cooldown either way so a rejected
+                // false-positive doesn't immediately re-fire on the same audio.
                 consecutiveMisses = 0
                 POST_WAKEWORD_DELAY_MS
             }
@@ -693,6 +737,44 @@ class WakeWordDetector(
             delay(restartDelay)
             if (isActive && !isPaused) startSilenceMonitor()
         }
+    }
+
+    /**
+     * Gate a raw Vosk candidate through Whisper. Returns true if it should
+     * fire, false if it should be silently dropped.
+     *
+     * Fail-open (returns true without calling Whisper) when:
+     *  - no confirmer (blank serverUrl), or
+     *  - the engine handed back no PCM (SR fallback path — it can't expose its
+     *    audio, so we trust its match as before).
+     *
+     * Otherwise transcribes the captured audio and returns Whisper's verdict.
+     * Whisper itself is fail-CLOSED (network error/timeout → reject) — that
+     * policy lives in [WhisperConfirmer].
+     */
+    private suspend fun confirmMatch(match: RecognitionResult.Matched): Boolean {
+        val confirmer = whisperConfirmer ?: return true
+        if (match.capturedPcm.isEmpty()) {
+            Log.d(TAG, "No captured PCM (SR path?) — firing without Whisper confirmation")
+            return true
+        }
+        // Announce the candidate so the UI shows "confirming…" during the gate.
+        LocalBroadcastManager.getInstance(context).sendBroadcast(
+            Intent(ACTION_WAKE_CONFIRMING).putExtra(EXTRA_IS_REALTIME, match.isRealtime),
+        )
+        val result = confirmer.confirm(match.capturedPcm)
+        if (!result.confirmed) {
+            Log.d(
+                TAG,
+                "Whisper gate rejected \"${match.matchedPhrase}\" " +
+                    "(failed=${result.failed}, heard=\"${result.transcript}\")",
+            )
+            LocalBroadcastManager.getInstance(context).sendBroadcast(
+                Intent(ACTION_WAKE_CONFIRM_FAILED).putExtra(EXTRA_IS_REALTIME, match.isRealtime),
+            )
+            return false
+        }
+        return true
     }
 
     private fun fireMatchBroadcast(match: RecognitionResult.Matched) {

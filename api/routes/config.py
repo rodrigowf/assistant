@@ -273,6 +273,55 @@ async def get_config() -> dict[str, Any]:
     return _load_config()
 
 
+def _resolve_openai_key() -> str | None:
+    """Return the OpenAI API key, preferring the process environment.
+
+    ``context/scripts/run.sh`` sources ``context/.env`` before launching the
+    backend, so ``OPENAI_API_KEY`` is normally already in ``os.environ``. If it
+    isn't (e.g. the backend was started some other way), fall back to parsing
+    ``context/.env`` directly so the single source of truth stays that file.
+    """
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key.strip()
+    env_path = PROJECT_ROOT / "context" / ".env"
+    if not env_path.exists():
+        return None
+    try:
+        for raw in env_path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip() == "OPENAI_API_KEY":
+                # Strip surrounding quotes a shell `source` would have removed.
+                return value.strip().strip('"').strip("'")
+    except OSError:
+        logger.exception("Failed to read context/.env for OPENAI_API_KEY")
+    return None
+
+
+@router.get("/openai-key")
+async def get_openai_key() -> dict[str, Any]:
+    """Serve the OpenAI API key to LAN peripherals (e.g. the Android app).
+
+    The Android wake-word confirmation calls OpenAI's ``audio/transcriptions``
+    (Whisper) endpoint directly for lowest latency, which needs the raw key.
+    The app has no key of its own; it fetches it here and caches it. Same LAN
+    trust model as ``POST /api/orchestrator/voice/session`` (which already
+    hands out short-lived OpenAI credentials to the same clients).
+
+    Returns ``{"api_key": "sk-..."}`` or 404 if no key is configured.
+    """
+    key = _resolve_openai_key()
+    if not key:
+        raise HTTPException(
+            status_code=404,
+            detail="OPENAI_API_KEY is not configured on the backend.",
+        )
+    return {"api_key": key}
+
+
 @router.get("/providers")
 async def list_session_providers() -> dict[str, Any]:
     """Return the registered session-harness specs for the frontend picker.
