@@ -68,6 +68,14 @@ internal class VoskRecognitionEngine(
          * once the leading edge already triggered.
          */
         private const val MATCH_TAIL_MS = 400L
+
+        /**
+         * Upper bound on how much audio (ending at the post-match tail) is sent
+         * to Whisper. The wake phrase is ~1s; 2s comfortably contains it plus a
+         * little lead-in, while keeping the upload small and the transcription
+         * fast even when the recognition window ran long.
+         */
+        private const val MAX_CONFIRM_WINDOW_MS = 2000L
     }
 
     /**
@@ -235,18 +243,43 @@ internal class VoskRecognitionEngine(
             if (read <= 0) { delay(10L); continue }
             captured.add(tailBuffer.copyOf(read))
         }
-        val totalSamples = captured.sumOf { it.size }
+        // Trim to just the audio AROUND the trigger. The recognition window can
+        // run several seconds (a slow speaker, or repeated attempts), but the
+        // wake phrase itself is ~1s. Sending Whisper the whole multi-second run
+        // is slow and costly and can bury the phrase among unrelated speech, so
+        // keep only the trailing MAX_CONFIRM_WINDOW_MS (which always includes
+        // the just-captured tail, hence the phrase).
+        val trimmed = trimToTrailingWindow(captured, MAX_CONFIRM_WINDOW_MS)
+        val totalSamples = trimmed.sumOf { it.size }
         Log.d(
             TAG,
-            "Captured ${captured.size} frames / $totalSamples samples " +
-                "(${totalSamples * 1000 / sampleRate.toInt()}ms) for Whisper confirmation",
+            "Captured ${trimmed.size} frames / $totalSamples samples " +
+                "(${totalSamples * 1000 / sampleRate.toInt()}ms) for Whisper confirmation" +
+                if (trimmed.size < captured.size) " (trimmed from ${captured.size} frames)" else "",
         )
         return RecognitionResult.Matched(
             matchedPhrase = match.matchedVariant,
             isRealtime = match.isRealtime,
             rawText = match.rawText,
-            capturedPcm = captured.toList(),
+            capturedPcm = trimmed,
         )
+    }
+
+    /**
+     * Keep only the most recent [windowMs] of audio from [frames] (oldest
+     * dropped first). Walks from the end summing sample counts until the
+     * window is filled, then returns the kept suffix in chronological order.
+     */
+    private fun trimToTrailingWindow(frames: List<ShortArray>, windowMs: Long): List<ShortArray> {
+        val maxSamples = (sampleRate * windowMs / 1000).toInt()
+        var running = 0
+        var startIdx = frames.size
+        for (i in frames.indices.reversed()) {
+            running += frames[i].size
+            startIdx = i
+            if (running >= maxSamples) break
+        }
+        return if (startIdx == 0) frames else frames.subList(startIdx, frames.size).toList()
     }
 
     override suspend fun tearDown() {
