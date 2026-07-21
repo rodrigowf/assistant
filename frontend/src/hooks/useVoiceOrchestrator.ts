@@ -106,8 +106,11 @@ export interface VoiceOrchestratorResult {
   /** True when this device initiated the voice session (called startVoice).
    *  False for passive viewers receiving voice events from another device. */
   isLocalVoice: boolean;
-  /** Process a voice-related server event for passive viewing. Handles
-   *  voice_event (provider transcripts), voice_ending, and voice_ended. */
+  /** True when voice is active on ANOTHER device sharing this session — drives
+   *  a read-only indicator + disables this device's Connect button. */
+  remoteVoiceActive: boolean;
+  /** Process a voice-related server event for passive viewing: mirrors
+   *  transcripts and tracks voice_owner_active for the remote indicator. */
   handlePassiveVoiceEvent: (event: ServerEvent) => void;
 }
 
@@ -130,6 +133,11 @@ export function useVoiceOrchestrator(
   // True when this device called startVoice() — distinguishes the voice
   // owner from passive viewers receiving events from another device.
   const [isLocalVoice, setIsLocalVoice] = useState(false);
+  // True when voice is active on ANOTHER device sharing this orchestrator
+  // session. Drives a read-only "voice active on another device" indicator +
+  // disables this device's Connect button (single-user peripherals shouldn't
+  // fight over one voice session). Set from the voice_owner_active broadcast.
+  const [remoteVoiceActive, setRemoteVoiceActive] = useState(false);
   const transportRef = useRef<AnyVoiceTransportHandles | null>(null);
   const wsRef = useRef<ChatSocket | null>(null);
 
@@ -682,6 +690,7 @@ export function useVoiceOrchestrator(
     if (voiceStatus !== "off" && voiceStatus !== "error") return;
 
     setIsLocalVoice(true);
+    setRemoteVoiceActive(false);
     setVoiceError(null);
     setVoiceErrorDetails(null);
     setVadState("idle");
@@ -865,17 +874,25 @@ export function useVoiceOrchestrator(
   const handlePassiveVoiceEvent = useCallback((event: ServerEvent) => {
     switch (event.type) {
       case "voice_event":
+        // Transcript mirroring is fine for a passive viewer, but must NOT
+        // flip our own connection status (a provider voice_status:preparing
+        // would show "Connecting…" on a device that never connected). The
+        // provider-status flip is already guarded by currentProvider==null in
+        // handleProviderEvent; transcripts still render.
         handleProviderEvent(event.event);
         break;
-      case "voice_ending":
-        updateStatus("ending");
+      case "voice_owner_active":
+        // The ONLY signal a passive device acts on: show/clear the read-only
+        // "voice active on another device" indicator. Its own primary voice
+        // status stays "off".
+        setRemoteVoiceActive(event.active);
         break;
-      case "voice_ended":
-      case "voice_stopped":
-        updateStatus("off");
-        break;
+      // voice_ending / voice_ended / voice_stopped are deliberately NOT
+      // handled here: a passive viewer must not flip its own status to
+      // "ending"/"off" off another device's lifecycle (that's the wedge bug).
+      // The owner processes those on its dedicated voice WS (handleServerEvent).
     }
-  }, [handleProviderEvent, updateStatus]);
+  }, [handleProviderEvent]);
 
   return {
     voiceStatus,
@@ -893,6 +910,7 @@ export function useVoiceOrchestrator(
     vadState,
     vadDurationMs,
     isLocalVoice,
+    remoteVoiceActive,
     handlePassiveVoiceEvent,
   };
 }

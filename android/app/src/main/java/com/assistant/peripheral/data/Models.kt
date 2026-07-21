@@ -199,6 +199,14 @@ sealed class WebSocketEvent {
      *  release of the migration. Remove after the new path is verified. */
     object VoiceStopped : WebSocketEvent()
 
+    /** Voice became active/inactive on SOME device connected to this
+     *  orchestrator session. Broadcast to every subscriber so NON-owner
+     *  devices can show a read-only "voice active on another device" status
+     *  and disable their own Connect button. The owning device ignores this
+     *  (it drives its own state from its voice_start). [ownerLocalId] is the
+     *  local_id of the device that started voice (may be null). */
+    data class VoiceOwnerActive(val active: Boolean, val ownerLocalId: String?) : WebSocketEvent()
+
     /** Provider event mirrored from backend (WebSocket providers only). */
     data class VoiceProviderEvent(val event: Map<String, Any?>) : WebSocketEvent()
     /** Speaker chunk from WS-path voice providers.  Base64-encoded PCM. */

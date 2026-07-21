@@ -20,6 +20,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
@@ -45,7 +46,11 @@ fun VoiceButton(
     voiceState: VoiceState,
     onStart: () -> Unit,
     onStop: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // True when voice is active on ANOTHER device sharing this orchestrator
+    // session. Disables the button + shows a distinct "active elsewhere" icon,
+    // so a single user's peripherals don't contend for one voice session.
+    remoteActive: Boolean = false,
 ) {
     val isActive = voiceState != VoiceState.Off && voiceState !is VoiceState.Error
 
@@ -132,13 +137,25 @@ fun VoiceButton(
                 isFocused = focusState.isFocused
             }
             .clickable(
+                enabled = !remoteActive,
                 interactionSource = interactionSource,
                 indication = rememberRipple(bounded = false, radius = 32.dp)
             ) {
                 if (isActive) onStop() else onStart()
-            },
+            }
+            .alpha(if (remoteActive) 0.45f else 1f),
         contentAlignment = Alignment.Center
     ) {
+        if (remoteActive) {
+            // Voice is live on another device — read-only indicator, no action.
+            Icon(
+                imageVector = Icons.Default.PhonelinkRing,
+                contentDescription = "Voice active on another device",
+                tint = iconTint,
+                modifier = Modifier.size(26.dp)
+            )
+            return@Box
+        }
         when (voiceState) {
             is VoiceState.Connecting,
             is VoiceState.Summarizing,

@@ -134,6 +134,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
     val isMuted: StateFlow<Boolean> = voiceController.isMuted
     val isRecording: StateFlow<Boolean> = voiceController.isRecording
     val wakeConfirming: StateFlow<Boolean> = voiceController.wakeConfirming
+    val remoteVoiceActive: StateFlow<Boolean> = voiceController.remoteVoiceActive
 
     /**
      * One-shot transient toast strings for the UI. Merged from chat +

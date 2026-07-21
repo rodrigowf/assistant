@@ -251,6 +251,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
     val termination by viewModel.termination.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
     val wakeConfirming by viewModel.wakeConfirming.collectAsState()
+    val remoteVoiceActive by viewModel.remoteVoiceActive.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val voiceState by viewModel.voiceState.collectAsState()
     val vadState by viewModel.vadState.collectAsState()
@@ -663,7 +664,8 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                 onStartVoice = viewModel::startVoiceSession,
                 onStopVoice = viewModel::stopVoiceSession,
                 isOrchestratorSession = isOrchestratorSession,
-                onUploadFile = { uploadPicker.launch("*/*") }
+                onUploadFile = { uploadPicker.launch("*/*") },
+                remoteVoiceActive = remoteVoiceActive,
             )
         }
 

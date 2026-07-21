@@ -81,6 +81,9 @@ interface Props {
    *  to render a "listening Ns" duration indicator when stuck. */
   vadState?: import("../types").VadState;
   vadDurationMs?: number;
+  /** True when voice is active on another device sharing this session —
+   *  disables the Connect button + shows a read-only indicator. */
+  remoteVoiceActive?: boolean;
   /** Whether the current model supports audio input */
   supportsAudio?: boolean;
   /** Open session-specific config panel (non-orchestrator only) */
@@ -122,6 +125,7 @@ export function ChatPanel({
   voiceError,
   vadState,
   vadDurationMs,
+  remoteVoiceActive,
   supportsAudio,
   onOpenSessionConfig,
 }: Props) {
@@ -205,6 +209,7 @@ export function ChatPanel({
             onVoiceStop={isOrchestrator ? onVoiceStop : undefined}
             vadState={isOrchestrator ? vadState : undefined}
             vadDurationMs={isOrchestrator ? vadDurationMs : undefined}
+            remoteVoiceActive={isOrchestrator ? remoteVoiceActive : undefined}
             onOpenConfig={!isOrchestrator ? onOpenSessionConfig : undefined}
           />
           {isOrchestrator && voiceStatus === "error" && voiceError && (

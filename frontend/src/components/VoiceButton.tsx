@@ -28,16 +28,35 @@ interface Props {
    *  transition. Only rendered when ``vadState === "listening"`` and
    *  ``vadDurationMs >= 3000``. */
   vadDurationMs?: number;
+  /** True when voice is active on ANOTHER device sharing this orchestrator
+   *  session. Disables the button and shows a read-only "active elsewhere"
+   *  label — a single user's peripherals shouldn't contend for one session. */
+  remoteActive?: boolean;
 }
 
 const _LISTENING_DURATION_REVEAL_MS = 3000;
 
-export function VoiceButton({ status, onStart, onStop, vadState, vadDurationMs }: Props) {
+export function VoiceButton({ status, onStart, onStop, vadState, vadDurationMs, remoteActive }: Props) {
   const isOff = status === "off" || status === "error";
   const isConnecting = status === "connecting";
   // While Ending, swallow extra clicks — the backend is already
   // tearing the session down and a second stop is just noise.
   const isEnding = status === "ending";
+
+  // Voice is owned by another device — read-only, no action.
+  if (remoteActive) {
+    return (
+      <button
+        className="voice-start-btn voice-start-btn--remote"
+        title="Voice active on another device"
+        aria-label="Voice active on another device"
+        disabled
+      >
+        <RemoteIcon />
+        <span className="voice-start-label">Active elsewhere</span>
+      </button>
+    );
+  }
 
   const label = {
     off: "Start Voice",
@@ -99,6 +118,15 @@ function SpinnerIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
       <circle cx="12" cy="12" r="9" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function RemoteIcon() {
+  // Phone-link glyph — voice is live on another connected device.
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M23 8c-1.1 0-2 .9-2 2v9c0 .55-.45 1-1 1H4c-.55 0-1-.45-1-1V5c0-.55.45-1 1-1h9c1.1 0 2-.9 2-2s-.9-2-2-2H3C1.9 0 1 .9 1 2v20c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM8 12v2c3.31 0 6 2.69 6 6h2c0-4.42-3.58-8-8-8zm0-4v2c5.52 0 10 4.48 10 10h2C20 12.28 14.72 7 8 7z" />
     </svg>
   );
 }

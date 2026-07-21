@@ -198,10 +198,14 @@ class TestEndVoiceCanonical:
 
         # Both broadcasts fired, in order, with the right reason.
         broadcast_calls = pool.broadcast_orchestrator.await_args_list
-        # 1) voice_ending, 2) voice_ended, 3) legacy voice_stopped alias
+        # 1) voice_ending, 2) voice_ended, 3) legacy voice_stopped alias,
+        # 4) voice_owner_active:false (peers clear the "active elsewhere" UI)
         types_in_order = [call.args[0]["type"] for call in broadcast_calls]
-        assert types_in_order == ["voice_ending", "voice_ended", "voice_stopped"]
+        assert types_in_order == [
+            "voice_ending", "voice_ended", "voice_stopped", "voice_owner_active",
+        ]
         assert broadcast_calls[0].args[0]["reason"] == "user_stop"
+        assert broadcast_calls[3].args[0]["active"] is False
         assert broadcast_calls[1].args[0]["reason"] == "user_stop"
 
     @pytest.mark.asyncio
@@ -261,7 +265,9 @@ class TestEndVoiceCanonical:
         assert s._voice_end_reason == "user_stop"
         # Broadcasts fired so the frontends can clear their UI.
         types = [c.args[0]["type"] for c in pool.broadcast_orchestrator.await_args_list]
-        assert types == ["voice_ending", "voice_ended", "voice_stopped"]
+        assert types == [
+            "voice_ending", "voice_ended", "voice_stopped", "voice_owner_active",
+        ]
 
     @pytest.mark.asyncio
     async def test_end_voice_tolerates_shutdown_frame_timeout(self):
@@ -351,9 +357,12 @@ class TestEndVoiceCanonical:
         await s.end_voice("user_stop")
 
         relay.stop.assert_awaited_once()  # not 2x
-        # Only one pair of broadcasts (plus legacy voice_stopped).
+        # Only one set of broadcasts (voice_ending/ended/stopped + owner_active),
+        # not duplicated by the idempotent second end_voice call.
         types = [c.args[0]["type"] for c in pool.broadcast_orchestrator.await_args_list]
-        assert types == ["voice_ending", "voice_ended", "voice_stopped"]
+        assert types == [
+            "voice_ending", "voice_ended", "voice_stopped", "voice_owner_active",
+        ]
 
     @pytest.mark.asyncio
     async def test_concurrent_end_voice_callers_piggyback(self):

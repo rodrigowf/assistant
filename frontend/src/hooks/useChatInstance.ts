@@ -843,6 +843,7 @@ export function useChatInstance(options: UseChatInstanceOptions): ChatInstance {
       case "voice_ending":
       case "voice_ended":
       case "voice_stopped":
+      case "voice_owner_active":
         voiceEventHandlerRef.current?.(event);
         break;
     }

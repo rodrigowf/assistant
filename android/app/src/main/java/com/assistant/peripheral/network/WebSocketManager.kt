@@ -495,6 +495,11 @@ class WebSocketManager {
                     emit(WebSocketEvent.VoiceEnded(reason))
                 }
                 "voice_stopped" -> emit(WebSocketEvent.VoiceStopped)
+                "voice_owner_active" -> {
+                    val active = json.optBoolean("active", false)
+                    val ownerLocalId = json.optString("owner_local_id", "").ifEmpty { null }
+                    emit(WebSocketEvent.VoiceOwnerActive(active, ownerLocalId))
+                }
 
                 "voice_vad_state" -> {
                     // Increment B (voice subsystem refactor) — typed VAD

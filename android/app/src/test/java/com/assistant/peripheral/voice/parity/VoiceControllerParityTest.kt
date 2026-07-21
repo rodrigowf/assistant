@@ -451,6 +451,8 @@ class VoiceControllerParityTest {
     @Test
     fun `WS event — VoiceEnding flips state to Ending and arms safety timeout`() = runTest {
         val (ctrl, _) = controller(this)
+        // Owner-gated: only the voice owner reacts to lifecycle broadcasts.
+        ctrl.markVoiceOwnerForTest()
         ctrl.handleVoiceWebSocketEventForTest(WebSocketEvent.VoiceEnding(reason = "user"))
         // `runCurrent` drains ready coroutines WITHOUT advancing time, so
         // the state set inside the VoiceEnding handler is visible but the
@@ -469,6 +471,45 @@ class VoiceControllerParityTest {
             "safety timeout must call finalizeVoiceStop (flag set)",
             ctrl.voiceStopFinalizedForTest
         )
+        cleanup()
+    }
+
+    @Test
+    fun `WS event — non-owner ignores VoiceEnding (no wedge)`() = runTest {
+        val (ctrl, _) = controller(this)
+        // This device is NOT the voice owner (never called startVoiceSession).
+        // A VoiceEnding broadcast from another device must not flip our state.
+        ctrl.handleVoiceWebSocketEventForTest(WebSocketEvent.VoiceEnding(reason = "user"))
+        runCurrent()
+        assertEquals(
+            "non-owner must stay Off — reacting would wedge in Ending",
+            VoiceState.Off, ctrl.voiceState.value,
+        )
+        // And the safety timeout must not have been armed / not finalize.
+        advanceTimeBy(VoiceController.ENDING_ACK_TIMEOUT_MS + 100)
+        advanceUntilIdle()
+        assertFalse(
+            "non-owner must not run finalizeVoiceStop off a peer's VoiceEnding",
+            ctrl.voiceStopFinalizedForTest,
+        )
+        cleanup()
+    }
+
+    @Test
+    fun `WS event — VoiceOwnerActive drives remote indicator for non-owner`() = runTest {
+        val (ctrl, _) = controller(this)
+        // Non-owner: voice_owner_active:true → show read-only "active elsewhere".
+        ctrl.handleVoiceWebSocketEventForTest(
+            WebSocketEvent.VoiceOwnerActive(active = true, ownerLocalId = "other-device"),
+        )
+        runCurrent()
+        assertTrue("non-owner should reflect remote voice active", ctrl.remoteVoiceActiveForTest)
+        // …and clears when the owner ends.
+        ctrl.handleVoiceWebSocketEventForTest(
+            WebSocketEvent.VoiceOwnerActive(active = false, ownerLocalId = "other-device"),
+        )
+        runCurrent()
+        assertFalse("indicator clears when remote voice ends", ctrl.remoteVoiceActiveForTest)
         cleanup()
     }
 }

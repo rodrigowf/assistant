@@ -1242,7 +1242,8 @@ fun ChatInputBar(
     onStartVoice: () -> Unit,
     onStopVoice: () -> Unit,
     isOrchestratorSession: Boolean,
-    onUploadFile: (() -> Unit)? = null
+    onUploadFile: (() -> Unit)? = null,
+    remoteVoiceActive: Boolean = false,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1261,7 +1262,8 @@ fun ChatInputBar(
                     voiceState = voiceState,
                     onStart = onStartVoice,
                     onStop = onStopVoice,
-                    modifier = Modifier.size(48.dp)
+                    modifier = Modifier.size(48.dp),
+                    remoteActive = remoteVoiceActive,
                 )
                 Spacer(modifier = Modifier.width(8.dp))
 

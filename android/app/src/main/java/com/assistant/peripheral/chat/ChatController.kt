@@ -791,6 +791,7 @@ class ChatController(
             is WebSocketEvent.VoiceEnding,
             is WebSocketEvent.VoiceEnded,
             is WebSocketEvent.VoiceStopped,
+            is WebSocketEvent.VoiceOwnerActive,
             is WebSocketEvent.VoiceTranscript,
             is WebSocketEvent.VoiceVadState -> {
                 // Forwarded by the ViewModel — see AssistantViewModel.handleWebSocketEvent.

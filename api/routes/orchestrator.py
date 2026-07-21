@@ -182,6 +182,15 @@ async def orchestrator_ws(ws: WebSocket):
                     # itself instead of a route-local bool. Only this
                     # WS is allowed to tear voice down on disconnect.
                     session.register_voice_owner(ws)
+                    # Tell every OTHER subscriber that voice is now active on a
+                    # different device, so their UI shows a read-only status +
+                    # disables their own Connect button. The owner itself
+                    # ignores this (it drives its own state from voice_start).
+                    await pool.broadcast_orchestrator({
+                        "type": "voice_owner_active",
+                        "active": True,
+                        "owner_local_id": msg.get("local_id"),
+                    })
 
             elif msg_type == "send":
                 if session is None:
@@ -1059,7 +1068,7 @@ async def _handle_inject_text(
                     logger.exception("Failed to forward shared-text inject upstream")
         else:
             for cmd in commands:
-                await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+                await _send_voice_command(pool, session, cmd)
     except Exception as e:
         logger.exception("Orchestrator inject_text failed")
         await pool.broadcast_orchestrator({
@@ -1259,6 +1268,34 @@ async def _handle_voice_event(
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})
 
 
+async def _send_voice_command(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    command: dict,
+) -> None:
+    """Deliver a WebRTC ``voice_command`` to the VOICE OWNER only.
+
+    WebRTC control frames (SDP, session.update, response.create, …) belong to
+    the one device that owns the peer connection. Broadcasting them to every
+    orchestrator subscriber leaks provider control into passive peers — a
+    non-owner's ``VoiceManager`` would flip to "Connecting…" and could wedge
+    (see the multi-device voice-leak fix). Direct-send to ``voice_owner_ws``.
+
+    Fallback: if no owner is registered (shouldn't happen while voice is live,
+    but be defensive), broadcast as before so a command is never silently lost.
+    """
+    owner = session.voice_owner_ws
+    payload = orjson.dumps({"type": "voice_command", "command": command})
+    if owner is not None:
+        await _safe_send_bytes(owner, payload)
+    else:
+        logger.warning(
+            "voice_command with no registered owner — broadcasting (session=%s)",
+            getattr(session, "local_id", "?"),
+        )
+        await pool.broadcast_orchestrator({"type": "voice_command", "command": command})
+
+
 async def _dispatch_voice_commands(
     pool: SessionPool,
     session: OrchestratorSession,
@@ -1319,9 +1356,9 @@ async def _dispatch_voice_commands(
                     provider.mark_response_create_sent()
                     send_cmd = cmd
             if send_cmd is not None:
-                await pool.broadcast_orchestrator({"type": "voice_command", "command": send_cmd})
+                await _send_voice_command(pool, session, send_cmd)
             continue
-        await pool.broadcast_orchestrator({"type": "voice_command", "command": cmd})
+        await _send_voice_command(pool, session, cmd)
 
 
 async def _drain_deferred_response_create(
@@ -1363,7 +1400,7 @@ async def _drain_deferred_response_create(
             session.local_id,
             deferred.get("type"),
         )
-    await pool.broadcast_orchestrator({"type": "voice_command", "command": deferred})
+    await _send_voice_command(pool, session, deferred)
 
 
 def _tool_result_is_error(output: str) -> bool:

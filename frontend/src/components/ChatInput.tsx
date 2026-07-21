@@ -24,6 +24,8 @@ interface Props {
    *  appear when the user is stuck in speech_started. */
   vadState?: VadState;
   vadDurationMs?: number;
+  /** True when voice is active on another device — disables the button. */
+  remoteVoiceActive?: boolean;
   /** Open session-specific config panel (non-orchestrator only) */
   onOpenConfig?: () => void;
 }
@@ -42,6 +44,7 @@ export function ChatInput({
   onVoiceStop,
   vadState,
   vadDurationMs,
+  remoteVoiceActive,
   onOpenConfig,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -164,6 +167,7 @@ export function ChatInput({
           onStop={onVoiceStop}
           vadState={vadState}
           vadDurationMs={vadDurationMs}
+          remoteActive={remoteVoiceActive}
         />
       )}
       {onOpenConfig && (

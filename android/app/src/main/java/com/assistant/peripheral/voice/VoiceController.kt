@@ -143,6 +143,28 @@ class VoiceController(
     private val _wakeConfirming = MutableStateFlow(false)
     val wakeConfirming: StateFlow<Boolean> = _wakeConfirming.asStateFlow()
 
+    /**
+     * True while voice is active on ANOTHER device connected to the same
+     * orchestrator session. Drives a read-only "voice active on another
+     * device" status + disables THIS device's Connect button, so a single
+     * person's peripherals don't fight over one shared voice session. Set
+     * from the backend's `voice_owner_active` broadcast; only meaningful when
+     * [amVoiceOwner] is false.
+     */
+    private val _remoteVoiceActive = MutableStateFlow(false)
+    val remoteVoiceActive: StateFlow<Boolean> = _remoteVoiceActive.asStateFlow()
+
+    /**
+     * True when THIS device owns the live voice session (it sent voice_start).
+     * Voice lifecycle/command events broadcast by the backend are only acted
+     * on when this is true — a non-owner peer must ignore them for its own
+     * primary voice state (otherwise it flips to "Ending…"/"Connecting…" and
+     * can wedge). Set true in [startVoiceSession] and on a `session_started`
+     * with `voiceInitiator=true`; cleared in [finalizeVoiceStop].
+     */
+    @Volatile
+    private var amVoiceOwner: Boolean = false
+
     private val _toastMessage = MutableSharedFlow<String>(extraBufferCapacity = 8)
     /**
      * Toast channel — voice routing-fallback messages emit here. Inc 7
@@ -285,6 +307,13 @@ class VoiceController(
                 // the session.update payload to OpenAI (system prompt +
                 // tool defs). When NOT the initiator, skip — we don't own a
                 // provider transport on this device.
+                if (event.voice) {
+                    // Ownership: we own voice iff the backend says we're the
+                    // initiator of this (active) voice session. A non-initiator
+                    // subscriber to a live voice session is a passive peer.
+                    amVoiceOwner = event.voiceInitiator
+                    _remoteVoiceActive.value = !event.voiceInitiator
+                }
                 if (event.voiceInitiator) {
                     event.voiceSessionUpdate?.let { update ->
                         voiceManager?.handleBackendCommand(update)
@@ -314,9 +343,25 @@ class VoiceController(
                 _vadDurationMs.value = event.durationMs
             }
             is WebSocketEvent.VoiceCommand -> {
+                // WebRTC control frames belong to the voice owner only. A
+                // non-owner must never feed them to its provider transport
+                // (it has none) — the backend now directs these to the owner,
+                // but guard anyway so a stray broadcast can't leak.
+                if (!amVoiceOwner) {
+                    Log.d(TAG, "Ignoring voice_command — not the voice owner")
+                    return
+                }
                 @Suppress("UNCHECKED_CAST")
                 val command = event.command as? Map<String, Any?> ?: return
                 voiceManager?.handleBackendCommand(command)
+            }
+            is WebSocketEvent.VoiceOwnerActive -> {
+                // Voice started/stopped on some device. If it's not us, reflect
+                // it as a read-only "active elsewhere" status. If it IS us
+                // (owner), ignore — our own lifecycle drives our state.
+                if (!amVoiceOwner) {
+                    _remoteVoiceActive.value = event.active
+                }
             }
             is WebSocketEvent.VoiceProviderEvent -> {
                 voiceManager?.handleProviderEvent(event.event)
@@ -325,6 +370,14 @@ class VoiceController(
                 voiceManager?.pushSpeakerChunk(event.audioBase64)
             }
             is WebSocketEvent.VoiceEnding -> {
+                // Only the OWNER reacts to lifecycle events for its own primary
+                // voice state. A non-owner peer receiving this broadcast must
+                // NOT flip to "Ending…" (that's the multi-device wedge bug); it
+                // clears its read-only indicator via voice_owner_active instead.
+                if (!amVoiceOwner) {
+                    Log.d(TAG, "Ignoring voice_ending — not the voice owner")
+                    return
+                }
                 if (_voiceState.value !is VoiceState.Ending) {
                     _voiceState.value = VoiceState.Ending
                     endingTimeoutJob?.cancel()
@@ -337,6 +390,10 @@ class VoiceController(
             }
             is WebSocketEvent.VoiceEnded,
             is WebSocketEvent.VoiceStopped -> {
+                if (!amVoiceOwner) {
+                    Log.d(TAG, "Ignoring voice_ended/stopped — not the voice owner")
+                    return
+                }
                 // Backend teardown finished. Finalize any in-progress
                 // streaming message (TurnComplete never arrives in voice
                 // mode), then do the local teardown.
@@ -594,6 +651,10 @@ class VoiceController(
         // Pause wake word detection while voice session is active.
         val pauseAck = pauseWakeWord()
         voiceStopFinalized = false
+        // This device is now the voice owner — it will act on the lifecycle
+        // and command events the backend sends for this session.
+        amVoiceOwner = true
+        _remoteVoiceActive.value = false
 
         scope.launch {
             withTimeoutOrNull(WAKE_WORD_ACK_TIMEOUT_MS) { pauseAck.await() }
@@ -656,6 +717,8 @@ class VoiceController(
             return
         }
         voiceStopFinalized = true
+        amVoiceOwner = false
+        _remoteVoiceActive.value = false
         endingTimeoutJob?.cancel()
         endingTimeoutJob = null
         activeVoiceConfig = null
@@ -681,6 +744,12 @@ class VoiceController(
 
     /** Test seam — read the dedupe guard for parity assertions. */
     internal val voiceStopFinalizedForTest: Boolean get() = voiceStopFinalized
+
+    /** Test seam — mark this controller as the voice owner (as if it had
+     *  called startVoiceSession) so owner-gated lifecycle handlers act. */
+    internal fun markVoiceOwnerForTest() { amVoiceOwner = true }
+
+    internal val remoteVoiceActiveForTest: Boolean get() = remoteVoiceActive.value
 
     /** Test seam — read activeVoiceConfig. */
     internal val activeVoiceConfigForTest: VoiceConfig? get() = activeVoiceConfig

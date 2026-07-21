@@ -1212,6 +1212,21 @@ class OrchestratorSession:
                     "legacy voice_stopped broadcast failed for session %s",
                     self._local_id,
                 )
+            # Voice is fully torn down — tell peers the "voice active on another
+            # device" indicator can clear and their Connect button re-enable.
+            # (Paired with the voice_owner_active:true broadcast the route emits
+            # on voice_start.)
+            try:
+                await pool.broadcast_orchestrator({
+                    "type": "voice_owner_active",
+                    "active": False,
+                    "owner_local_id": self._local_id,
+                })
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "voice_owner_active(false) broadcast failed for session %s",
+                    self._local_id,
+                )
 
     async def restart_voice(
         self,

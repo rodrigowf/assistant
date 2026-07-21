@@ -204,6 +204,7 @@ export type ServerEvent =
   | ({ type: "voice_ending"; reason?: string; session_id?: string } & ResumeProtocolFields)
   | ({ type: "voice_ended"; reason?: string; session_id?: string } & ResumeProtocolFields)
   | ({ type: "voice_stopped" } & ResumeProtocolFields)
+  | ({ type: "voice_owner_active"; active: boolean; owner_local_id?: string | null } & ResumeProtocolFields)
   | { type: "ping" }
   | { type: "pong" };
 
