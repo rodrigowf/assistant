@@ -40,9 +40,18 @@ class WhisperConfirmer(
     private val talkVariants: List<String>,
     private val wakeVariants: List<String>,
     private val sampleRate: Int = 16_000,
-    // Whole-call budget. Whisper on a ~1-2s clip is typically 300-800ms; 2.5s
-    // covers a slow LAN + upload without making a real wake feel dead.
-    private val timeoutMs: Long = 2_500L,
+    // Whole-call budget for the Whisper round-trip (key fetch on first call +
+    // multipart upload of a ~2s WAV + whisper-1 inference + response).
+    //
+    // Field-measured on the A300M over wifi (2026-07-21): the real round-trip
+    // routinely exceeded 2.5s, so the OLD 2.5s budget timed out on nearly every
+    // attempt (fail-closed → every wake/talk silently rejected, "wake up
+    // stopped working"). whisper-1 on a 2s clip is fast server-side, but the
+    // device's upload + TLS + variable mobile-grade wifi RTT dominate. 10s is
+    // comfortably above the observed worst case; a talk command isn't latency
+    // critical, and for the wake path a reliable confirm beats a fast failure.
+    // (okhttp's own connect=10s/read=30s timeouts remain the hard ceiling.)
+    private val timeoutMs: Long = 10_000L,
 ) {
     /**
      * @param confirmed true → fire the broadcast; false → cancel silently.
@@ -95,11 +104,14 @@ class WhisperConfirmer(
 
     private suspend fun transcribe(pcmFrames: List<ShortArray>): Transcription =
         withContext(Dispatchers.IO) {
+            val t0 = System.nanoTime()
             val key = ensureKey()
                 ?: return@withContext Transcription("", failed = true).also {
                     Log.w(TAG, "No OpenAI key available — rejecting (fail-closed)")
                 }
+            val tKey = System.nanoTime()
             val wav = WavUtils.shortFramesToWav(pcmFrames, sampleRate)
+            val tWav = System.nanoTime()
             try {
                 val body = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
@@ -140,6 +152,14 @@ class WhisperConfirmer(
                     val respBody = response.body?.string()
                         ?: return@withContext Transcription("", failed = true)
                     val text = JSONObject(respBody).optString("text", "").trim()
+                    val tHttp = System.nanoTime()
+                    fun ms(a: Long, b: Long) = (b - a) / 1_000_000
+                    Log.d(
+                        TAG,
+                        "Whisper timing: key=${ms(t0, tKey)}ms wav=${ms(tKey, tWav)}ms " +
+                            "http=${ms(tWav, tHttp)}ms total=${ms(t0, tHttp)}ms " +
+                            "(wav ${wav.size}B)",
+                    )
                     Transcription(text)
                 }
             } catch (e: Exception) {
