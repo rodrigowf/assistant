@@ -2011,13 +2011,16 @@ class OrchestratorSession:
         """Summarize older conversation messages into a rich digest.
 
         The digest is what the voice agent reads at the start of a session to
-        remember the earlier conversation, so it must be both comprehensive
-        (every major arc) and faithful (every user utterance represented in
-        short form). The API call is *uncapped* — the model writes as much as
-        it needs.  ``target_words`` is a soft steering range (min, max)
-        injected into the system prompt to nudge the model toward an
-        appropriate length for this conversation size; the model is explicitly
-        told it may go over rather than drop information.
+        remember the earlier conversation, so it must be comprehensive about
+        *topics, decisions, and open threads* — but it is a genuine SUMMARY, not
+        a transcript: it distills and merges repetition rather than reproducing
+        every user turn.  That keeps its length driven by the conversation's
+        topic diversity, not its raw turn count, so even a very long session's
+        digest stays bounded (an earlier version forced a beat-by-beat "every
+        user message" list, which grew linearly with turn count and eventually
+        blew the voice prompt's token budget).  The API call is *uncapped*;
+        ``target_words`` is a soft steering range (min, max) that nudges length
+        to conversation size.
 
         The summarizer model is configurable via ``summarizer_model`` in
         ``assistant_config.json`` so a fast frontier model can compress the
@@ -2072,10 +2075,11 @@ class OrchestratorSession:
         length_hint = (
             f"## Target length\n"
             f"Aim for roughly **{min_words}–{max_words} words**. This is a "
-            f"steering range, not a hard limit — if covering every user "
-            f"message and every topic faithfully needs more space, USE MORE. "
-            f"Never drop content to fit a target. If the conversation is "
-            f"short and the range feels too long, write less.\n\n"
+            f"steering range, not a hard limit. Cover every distinct topic, "
+            f"decision, and open thread — but you get there by distilling and "
+            f"merging repetition, not by transcribing every turn, so a faithful "
+            f"digest of even a very long conversation fits comfortably. If the "
+            f"conversation is short, write less.\n\n"
         )
 
         system = (
@@ -2087,8 +2091,10 @@ class OrchestratorSession:
             "- DO NOT continue the conversation.\n"
             "- DO NOT roleplay as the assistant or address the user.\n"
             "- DO NOT answer any questions in the transcript — they're history.\n"
-            "- DO NOT omit any user message or topic to save space — go over "
-            "the length target if you have to.\n"
+            "- This is a SUMMARY: distill and compress. Cover every distinct "
+            "topic, decision, and open thread — but do NOT reproduce the "
+            "transcript turn-by-turn. Merge repetition; a long back-and-forth "
+            "on one point becomes one bullet, not many.\n"
             "- Output only the digest, in the format below.\n\n"
             + length_hint +
             "Format — include every section that has any content, in this order:\n\n"
@@ -2102,13 +2108,13 @@ class OrchestratorSession:
             "Every distinct topic that came up, in roughly chronological order. "
             "One bullet per topic with a 1–2 sentence description of what was "
             "discussed and any outcome. Don't merge unrelated topics.\n\n"
-            "## Every user message (short)\n"
-            "A faithful list of every user utterance from the transcript, in "
-            "order, in short form. One bullet per user line. Compress long "
-            "messages to their essential ask/statement (≤25 words) but DO NOT "
-            "drop any — even greetings, asides, and one-word replies. This "
-            "section is what lets the assistant reconstruct the conversation "
-            "beat-by-beat. Use the user's own wording when possible.\n\n"
+            "## Notable user asks & moments\n"
+            "The user's substantive requests, questions, and turning points — "
+            "in rough chronological order, in the user's own voice where it "
+            "matters. Distill; skip greetings, acks, and filler, and collapse "
+            "repeated attempts at the same thing into one line. This is a "
+            "digest of what the user wanted and how their intent evolved, NOT a "
+            "transcript of every line.\n\n"
             "## Decisions & conclusions\n"
             "Concrete choices made, trade-offs accepted, conclusions reached. "
             "One bullet each, specific.\n\n"
@@ -2152,9 +2158,9 @@ class OrchestratorSession:
             "Summarize the transcript below according to your instructions.\n\n"
             f"<transcript>\n{transcript}\n</transcript>\n\n"
             "Produce only the structured digest. Do not greet, do not reply, "
-            "do not continue the conversation. Cover every user message in the "
-            '"Every user message (short)" section — do not skip any. If you '
-            "need more than the target length to do that faithfully, use it."
+            "do not continue the conversation. Distill — cover every distinct "
+            "topic, decision, and open thread, but compress repetition and do "
+            "not reproduce the transcript turn-by-turn."
         )
 
         model, provider = self._resolve_summarizer_model()
