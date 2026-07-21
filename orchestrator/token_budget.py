@@ -37,8 +37,19 @@ HISTORY_SECTION_TOKENS = 18_000
 # payloads, so 6k of verbatim conversation is ample.
 RECENT_VERBATIM_TOKENS = 6_000
 # Soft ceiling on summary length, used only to compute the upper bound of the
-# steering range we suggest to the summarizer model.  Not a hard cap.
-SUMMARY_SOFT_TARGET_TOKENS = 10_000
+# steering range we suggest to the summarizer model.  NOT a hard cap — the
+# summary always covers the ENTIRE older prefix; this only steers how densely it
+# is written, so no information is ever dropped.
+#
+# Sized to the real budget, not the old 24k design reference: the assembled
+# voice prompt must stay under OpenAI Realtime's 16,384-token cap.  Fixed cost
+# is static sections (~6.0k) + verbatim (~5.3k at the 6k est budget) ≈ 11.3k,
+# leaving ~4-5k of room for the summary.  We steer toward ~3.5k so an overshoot
+# (the model exceeded its target ~1.5x in the 2026-07-21 measurement) still
+# lands under the cap.  If a future prompt genuinely needs more room, grow the
+# budget by trimming static sections or lowering the verbatim budget — never by
+# dropping summary content.
+SUMMARY_SOFT_TARGET_TOKENS = 3_500
 
 # Tool results in the verbatim history are clipped to this many chars plus a
 # short "re-read to get full content" hint, so huge tool outputs don't eat the
@@ -184,10 +195,13 @@ def summary_target_word_range(
     # 0.75 words per token, rounded for readability.
     soft_max_words = int(SUMMARY_SOFT_TARGET_TOKENS * 0.75)
 
-    # The richer digest format keeps a short version of every user message
-    # plus a narrative arc + topics + decisions + entities, so the summary
-    # legitimately needs to scale ~30% of the input on long conversations.
-    scaled_max = int(prefix_tokens * 0.30)
+    # The digest keeps a short version of every user message plus a narrative
+    # arc + topics + decisions + entities.  It scales with the input, but must
+    # stay within the room the voice prompt has for it (see
+    # SUMMARY_SOFT_TARGET_TOKENS).  ~18% of the input keeps long conversations
+    # dense enough to fit while still covering the whole prefix — no content is
+    # dropped, only compressed harder.  0.75 words/token, so tokens≈words/0.75.
+    scaled_max = int(prefix_tokens * 0.18)
     max_words = min(soft_max_words, max(400, scaled_max))
     # Lower bound keeps the model from being overly terse — roughly a third
     # of the max, with a small floor for tiny prefixes.

@@ -136,8 +136,10 @@ class TestSummaryTargetWordRange:
         assert summary_target_word_range(3, 100) == (133, 400)
 
     def test_medium_prefix_scales(self):
-        # 10k prefix tokens × 0.30 = 3000 words max, 1000 min.
-        assert summary_target_word_range(80, 10_000) == (1000, 3000)
+        # Summary target scales at 0.18 of the prefix so the digest fits under
+        # the 16,384-token voice-prompt cap alongside static + verbatim.
+        # 10k prefix tokens × 0.18 = 1800 words max, 600 min.
+        assert summary_target_word_range(80, 10_000) == (600, 1800)
 
     def test_large_prefix_caps_at_soft_target(self):
         # 50k prefix tokens × 0.30 = 15000 words, but capped at the
