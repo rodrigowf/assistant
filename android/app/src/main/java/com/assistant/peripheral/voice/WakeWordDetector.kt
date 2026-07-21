@@ -105,11 +105,11 @@ class WakeWordDetector(
         const val EXTRA_TALK_AUDIO_B64 = "talk_audio_b64"
 
         /**
-         * Command capture: silence (RMS below the same effective threshold)
-         * must persist this long AFTER speech began before we stop and send.
-         * 1.5s is forgiving of mid-sentence pauses without feeling laggy.
+         * Command capture: silence (RMS below the speech level) must persist
+         * this long AFTER speech began before we stop and send. 1.2s is
+         * forgiving of brief mid-sentence pauses while still feeling snappy.
          */
-        private const val COMMAND_SILENCE_MS = 1500L
+        private const val COMMAND_SILENCE_MS = 1200L
 
         /**
          * Absolute lower bound (gain-independent) on what counts as speech
