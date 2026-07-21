@@ -32,7 +32,7 @@ fun MarkdownText(
     text: String,
     modifier: Modifier = Modifier
 ) {
-    val blocks = remember(text) { parseBlocks(text) }
+    val blocks = rememberMarkdownBlocks(text)
 
     Column(
         modifier = modifier,
@@ -54,6 +54,45 @@ fun MarkdownText(
             }
         }
     }
+}
+
+/**
+ * Parse [text] into blocks WITHOUT re-parsing the whole message on every
+ * streaming delta.
+ *
+ * The old code did `remember(text) { parseBlocks(text) }`, keyed on the entire
+ * message string. Every `text_delta` changed `text`, so the full message was
+ * re-parsed AND the whole Column re-laid-out on every frame — that is what
+ * produced the "Skipped 344 frames … doing too much work on its main thread"
+ * logcat spam and, on the A300M's weak CPU + old GPU, handed libhwui a freshly
+ * rebuilt worst-case display-list tree every frame until its RenderThread stack
+ * overflowed (native SIGSEGV in libhwui.so).
+ *
+ * Fix: markdown blocks are separated by a blank line (`\n\n`). Everything up to
+ * the LAST blank line is "stable" — it can't change as more text streams in —
+ * so we parse that prefix once and cache it, keyed only on the prefix length.
+ * Only the actively-streaming tail (after the last `\n\n`) re-parses per delta,
+ * and it's small. Completed blocks keep their identity across deltas, so Compose
+ * skips re-laying-them-out too.
+ */
+@Composable
+private fun rememberMarkdownBlocks(text: String): List<MdBlock> {
+    // Index just past the last blank-line separator; everything before it is
+    // final. -1 (no separator yet) means the whole message is still streaming.
+    val splitAt = remember(text) {
+        val idx = text.lastIndexOf("\n\n")
+        if (idx < 0) 0 else idx + 2
+    }
+    val stablePrefix = text.substring(0, splitAt)
+    val streamingTail = text.substring(splitAt)
+
+    // Parse the stable prefix once per prefix-boundary change (keyed on its
+    // length, which only grows when a new block completes), not per delta.
+    val stableBlocks = remember(stablePrefix.length) { parseBlocks(stablePrefix) }
+    // The tail is small and re-parses cheaply each delta.
+    val tailBlocks = remember(streamingTail) { parseBlocks(streamingTail) }
+
+    return remember(stableBlocks, tailBlocks) { stableBlocks + tailBlocks }
 }
 
 // ── Inline rendering ─────────────────────────────────────────────────────────
@@ -243,17 +282,27 @@ private fun CodeBlockView(language: String, code: String) {
                 Divider(color = MdColors.borderSubtle)
             }
 
-            // Code content with horizontal scroll
-            val scrollState = rememberScrollState()
+            // Code content. Deliberately WRAPPING (soft-wrap on), NOT
+            // horizontalScroll: a single very long monospace line inside a
+            // horizontal scroll produces one enormous unbounded RenderNode. When
+            // an assistant message is still streaming, an unterminated ``` fence
+            // makes the parser swallow the entire remaining message into one code
+            // string — so that giant single node is exactly what libhwui was
+            // recursing over when its RenderThread stack overflowed. Wrapping
+            // bounds the node to the viewport width and lets layout break it into
+            // ordinary lines. (Trade-off: long code lines wrap instead of
+            // scrolling horizontally — acceptable on this small-screen device,
+            // and it can't crash the renderer.)
             Text(
                 text = styledCode,
+                softWrap = true,
                 style = TextStyle(
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.sp,
                     lineHeight = 18.sp
                 ),
                 modifier = Modifier
-                    .horizontalScroll(scrollState)
+                    .fillMaxWidth()
                     .padding(12.dp)
             )
         }

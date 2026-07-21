@@ -137,7 +137,14 @@ fun ChatScreen(
             lastKnownFirstId = messages.firstOrNull()?.id
             hasInitialScrollCompleted = true
         } else if (isAtBottom) {
-            listState.animateScrollToItem(messages.size - 1, scrollOffset = Int.MAX_VALUE)
+            // Instant scroll, NOT animateScrollToItem: this effect refires on
+            // every streaming delta (lastMessageTailSignal grows per token). An
+            // animated scroll runs a fling animation + full relayout each time,
+            // which on the A300M piled onto the per-delta markdown work and
+            // helped starve the main thread ("Skipped 344 frames"). scrollToItem
+            // just snaps to the bottom — cheap, and visually identical while
+            // streaming keeps appending.
+            listState.scrollToItem(messages.size - 1, scrollOffset = Int.MAX_VALUE)
         }
     }
 

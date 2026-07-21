@@ -38,7 +38,13 @@ sealed class MdInline {
 private val headingRegex = Regex("^(#{1,3})\\s+(.+)")
 private val ulRegex = Regex("^\\s*[-*+]\\s+(.*)")
 private val olRegex = Regex("^\\s*\\d+\\.\\s+(.*)")
-private val hrRegex = Regex("^\\s*([-*_])\\s*\\1\\s*\\1[\\s\\1]*$")
+// Horizontal rule: 3+ of the same marker (-, *, _) with optional spaces
+// between/after, e.g. "---", "* * *", "___  ". The old pattern used `[\s\1]`
+// (a backreference INSIDE a character class), which is a no-op on Android's
+// regex engine but a hard PatternSyntaxException on the standard JVM — so it
+// crashed unit tests at class-init. This form matches marker + (spaces + same
+// marker){2,} + trailing spaces, using the backreference outside a class.
+private val hrRegex = Regex("^\\s*([-*_])(?:\\s*\\1){2,}\\s*$")
 private val tableSepRegex = Regex("^[\\s|:-]+$")
 
 fun parseBlocks(input: String): List<MdBlock> {
@@ -181,8 +187,21 @@ private val inlinePattern = Regex(
     "|\\[([^\\]]+)]\\(([^)]+)\\)"         // group 7+8: [text](url)
 )
 
-fun parseInline(text: String): List<MdInline> {
+// Cap on inline emphasis/link nesting. Well-formed markdown never nests inline
+// styles more than a couple deep; malformed or mid-stream markdown (stray
+// `*`/`_`, em-dashes, an unclosed `**`) can otherwise make the lazy regexes
+// re-segment and recurse arbitrarily deep, which both burns CPU per delta and
+// deepens the AnnotatedString span tree libhwui has to traverse. Past the cap
+// we stop recursing and emit the inner content as literal text.
+private const val MAX_INLINE_DEPTH = 8
+
+fun parseInline(text: String): List<MdInline> = parseInline(text, 0)
+
+private fun parseInline(text: String, depth: Int): List<MdInline> {
     if (text.isEmpty()) return listOf(MdInline.Text(""))
+    // Depth guard: stop recursing into emphasis/link children and treat the
+    // remaining text literally. Bounds recursion regardless of input.
+    if (depth >= MAX_INLINE_DEPTH) return listOf(MdInline.Text(text))
 
     val result = mutableListOf<MdInline>()
     var remaining = text
@@ -202,15 +221,16 @@ fun parseInline(text: String): List<MdInline> {
         // Determine which group matched. For emphasis types we recursively
         // parse the inner content so `**[label](url)**` produces
         // Bold(children=[Link(...)]) instead of Bold(text="[label](url)").
+        val d = depth + 1
         when {
-            match.groups[1] != null -> result.add(MdInline.BoldItalic(parseInline(match.groups[1]!!.value)))
-            match.groups[2] != null -> result.add(MdInline.Bold(parseInline(match.groups[2]!!.value)))
-            match.groups[3] != null -> result.add(MdInline.Bold(parseInline(match.groups[3]!!.value)))
-            match.groups[4] != null -> result.add(MdInline.Italic(parseInline(match.groups[4]!!.value)))
-            match.groups[5] != null -> result.add(MdInline.Italic(parseInline(match.groups[5]!!.value)))
+            match.groups[1] != null -> result.add(MdInline.BoldItalic(parseInline(match.groups[1]!!.value, d)))
+            match.groups[2] != null -> result.add(MdInline.Bold(parseInline(match.groups[2]!!.value, d)))
+            match.groups[3] != null -> result.add(MdInline.Bold(parseInline(match.groups[3]!!.value, d)))
+            match.groups[4] != null -> result.add(MdInline.Italic(parseInline(match.groups[4]!!.value, d)))
+            match.groups[5] != null -> result.add(MdInline.Italic(parseInline(match.groups[5]!!.value, d)))
             match.groups[6] != null -> result.add(MdInline.Code(match.groups[6]!!.value))
             match.groups[7] != null -> result.add(
-                MdInline.Link(parseInline(match.groups[7]!!.value), match.groups[8]!!.value)
+                MdInline.Link(parseInline(match.groups[7]!!.value, d), match.groups[8]!!.value)
             )
         }
 
