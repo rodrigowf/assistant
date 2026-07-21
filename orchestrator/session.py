@@ -1780,6 +1780,15 @@ class OrchestratorSession:
 
         Split out so the notification-drain wrapper above can stay readable.
         """
+        # OpenAI-only symbols — import lazily here (not just in the send_audio
+        # wrapper) because THIS is the function that actually uses them. The
+        # wrapper's import binds names in its own scope, not ours; without this
+        # line, `create_audio_message` / `OpenAITextProvider` below raise
+        # NameError ("name 'create_audio_message' is not defined") at runtime.
+        from orchestrator.providers.openai_text import (
+            OpenAITextProvider, create_audio_message,
+        )
+
         if not self._config.supports_audio:
             # Switch to audio-capable model automatically.
             # Note: gpt-4o does NOT support audio input - must use gpt-4o-audio-preview.
