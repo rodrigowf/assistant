@@ -19,13 +19,18 @@ MAX_VOICE_PROMPT_TOKENS = 24_000
 # Within the prompt, the history section (summary + recent verbatim) gets ~18k.
 HISTORY_SECTION_TOKENS = 18_000
 
-# Of that, 8k is kept verbatim (newest messages).  The summary side is
+# Of that, 7k is kept verbatim (newest messages).  The summary side is
 # uncapped at the API level — the model decides how long it needs to be — but
 # we steer it toward ~10k tokens (~7500 words) for the very largest digests
 # via a "Target length" hint in the system prompt.  See
 # ``summary_target_word_range`` below and ``_summarize_history`` in
 # ``orchestrator/session.py``.
-RECENT_VERBATIM_TOKENS = 8_000
+# NOTE: OpenAI Realtime caps session.instructions at 16,384 tokens; the
+# verbatim budget is one lever that keeps the assembled voice prompt under it.
+# The static sections (~6.5k) + this verbatim budget + the summary must stay
+# below that cap.  History is already clipped of tool-call payloads, so 7k of
+# verbatim conversation is ample.
+RECENT_VERBATIM_TOKENS = 7_000
 # Soft ceiling on summary length, used only to compute the upper bound of the
 # steering range we suggest to the summarizer model.  Not a hard cap.
 SUMMARY_SOFT_TARGET_TOKENS = 10_000

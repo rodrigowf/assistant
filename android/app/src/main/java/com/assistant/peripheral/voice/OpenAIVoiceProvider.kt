@@ -605,7 +605,17 @@ class OpenAIVoiceProvider(
                 else
                     VoiceState.Error("Voice error: $code")
                 _events.tryEmit(VoiceEvent.Error(errorMessage))
-                cleanup()
+                // handleDataChannelMessage runs ON the WebRTC data-channel
+                // callback thread (the native network/signaling thread).
+                // Calling cleanup() synchronously here would close()/dispose()
+                // the PeerConnection and PeerConnectionFactory from inside their
+                // own callback, corrupting the mutex the signaling thread locks
+                // as control returns up the native stack — the exact
+                // "FORTIFY: pthread_mutex_lock called on a destroyed mutex"
+                // SIGABRT. Bounce teardown onto scope (Dispatchers.IO), matching
+                // the ICE-FAILED path above. This is the documented rule for
+                // this class: NEVER dispose WebRTC objects from a WebRTC callback.
+                scope.launch { disconnect() }
                 return
             }
 
@@ -730,7 +740,14 @@ class OpenAIVoiceProvider(
 
     // --- Cleanup -----------------------------------------------------------
 
-    private fun cleanup() {
+    // Serializes cleanup() against itself. cleanup() is reachable from five
+    // sites (user disconnect, ICE FAILED, connection-closed, error paths) that
+    // can fire on different threads at once; without this lock two callers can
+    // both pass the peerConnection null-check and double-tear-down the native
+    // objects.
+    private val cleanupLock = Any()
+
+    private fun cleanup() = synchronized(cleanupLock) {
         Log.i(TAG, "[VM] ${t()} cleanup() | agentPlaying=$agentAudioPlaying gain=$micGainLevel gainSaved=$gainBeforeSpeaking")
 
         // Restore mic gain if session ends while agent was speaking
@@ -750,7 +767,19 @@ class OpenAIVoiceProvider(
         localAudioTrack?.dispose()
         localAudioTrack = null
 
-        peerConnection?.close()
+        // ORDERING BARRIER — do NOT collapse these two disposes.
+        // PeerConnection.close() only *schedules* teardown on WebRTC's native
+        // signaling_thread and returns immediately. dispose() then BLOCKS until
+        // that thread has fully destroyed the native PeerConnection. Disposing
+        // the PeerConnectionFactory before this drain completes frees the mutexes
+        // the signaling_thread is still locking, which aborts the whole process
+        // with "FORTIFY: pthread_mutex_lock called on a destroyed mutex"
+        // (SIGABRT in libjingle_peerconnection_so.so). Always: close → dispose
+        // the PeerConnection → only then dispose the factory.
+        peerConnection?.let {
+            it.close()
+            it.dispose()
+        }
         peerConnection = null
 
         peerConnectionFactory?.dispose()
