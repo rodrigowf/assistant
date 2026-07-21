@@ -231,23 +231,23 @@ export function ChatPanelContainer({
   // (number of messages to drop from the end), so the request stays correct
   // even when the frontend has only loaded the most recent page.
   const [pendingAction, setPendingAction] = useState<
-    | { kind: "rewind"; tabSessionId: string; sdkSessionId: string; dropLastN: number }
-    | { kind: "fork"; tabSessionId: string; sdkSessionId: string; dropLastN: number }
+    | { kind: "rewind"; tabSessionId: string; sdkSessionId: string; dropLastN: number; isOrchestrator: boolean }
+    | { kind: "fork"; tabSessionId: string; sdkSessionId: string; dropLastN: number; isOrchestrator: boolean }
     | null
   >(null);
 
   const requestRewind = useCallback(
-    (tabSessionId: string, sdkSessionId: string | null | undefined, dropLastN: number) => {
+    (tabSessionId: string, sdkSessionId: string | null | undefined, dropLastN: number, isOrchestrator: boolean) => {
       if (!sdkSessionId) return;
-      setPendingAction({ kind: "rewind", tabSessionId, sdkSessionId, dropLastN });
+      setPendingAction({ kind: "rewind", tabSessionId, sdkSessionId, dropLastN, isOrchestrator });
     },
     []
   );
 
   const requestFork = useCallback(
-    (tabSessionId: string, sdkSessionId: string | null | undefined, dropLastN: number) => {
+    (tabSessionId: string, sdkSessionId: string | null | undefined, dropLastN: number, isOrchestrator: boolean) => {
       if (!sdkSessionId) return;
-      setPendingAction({ kind: "fork", tabSessionId, sdkSessionId, dropLastN });
+      setPendingAction({ kind: "fork", tabSessionId, sdkSessionId, dropLastN, isOrchestrator });
     },
     []
   );
@@ -268,14 +268,16 @@ export function ChatPanelContainer({
         closeTab(action.tabSessionId);
         await apiTruncateSession(action.sdkSessionId, action.dropLastN);
         // Reopen as a brand-new tab — fresh local_id, resume the JSONL.
-        openTab(generateUUID(), "Rewound conversation", false, action.sdkSessionId);
+        // Preserve the orchestrator flag so a rewound orchestrator session
+        // reopens as an orchestrator tab, not a plain chat tab.
+        openTab(generateUUID(), "Rewound conversation", action.isOrchestrator, action.sdkSessionId);
       } else {
         const { session_id: newSdkId } = await apiForkSession(
           action.sdkSessionId,
           action.dropLastN,
         );
         // Open the fork in a new tab so the user sees the result immediately.
-        openTab(generateUUID(), "Forked conversation", false, newSdkId);
+        openTab(generateUUID(), "Forked conversation", action.isOrchestrator, newSdkId);
       }
       onSessionChange();
     } catch (err) {
@@ -379,8 +381,8 @@ export function ChatPanelContainer({
                 onSessionChange={onSessionChange}
                 isActive={isActive}
                 supportsAudio={supportsAudio}
-                onRewindMessage={(idx) => requestRewind(tab.sessionId, tab.resumeSdkId, idx)}
-                onForkMessage={(idx) => requestFork(tab.sessionId, tab.resumeSdkId, idx)}
+                onRewindMessage={(idx) => requestRewind(tab.sessionId, tab.resumeSdkId, idx, true)}
+                onForkMessage={(idx) => requestFork(tab.sessionId, tab.resumeSdkId, idx, true)}
               />
             ) : (
               <ChatPanel
@@ -407,8 +409,8 @@ export function ChatPanelContainer({
                 isActive={isActive}
                 hasMoreMessages={inst.hasMoreMessages}
                 onLoadMore={inst.loadMoreMessages}
-                onRewindMessage={(n) => requestRewind(tab.sessionId, tab.resumeSdkId, n)}
-                onForkMessage={(n) => requestFork(tab.sessionId, tab.resumeSdkId, n)}
+                onRewindMessage={(n) => requestRewind(tab.sessionId, tab.resumeSdkId, n, false)}
+                onForkMessage={(n) => requestFork(tab.sessionId, tab.resumeSdkId, n, false)}
                 onOpenSessionConfig={() => setSessionConfigTabId(tab.sessionId)}
               />
             )}
