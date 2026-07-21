@@ -440,6 +440,18 @@ class VoiceController(
                         content = "Voice error: ${event.message}"
                     )
                 )
+                // A voice error is terminal for the session: OpenAI won't
+                // recover a session it rejected (e.g. instructions too long),
+                // and leaving it half-open wedges the wake-word detector — it
+                // was paused when the session started and only resume()s on
+                // finalizeVoiceStop. Tear down + resume wake word here so a
+                // failed voice start can't silently kill wake-word detection.
+                // finalizeVoiceStop is idempotency-guarded, so a later
+                // VoiceEnded/Stopped is a harmless no-op. It ends by flipping
+                // _voiceState to Off; surface the error to the user first via a
+                // toast (the Off state hides the error banner).
+                _toastMessage.tryEmit("Voice error: ${event.message}")
+                finalizeVoiceStop()
             }
             is VoiceEvent.RoutingFallback -> {
                 Log.w(TAG, "Routing fallback: ${event.message}")
