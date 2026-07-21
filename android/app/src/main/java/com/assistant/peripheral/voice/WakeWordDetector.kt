@@ -10,6 +10,7 @@ import android.os.Build
 import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import com.assistant.peripheral.audio.WavUtils
 import com.assistant.peripheral.service.AssistantService
 import kotlinx.coroutines.*
 import kotlin.math.sqrt
@@ -88,6 +89,48 @@ class WakeWordDetector(
         const val ACTION_WAKE_CONFIRM_FAILED = "com.assistant.peripheral.WAKE_CONFIRM_FAILED"
 
         const val EXTRA_IS_REALTIME = "is_realtime"
+
+        /**
+         * Talk-word only: the full turn message (wake phrase + spoken command)
+         * was captured on the SAME mic and is ready to send. Carries the
+         * base64-encoded WAV as [EXTRA_TALK_AUDIO_B64]. The app sends it as a
+         * voice message — no mic switch, no button press. Fired instead of the
+         * legacy ACTION_TALK_WORD_DETECTED when same-mic capture succeeds.
+         *
+         * LocalBroadcastManager is in-process (no Binder serialization), so a
+         * few-hundred-KB base64 string in the extra is safe.
+         */
+        const val ACTION_TALK_MESSAGE_CAPTURED =
+            "com.assistant.peripheral.TALK_MESSAGE_CAPTURED"
+        const val EXTRA_TALK_AUDIO_B64 = "talk_audio_b64"
+
+        /**
+         * Command capture: silence (RMS below the same effective threshold)
+         * must persist this long AFTER speech began before we stop and send.
+         * 1.5s is forgiving of mid-sentence pauses without feeling laggy.
+         */
+        private const val COMMAND_SILENCE_MS = 1500L
+
+        /**
+         * Silence threshold as a fraction of the voice/activity threshold
+         * (hysteresis). Audio must fall below voiceThreshold*this to count as
+         * silence, so ambient noise sitting near the activity level doesn't
+         * keep the capture open forever. 0.5 = "clearly quieter than speech".
+         */
+        private const val COMMAND_SILENCE_RATIO = 0.5
+
+        /**
+         * Hard cap on command length so a noisy room / never-ending speech
+         * can't record forever. Sends whatever was captured at the cap.
+         */
+        private const val COMMAND_MAX_MS = 30_000L
+
+        /**
+         * Speech must be detected (RMS above threshold) within this window
+         * after the talk-word, else we abort the capture (the user said the
+         * talk phrase but no command followed).
+         */
+        private const val COMMAND_SPEECH_ONSET_TIMEOUT_MS = 4_000L
 
         private const val SAMPLE_RATE = 16000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
@@ -583,8 +626,8 @@ class WakeWordDetector(
                             "Audio activity detected (rms=${"%.0f".format(rms)}) — starting recognizer",
                         )
                         // Hand off to the engine. SR engine needs exclusive
-                        // mic — release the AudioRecord first. Vosk engine
-                        // (V3b) keeps the AudioRecord open and feeds off it.
+                        // mic — release the AudioRecord first, hop to Main,
+                        // run the legacy cycle (unchanged).
                         if (activeEngine.needsExclusiveMic) {
                             stopAudioRecord()
                             withContext(Dispatchers.Main) {
@@ -592,23 +635,18 @@ class WakeWordDetector(
                                     runRecognitionCycle(sharedAudioRecord = null)
                                 }
                             }
-                        } else {
-                            // V3b path: pass the shared AudioRecord through.
-                            // Engine reads but doesn't release. Hand over the
-                            // rolling pre-buffer so the engine can replay
-                            // the leading edge that the silence monitor
-                            // already consumed.
-                            val ar = audioRecord ?: return@launch
-                            val preFrames = preBuffer.toList()
-                            withContext(Dispatchers.Main) {
-                                if (isActive && !isRecognizing) {
-                                    runRecognitionCycle(
-                                        sharedAudioRecord = ar,
-                                        preBuffer = preFrames,
-                                    )
-                                }
-                            }
+                            return@launch
                         }
+                        // Vosk path: run recognition INLINE on this same IO
+                        // coroutine — NO dispatch hop, so the mic stream stays
+                        // continuous from monitoring → recognition → (talk)
+                        // command capture. The old IO→Main→IO hand-off dropped
+                        // audio mid-phrase, so "hello my friend" often decoded
+                        // as just "hello". Only Main-confined mutations (the
+                        // FSM state) hop to Main; the reads never leave IO.
+                        val ar = audioRecord ?: return@launch
+                        val preFrames = preBuffer.toList()
+                        runVoskRecognitionInline(ar, preFrames)
                         return@launch
                     }
                 } else {
@@ -692,6 +730,10 @@ class WakeWordDetector(
         // transcribe the exact flagged audio and fire only if a real wake/talk
         // variant is present. `confirmed` stays true for the unconfigured /
         // disabled path (fail-open) and for the SR fallback (no captured PCM).
+        // This path is now SR-fallback only (Vosk runs inline via
+        // runVoskRecognitionInline). SR matches carry no capturedPcm and open
+        // their own mic, so same-mic capture doesn't apply — confirm (fail-open
+        // for SR) then fire the legacy broadcast.
         var confirmed = false
         if (matched != null) {
             confirmed = confirmMatch(matched)
@@ -722,6 +764,99 @@ class WakeWordDetector(
             }
             else -> {
                 // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (cap).
+                val backoff = (POST_RECOGNITION_BASE_MS shl consecutiveMisses)
+                    .coerceAtMost(POST_RECOGNITION_MAX_MS)
+                consecutiveMisses++
+                if (consecutiveMisses >= 10) {
+                    Log.w(TAG, "No match — miss #$consecutiveMisses (at max backoff)")
+                } else {
+                    Log.d(TAG, "No match — miss #$consecutiveMisses, waiting ${backoff}ms")
+                }
+                backoff
+            }
+        }
+        scope.launch {
+            delay(restartDelay)
+            if (isActive && !isPaused) startSilenceMonitor()
+        }
+    }
+
+    /**
+     * Vosk recognition + (talk) command capture, run INLINE on the silence
+     * monitor's IO coroutine — no dispatch hop, so the shared AudioRecord
+     * stream is continuous from monitoring through recognition through command
+     * capture. This is the fix for the leading-edge loss that made
+     * "hello my friend" decode as just "hello".
+     *
+     * Realtime wake match: confirm → broadcast → return (the app hands off to
+     * the WebRTC voice conversation — unchanged behaviour). The re-arm after
+     * POST_WAKEWORD_DELAY_MS still happens; if voice takes the mic, the
+     * silence monitor's acquisition retry / pauseWakeWord handles it.
+     *
+     * Talk match: confirm → capture the command on THIS mic with VAD → auto-
+     * send. Only after capture completes do we release + re-arm.
+     */
+    private suspend fun runVoskRecognitionInline(
+        ar: AudioRecord,
+        preBuffer: List<ShortArray>,
+    ) {
+        if (!isActive || isRecognizing) return
+        val activeEngine = engine ?: return
+        withContext(Dispatchers.Main) {
+            state = WakeWordState.Recognizing(
+                startedAtMs = android.os.SystemClock.elapsedRealtime(),
+                beganSpeechAtMs = null,
+            )
+        }
+        // Vosk's recognize() reads from `ar` on this same IO context — the
+        // stream continues seamlessly from the monitor loop's last read.
+        val result = activeEngine.recognize(ar, preBuffer)
+
+        withContext(Dispatchers.Main) {
+            if (state is WakeWordState.Recognizing) state = WakeWordState.Idle
+        }
+
+        val matched = result as? RecognitionResult.Matched
+        if (matched != null) {
+            if (!matched.isRealtime && matched.capturedPcm.isNotEmpty()) {
+                // TALK path. Vosk fired early (possibly just on the phrase's
+                // opening word), so confirming NOW would only see "hello". Do
+                // the same-mic command capture FIRST — collecting the whole
+                // "hello my friend <command>" utterance — THEN confirm with
+                // Whisper over the FULL audio, and send only if the talk phrase
+                // is actually present. fireMatchBroadcast gives the instant UI
+                // ack (beep + recording indicator) before the capture.
+                fireMatchBroadcast(matched)
+                val fullAudio = captureTalkCommand(ar, matched.capturedPcm)
+                if (fullAudio != null) {
+                    val confirmed = confirmMatchAudio(fullAudio, isRealtime = false)
+                    if (confirmed) {
+                        sendTalkAudio(fullAudio)
+                    } else {
+                        // Whisper didn't hear the talk phrase in the full
+                        // utterance — drop it and clear the recording UI.
+                        LocalBroadcastManager.getInstance(context).sendBroadcast(
+                            Intent(ACTION_WAKE_CONFIRM_FAILED).putExtra(EXTRA_IS_REALTIME, false),
+                        )
+                    }
+                }
+            } else {
+                // REALTIME wake (or SR edge). Its snapshot already holds the
+                // full "wake up", so confirm then broadcast + hand off to the
+                // WebRTC voice conversation. Unchanged good behaviour.
+                val confirmed = confirmMatch(matched)
+                if (confirmed) fireMatchBroadcast(matched)
+            }
+            consecutiveMisses = 0
+        }
+
+        val restartDelay = when {
+            matched != null -> POST_WAKEWORD_DELAY_MS
+            result is RecognitionResult.Cancelled -> return  // pause/stop already handled
+            result is RecognitionResult.NoSpeech ||
+                (result is RecognitionResult.Error && result.flatDelay) ->
+                SpeechRecognizerEngine.CLIENT_ERROR_DELAY_MS
+            else -> {
                 val backoff = (POST_RECOGNITION_BASE_MS shl consecutiveMisses)
                     .coerceAtMost(POST_RECOGNITION_MAX_MS)
                 consecutiveMisses++
@@ -783,5 +918,109 @@ class WakeWordDetector(
         val action = if (match.isRealtime)
             ACTION_WAKE_WORD_DETECTED else ACTION_TALK_WORD_DETECTED
         LocalBroadcastManager.getInstance(context).sendBroadcast(Intent(action))
+    }
+
+    /**
+     * Capture the spoken command that follows a confirmed talk-word, on the
+     * SAME [audioRecord] the detector is already holding — no mic switch, so
+     * the wake phrase and command are one continuous stream. Ends on
+     * [COMMAND_SILENCE_MS] of sustained silence after speech began (VAD), or
+     * at [COMMAND_MAX_MS]. Returns the full utterance ([wakePhrasePcm] pre-roll
+     * + command) as PCM frames for the caller to Whisper-confirm + send, or
+     * null if no command was spoken (onset timeout) or the detector stopped.
+     *
+     * Runs on the same IO coroutine as the silence monitor + Vosk recognition
+     * (called from runVoskRecognitionInline) — the mic stream is continuous
+     * from the wake phrase straight into the command, no gap.
+     */
+    private suspend fun captureTalkCommand(
+        audioRecord: AudioRecord,
+        wakePhrasePcm: List<ShortArray>,
+    ): List<ShortArray>? = withContext(Dispatchers.IO) {
+        // Two thresholds with hysteresis:
+        //  - voiceThreshold (the activity level) marks "the user is speaking",
+        //    refreshing the silence timer.
+        //  - silenceThreshold is LOWER — audio must fall below THIS to count as
+        //    silence. Using the same level for both means ambient room noise
+        //    that sits right at the activity threshold never reads as silence,
+        //    so the capture never ends ("never stops listening").
+        val voiceThreshold =
+            (if (micGain > 0f) RMS_THRESHOLD / micGain else RMS_THRESHOLD)
+        val silenceThreshold = voiceThreshold * COMMAND_SILENCE_RATIO
+        val command = ArrayList<ShortArray>(wakePhrasePcm)  // pre-roll first
+        val buffer = ShortArray(3200)  // 200ms at 16kHz
+        val startedMs = System.currentTimeMillis()
+        var speechBegan = false
+        var lastVoiceMs = startedMs
+        var loggedRmsAtMs = 0L
+
+        Log.d(TAG, "Talk command capture started (same mic, voice≥${voiceThreshold.toInt()}, silence<${silenceThreshold.toInt()})")
+        while (isActive) {
+            val now = System.currentTimeMillis()
+            if (now - startedMs >= COMMAND_MAX_MS) {
+                Log.d(TAG, "Talk command hit max ${COMMAND_MAX_MS}ms — sending")
+                break
+            }
+            if (!speechBegan && now - startedMs >= COMMAND_SPEECH_ONSET_TIMEOUT_MS) {
+                Log.d(TAG, "No command spoken within ${COMMAND_SPEECH_ONSET_TIMEOUT_MS}ms — aborting")
+                return@withContext null
+            }
+            val read = audioRecord.read(buffer, 0, buffer.size)
+            if (read <= 0) { delay(10L); continue }
+            command.add(buffer.copyOf(read))
+            val rms = computeRms(buffer, read)
+            // Diagnostic: log RMS ~2x/sec so we can see why silence does/doesn't trip.
+            if (now - loggedRmsAtMs >= 500) {
+                Log.d(TAG, "  cmd rms=${rms.toInt()} speechBegan=$speechBegan silenceFor=${if (speechBegan) now - lastVoiceMs else 0}ms")
+                loggedRmsAtMs = now
+            }
+            // Speech begins once we cross the (higher) voice threshold.
+            if (rms >= voiceThreshold) speechBegan = true
+            // "Not silent" = above the (lower) silence threshold. Any such frame
+            // refreshes the timer; only a continuous run BELOW it ends capture.
+            if (rms >= silenceThreshold) {
+                lastVoiceMs = now
+            } else if (speechBegan && now - lastVoiceMs >= COMMAND_SILENCE_MS) {
+                Log.d(TAG, "Command ended on ${COMMAND_SILENCE_MS}ms silence — sending")
+                break
+            }
+        }
+        if (!isActive) return@withContext null
+
+        val totalSamples = command.sumOf { it.size }
+        Log.d(TAG, "Talk command captured: ${totalSamples * 1000 / SAMPLE_RATE}ms — confirming")
+        command
+    }
+
+    /**
+     * Whisper-confirm an arbitrary captured utterance (used by the talk path,
+     * which confirms over the FULL "phrase + command" audio rather than the
+     * early Vosk snapshot). Returns true if the confirmer isn't configured
+     * (fail-open) or Whisper hears a matching variant; false on rejection.
+     */
+    private suspend fun confirmMatchAudio(
+        frames: List<ShortArray>,
+        isRealtime: Boolean,
+    ): Boolean {
+        val confirmer = whisperConfirmer ?: return true
+        LocalBroadcastManager.getInstance(context).sendBroadcast(
+            Intent(ACTION_WAKE_CONFIRMING).putExtra(EXTRA_IS_REALTIME, isRealtime),
+        )
+        val result = confirmer.confirm(frames)
+        if (!result.confirmed) {
+            Log.d(TAG, "Whisper gate rejected talk utterance (failed=${result.failed}, heard=\"${result.transcript}\")")
+        }
+        return result.confirmed
+    }
+
+    /** WAV-encode + base64 the captured talk utterance and broadcast it for the
+     *  app to send as a voice message. */
+    private fun sendTalkAudio(frames: List<ShortArray>) {
+        val wav = WavUtils.shortFramesToWav(frames, SAMPLE_RATE)
+        val b64 = android.util.Base64.encodeToString(wav, android.util.Base64.NO_WRAP)
+        Log.d(TAG, "Talk message confirmed: ${wav.size} bytes — broadcasting for send")
+        LocalBroadcastManager.getInstance(context).sendBroadcast(
+            Intent(ACTION_TALK_MESSAGE_CAPTURED).putExtra(EXTRA_TALK_AUDIO_B64, b64),
+        )
     }
 }

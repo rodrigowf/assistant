@@ -633,6 +633,31 @@ class VoiceController(
     }
 
     /**
+     * Send a pre-captured voice message (base64 WAV). Used by the talk-word
+     * same-mic path: the WakeWordDetector already recorded the wake phrase +
+     * command on its own mic and auto-sent on silence, so there is no
+     * AudioRecorder session to stop here — we just ship the bytes and clear the
+     * recording indicator that the talk-word ack turned on.
+     */
+    fun sendCapturedVoiceMessage(base64Audio: String) {
+        scope.launch {
+            _isRecording.value = false
+            chatController.appendOrchestratorMessage(
+                ChatMessage(
+                    role = MessageRole.USER,
+                    content = "[Voice message]",
+                    blocks = listOf(MessageBlock.Text("[Voice message]"))
+                )
+            )
+            webSocketManager.send(
+                WebSocketMessage.SendAudio(base64Audio, "wav"),
+                endpoint = if (chatController.isOrchestratorSession.value)
+                    WebSocketEndpoint.ORCHESTRATOR else WebSocketEndpoint.AGENT
+            )
+        }
+    }
+
+    /**
      * Begin a realtime voice session against the orchestrator. Pinned from
      * HEAD AssistantViewModel.kt:506-545.
      */

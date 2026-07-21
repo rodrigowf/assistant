@@ -212,6 +212,20 @@ internal class VoskRecognitionEngine(
                         Log.d(TAG, "Vosk partial: \"$partial\"")
                         lastPartial = partial
                     }
+                    // TALK prefix trigger: Vosk's grammar stalls decoding a
+                    // multi-word talk phrase mid-continuous-utterance (e.g.
+                    // "hello my friend <command>" → stuck at "hello"). Fire as
+                    // soon as the phrase's opening word(s) appear; Whisper
+                    // confirms the full utterance. Realtime wake variants are
+                    // NOT prefix-triggered here (findMatch handles them fully).
+                    val prefix = VoskWakeWordEngine.findTalkPrefixMatch(partial, talkVariants)
+                    if (prefix != null) {
+                        Log.d(
+                            TAG,
+                            "Vosk talk-prefix trigger: \"${prefix.matchedVariant}\" from partial \"$partial\"",
+                        )
+                        return@withContext matchedResult(prefix, audioRecord, captured)
+                    }
                 }
                 RecognitionResult.Cancelled
             } finally {

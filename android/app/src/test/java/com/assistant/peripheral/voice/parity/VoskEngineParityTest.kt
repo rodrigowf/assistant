@@ -177,6 +177,52 @@ class VoskEngineParityTest {
     }
 
     // -------------------------------------------------------------------------
+    // findTalkPrefixMatch — early trigger on a talk phrase's opening word(s)
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `talkPrefixMatchesOpeningWord`() {
+        // Vosk stalls at "hello" mid-utterance; the prefix trigger fires there.
+        val m = VoskWakeWordEngine.findTalkPrefixMatch("hello", listOf("hello my friend"))
+        assertEquals("hello my friend", m?.matchedVariant)
+        assertEquals(false, m?.isRealtime)
+    }
+
+    @Test
+    fun `talkPrefixMatchesLeadingWords`() {
+        val m = VoskWakeWordEngine.findTalkPrefixMatch("hello my", listOf("hello my friend"))
+        assertEquals("hello my friend", m?.matchedVariant)
+    }
+
+    @Test
+    fun `talkPrefixRejectsWrongWord`() {
+        // "help" is not the opening word of "hello my friend".
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("help", listOf("hello my friend")))
+        // A word that only partially resembles the first token must not match
+        // (word-boundary aware, not character-prefix).
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("hell", listOf("hello my friend")))
+    }
+
+    @Test
+    fun `talkPrefixRejectsWrongOrder`() {
+        // Words must be a leading run in order.
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("my hello", listOf("hello my friend")))
+    }
+
+    @Test
+    fun `talkPrefixSkipsSingleWordVariants`() {
+        // A single-word talk variant is already fully matched by findMatch;
+        // prefix trigger must not fire on it (would be identical to full match).
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("archie", listOf("archie")))
+    }
+
+    @Test
+    fun `talkPrefixReturnsNullForBlank`() {
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("", listOf("hello my friend")))
+        assertNull(VoskWakeWordEngine.findTalkPrefixMatch("   ", listOf("hello my friend")))
+    }
+
+    // -------------------------------------------------------------------------
     // buildKeywordGrammar — Vosk constrained-vocab grammar
     // -------------------------------------------------------------------------
 

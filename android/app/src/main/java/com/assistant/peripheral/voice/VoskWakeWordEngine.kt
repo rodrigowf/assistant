@@ -172,6 +172,46 @@ class VoskWakeWordEngine(
         }
 
         /**
+         * Prefix trigger for the TALK path. Returns a talk [Match] when [text]
+         * is a leading word-prefix of some talk variant — e.g. partial "hello"
+         * triggers the variant "hello my friend".
+         *
+         * Why: Vosk's constrained grammar can't reliably decode a multi-word
+         * talk phrase when it's immediately followed by out-of-grammar command
+         * words in one continuous utterance (it stalls after the first word).
+         * So instead of waiting for the full phrase, we fire as soon as the
+         * phrase's opening word(s) appear and let Whisper — which transcribes
+         * the whole captured utterance — do the real confirmation. Realtime
+         * wake variants are intentionally NOT prefix-matched (they hand off to
+         * a live voice session, so a false early trigger is costlier).
+         *
+         * Word-boundary aware: "hello" matches variant "hello my friend" (the
+         * variant's first word), but "hell" does not, and "help" does not.
+         * Only fires on variants with MORE than one word (a single-word talk
+         * variant is already matched fully by [findMatch]).
+         */
+        fun findTalkPrefixMatch(
+            text: String,
+            talkVariants: List<String>,
+        ): Match? {
+            val words = text.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (words.isEmpty()) return null
+            for (variant in talkVariants) {
+                val vWords = variant.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (vWords.size <= 1) continue  // full match handles single words
+                // text must be a leading run of the variant's words, in order,
+                // and at least the first word must be present.
+                val n = minOf(words.size, vWords.size)
+                var matches = n >= 1
+                for (i in 0 until n) if (words[i] != vWords[i]) { matches = false; break }
+                if (matches) {
+                    return Match(matchedVariant = variant, isRealtime = false, rawText = text.trim())
+                }
+            }
+            return null
+        }
+
+        /**
          * Build a Vosk constrained-vocab grammar from the configured phrases.
          * The JSON array is passed to the `Recognizer` constructor — the
          * decoder only considers these phrases plus the `[unk]` sentinel for

@@ -82,19 +82,28 @@ class WhisperConfirmer(
         if (transcript.failed) {
             return Result(confirmed = false, transcript = "", failed = true)
         }
-        val lower = transcript.text.lowercase()
+        // Whisper adds punctuation + casing ("Hello, my friend.") that bare
+        // variants ("hello my friend") don't have, so normalize both sides:
+        // lowercase, strip everything but letters/digits/spaces, collapse
+        // whitespace. Without this, punctuation between/after variant words
+        // breaks the substring match and rejects real detections.
+        val norm = normalize(transcript.text)
         // Realtime-first precedence, same as VoskWakeWordEngine.findMatch.
-        wakeVariants.firstOrNull { lower.contains(it) }?.let {
+        wakeVariants.firstOrNull { norm.contains(normalize(it)) }?.let {
             Log.d(TAG, "Whisper CONFIRMED wake \"$it\" in \"${transcript.text}\"")
             return Result(confirmed = true, transcript = transcript.text, isRealtime = true)
         }
-        talkVariants.firstOrNull { lower.contains(it) }?.let {
+        talkVariants.firstOrNull { norm.contains(normalize(it)) }?.let {
             Log.d(TAG, "Whisper CONFIRMED talk \"$it\" in \"${transcript.text}\"")
             return Result(confirmed = true, transcript = transcript.text, isRealtime = false)
         }
-        Log.d(TAG, "Whisper REJECTED — no variant in \"${transcript.text}\"")
+        Log.d(TAG, "Whisper REJECTED — no variant in \"${transcript.text}\" (normalized: \"$norm\")")
         return Result(confirmed = false, transcript = transcript.text)
     }
+
+    /** Lowercase, drop non-alphanumerics (punctuation), collapse whitespace. */
+    private fun normalize(s: String): String =
+        s.lowercase().replace(Regex("[^a-z0-9\\s]"), " ").replace(Regex("\\s+"), " ").trim()
 
     private data class Transcription(val text: String, val failed: Boolean = false)
 

@@ -71,6 +71,11 @@ class MainActivity : ComponentActivity() {
     var onWakeConfirming: ((isRealtime: Boolean) -> Unit)? = null
     var onWakeConfirmFailed: ((isRealtime: Boolean) -> Unit)? = null
 
+    // Talk-word same-mic capture: the full turn message (wake phrase + command)
+    // was captured on the shared mic and auto-sent on silence. Carries the
+    // base64 WAV — the app just ships it, no recording UI dance needed.
+    var onTalkMessageCaptured: ((audioB64: String) -> Unit)? = null
+
     /**
      * A payload shared into the app via ACTION_SEND (share sheet). Observed by
      * the AssistantApp composable, which dispatches it to the ViewModel
@@ -115,6 +120,10 @@ class MainActivity : ComponentActivity() {
                     onWakeConfirmFailed?.invoke(
                         intent.getBooleanExtra(WakeWordDetector.EXTRA_IS_REALTIME, false),
                     )
+                WakeWordDetector.ACTION_TALK_MESSAGE_CAPTURED ->
+                    intent.getStringExtra(WakeWordDetector.EXTRA_TALK_AUDIO_B64)?.let {
+                        onTalkMessageCaptured?.invoke(it)
+                    }
             }
         }
     }
@@ -130,6 +139,7 @@ class MainActivity : ComponentActivity() {
             addAction(WakeWordDetector.ACTION_WAKE_WORD_DETECTED)
             addAction(WakeWordDetector.ACTION_WAKE_CONFIRMING)
             addAction(WakeWordDetector.ACTION_WAKE_CONFIRM_FAILED)
+            addAction(WakeWordDetector.ACTION_TALK_MESSAGE_CAPTURED)
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(wakeWordReceiver, filter)
 
@@ -303,32 +313,31 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         if (sharedPayload != null) activity.sharedPayload.value = null
     }
 
-    // Wire talk-word detection: start a single turn-based voice message recording.
-    val coroutineScope = rememberCoroutineScope()
+    // Wire talk-word detection. Same-mic capture: the WakeWordDetector keeps
+    // its mic open and records the spoken command directly, auto-sending on
+    // ~1.5s of silence — no mic switch, no 5s timer, no button press. This
+    // callback is now UI-ack only: beep + show the recording indicator the
+    // instant the phrase is confirmed. The audio arrives via
+    // onTalkMessageCaptured below.
     DisposableEffect(Unit) {
         activity.onTalkWordDetected = {
-            // Immediate user feedback BEFORE the async work — so the user
-            // knows their phrase was heard during the ~0.3–0.5s confidence-gate
-            // latency + the AudioRecorder.startRecording() time.
             viewModel.playTalkWordAckBeep()
             viewModel.markRecordingStarting()
-            // Navigate to chat so the user sees the recording UI
             navController.navigate(Screen.Chat.route) {
                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
                 launchSingleTop = true
                 restoreState = true
             }
-            // Start recording — same as pressing the mic button
-            viewModel.startRecording()
-            // Auto-stop after 5 seconds (user speaks their request after the trigger phrase)
-            coroutineScope.launch {
-                kotlinx.coroutines.delay(5000L)
-                if (viewModel.isRecording.value) {
-                    viewModel.stopRecording()
-                }
-            }
         }
-        onDispose { activity.onTalkWordDetected = null }
+        // The command was captured on the shared mic and auto-sent on silence —
+        // ship the base64 WAV as a voice message and clear the recording UI.
+        activity.onTalkMessageCaptured = { audioB64 ->
+            viewModel.sendCapturedVoiceMessage(audioB64)
+        }
+        onDispose {
+            activity.onTalkWordDetected = null
+            activity.onTalkMessageCaptured = null
+        }
     }
 
     // Wire wake-word detection: start a realtime WebRTC voice conversation.

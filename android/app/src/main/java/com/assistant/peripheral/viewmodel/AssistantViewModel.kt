@@ -380,6 +380,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun startRecording() = voiceController.startRecording()
     fun stopRecording() = voiceController.stopRecording()
+    fun sendCapturedVoiceMessage(audioB64: String) = voiceController.sendCapturedVoiceMessage(audioB64)
     fun startVoiceSession() = voiceController.startVoiceSession()
     fun stopVoiceSession() = voiceController.stopVoiceSession()
     fun markRecordingStarting() = voiceController.markRecordingStarting()
