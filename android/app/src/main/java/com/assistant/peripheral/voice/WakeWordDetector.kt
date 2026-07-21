@@ -105,11 +105,16 @@ class WakeWordDetector(
         const val EXTRA_TALK_AUDIO_B64 = "talk_audio_b64"
 
         /**
-         * Command capture: silence (RMS below the speech level) must persist
-         * this long AFTER speech began before we stop and send. 1.2s is
-         * forgiving of brief mid-sentence pauses while still feeling snappy.
+         * Command capture: silence (a run of frames below the speech level)
+         * must persist this long after the last speech-level frame before we
+         * stop and send. Single-threshold VAD (no hysteresis) — a frame is
+         * "voice" iff rms >= voiceThreshold AND >= COMMAND_ABS_SPEECH_FLOOR — so
+         * this value is the whole end-of-utterance wait; there is no extra
+         * hidden padding. 1.0s stops promptly after you finish while still
+         * tolerating a brief between-words pause. Detection granularity is the
+         * 200ms read-frame size.
          */
-        private const val COMMAND_SILENCE_MS = 1200L
+        private const val COMMAND_SILENCE_MS = 1000L
 
         /**
          * Absolute lower bound (gain-independent) on what counts as speech
