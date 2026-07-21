@@ -168,6 +168,33 @@ interface VoiceProvider {
     }
 
     /**
+     * Supply a fallback source for the `session.update` payload that wires
+     * the OpenAI Realtime session (system prompt, tools, voice, input
+     * transcription).
+     *
+     * Normally the payload rides in on `session_started` and is drained
+     * into the provider's own [handleBackendCommand] queue before the data
+     * channel opens.  But on a voice *restart* (WS drop → auto-reconnect,
+     * or end→re-arm), the `session_started` mirror can land in a timing
+     * window where it neither reaches the freshly-created provider's queue
+     * nor survives the one-shot drain in `VoiceManager.start()`.  The data
+     * channel then opens with no `session.update`, and OpenAI runs on bare
+     * defaults — wrong voice, canned instructions, no history, no tools.
+     *
+     * To make delivery idempotent, [VoiceManager] caches the last
+     * `session.update` it saw and hands a getter here.  At
+     * data-channel-open the WebRTC provider re-asserts the cached payload
+     * if it never sent one this session.  Only WebRTC (OpenAI) overrides
+     * this; WebSocket providers get their session.update applied by the
+     * backend relay and ignore it.
+     *
+     * See the 2026-07-21 stale-provider race investigation.
+     */
+    fun setSessionUpdateFallback(provider: () -> Map<String, Any?>?) {
+        // Default no-op — only the WebRTC (OpenAI) provider overrides.
+    }
+
+    /**
      * Handle a provider event mirrored from the backend.
      *
      * For WebSocket providers, the backend's voice_relay forwards every

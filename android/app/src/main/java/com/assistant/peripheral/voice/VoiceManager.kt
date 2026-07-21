@@ -121,6 +121,19 @@ class VoiceManager(
     private val pendingBackendCommands =
         Channel<Map<String, Any?>>(capacity = Channel.UNLIMITED)
 
+    // --- session.update cache (2026-07-21 stale-provider race fix) --------
+    // The last `session.update` payload the backend sent (via a
+    // `session_started` mirror → handleBackendCommand). On a voice restart
+    // (WS drop → reconnect, or end→re-arm) the payload can land in a window
+    // where it neither reaches the fresh provider's queue nor survives the
+    // one-shot drain below — the data channel then opens with no
+    // session.update and OpenAI runs on bare defaults (wrong voice, canned
+    // instructions, no history, no tools). We cache it here and hand a
+    // getter to the provider so it can self-heal at data-channel-open.
+    // @Volatile: written from the WS dispatch coroutine, read from the
+    // provider's data-channel callback thread.
+    @Volatile private var lastSessionUpdate: Map<String, Any?>? = null
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // --- Public flows the ViewModel observes ------------------------------
@@ -276,6 +289,10 @@ class VoiceManager(
         // 3. Apply persisted settings to the new provider before connect.
         provider.setMicGain(pendingMicGain)
         provider.setEchoDuckingGain(pendingEchoDuckingGain)
+        // Hand the provider a getter for the cached session.update so it can
+        // re-assert it at data-channel-open if the drain below came up empty
+        // (the restart race). No-op for providers that don't need it.
+        provider.setSessionUpdateFallback { lastSessionUpdate }
 
         // 4. Wire state + events.
         currentProvider = provider
@@ -400,6 +417,14 @@ class VoiceManager(
     // --- Backend command + audio routing pass-through --------------------
 
     fun handleBackendCommand(command: Map<String, Any?>) {
+        // Cache session.update payloads so a provider created *after* this
+        // arrives (the restart race) can still self-heal at DC-open. Cache
+        // regardless of which branch below routes the command — the whole
+        // point is that immediate-forward to a not-yet-connected provider
+        // can silently drop it.
+        if (command["type"] == "session.update") {
+            lastSessionUpdate = command
+        }
         val provider = currentProvider
         if (provider != null) {
             provider.handleBackendCommand(command)

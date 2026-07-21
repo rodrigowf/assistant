@@ -84,6 +84,17 @@ class OpenAIVoiceProvider(
     private var dcReady = false
     private val pendingCommands = mutableListOf<Map<String, Any?>>()
 
+    // --- session.update idempotency (2026-07-21 stale-provider race fix) ---
+    // Whether we've sent a `session.update` to OpenAI this session. Set the
+    // first time one goes out (drained pending command OR fallback re-assert)
+    // so we never double-apply and can detect the "never applied" case at
+    // data-channel-open. Reset in cleanup().
+    private var sessionUpdateSent = false
+    // Getter supplied by VoiceManager returning the last cached
+    // `session.update` payload, used to self-heal when the drained queue
+    // was empty (the payload got lost in a restart timing window).
+    private var sessionUpdateFallback: (() -> Map<String, Any?>?)? = null
+
     // --- Mic gain + ducking -----------------------------------------------
     // These manipulate the mic stream BEFORE WebRTC processes it via the
     // JavaAudioDeviceModule callback — so they're inherently WebRTC-coupled
@@ -187,6 +198,10 @@ class OpenAIVoiceProvider(
     override fun handleBackendCommand(command: Map<String, Any?>) {
         // Backend → OpenAI command — forward via data channel.
         sendToOpenAI(command)
+    }
+
+    override fun setSessionUpdateFallback(provider: () -> Map<String, Any?>?) {
+        sessionUpdateFallback = provider
     }
 
     override fun toggleMute(): Boolean {
@@ -570,6 +585,24 @@ class OpenAIVoiceProvider(
                         Log.d(TAG, "[VM] ${t()} Draining ${pending.size} pending commands")
                     }
                     for (cmd in pending) sendToOpenAI(cmd)
+
+                    // Self-heal: if the drain produced no session.update, the
+                    // payload got lost in a restart timing window (WS drop →
+                    // reconnect, or end→re-arm). Re-assert the cached one so
+                    // OpenAI never runs on bare defaults (wrong voice, canned
+                    // instructions, no history, no tools). See the 2026-07-21
+                    // stale-provider race investigation.
+                    if (!sessionUpdateSent) {
+                        val fallback = sessionUpdateFallback?.invoke()
+                        if (fallback != null) {
+                            Log.w(TAG, "[VM] ${t()} session.update missing at DC_OPEN — " +
+                                    "re-asserting cached payload (restart race self-heal)")
+                            sendToOpenAI(fallback)
+                        } else {
+                            Log.e(TAG, "[VM] ${t()} session.update missing at DC_OPEN and " +
+                                    "no cached fallback available — session will run on OpenAI defaults")
+                        }
+                    }
                 }
             }
             override fun onMessage(buffer: DataChannel.Buffer) {
@@ -620,6 +653,24 @@ class OpenAIVoiceProvider(
             }
 
             when (eventType) {
+                "session.updated" -> {
+                    // Echo of the session config OpenAI is actually running.
+                    // Belt-and-braces: if we reach here without ever having
+                    // sent a session.update (both the drain AND the DC-open
+                    // self-heal missed), the session is on bare defaults —
+                    // re-assert the cached payload one last time so identity,
+                    // voice, history and tools get applied. Idempotent: a
+                    // successful send flips sessionUpdateSent and the echo of
+                    // *that* update no-ops here.
+                    if (!sessionUpdateSent) {
+                        val fallback = sessionUpdateFallback?.invoke()
+                        if (fallback != null) {
+                            Log.w(TAG, "[VM] ${t()} session.updated seen but no session.update " +
+                                    "was ever sent — re-asserting cached payload")
+                            sendToOpenAI(fallback)
+                        }
+                    }
+                }
                 "response.created" -> {
                     micRestoreJob?.cancel()
                     micRestoreJob = null
@@ -723,6 +774,11 @@ class OpenAIVoiceProvider(
                 false
             )
             dataChannel?.send(buffer)
+            // Track that the session got wired so the DC-open self-heal and
+            // the session.updated echo check don't redundantly re-assert.
+            if (command["type"] == "session.update") {
+                sessionUpdateSent = true
+            }
         } else {
             pendingCommands.add(command)
         }
@@ -759,6 +815,7 @@ class OpenAIVoiceProvider(
 
         dcReady = false
         pendingCommands.clear()
+        sessionUpdateSent = false
 
         dataChannel?.close()
         dataChannel = null
