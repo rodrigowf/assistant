@@ -210,9 +210,39 @@ class WakeWordDetector(
         private const val POST_WAKEWORD_DELAY_MS = 3000L
 
         // Base delay after a missed recognition — doubles on each consecutive
-        // miss (backoff).
+        // miss (backoff). This backoff is meaningful ONLY for the
+        // SpeechRecognizer path, where a miss usually accompanies a real
+        // recognizer error (CLIENT_ERROR / NO_SPEECH) and rapid retry both
+        // wastes battery and re-triggers the SR beep. See POST_VOSK_NOMATCH_MS
+        // for why the Vosk always-on path must NOT use this.
         private const val POST_RECOGNITION_BASE_MS = 1000L
         private const val POST_RECOGNITION_MAX_MS = 30_000L
+
+        /**
+         * Re-arm delay after a Vosk recognition window elapsed WITHOUT the
+         * wake/talk phrase ([RecognitionResult.NoMatch]).
+         *
+         * This is the fix for the "wake word worked once then stopped" field
+         * bug (2026-07-22). For the always-on Vosk engine, a window with no
+         * wake word is the NORMAL idle outcome — a cough, a passing word, music,
+         * or the orchestrator's own spoken TTS response all cross the RMS
+         * activity gate, open a ~5s Vosk window, and correctly decode to no
+         * match. Feeding those NoMatch results into the exponential
+         * [POST_RECOGNITION_BASE_MS] backoff meant that after only ~5 such
+         * non-wake activity windows the re-arm delay saturated at
+         * [POST_RECOGNITION_MAX_MS] (30 s). The mic then stayed CLOSED for 30 s
+         * at a time, so a real "wake up" spoken in that dead window was never
+         * heard — the detector looked disabled but was merely asleep. A single
+         * successful turn-based capture reliably triggered this because the
+         * assistant's audible reply drove several NoMatch windows immediately
+         * after the send.
+         *
+         * A Vosk NoMatch carries no per-call cost (no SR beep, no service
+         * round-trip) and no error to back off from, so we re-arm promptly.
+         * 500 ms is enough to let the AudioRecord fully release + the HAL settle
+         * between windows without leaving a perceptible dead spot.
+         */
+        private const val POST_VOSK_NOMATCH_MS = 500L
 
         /**
          * Normalize a wake-word phrase. Inc 5 dropped the phonetic `wordSubs`
@@ -932,6 +962,16 @@ class WakeWordDetector(
         val restartDelay = when {
             matched != null -> POST_WAKEWORD_DELAY_MS
             result is RecognitionResult.Cancelled -> return  // pause/stop already handled
+            result is RecognitionResult.NoMatch -> {
+                // Normal idle outcome for the always-on Vosk engine — a window
+                // of activity (cough, passing word, music, the assistant's own
+                // TTS reply) that carried no wake/talk phrase. This is NOT an
+                // error, so it must NOT accrue exponential backoff — doing so
+                // was the "worked once then stopped" wedge (mic closed 30 s at
+                // a time). Reset the miss counter and re-arm promptly.
+                consecutiveMisses = 0
+                POST_VOSK_NOMATCH_MS
+            }
             result is RecognitionResult.NoSpeech ||
                 (result is RecognitionResult.Error && result.flatDelay) ->
                 SpeechRecognizerEngine.CLIENT_ERROR_DELAY_MS
