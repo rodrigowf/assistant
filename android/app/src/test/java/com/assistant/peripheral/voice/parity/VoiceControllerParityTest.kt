@@ -304,17 +304,36 @@ class VoiceControllerParityTest {
     }
 
     @Test
-    fun `WS disconnect mid-voice — clears activeVoiceConfig so reconnect cannot auto-restart voice`() = runTest {
-        val (ctrl, _) = controller(this)
+    fun `WS TERMINAL disconnect mid-voice — clears config AND finalizes (re-arms wake word)`() = runTest {
+        val (ctrl, fakes) = controller(this)
         ctrl.setActiveVoiceConfigForTest(sampleVoiceConfig)
         assertNotNull(ctrl.activeVoiceConfigForTest)
+        assertFalse(ctrl.voiceStopFinalizedForTest)
 
-        ctrl.handleVoiceWebSocketEventForTest(WebSocketEvent.Disconnected)
+        // willReconnect=false → terminal (user closed conversation / screen dim
+        // closed the socket). Must fully tear down so wake word re-arms.
+        ctrl.handleVoiceWebSocketEventForTest(WebSocketEvent.Disconnected(willReconnect = false))
         advanceUntilIdle()
 
-        // Must be cleared — prevents handleReconnectedEvent from sending voice_start
-        // on the next Reconnected event without explicit user action.
-        assertNull("activeVoiceConfig must be cleared on WS disconnect", ctrl.activeVoiceConfigForTest)
+        assertNull("activeVoiceConfig must be cleared on terminal disconnect", ctrl.activeVoiceConfigForTest)
+        assertTrue("terminal disconnect must finalize the voice stop", ctrl.voiceStopFinalizedForTest)
+        assertEquals("terminal disconnect must re-arm wake word (resumeWakeWord)", 1, fakes.resumeCalls.get())
+        cleanup()
+    }
+
+    @Test
+    fun `WS TRANSIENT disconnect mid-voice — keeps config + does NOT finalize (reconnect continuity)`() = runTest {
+        val (ctrl, fakes) = controller(this)
+        ctrl.setActiveVoiceConfigForTest(sampleVoiceConfig)
+
+        // willReconnect=true → okhttp ping-timeout blip; the socket auto-reconnects
+        // and Reconnected re-arms voice. A live voice session must survive.
+        ctrl.handleVoiceWebSocketEventForTest(WebSocketEvent.Disconnected(willReconnect = true))
+        advanceUntilIdle()
+
+        assertNotNull("transient disconnect must KEEP activeVoiceConfig", ctrl.activeVoiceConfigForTest)
+        assertFalse("transient disconnect must NOT finalize", ctrl.voiceStopFinalizedForTest)
+        assertEquals("transient disconnect must NOT re-arm wake word", 0, fakes.resumeCalls.get())
         cleanup()
     }
 

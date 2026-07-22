@@ -401,15 +401,30 @@ class VoiceController(
                 finalizeVoiceStop()
             }
             is WebSocketEvent.Disconnected -> {
-                // WS dropped — clear the active voice config so that the
-                // Reconnected event (emitted by OrchestratorConnectionController
-                // on genuine WS-drop reconnects) doesn't re-arm voice_start for
-                // a session that was never active in this process. The voice
-                // subsystem treats the reconnect as a clean slate; the user must
-                // press Start or say the wake word to re-enter voice mode.
-                if (activeVoiceConfig != null) {
-                    Log.i(TAG, "WS disconnected mid-voice — clearing activeVoiceConfig to prevent auto-restart")
+                if (event.willReconnect) {
+                    // TRANSIENT drop (e.g. okhttp ping timeout) — the socket will
+                    // auto-reconnect and the Reconnected handler re-arms voice via
+                    // activeVoiceConfig. Keep everything; do NOT tear down. (This
+                    // is the keepalive-blip continuity path — see
+                    // feedback_android_ws_keepalive_silent_drop.)
+                    return
+                }
+                // TERMINAL drop — the socket will NOT reconnect (user closed the
+                // conversation, screen dimmed → socket closed, shouldReconnect
+                // cleared). If this device owned a live voice session that ended
+                // WITHOUT a clean voice_ended, we must do the full local
+                // teardown here — otherwise finalizeVoiceStop() never runs,
+                // resumeWakeWord() is never sent, the service's
+                // voiceSessionActive stays true forever, and WAKE WORD NEVER
+                // RE-ARMS ("wake up worked once then stopped" — field bug
+                // 2026-07-21). finalizeVoiceStop() is idempotent, clears
+                // amVoiceOwner, stops the voice manager, and re-arms the wake
+                // word after the mic-release delay. Clearing activeVoiceConfig
+                // also stops any Reconnected from auto-restarting a dead session.
+                if (activeVoiceConfig != null || amVoiceOwner) {
+                    Log.i(TAG, "WS terminal disconnect mid-voice — finalizing voice stop (re-arms wake word)")
                     activeVoiceConfig = null
+                    finalizeVoiceStop()
                 }
             }
             else -> {

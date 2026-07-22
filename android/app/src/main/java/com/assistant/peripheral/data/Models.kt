@@ -179,7 +179,14 @@ sealed class WebSocketEvent {
 
     // Connection
     object Connected : WebSocketEvent()
-    object Disconnected : WebSocketEvent()
+    /**
+     * @param willReconnect true when the socket will auto-reconnect (transient
+     *   drop — e.g. okhttp ping timeout) and a [Reconnected] will follow, so a
+     *   live voice session should be KEPT (the Reconnected handler re-arms it).
+     *   false on a terminal close (user disconnect / shouldReconnect cleared),
+     *   where a live voice session must be torn down + wake word re-armed.
+     */
+    data class Disconnected(val willReconnect: Boolean = false) : WebSocketEvent()
 
     // Session list (from REST API via ViewModel)
     data class SessionList(val sessions: List<SessionInfo>) : WebSocketEvent()

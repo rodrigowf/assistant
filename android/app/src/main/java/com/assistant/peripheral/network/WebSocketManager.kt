@@ -172,7 +172,7 @@ class WebSocketManager {
     private fun handleDisconnect(endpoint: WebSocketEndpoint) {
         val conn = connections.getValue(endpoint)
         conn.state.value = ConnectionState.Disconnected
-        _events.tryEmit(endpoint to WebSocketEvent.Disconnected)
+        _events.tryEmit(endpoint to WebSocketEvent.Disconnected(willReconnect = conn.shouldReconnect))
 
         if (conn.shouldReconnect) {
             scope.launch {
