@@ -293,8 +293,12 @@ class EchoDuckController(
 
     companion object {
         /** After the speaker hardware buffer has finished draining,
-         *  wait this long before restoring the mic. Pre-Inc-H L155. */
-        const val MIC_RESTORE_TAIL_MS = 600L
+         *  wait this long before restoring the mic. Pads for speaker
+         *  decay + room reverb + BT output latency (which lands after the
+         *  DAC head reports drained). Bumped 600→1000 (2026-07-22) — the
+         *  mic was re-arming into the acoustic tail and hearing the
+         *  assistant's own voice right after it finished speaking. */
+        const val MIC_RESTORE_TAIL_MS = 1000L
 
         /** Poll interval while waiting for the buffer to drain.
          *  Pre-Inc-H L173. */
