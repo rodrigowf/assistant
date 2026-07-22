@@ -19,23 +19,30 @@ MAX_VOICE_PROMPT_TOKENS = 24_000
 # Within the prompt, the history section (summary + recent verbatim) gets ~18k.
 HISTORY_SECTION_TOKENS = 18_000
 
-# Of that, 6k is kept verbatim (newest messages).  The summary side is
+# Of that, 5k (est) is kept verbatim (newest messages).  The summary side is
 # uncapped at the API level — the model decides how long it needs to be — but
-# we steer it toward ~10k tokens (~7500 words) for the very largest digests
-# via a "Target length" hint in the system prompt.  See
-# ``summary_target_word_range`` below and ``_summarize_history`` in
-# ``orchestrator/session.py``.
+# we steer it via ``summary_target_word_range`` (see below) and
+# ``_summarize_history`` in ``orchestrator/session.py``.
 # NOTE: OpenAI Realtime caps session.instructions at 16,384 tokens; the
 # verbatim budget is one lever that keeps the assembled voice prompt under it.
 # The static sections + this verbatim budget + the summary must stay below that
 # cap.  This budget is measured with the char-estimator (~3.5 chars/tok) which
 # over-counts vs. tiktoken's o200k_base (the tokenizer the API actually uses),
-# so 6k here is ~5k real tokens.  Measured breakdown (2026-07-21, a 206-msg
-# session): static sections ≈6.0k real tok, history ≈10.6k at the old 7k budget,
-# total 16.7k — over cap.  Dropping to 6k + compacting the memory/scripts
-# sections brought it back under.  History is already clipped of tool-call
-# payloads, so 6k of verbatim conversation is ample.
-RECENT_VERBATIM_TOKENS = 6_000
+# so 5k here is ~4k real tokens.  History is already clipped of tool-call
+# payloads, so a smaller verbatim window is ample — recent turns are also
+# covered by the summary, so shrinking it loses nothing.
+#
+# 2026-07-22: dropped 6k -> 5k to widen the margin for the stale-reuse SPIKE.
+# When a voice session is stopped and restarted before its summary regeneration
+# completes, `_build_history_for_prompt` falls into the lossless stale-reuse
+# path (session.py): it keeps the previous summary and PROMOTES every message
+# added since it was generated back into the verbatim window (`recent =
+# older[stale.input_message_count:] + recent`).  On a very long session with a
+# big pile-up of un-summarised turns, that transiently inflates the verbatim
+# window and can breach the cap until the background refresh catches up.  A
+# smaller baseline verbatim budget leaves headroom for that spike.  Do NOT
+# "fix" the spike by truncating — the promotion is deliberately lossless.
+RECENT_VERBATIM_TOKENS = 5_000
 # Soft ceiling on summary length, used only to compute the upper bound of the
 # steering range we suggest to the summarizer model.  NOT a hard cap — the
 # summary always covers the ENTIRE older prefix; this only steers how densely it
