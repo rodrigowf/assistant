@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +207,26 @@ The user interacts with you through a multi-tab web interface. Each agent sessio
 - Monitor their progress and collect results
 - Coordinate multi-step workflows across sessions
 - Maintain persistent memory for cross-session context"""
+
+
+def _datetime_section() -> str:
+    """Build the current-date/time section.
+
+    Stamped at prompt-build time. In text mode the prompt is rebuilt every
+    turn, so this stays fresh across a long-running conversation; in voice
+    mode it reflects when the session (or last session.update) was built.
+    Uses local machine time — the orchestrator runs on the Jetson/laptop in
+    Rodrigo's timezone.
+    """
+    now = datetime.now().astimezone()
+    return (
+        "## Current Date & Time\n"
+        f"{now.strftime('%A, %B %-d, %Y — %-I:%M %p %Z')} "
+        f"(ISO: {now.strftime('%Y-%m-%dT%H:%M:%S%z')})\n\n"
+        "This is stamped when this prompt was built. In a long voice session it "
+        "may drift; treat it as \"now\" for relative dates and don't assume "
+        "minute-level precision."
+    )
 
 
 def _self_reference_section(context: dict[str, Any]) -> str | None:
@@ -659,6 +680,7 @@ def build_system_prompt(
     """
     sections = [
         _role_section(),
+        _datetime_section(),
         _self_reference_section(context),
         _active_sessions_section(context),
         _mcp_section(),
