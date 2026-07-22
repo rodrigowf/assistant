@@ -331,6 +331,67 @@ class TestOpenAITextProvider:
         assert len(tool_msgs) == 1
         assert tool_msgs[0]["tool_call_id"] == "tc1"
 
+    def test_interposed_message_orphans_tool_result(self):
+        """A user message landing between a tool_use and its tool_result
+        must not produce an orphaned OpenAI `tool` message.
+
+        Regression for the voice-mode 400: a spurious [voice] transcription
+        arriving mid tool-execution splits the assistant tool_use from its
+        results during JSONL reconstruction, so the results appear as a
+        standalone user/tool_result message with no adjacent tool_calls.
+        OpenAI rejects that with "messages with role 'tool' must be a
+        response to a preceding message with 'tool_calls'". The converter
+        must re-home the orphaned result as a user message instead.
+        """
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": "Set the lamps"},
+            # Assistant fired two tool calls...
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tc1", "name": "run_script", "input": {}},
+                    {"type": "tool_use", "id": "tc2", "name": "run_script", "input": {}},
+                ],
+            },
+            # ...but a stray voice transcription landed before the results,
+            # so reconstruction split them into a separate assistant + user.
+            {"role": "user", "content": "[voice] Thanks for watching!"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tc1", "content": "done1"},
+                    {"type": "tool_result", "tool_use_id": "tc2", "content": "done2"},
+                ],
+            },
+            {"role": "user", "content": "[voice] next"},
+        ]
+
+        result = convert_messages_for_openai(messages, "SYS")
+
+        # Invariant: every `tool` message is answered by an immediately
+        # preceding assistant tool_calls entry.
+        open_ids: set[str] = set()
+        for m in result:
+            if m["role"] == "assistant":
+                open_ids = {tc["id"] for tc in m.get("tool_calls", [])}
+            elif m["role"] == "tool":
+                assert m["tool_call_id"] in open_ids, (
+                    f"orphaned tool message {m['tool_call_id']}"
+                )
+                open_ids.discard(m["tool_call_id"])
+            else:
+                open_ids = set()
+
+        # The orphaned results are preserved (re-homed as user text), not lost.
+        blob = "\n".join(
+            m["content"] for m in result
+            if m["role"] == "user" and isinstance(m.get("content"), str)
+        )
+        assert "done1" in blob and "done2" in blob
+
     def test_audio_content_creation(self):
         """Test audio content block creation."""
         from orchestrator.providers.openai_text import AudioContent

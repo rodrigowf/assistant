@@ -201,10 +201,69 @@ def convert_messages_for_openai(
         elif role == "assistant":
             openai_messages.extend(_convert_assistant_message(msg))
 
-    # Sanitize: remove tool_calls from assistant messages that aren't followed
-    # by the required tool result messages. This handles sessions resumed from
-    # JSONL where tool execution was interrupted before results were persisted.
-    return _sanitize_orphaned_tool_calls(openai_messages)
+    # Sanitize in two directions so the OpenAI ordering invariant holds:
+    #   1. assistant.tool_calls must be immediately followed by a matching
+    #      `tool` message for every id (else 400: "tool_calls did not have
+    #      response messages").
+    #   2. every `tool` message must be immediately preceded by an assistant
+    #      message whose tool_calls include its id (else 400: "messages with
+    #      role 'tool' must be a response to a preceding message with
+    #      'tool_calls'").
+    # Both can be violated when a JSONL was reconstructed with an unrelated
+    # message interposed between a tool_use and its tool_result — e.g. a
+    # spurious [voice] transcription landing mid tool-execution splits the
+    # assistant tool_use from its results, orphaning the results.
+    sanitized = _sanitize_orphaned_tool_calls(openai_messages)
+    return _drop_orphaned_tool_messages(sanitized)
+
+
+def _drop_orphaned_tool_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop `tool` messages not answering an immediately-preceding tool_call.
+
+    OpenAI requires every ``role: "tool"`` message to be part of a contiguous
+    run that directly follows an assistant message carrying the matching
+    ``tool_calls``. A tool message whose id is not in the nearest preceding
+    assistant ``tool_calls`` (or that follows a non-tool_calls message) is
+    orphaned and triggers a 400.
+
+    Rather than discard the result payload outright, an orphaned tool result
+    is re-attached to the conversation as a plain user message so the model
+    still sees the information, just not in tool-response position.
+    """
+    result: list[dict[str, Any]] = []
+    # Set of tool_call ids answerable at the current position — populated by
+    # the most recent assistant message with tool_calls, consumed as the
+    # contiguous run of tool messages after it is walked.
+    open_ids: set[str] = set()
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            open_ids = {tc["id"] for tc in msg.get("tool_calls", []) if tc.get("id")}
+            result.append(msg)
+        elif role == "tool":
+            tid = msg.get("tool_call_id", "")
+            if tid in open_ids:
+                # Valid response; consume the id so a duplicate can't reuse it.
+                open_ids.discard(tid)
+                result.append(msg)
+            else:
+                # Orphaned — preserve the payload as a user message instead of
+                # emitting an invalid `tool` message.
+                content = msg.get("content", "")
+                if content:
+                    result.append({
+                        "role": "user",
+                        "content": f"[tool result {tid}]\n{content}",
+                    })
+        else:
+            # Any non-tool message closes the answerable window.
+            open_ids = set()
+            result.append(msg)
+
+    return result
 
 
 def _sanitize_orphaned_tool_calls(
