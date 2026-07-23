@@ -40,6 +40,7 @@ fun SettingsScreen(
     onUpdateAutoConnect: (Boolean) -> Unit,
     onUpdateMicGainLevel: (Float) -> Unit,
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
+    onUpdateTalkSilenceSensitivity: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateAudioOutput: (AudioOutput) -> Unit,
@@ -103,6 +104,7 @@ fun SettingsScreen(
                 onUpdateAutoConnect = onUpdateAutoConnect,
                 onUpdateMicGainLevel = onUpdateMicGainLevel,
                 onUpdateWakeWordMicGainLevel = onUpdateWakeWordMicGainLevel,
+                onUpdateTalkSilenceSensitivity = onUpdateTalkSilenceSensitivity,
                 onUpdateSpeakerVolumeLevel = onUpdateSpeakerVolumeLevel,
                 onUpdateEchoDuckingGain = onUpdateEchoDuckingGain,
                 onUpdateAudioOutput = onUpdateAudioOutput,
@@ -145,6 +147,7 @@ private fun AppSettingsTabContent(
     onUpdateAutoConnect: (Boolean) -> Unit,
     onUpdateMicGainLevel: (Float) -> Unit,
     onUpdateWakeWordMicGainLevel: (Float) -> Unit,
+    onUpdateTalkSilenceSensitivity: (Float) -> Unit,
     onUpdateSpeakerVolumeLevel: (Float) -> Unit,
     onUpdateEchoDuckingGain: (Float) -> Unit,
     onUpdateAudioOutput: (AudioOutput) -> Unit,
@@ -501,6 +504,25 @@ private fun AppSettingsTabContent(
                             defaultValue = 100f,
                             supporting = "Higher = easier to trigger (independent of voice session gain)",
                             onCommit = { onUpdateWakeWordMicGainLevel(it / 100f) }
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Turn-based ("my friend") command capture: how much
+                        // quieter than your speech the room must get before the
+                        // recording auto-stops. The VAD floor self-calibrates to
+                        // the room; this multiplier only sets the margin above it.
+                        val talkSilenceSteps = (10..40 step 5).map { it / 10f }  // 1.0 … 4.0
+                        LevelSlider(
+                            icon = Icons.Default.Mic,
+                            title = "Talk Auto-Stop Sensitivity",
+                            value = settings.talkSilenceSensitivity,
+                            steps = talkSilenceSteps,
+                            defaultIndex = talkSilenceSteps.indexOf(2.0f).toFloat(),
+                            formatValue = { "%.1f×".format(it) },
+                            defaultValue = 2.0f,
+                            supporting = "Turn-based capture stops after you pause. Lower = stops sooner (may clip a soft trailing word); higher = waits for a clearer pause (better in a livelier room).",
+                            onCommit = { onUpdateTalkSilenceSensitivity(it) }
                         )
 
                         Spacer(modifier = Modifier.height(4.dp))

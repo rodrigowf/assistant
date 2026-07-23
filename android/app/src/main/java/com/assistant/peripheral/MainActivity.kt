@@ -417,6 +417,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
         settings.talkWord,
         settings.wakeWord,
         settings.wakeWordMicGainLevel,
+        settings.talkSilenceSensitivity,
         settings.serverUrl,
     ) {
         AssistantService.updateWakeWord(
@@ -425,6 +426,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
             settings.talkWord,
             settings.wakeWord,
             settings.wakeWordMicGainLevel,
+            settings.talkSilenceSensitivity,
             settings.serverUrl,
         )
     }
@@ -571,6 +573,7 @@ fun AssistantApp(viewModel: AssistantViewModel, activity: MainActivity) {
                         onUpdateAutoConnect = viewModel::updateAutoConnect,
                         onUpdateMicGainLevel = viewModel::updateMicGainLevel,
                         onUpdateWakeWordMicGainLevel = viewModel::updateWakeWordMicGainLevel,
+                        onUpdateTalkSilenceSensitivity = viewModel::updateTalkSilenceSensitivity,
                         onUpdateSpeakerVolumeLevel = viewModel::updateSpeakerVolumeLevel,
                         onUpdateEchoDuckingGain = viewModel::updateEchoDuckingGain,
                         onUpdateAudioOutput = viewModel::updateAudioOutput,

@@ -445,6 +445,10 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch { settingsRepository.updateWakeWordMicGainLevel(level) }
     }
 
+    fun updateTalkSilenceSensitivity(value: Float) {
+        viewModelScope.launch { settingsRepository.updateTalkSilenceSensitivity(value) }
+    }
+
     fun updateAudioOutput(output: AudioOutput) {
         viewModelScope.launch { settingsRepository.updateAudioOutput(output) }
     }

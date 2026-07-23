@@ -427,6 +427,7 @@ data class AppSettings(
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val micGainLevel: Float = 1.0f,            // 0.0 to 1.5, where 1.0 is normal (voice session only)
     val wakeWordMicGainLevel: Float = 1.0f,    // 0.0 to 1.5, scales RMS threshold for the wake-word detector (umbrella, both phrase types)
+    val talkSilenceSensitivity: Float = 2.0f,  // 1.0 to 4.0, end-of-utterance VAD multiplier for turn-based talk capture: voiceThreshold = max(ambientFloor × this, floorMin). Higher = tolerates a livelier room / slower to stop; lower = stops sooner.
     val speakerVolumeLevel: Float = 1.0f,      // 0.0 to 1.5, where 1.0 is 100%
     val echoDuckingGain: Float = 0.05f,        // 0.0 to 1.0, mic gain while agent is speaking (5% default)
     val audioOutput: AudioOutput = AudioOutput.AUTO,  // where voice session audio is routed; AUTO lets the OS pick

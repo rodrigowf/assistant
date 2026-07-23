@@ -101,6 +101,7 @@ class AssistantService : Service() {
         private const val PREF_TALK_WORD = "turn_talk_word"
         private const val PREF_WAKE_WORD = "realtime_wake_word"
         private const val PREF_WAKE_MIC_GAIN = "wake_word_mic_gain"
+        private const val PREF_TALK_SILENCE_SENSITIVITY = "talk_silence_sensitivity"
         private const val PREF_SERVER_URL = "server_url"
 
         // Inc 8 removed `WATCHDOG_INTERVAL_MS` (was `2 * 60 * 60 * 1000L`).
@@ -233,6 +234,7 @@ class AssistantService : Service() {
             talkWord: String,
             wakeWord: String,
             wakeWordMicGain: Float,
+            talkSilenceSensitivity: Float,
             serverUrl: String,
         ) {
             val intent = Intent(context, AssistantService::class.java).apply {
@@ -240,6 +242,7 @@ class AssistantService : Service() {
                 putExtra(EXTRA_TALK_WORD, talkWord)
                 putExtra(EXTRA_WAKE_WORD, wakeWord)
                 putExtra("wake_word_mic_gain", wakeWordMicGain)
+                putExtra("talk_silence_sensitivity", talkSilenceSensitivity)
                 putExtra("server_url", serverUrl)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -331,6 +334,7 @@ class AssistantService : Service() {
     private var lastWakeWord: String = "wake up"
     private var lastEnabled: Boolean = false
     private var lastWakeMicGain: Float = 1.0f
+    private var lastTalkSilenceSensitivity: Float = 2.0f
     private var lastServerUrl: String = ""
 
     // Inc 3 dedupe: last `startWakeWord` (key, monotonic-clock timestamp)
@@ -373,12 +377,14 @@ class AssistantService : Service() {
         val talkWord = prefs.getString(PREF_TALK_WORD, "my friend") ?: "my friend"
         val wakeWord = prefs.getString(PREF_WAKE_WORD, "wake up") ?: "wake up"
         val wakeMicGain = prefs.getFloat(PREF_WAKE_MIC_GAIN, 1.0f)
+        val talkSilenceSensitivity = prefs.getFloat(PREF_TALK_SILENCE_SENSITIVITY, 2.0f)
         val serverUrl = prefs.getString(PREF_SERVER_URL, "") ?: ""
         // Sync in-memory cache
         lastEnabled = enabled
         lastTalkWord = talkWord
         lastWakeWord = wakeWord
         lastWakeMicGain = wakeMicGain
+        lastTalkSilenceSensitivity = talkSilenceSensitivity
         lastServerUrl = serverUrl
 
         if (!enabled) return
@@ -495,6 +501,8 @@ class AssistantService : Service() {
                 val talkWord = intent.getStringExtra(EXTRA_TALK_WORD) ?: "my friend"
                 val wakeWord = intent.getStringExtra(EXTRA_WAKE_WORD) ?: "wake up"
                 val wakeMicGain = intent.getFloatExtra("wake_word_mic_gain", lastWakeMicGain)
+                val talkSilenceSensitivity =
+                    intent.getFloatExtra("talk_silence_sensitivity", lastTalkSilenceSensitivity)
                 val serverUrl = intent.getStringExtra("server_url") ?: lastServerUrl
                 // Persist config to SharedPreferences so it survives process death.
                 prefs.edit()
@@ -502,12 +510,14 @@ class AssistantService : Service() {
                     .putString(PREF_TALK_WORD, talkWord)
                     .putString(PREF_WAKE_WORD, wakeWord)
                     .putFloat(PREF_WAKE_MIC_GAIN, wakeMicGain)
+                    .putFloat(PREF_TALK_SILENCE_SENSITIVITY, talkSilenceSensitivity)
                     .putString(PREF_SERVER_URL, serverUrl)
                     .apply()
                 lastEnabled = enableWakeWord
                 lastTalkWord = talkWord
                 lastWakeWord = wakeWord
                 lastWakeMicGain = wakeMicGain
+                lastTalkSilenceSensitivity = talkSilenceSensitivity
                 lastServerUrl = serverUrl
                 if (enableWakeWord) {
                     startWakeWord(talkWord, wakeWord, wakeMicGain, serverUrl)
@@ -522,13 +532,15 @@ class AssistantService : Service() {
             val talkWord = prefs.getString(PREF_TALK_WORD, "my friend") ?: "my friend"
             val wakeWord = prefs.getString(PREF_WAKE_WORD, "wake up") ?: "wake up"
             val wakeMicGain = prefs.getFloat(PREF_WAKE_MIC_GAIN, 1.0f)
+            val talkSilenceSensitivity = prefs.getFloat(PREF_TALK_SILENCE_SENSITIVITY, 2.0f)
             val serverUrl = prefs.getString(PREF_SERVER_URL, "") ?: ""
             lastEnabled = enabled
             lastTalkWord = talkWord
             lastWakeWord = wakeWord
             lastWakeMicGain = wakeMicGain
+            lastTalkSilenceSensitivity = talkSilenceSensitivity
             lastServerUrl = serverUrl
-            Log.d(TAG, "Sticky restart — restored config from prefs: enabled=$enabled, talk=\"$talkWord\", wake=\"$wakeWord\", gain=$wakeMicGain")
+            Log.d(TAG, "Sticky restart — restored config from prefs: enabled=$enabled, talk=\"$talkWord\", wake=\"$wakeWord\", gain=$wakeMicGain, talkSilenceSensitivity=$talkSilenceSensitivity")
             if (enabled) {
                 startWakeWord(talkWord, wakeWord, wakeMicGain, serverUrl)
             }
@@ -561,9 +573,14 @@ class AssistantService : Service() {
         wakeWord: String,
         micGain: Float = lastWakeMicGain,
         serverUrl: String = lastServerUrl,
+        talkSilenceSensitivity: Float = lastTalkSilenceSensitivity,
     ) {
         // Inc 3 dedupe target is Android intent redelivery / sticky-restart
-        // races on the (talk, wake, gain) tuple.
+        // races on the (talk, wake, gain) tuple. talkSilenceSensitivity is NOT
+        // part of the dedupe key: it only affects the in-progress talk-capture
+        // VAD (read live from the constructed detector), never the arm identity,
+        // so a change to it alone shouldn't force a detector rebuild storm — the
+        // next capture picks up the new value via the fresh detector anyway.
         val key = Triple(talkWord, wakeWord, micGain)
         val nowMs = SystemClock.elapsedRealtime()
         if (shouldDedupeWakeStart(key, nowMs, lastStartKey, lastStartAtMs)) {
@@ -574,10 +591,10 @@ class AssistantService : Service() {
         lastStartAtMs = nowMs
         wakeWordDetector?.stop()
         wakeWordDetector = WakeWordDetector(
-            this, talkWord, wakeWord, micGain, serverUrl,
+            this, talkWord, wakeWord, micGain, serverUrl, talkSilenceSensitivity,
         )
         wakeWordDetector?.start()
-        Log.d(TAG, "Wake word detection started — talk: \"$talkWord\", wake: \"$wakeWord\", gain=$micGain")
+        Log.d(TAG, "Wake word detection started — talk: \"$talkWord\", wake: \"$wakeWord\", gain=$micGain, talkSilenceSensitivity=$talkSilenceSensitivity")
     }
 
     private fun stopWakeWord() {

@@ -64,6 +64,12 @@ class WakeWordDetector(
     // Whisper confirmation gate. Blank disables confirmation (fail-open — the
     // detector fires on the raw Vosk match). Normally always set.
     private val serverUrl: String = "",
+    // End-of-utterance sensitivity K for the talk-command adaptive VAD:
+    // voiceThreshold = max(ambientFloor × K, ADAPTIVE_VOICE_FLOOR_MIN). User-
+    // adjustable via the SettingsScreen "Talk silence sensitivity" slider. See
+    // DEFAULT_TALK_SILENCE_SENSITIVITY. Higher = tolerates a livelier room /
+    // less likely to clip mid-command but slower to stop; lower = stops sooner.
+    private val talkSilenceSensitivity: Float = DEFAULT_TALK_SILENCE_SENSITIVITY.toFloat(),
 ) {
     companion object {
         private const val TAG = "WakeWordDetector"
@@ -129,6 +135,51 @@ class WakeWordDetector(
          * the same companion object; SPEECH_FLOOR_RMS is declared below.)
          */
         private const val COMMAND_ABS_SPEECH_FLOOR = 30.0
+
+        /**
+         * Adaptive-floor VAD (2026-07-22). A FIXED voice threshold can't decide
+         * "is this frame speech or the room?" across devices: the A300M's
+         * VOICE_COMMUNICATION source runs a quiet-room RMS floor of ~150–200 (AGC
+         * pumps the gain up in a silent room), while the tuning that set
+         * [COMMAND_ABS_SPEECH_FLOOR]=30 assumed a floor of 4–11. With a fixed
+         * voiceThreshold≈58, every silent frame on the A300M read ~170 > 58 →
+         * counted as "voice" → the silence timer never drained → capture only
+         * ever ended at [COMMAND_MAX_MS] or a manual Stop (the field bug).
+         *
+         * Fix: estimate the ambient floor continuously from the quietest recent
+         * audio and set the end-of-utterance threshold RELATIVE to it. Speech
+         * (RMS 1500–2600 measured) sits far above floor×K; the post-speech tail
+         * (~170, i.e. the room itself) sits below it, so the timer drains and the
+         * capture ends ~[COMMAND_SILENCE_MS] after you actually stop.
+         *
+         * The floor tracker adapts DOWN fast (so it locks onto a genuine quiet
+         * gap quickly) and UP slowly (so a loud command word can't inflate the
+         * floor and swallow the following silence). See [NoiseFloorTracker].
+         */
+        private const val SILENCE_FLOOR_ATTACK = 0.30   // weight toward a NEW lower reading (fast down)
+        private const val SILENCE_FLOOR_RELEASE = 0.02  // weight toward a NEW higher reading (slow up)
+
+        /**
+         * Default end-of-utterance sensitivity multiplier K:
+         * `voiceThreshold = max(noiseFloor × K, absoluteMinimum)`. A frame at or
+         * above that counts as speech and refreshes the silence timer; below it
+         * counts as a pause. Higher K = the tail must be much quieter than speech
+         * to end capture (less likely to clip mid-command, slower to stop in a
+         * live room); lower K = ends sooner but risks a soft trailing word being
+         * read as silence. 2.0 means "speech must be at least twice the room
+         * floor" — comfortably true for real speech (10–15× the floor in the
+         * measured trace) and false for the room itself. Overridable per-user via
+         * the [talkSilenceSensitivity] config knob (SettingsScreen slider).
+         */
+        private const val DEFAULT_TALK_SILENCE_SENSITIVITY = 2.0
+
+        /**
+         * Absolute lower bound on the adaptive voice threshold, so that in a
+         * truly silent room (floor near 0) a whisper-quiet stray sound can't be
+         * mistaken for speech. Kept at [COMMAND_ABS_SPEECH_FLOOR] so the adaptive
+         * path never dips below the old absolute gate.
+         */
+        private const val ADAPTIVE_VOICE_FLOOR_MIN = COMMAND_ABS_SPEECH_FLOOR
 
         /**
          * A genuine speech onset must sustain voice-level audio for at least
@@ -352,6 +403,44 @@ class WakeWordDetector(
         internal fun computePreBufferCapacity(readShorts: Int): Int {
             val targetSamples = SAMPLE_RATE * PRE_BUFFER_MS / 1000
             return (targetSamples / readShorts).coerceAtLeast(1)
+        }
+
+        /**
+         * Compute the end-of-utterance voice threshold from the current ambient
+         * floor estimate and the user's sensitivity multiplier K, clamped to
+         * [ADAPTIVE_VOICE_FLOOR_MIN]. Pure so [captureTalkCommand]'s VAD decision
+         * is unit-testable (`AdaptiveVadParityTest`).
+         *
+         * `voiceThreshold = max(floor × K, ADAPTIVE_VOICE_FLOOR_MIN)`
+         */
+        internal fun adaptiveVoiceThreshold(noiseFloor: Double, sensitivity: Double): Double =
+            (noiseFloor * sensitivity).coerceAtLeast(ADAPTIVE_VOICE_FLOOR_MIN)
+
+        internal fun adaptiveVoiceFloorMinForTest(): Double = ADAPTIVE_VOICE_FLOOR_MIN
+    }
+
+    /**
+     * Asymmetric exponential tracker of the ambient noise floor during command
+     * capture. Adapts DOWN quickly ([SILENCE_FLOOR_ATTACK]) so it locks onto a
+     * genuine quiet gap within a few frames, and UP slowly
+     * ([SILENCE_FLOOR_RELEASE]) so a loud command word can't inflate the floor
+     * and swallow the following silence. Seeded with the first observed RMS so
+     * the very first pause is judged against a real reading, not 0.
+     *
+     * NOT thread-safe — used only on the single capture IO coroutine.
+     */
+    internal class NoiseFloorTracker(initial: Double = -1.0) {
+        var floor: Double = initial
+            private set
+
+        /** Feed one frame's RMS; returns the updated floor estimate. */
+        fun update(rms: Double): Double {
+            floor = when {
+                floor < 0.0 -> rms  // first reading seeds the estimate
+                rms < floor -> rms * SILENCE_FLOOR_ATTACK + floor * (1 - SILENCE_FLOOR_ATTACK)
+                else -> rms * SILENCE_FLOOR_RELEASE + floor * (1 - SILENCE_FLOOR_RELEASE)
+            }
+            return floor
         }
     }
 
@@ -1091,24 +1180,43 @@ class WakeWordDetector(
         wakePhrasePcm: List<ShortArray>,
         onSpeechOnset: () -> Unit,
     ): List<ShortArray>? = withContext(Dispatchers.IO) {
-        // Real-speech level (gain-scaled). A frame at/above this is "voice";
-        // anything below is treated as non-speech for the purpose of ending
-        // capture. We deliberately do NOT use a lower relative silence floor
-        // here — that was the bug: ambient noise living above the low floor
-        // refreshed the timer forever. Voice-level hysteresis + the absolute
-        // floor below is what lets a genuine pause end the capture.
-        val voiceThreshold =
-            (if (micGain > 0f) RMS_THRESHOLD / micGain else RMS_THRESHOLD)
+        // ADAPTIVE end-of-utterance VAD (2026-07-22). The old fixed voice
+        // threshold (RMS_THRESHOLD / micGain ≈ 58) could not tell speech from a
+        // hot mic's quiet-room floor: on the A300M the VOICE_COMMUNICATION source
+        // idles at RMS ~150–200 in silence, so every "silent" frame read as
+        // "voice" and the capture never ended (field bug — only Stop or the 12s
+        // cap stopped it). Instead we track the ambient floor continuously and
+        // judge each frame against `max(floor × sensitivity, ADAPTIVE_VOICE_FLOOR_MIN)`.
+        // Real speech (RMS 1500–2600 measured) is many multiples of the floor;
+        // the post-speech tail (the room itself, ~170) is not, so the silence
+        // timer drains and capture ends ~COMMAND_SILENCE_MS after you stop.
+        val sensitivity = talkSilenceSensitivity
+            .toDouble()
+            .takeIf { it > 0.0 }
+            ?: DEFAULT_TALK_SILENCE_SENSITIVITY
+        // Seed the floor estimate from the QUIETEST frame of the wake-phrase
+        // pre-roll rather than 0 or the first (loud) command frame. The pre-roll
+        // spans the wake phrase plus the gaps around it, so its minimum frame is
+        // a good first approximation of the room floor — the tracker then starts
+        // near the true floor and only fine-tunes, instead of spending ~1s
+        // converging down from a loud speech seed (which would briefly hold the
+        // threshold too high and risk clipping the command's opening words).
+        val seedFloor = wakePhrasePcm
+            .map { computeRms(it, it.size) }
+            .filter { it > 0.0 }
+            .minOrNull()
+            ?: -1.0
+        val noiseFloor = NoiseFloorTracker(seedFloor)
         val command = ArrayList<ShortArray>(wakePhrasePcm)  // pre-roll first
         val buffer = ShortArray(3200)  // 200ms at 16kHz
         val startedMs = System.currentTimeMillis()
         var onsetFired = false                 // onSpeechOnset() called yet?
         var sustainedVoiceMs = 0L              // run-length of consecutive voice audio
-        var lastVoiceMs = startedMs            // last frame at/above voiceThreshold
+        var lastVoiceMs = startedMs            // last frame counted as voice
         var prevFrameMs = startedMs
         var loggedRmsAtMs = 0L
 
-        Log.d(TAG, "Talk command capture started (same mic, voice≥${voiceThreshold.toInt()}, onset needs ${ONSET_SUSTAIN_MS}ms sustained)")
+        Log.d(TAG, "Talk command capture started (same mic, adaptive VAD sensitivity=${"%.1f".format(sensitivity)}, onset needs ${ONSET_SUSTAIN_MS}ms sustained)")
         while (isActive) {
             val now = System.currentTimeMillis()
             if (now - startedMs >= COMMAND_MAX_MS) {
@@ -1128,7 +1236,13 @@ class WakeWordDetector(
             val frameDtMs = now - prevFrameMs
             prevFrameMs = now
 
-            val isVoice = rms >= voiceThreshold && rms >= COMMAND_ABS_SPEECH_FLOOR
+            // Update the ambient floor estimate, then derive the current voice
+            // threshold from it. The tracker adapts down fast / up slow, so the
+            // threshold locks just above the room floor within a few frames and a
+            // loud command word can't drag it up to swallow the trailing silence.
+            val floor = noiseFloor.update(rms)
+            val voiceThreshold = adaptiveVoiceThreshold(floor, sensitivity)
+            val isVoice = rms >= voiceThreshold
             if (isVoice) {
                 sustainedVoiceMs += frameDtMs
                 lastVoiceMs = now
@@ -1137,7 +1251,7 @@ class WakeWordDetector(
             }
 
             if (now - loggedRmsAtMs >= 500) {
-                Log.d(TAG, "  cmd rms=${rms.toInt()} voice=$isVoice onset=$onsetFired sustained=${sustainedVoiceMs}ms silenceFor=${if (onsetFired) now - lastVoiceMs else 0}ms")
+                Log.d(TAG, "  cmd rms=${rms.toInt()} floor=${floor.toInt()} voice≥${voiceThreshold.toInt()} voice=$isVoice onset=$onsetFired sustained=${sustainedVoiceMs}ms silenceFor=${if (onsetFired) now - lastVoiceMs else 0}ms")
                 loggedRmsAtMs = now
             }
 
