@@ -161,6 +161,118 @@ def anthropic_to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any
     return openai_tools
 
 
+def _anthropic_image_to_openai(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert an Anthropic ``image`` block to an OpenAI ``image_url`` block.
+
+    Returns None if the source shape isn't understood (caller falls back to a
+    text placeholder rather than emitting an invalid block).
+    """
+    source = block.get("source", {})
+    if isinstance(source, dict) and source.get("type") == "base64":
+        media = source.get("media_type", "image/png")
+        data = source.get("data", "")
+        if data:
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:{media};base64,{data}"},
+            }
+    # Some paths already carry an OpenAI-shaped image_url — pass through.
+    if isinstance(block.get("image_url"), dict):
+        return {"type": "image_url", "image_url": block["image_url"]}
+    return None
+
+
+def _coerce_block_to_openai(block: Any) -> dict[str, Any]:
+    """Coerce ANY content block into an OpenAI-valid block (text/image_url).
+
+    This is the defensive backstop that prevents one malformed block — e.g. a
+    tool that returned a raw Anthropic ``image`` block, or any unrecognized
+    type — from 400-ing the whole request ("Content blocks are expected to be
+    either text or image_url type") and wedging the session so every following
+    turn re-sends the bad block and fails again. Anything we can't map to a
+    real block becomes a text rendering so the model still sees *something*.
+    """
+    if isinstance(block, dict):
+        btype = block.get("type")
+        if btype == "text":
+            return {"type": "text", "text": str(block.get("text", ""))}
+        if btype in ("image_url", "input_audio"):
+            return block  # already OpenAI-valid
+        if btype == "image":
+            converted = _anthropic_image_to_openai(block)
+            if converted is not None:
+                return converted
+            return {"type": "text", "text": "[image omitted]"}
+        # Unknown block type — render as text so it can't break the request.
+        return {"type": "text", "text": _stringify_block(block)}
+    # Non-dict block (str, etc.)
+    return {"type": "text", "text": str(block)}
+
+
+def _stringify_block(block: dict[str, Any]) -> str:
+    """Best-effort text rendering of an unknown content block."""
+    for key in ("text", "content", "output"):
+        val = block.get(key)
+        if isinstance(val, str) and val:
+            return val
+    try:
+        return json.dumps(block, ensure_ascii=False)[:4000]
+    except (TypeError, ValueError):
+        return str(block)[:4000]
+
+
+def _coerce_content_to_openai(content: Any) -> str | list[dict[str, Any]]:
+    """Normalize a message/tool ``content`` field to an OpenAI-valid shape.
+
+    OpenAI accepts either a plain string or a list of text/image_url (/input_audio)
+    blocks. A string passes through unchanged; a list has every block coerced;
+    anything else is stringified. Guarantees the return can never trip the
+    "Content blocks are expected to be either text or image_url type" 400.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        coerced = [_coerce_block_to_openai(b) for b in content]
+        # Collapse a pure-text list to a plain string — smaller and avoids
+        # edge cases with empty lists.
+        if coerced and all(b.get("type") == "text" for b in coerced):
+            return "\n".join(b.get("text", "") for b in coerced)
+        return coerced or ""
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _sanitize_all_content(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Coerce every message's ``content`` to an OpenAI-valid shape.
+
+    The last line of defense before the request goes out. Preserves each
+    message's other keys (role, tool_calls, tool_call_id). An assistant
+    message that legitimately has ``content: None`` alongside ``tool_calls``
+    is left as-is (OpenAI requires null content there); only genuine content
+    payloads are coerced.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        if "content" not in m:
+            out.append(m)
+            continue
+        # Assistant tool-call carrier with null content + tool_calls is valid.
+        if (
+            m.get("role") == "assistant"
+            and m.get("content") is None
+            and m.get("tool_calls")
+        ):
+            out.append(m)
+            continue
+        m = dict(m)
+        m["content"] = _coerce_content_to_openai(m.get("content"))
+        out.append(m)
+    return out
+
+
 def convert_messages_for_openai(
     messages: list[dict[str, Any]],
     system: str,
@@ -214,7 +326,14 @@ def convert_messages_for_openai(
     # spurious [voice] transcription landing mid tool-execution splits the
     # assistant tool_use from its results, orphaning the results.
     sanitized = _sanitize_orphaned_tool_calls(openai_messages)
-    return _drop_orphaned_tool_messages(sanitized)
+    ordered = _drop_orphaned_tool_messages(sanitized)
+    # Final defense-in-depth pass: guarantee every message's content is an
+    # OpenAI-valid shape (string, or list of text/image_url/input_audio
+    # blocks). Any block a per-message converter missed — a raw image, an
+    # unknown type from a future tool — is coerced to text here rather than
+    # 400-ing the whole request and wedging the session. Runs regardless of
+    # which path produced the message, so it can never be bypassed.
+    return _sanitize_all_content(ordered)
 
 
 def _drop_orphaned_tool_messages(
@@ -335,23 +454,24 @@ def _convert_user_message(msg: dict[str, Any]) -> dict[str, Any] | list[dict[str
                 # Already in OpenAI format (from our audio handling)
                 openai_content.append(block)
             elif block_type == "image":
-                # Anthropic image format → OpenAI
-                source = block.get("source", {})
-                if source.get("type") == "base64":
-                    openai_content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}",
-                        },
-                    })
+                # Anthropic image format → OpenAI (base64 or already-OpenAI
+                # image_url). A shape we can't map becomes a text placeholder
+                # instead of silently vanishing.
+                openai_content.append(_coerce_block_to_openai(block))
             elif block_type == "tool_result":
                 # Tool results in user messages (Anthropic style)
-                # Convert to OpenAI tool role messages
+                # Convert to OpenAI tool role messages. Coerce the content so a
+                # tool that returned structured/image blocks can't emit a raw
+                # non-text/image_url block (the 400 that wedged the session).
                 tool_results.append({
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id", ""),
-                    "content": block.get("content", ""),
+                    "content": _coerce_content_to_openai(block.get("content", "")),
                 })
+            else:
+                # Unknown block type in a user message — render as text rather
+                # than dropping it silently (or, worse, passing it through raw).
+                openai_content.append(_coerce_block_to_openai(block))
 
         # If message ONLY contains tool results, return them as tool messages
         if tool_results and not openai_content:
@@ -410,7 +530,7 @@ def _convert_assistant_message(msg: dict[str, Any]) -> list[dict[str, Any]]:
                 tool_results.append({
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id", ""),
-                    "content": block.get("content", ""),
+                    "content": _coerce_content_to_openai(block.get("content", "")),
                 })
 
         # Build assistant message

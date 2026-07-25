@@ -431,6 +431,101 @@ class TestOpenAITextProvider:
         assert OpenAIModel.GPT_4O_AUDIO.supports_audio is True
         assert OpenAIModel.GPT_4O_MINI_AUDIO.supports_audio is True
 
+    # --- content coercion: no block can trip the "text or image_url" 400 ----
+
+    @staticmethod
+    def _invalid_blocks(result):
+        """Every list-content block must be text/image_url/input_audio."""
+        bad = []
+        for i, m in enumerate(result):
+            c = m.get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if not isinstance(b, dict) or b.get("type") not in (
+                        "text", "image_url", "input_audio",
+                    ):
+                        bad.append((i, m.get("role"), b))
+        return bad
+
+    def test_tool_result_with_image_block_coerced_to_image_url(self):
+        """A tool returning a raw Anthropic image block must not 400.
+
+        Regression for the 2026-07-25 wedge: a tool_result whose content was a
+        list containing an ``image`` block was passed straight into an OpenAI
+        ``tool`` message, producing 'Content blocks are expected to be either
+        text or image_url type' — which then re-fired on every subsequent turn
+        and broke all follow-up tool calls.
+        """
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "read_img", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "AAAA",
+                    }},
+                ]},
+            ]},
+        ]
+        result = convert_messages_for_openai(messages, "SYS")
+        assert self._invalid_blocks(result) == []
+        # The image survived as a valid image_url block.
+        tool_msg = next(m for m in result if m.get("role") == "tool")
+        assert tool_msg["content"][0]["type"] == "image_url"
+        assert tool_msg["content"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_unknown_block_type_coerced_to_text(self):
+        """An unrecognized content block is rendered as text, never emitted raw."""
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": [
+                {"type": "some_future_type", "payload": {"k": "v"}},
+            ]},
+        ]
+        result = convert_messages_for_openai(messages, "SYS")
+        assert self._invalid_blocks(result) == []
+
+    def test_non_base64_image_becomes_placeholder_not_dropped(self):
+        """A non-base64 image source must not silently vanish."""
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "url", "url": "http://x/y.png"}},
+            ]},
+        ]
+        result = convert_messages_for_openai(messages, "SYS")
+        assert self._invalid_blocks(result) == []
+        user_msg = next(m for m in result if m.get("role") == "user")
+        # Coerced to a text placeholder rather than dropped.
+        assert "image" in str(user_msg["content"]).lower()
+
+    def test_assistant_tool_call_carrier_keeps_null_content(self):
+        """The null-content + tool_calls assistant carrier is left valid."""
+        from orchestrator.providers.openai_text import convert_messages_for_openai
+
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "run", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ]},
+        ]
+        result = convert_messages_for_openai(messages, "SYS")
+        carrier = next(
+            m for m in result
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        # OpenAI requires null (not "") content on a pure tool-call turn.
+        assert carrier.get("content") is None
+
 
 # ---------------------------------------------------------------------------
 # Anthropic provider tests
