@@ -124,6 +124,13 @@ class _HookProvider:
     def gate_cleared(self):
         return not self._response_active
 
+    def should_close_after_event(self, event):
+        # The relay drain loop consults this on every inbound frame (Gemini's
+        # goAway is the motivating case). Default no-op like the base class —
+        # without it the drain loop raises AttributeError and dies before
+        # processing later frames (audio_out / response.done).
+        return False
+
     def build_keepalive_chunk(self):
         return self._keepalive_chunk
 
