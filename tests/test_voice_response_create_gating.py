@@ -98,6 +98,87 @@ def test_openai_provider_mark_response_create_sent_flips_optimistically():
     assert p.gate_cleared() is True
 
 
+# ---------- Barge-in gate-clearing (2026-07-24 wedge) --------------------
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    ["input_audio_buffer.speech_started", "output_audio_buffer.cleared"],
+)
+def test_openai_provider_gate_clears_on_barge_in(interrupt):
+    """A barge-in tears down the response; the gate must not stick True.
+
+    Regression for the wedge where ``speech_started`` cancelled a response
+    whose ``response.done`` was never mirrored, leaving ``_response_active``
+    stuck True and parking every subsequent tool-result ``response.create``.
+    """
+    p = OpenAIVoiceProvider()
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+    # User barges in (or the output buffer is cleared) — gate clears without
+    # ever seeing a terminal response.done.
+    p.on_inbound_event({"type": interrupt})
+    assert p.gate_cleared() is True
+    # And a fresh response.create is no longer gated.
+    assert p.should_gate_event({"type": "response.create"}) is False
+
+
+def test_openai_provider_barge_in_noop_when_no_response_active():
+    """A speech_started with no response in flight must not corrupt state."""
+    p = OpenAIVoiceProvider()
+    assert p.gate_cleared() is True
+    p.on_inbound_event({"type": "input_audio_buffer.speech_started"})
+    assert p.gate_cleared() is True
+
+
+# ---------- Staleness watchdog -------------------------------------------
+
+
+def test_openai_provider_gate_force_cleared_when_stale(monkeypatch):
+    """A gate active past the staleness window is force-cleared.
+
+    Backstops the barge-in fix: even if BOTH the terminal event and the
+    interrupt signal are lost, the gate self-heals instead of wedging the
+    session forever.
+    """
+    import orchestrator.providers.openai_voice as ov
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ov.time, "monotonic", lambda: clock["t"])
+
+    p = OpenAIVoiceProvider()
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+
+    # Just under the threshold — still gated.
+    clock["t"] += p._RESPONSE_ACTIVE_STALE_SECONDS - 0.1
+    assert p.gate_cleared() is False
+    assert p.should_gate_event({"type": "response.create"}) is True
+
+    # Past the threshold — force-cleared on the next check.
+    clock["t"] += 0.2
+    assert p.gate_cleared() is True
+    # And a subsequent should_gate_event sees a clean gate.
+    assert p.should_gate_event({"type": "response.create"}) is False
+
+
+def test_openai_provider_stale_clock_resets_on_reactivation(monkeypatch):
+    """Each activation restarts the staleness clock (no premature clear)."""
+    import orchestrator.providers.openai_voice as ov
+
+    clock = {"t": 500.0}
+    monkeypatch.setattr(ov.time, "monotonic", lambda: clock["t"])
+
+    p = OpenAIVoiceProvider()
+    p.on_inbound_event({"type": "response.created"})
+    # Age most of the way to stale, then a fresh response.created restarts it.
+    clock["t"] += p._RESPONSE_ACTIVE_STALE_SECONDS - 0.1
+    p.on_inbound_event({"type": "response.created"})
+    # Only 0.2s past the *first* activation — but the clock reset, so still gated.
+    clock["t"] += 0.2
+    assert p.gate_cleared() is False
+
+
 # ---------- Dispatch-layer behaviour -------------------------------------
 
 

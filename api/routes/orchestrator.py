@@ -1287,7 +1287,21 @@ async def _send_voice_command(
     owner = session.voice_owner_ws
     payload = orjson.dumps({"type": "voice_command", "command": command})
     if owner is not None:
-        await _safe_send_bytes(owner, payload)
+        delivered = await _safe_send_bytes(owner, payload)
+        if not delivered:
+            # The owner reference is stale — the socket closed (okhttp 1011
+            # keepalive drop) without the reconnect re-registering ownership.
+            # Previously the return value was discarded and the command was
+            # silently lost, so tool results never reached the model. Fall
+            # back to a broadcast so an active peer still forwards the frame,
+            # and warn so the stale-owner condition is visible.
+            logger.warning(
+                "voice_command owner send failed (stale socket) — "
+                "broadcasting fallback (session=%s type=%s)",
+                getattr(session, "local_id", "?"),
+                command.get("type", "?"),
+            )
+            await pool.broadcast_orchestrator({"type": "voice_command", "command": command})
     else:
         logger.warning(
             "voice_command with no registered owner — broadcasting (session=%s)",
@@ -1341,7 +1355,13 @@ async def _dispatch_voice_commands(
                     # Multiple deferred ``response.create``s are semantically
                     # one (no payload, no ordering), so we keep just the latest.
                     session._deferred_response_create = cmd
-                    logger.info(
+                    # WARNING, not INFO: a parked response.create is the shape
+                    # of the 2026-07-24 wedge (tool result executed but the
+                    # model never told to consume it). The provider's staleness
+                    # watchdog force-clears a gate that never gets its terminal
+                    # event, but a burst of these still deserves visibility —
+                    # the app logs only WARNING+ to journald.
+                    logger.warning(
                         "voice_command_deferred session=%s type=%s reason=provider_gate",
                         session.local_id,
                         cmd.get("type"),

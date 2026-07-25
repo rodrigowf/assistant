@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -95,6 +96,14 @@ class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         # defer parallel-tool ``response.create`` frames into a single-slot
         # queue that drains when the active response completes.
         self._response_active: bool = False
+        # Monotonic timestamp of the last time ``_response_active`` was set
+        # True (via ``on_inbound_event`` seeing ``response.created`` or the
+        # optimistic ``mark_response_create_sent`` flip). Used by the
+        # staleness watchdog in ``gate_cleared`` / ``should_gate_event`` to
+        # force-clear a gate that never received its terminal event — the
+        # exact wedge a barge-in produced when ``speech_started`` cancelled
+        # a response whose ``response.done`` was lost across a reconnect.
+        self._response_active_since: float = 0.0
 
     # --- identity ---------------------------------------------------------
 
@@ -298,20 +307,84 @@ class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         "response.failed",
     })
 
+    # A barge-in cancels the in-flight response server-side. OpenAI *should*
+    # follow with a ``response.done`` (status="cancelled") that clears the
+    # gate the normal way, but that terminal event is the fragile one: it can
+    # be lost across a WS reconnect, or never arrive when the response was
+    # cancelled before its ``response.created`` was ever mirrored (the
+    # optimistic ``mark_response_create_sent`` flip has no matching created).
+    # Treating the interruption signals themselves as gate-clearing makes the
+    # barge-in path self-healing instead of leaving ``_response_active`` stuck
+    # True forever — which parked every subsequent tool-result ``response.create``
+    # in the deferred slot and made the model narrate "still running" without
+    # ever consuming a tool output. (2026-07-24 wedge.)
+    _RESPONSE_INTERRUPT_TYPES = frozenset({
+        "input_audio_buffer.speech_started",
+        "output_audio_buffer.cleared",
+    })
+
+    # Backstop for the same wedge: if the gate has been active this long with
+    # no terminal/interrupt event clearing it, force-clear it. A real response
+    # completes (or is interrupted) in well under this; anything longer is a
+    # lost terminal event, not a genuinely in-flight response.
+    _RESPONSE_ACTIVE_STALE_SECONDS = 15.0
+
+    def _set_response_active(self, active: bool) -> None:
+        """Single writer for the gate flag so the staleness clock stays honest."""
+        self._response_active = active
+        self._response_active_since = time.monotonic() if active else 0.0
+
+    def _gate_is_stale(self) -> bool:
+        """True when the active gate has outlived any plausible real response."""
+        if not self._response_active:
+            return False
+        age = time.monotonic() - self._response_active_since
+        return age >= self._RESPONSE_ACTIVE_STALE_SECONDS
+
     def should_gate_event(self, event: dict[str, Any]) -> bool:
-        """Defer ``response.create`` while another response is in flight."""
-        return event.get("type") == "response.create" and self._response_active
+        """Defer ``response.create`` while another response is in flight.
+
+        A stale gate (terminal event lost) is force-cleared here so a fresh
+        ``response.create`` ships instead of being parked behind a phantom
+        in-flight response.
+        """
+        if event.get("type") != "response.create":
+            return False
+        if self._gate_is_stale():
+            logger.warning(
+                "openai voice gate force-cleared (stale >%.0fs) at should_gate_event",
+                self._RESPONSE_ACTIVE_STALE_SECONDS,
+            )
+            self._set_response_active(False)
+        return self._response_active
 
     def on_inbound_event(self, event: dict[str, Any]) -> None:
         """Track the active-response window from upstream events."""
         evt_type = event.get("type", "")
         if evt_type == "response.created":
-            self._response_active = True
+            self._set_response_active(True)
         elif evt_type in self._RESPONSE_TERMINAL_TYPES:
-            self._response_active = False
+            self._set_response_active(False)
+        elif evt_type in self._RESPONSE_INTERRUPT_TYPES:
+            # Barge-in / buffer-clear: the response is being torn down. Clear
+            # the gate now rather than waiting on a terminal event that may
+            # never be mirrored, so the next tool-result ``response.create``
+            # is not parked forever.
+            if self._response_active:
+                self._set_response_active(False)
 
     def gate_cleared(self) -> bool:
-        """True once no response is in flight, so a deferred frame can ship."""
+        """True once no response is in flight, so a deferred frame can ship.
+
+        Also force-clears a stale gate so a parked ``response.create`` drains
+        even if the terminal event that should have cleared it was lost.
+        """
+        if self._gate_is_stale():
+            logger.warning(
+                "openai voice gate force-cleared (stale >%.0fs) at gate_cleared",
+                self._RESPONSE_ACTIVE_STALE_SECONDS,
+            )
+            self._set_response_active(False)
         return not self._response_active
 
     def mark_response_create_sent(self) -> None:
@@ -323,8 +396,12 @@ class OpenAIVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         collides with this one on the upstream. Flipping the flag at send
         time closes that window. The eventual ``response.created`` is a
         no-op (already True); the terminal event clears it as usual.
+
+        The staleness clock starts here too, so an optimistic flip whose
+        response is cancelled before ``response.created`` ever arrives (a
+        barge-in mid-dispatch) still gets force-cleared by the watchdog.
         """
-        self._response_active = True
+        self._set_response_active(True)
 
     # --- command formatters ----------------------------------------------
 

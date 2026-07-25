@@ -47,12 +47,28 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 @pytest.mark.asyncio
 async def test_gemini_input_transcription_persists_voice_user_message(tmp_path):
-    """serverContent.inputTranscription.text → [voice] user JSONL entry."""
+    """serverContent.inputTranscription.text → [voice] user JSONL entry.
+
+    Gemini input transcripts are token-level deltas: the persister
+    ACCUMULATES them into ``_pending_user_transcript`` and flushes on a
+    turn boundary (first output delta or ``turnComplete``) — see the
+    accumulate-then-flush contract pinned in
+    ``tests/parity/test_voice_persister_parity.py``. So a lone
+    ``inputTranscription`` stages without writing; ``turnComplete`` is what
+    persists the user turn.
+    """
     session = _make_session(tmp_path)
+    # First delta: staged, not yet written.
     await session.process_voice_event({
         "serverContent": {
             "inputTranscription": {"text": "what is two plus two"},
         },
+    })
+    assert _read_jsonl(session._jsonl_path) == []
+
+    # turnComplete flushes the staged user transcript.
+    await session.process_voice_event({
+        "serverContent": {"turnComplete": True},
     })
     entries = _read_jsonl(session._jsonl_path)
     voice_msgs = [e for e in entries if e.get("source") == "voice_transcription"]
