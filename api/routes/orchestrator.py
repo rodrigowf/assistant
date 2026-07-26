@@ -35,6 +35,7 @@ from orchestrator.config import OrchestratorConfig, get_available_models
 from orchestrator.providers.discovery import list_orchestrator_models
 from orchestrator.session import OrchestratorSession
 from orchestrator.voice_timeouts import VoiceTimeouts
+from orchestrator import voice_word_transcriber
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,36 @@ async def orchestrator_ws(ws: WebSocket):
                 # No session_stopped ack here — the voice_ended broadcast
                 # that end_voice fires is the ack the frontend waits for.
 
+            elif msg_type == "enable_word_transcription":
+                # Opt-in: subscribe this WS client to word-level
+                # transcription of the assistant's outgoing audio for
+                # this session. The transcriber lazy-loads Vosk on the
+                # first subscriber. Everything else in the stack is
+                # unaffected.
+                if session is None:
+                    await _safe_send_bytes(ws, orjson.dumps({
+                        "type": "error", "error": "no_session",
+                        "detail": "enable_word_transcription requires an active session",
+                    }))
+                else:
+                    async def _broadcast_word(ev: dict) -> None:
+                        await pool.broadcast_orchestrator(ev)
+                    first = voice_word_transcriber.subscribe(
+                        session.local_id, id(ws), _broadcast_word,
+                    )
+                    await _safe_send_bytes(ws, orjson.dumps({
+                        "type": "word_transcription_status",
+                        "enabled": True,
+                        "first_subscriber": first,
+                    }))
+
+            elif msg_type == "disable_word_transcription":
+                if session is not None:
+                    voice_word_transcriber.unsubscribe(session.local_id, id(ws))
+                await _safe_send_bytes(ws, orjson.dumps({
+                    "type": "word_transcription_status", "enabled": False,
+                }))
+
             elif msg_type == "stop":
                 # Stop the orchestrator session entirely (close the tab).
                 # For voice sessions, also tear down the voice connection
@@ -376,6 +407,11 @@ async def orchestrator_ws(ws: WebSocket):
     finally:
         pool.unwatch(ws)
         pool.unsubscribe_orchestrator(ws)
+        # Also clean up any word-transcription subscription this WS may
+        # have held. No-op when this WS never subscribed; the last
+        # unsubscribe tears the recognizer down.
+        if session is not None:
+            voice_word_transcriber.unsubscribe(session.local_id, id(ws))
         # On client WS disconnect: tear down the voice connection ONLY
         # if this WebSocket is the voice owner (the one that sent
         # ``voice_start``). Passive subscribers (text-mode WebSockets
@@ -916,6 +952,11 @@ async def _attach_voice_payload(
                     "type": "voice_audio_out",
                     "audio": b64,
                 })
+                # Word-level transcription is opt-in per subscriber (see
+                # ``enable_word_transcription`` handler). This is a no-op
+                # unless the avatar observer or another client explicitly
+                # asked for it.
+                await voice_word_transcriber.feed_if_active(session.local_id, b64)
 
             # Provider events fired by audio that listen_recording injected
             # into the WS must not reach the frontend: the UI's barge-in
@@ -959,6 +1000,10 @@ async def _attach_voice_payload(
                         "type": "voice_event",
                         "event": event,
                     })
+                # Reset the word transcriber at end-of-turn so the next
+                # response's word indices start at 0. No-op unless a
+                # subscriber has activated it for this session.
+                voice_word_transcriber.reset_if_active_for_event(session.local_id, event)
                 # Tool calls go through _handle_voice_tool_call so the
                 # tool_use / tool_result broadcasts fire and execution
                 # happens off the relay-drain task.
