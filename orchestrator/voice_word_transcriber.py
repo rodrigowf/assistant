@@ -149,15 +149,35 @@ class VoiceWordTranscriber:
             self._enabled = False
             return
         try:
-            from vosk import KaldiRecognizer
+            from vosk import KaldiRecognizer  # noqa: F401  (import-availability probe)
         except ImportError:
             self._enabled = False
             return
-        self._recognizer = KaldiRecognizer(self._model, _VOSK_SR)
-        self._recognizer.SetWords(True)
+        # NOTE: the recognizer itself is built by ``start()`` on the
+        # executor thread — constructing a KaldiRecognizer costs ~0.4s
+        # on the Jetson, which must not run on the event loop (see
+        # ``_build_recognizer``).
+        self._recognizer = None
+
+    def _build_recognizer(self):
+        """Construct + configure a fresh KaldiRecognizer. ~0.4s on the
+        Jetson — MUST run on the executor thread, never the event loop."""
+        from vosk import KaldiRecognizer
+        rec = KaldiRecognizer(self._model, _VOSK_SR)
+        rec.SetWords(True)
         # We rely on partial results for low latency; full results
         # arrive at silence boundaries.
-        self._recognizer.SetPartialWords(True)
+        rec.SetPartialWords(True)
+        return rec
+
+    async def start(self) -> None:
+        """Build the initial recognizer off the event loop. Called once
+        by ``subscribe`` right after construction."""
+        if not self._enabled:
+            return
+        self._recognizer = await asyncio.get_running_loop().run_in_executor(
+            self._executor, self._build_recognizer
+        )
 
     @property
     def enabled(self) -> bool:
@@ -216,13 +236,15 @@ class VoiceWordTranscriber:
         # First flush the tail — do this BEFORE clearing seen_word_starts
         # so its dedupe is consistent with earlier emits.
         await self._flush_final()
+        # Rebuild off the event loop — KaldiRecognizer construction is
+        # ~0.4s on the Jetson and this runs on every end-of-turn.
         try:
-            from vosk import KaldiRecognizer
-        except ImportError:
+            self._recognizer = await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._build_recognizer
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Vosk recognizer rebuild failed")
             return
-        self._recognizer = KaldiRecognizer(self._model, _VOSK_SR)
-        self._recognizer.SetWords(True)
-        self._recognizer.SetPartialWords(True)
         self._word_index = 0
         self._seen_word_starts.clear()
 
@@ -378,23 +400,36 @@ _TRANSCRIBERS: dict[str, VoiceWordTranscriber] = {}
 _SUBSCRIBERS: dict[str, set[int]] = {}
 
 
-def subscribe(session_id: str, client_id: int, on_word: WordCallback) -> bool:
+async def subscribe(session_id: str, client_id: int, on_word: WordCallback) -> bool:
     """Register a subscriber for a voice session's word stream.
 
     On the FIRST subscriber for the session, instantiates the
-    transcriber (which lazy-loads the shared Vosk model). Subsequent
-    subscribers just increment the ref count.
+    transcriber. Subsequent subscribers just increment the ref count.
 
     Returns True if this was the first subscriber (i.e. the transcriber
     was just created).
+
+    ASYNC because the first subscriber triggers a cold Vosk model load
+    (``Model(...)`` — a synchronous C call that reads ~68 MB off the SD
+    card and builds the decoding graph). On the Jetson that can take
+    tens of seconds cold, and it used to run directly on the event loop
+    here — freezing the whole backend long enough to trip the
+    loop-liveness watchdog and restart mid-conversation (confirmed via
+    py-spy: MainThread stuck in vosk/__init__.py). We now warm the
+    shared singleton in a thread first so the loop stays live; the
+    subsequent ``VoiceWordTranscriber`` construction then gets the
+    already-cached model and only builds a cheap per-session recognizer.
     """
     subs = _SUBSCRIBERS.setdefault(session_id, set())
     first = not subs
     subs.add(client_id)
     if first and session_id not in _TRANSCRIBERS:
-        _TRANSCRIBERS[session_id] = VoiceWordTranscriber(
-            source_sample_rate=24000, on_word=on_word
-        )
+        # Load the heavy shared model off the event loop.
+        await asyncio.get_running_loop().run_in_executor(None, _get_model)
+        t = VoiceWordTranscriber(source_sample_rate=24000, on_word=on_word)
+        # Build the per-session recognizer off the loop too (~0.4s).
+        await t.start()
+        _TRANSCRIBERS[session_id] = t
     return first
 
 

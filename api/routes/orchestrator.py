@@ -351,7 +351,7 @@ async def orchestrator_ws(ws: WebSocket):
                 else:
                     async def _broadcast_word(ev: dict) -> None:
                         await pool.broadcast_orchestrator(ev)
-                    first = voice_word_transcriber.subscribe(
+                    first = await voice_word_transcriber.subscribe(
                         session.local_id, id(ws), _broadcast_word,
                     )
                     await _safe_send_bytes(ws, orjson.dumps({
