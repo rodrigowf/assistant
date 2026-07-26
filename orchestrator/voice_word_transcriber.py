@@ -148,12 +148,56 @@ class VoiceWordTranscriber:
     def enabled(self) -> bool:
         return self._enabled
 
-    def reset(self) -> None:
-        """Reset for a new assistant utterance. Call at response start."""
+    async def _flush_final(self) -> None:
+        """Emit any words still in the recognizer's partial buffer as a
+        final result. Called before reset so we don't lose the tail of
+        an utterance that didn't have a trailing silence to trigger a
+        natural final segment (common with LLM TTS output).
+        """
+        if self._recognizer is None:
+            return
+        try:
+            payload = self._recognizer.FinalResult()
+        except Exception:  # noqa: BLE001
+            logger.exception("Vosk FinalResult failed")
+            return
+        try:
+            parsed = json.loads(payload)
+        except Exception:  # noqa: BLE001
+            return
+        words = parsed.get("result") or []
+        for w in words:
+            start = w.get("start")
+            word = w.get("word") or ""
+            if start is None or not word:
+                continue
+            key = round(start * 1000)
+            if key in self._seen_word_starts:
+                continue
+            self._seen_word_starts.add(key)
+            ev = {
+                "type": "voice_word_out",
+                "word": word,
+                "start_ms": int(start * 1000),
+                "end_ms": int(w.get("end", start) * 1000),
+                "index": self._word_index,
+            }
+            self._word_index += 1
+            try:
+                await self._on_word(ev)
+            except Exception:  # noqa: BLE001
+                logger.exception("voice_word_out flush callback failed")
+
+    async def reset(self) -> None:
+        """Reset for a new assistant utterance. Flushes any pending
+        partial words as final before recreating the recognizer, so no
+        tail words are lost between turns.
+        """
         if not self._enabled:
             return
-        # Vosk doesn't expose an explicit reset — recreate the recognizer.
-        # Cheap: ~10 ms on Jetson Nano.
+        # First flush the tail — do this BEFORE clearing seen_word_starts
+        # so its dedupe is consistent with earlier emits.
+        await self._flush_final()
         try:
             from vosk import KaldiRecognizer
         except ImportError:
@@ -241,7 +285,7 @@ class VoiceWordTranscriber:
                 logger.exception("voice_word_out callback failed")
         return events
 
-    def maybe_reset_for_event(self, event: dict) -> bool:
+    async def maybe_reset_for_event(self, event: dict) -> bool:
         """Reset the recognizer if this provider event marks end-of-turn.
 
         Recognised end-of-turn shapes:
@@ -254,11 +298,11 @@ class VoiceWordTranscriber:
         if not self._enabled:
             return False
         if event.get("type") == "response.done":
-            self.reset()
+            await self.reset()
             return True
         sc = event.get("serverContent") if isinstance(event, dict) else None
         if isinstance(sc, dict) and (sc.get("turnComplete") or sc.get("interrupted")):
-            self.reset()
+            await self.reset()
             return True
         return False
 
@@ -331,8 +375,13 @@ async def feed_if_active(session_id: str, audio_b64: str) -> None:
         await t.feed_pcm_b64(audio_b64)
 
 
-def reset_if_active_for_event(session_id: str, event: dict) -> None:
-    """End-of-turn detection — no-op when transcriber isn't active."""
+async def reset_if_active_for_event(session_id: str, event: dict) -> None:
+    """End-of-turn detection — no-op when transcriber isn't active.
+
+    Awaitable because the reset path flushes any pending partial words
+    via FinalResult() and re-broadcasts them, which needs the async
+    ``on_word`` callback.
+    """
     t = _TRANSCRIBERS.get(session_id)
     if t is not None and t.enabled:
-        t.maybe_reset_for_event(event)
+        await t.maybe_reset_for_event(event)

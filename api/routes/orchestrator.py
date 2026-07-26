@@ -1001,9 +1001,11 @@ async def _attach_voice_payload(
                         "event": event,
                     })
                 # Reset the word transcriber at end-of-turn so the next
-                # response's word indices start at 0. No-op unless a
+                # response's word indices start at 0. Also flushes any
+                # trailing partial words via Vosk's FinalResult so we
+                # don't lose the tail of an utterance. No-op unless a
                 # subscriber has activated it for this session.
-                voice_word_transcriber.reset_if_active_for_event(session.local_id, event)
+                await voice_word_transcriber.reset_if_active_for_event(session.local_id, event)
                 # Tool calls go through _handle_voice_tool_call so the
                 # tool_use / tool_result broadcasts fire and execution
                 # happens off the relay-drain task.
