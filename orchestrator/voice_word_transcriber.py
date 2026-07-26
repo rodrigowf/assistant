@@ -253,6 +253,16 @@ class VoiceWordTranscriber:
 
         Returns the raw JSON result string (final or partial), or None
         if the recognizer went away mid-flight (e.g. reset/close raced).
+
+        WARNING: every call below is a synchronous, CPU-bound Kaldi C
+        call. On the Jetson the decode saturates a core in real time.
+        These MUST stay behind ``run_in_executor`` (see ``feed_pcm_b64``)
+        — calling them on the event loop starves every other callback
+        for seconds and trips the loop-liveness watchdog
+        (manager/loop_watchdog.py), which restarts the whole backend
+        mid-conversation. That was the original word-transcription
+        regression. If you add another Vosk call to the audio hot path,
+        route it through the executor too.
         """
         rec = self._recognizer
         if rec is None:
