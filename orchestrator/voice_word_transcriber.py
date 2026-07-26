@@ -37,11 +37,13 @@ Design:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Awaitable, Optional
 
 import numpy as np
@@ -129,6 +131,19 @@ class VoiceWordTranscriber:
         self._word_index = 0
         self._seen_word_starts: set[float] = set()  # dedupe partial-vs-final
         self._enabled = True
+        # Vosk's Kaldi decoder (``AcceptWaveform`` / ``Result`` /
+        # ``FinalResult``) is a synchronous, CPU-heavy C call. On the
+        # Jetson Nano decoding the assistant's audio-out stream in real
+        # time saturates a whole core, and running it directly on the
+        # asyncio event loop starves every other callback — which trips
+        # the loop-liveness watchdog and restarts the backend mid-voice
+        # (regression from the initial Vosk word-transcription landing).
+        # A dedicated *single*-thread executor moves the decode off the
+        # loop AND serialises all Vosk calls onto one thread, which is
+        # required because ``KaldiRecognizer`` is not thread-safe.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vosk-transcribe"
+        )
         self._model = _get_model()
         if self._model is None:
             self._enabled = False
@@ -154,10 +169,13 @@ class VoiceWordTranscriber:
         an utterance that didn't have a trailing silence to trigger a
         natural final segment (common with LLM TTS output).
         """
-        if self._recognizer is None:
+        rec = self._recognizer
+        if rec is None:
             return
         try:
-            payload = self._recognizer.FinalResult()
+            payload = await asyncio.get_running_loop().run_in_executor(
+                self._executor, rec.FinalResult
+            )
         except Exception:  # noqa: BLE001
             logger.exception("Vosk FinalResult failed")
             return
@@ -229,6 +247,20 @@ class VoiceWordTranscriber:
         out = (s0 * (1.0 - frac) + s1 * frac).astype(np.int16)
         return out.tobytes()
 
+    def _decode_chunk(self, pcm16: bytes) -> Optional[str]:
+        """Blocking Vosk decode of one chunk. Runs on the transcriber's
+        dedicated executor thread — never call from the event loop.
+
+        Returns the raw JSON result string (final or partial), or None
+        if the recognizer went away mid-flight (e.g. reset/close raced).
+        """
+        rec = self._recognizer
+        if rec is None:
+            return None
+        if rec.AcceptWaveform(pcm16):
+            return rec.Result()
+        return rec.PartialResult()
+
     async def feed_pcm_b64(self, audio_b64: str) -> list[dict]:
         """Feed one base64-encoded PCM16 chunk. Returns any new word
         events emitted (also delivered via the callback).
@@ -244,15 +276,19 @@ class VoiceWordTranscriber:
             return []
         pcm16 = self._downsample_24k_to_16k(pcm)
         events: list[dict] = []
+        # Run the blocking Kaldi decode off the event loop. Accept +
+        # result extraction happen together on the single executor
+        # thread so the recognizer's internal state is never touched
+        # concurrently (KaldiRecognizer is not thread-safe).
         try:
-            is_final = self._recognizer.AcceptWaveform(pcm16)
+            payload = await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._decode_chunk, pcm16
+            )
         except Exception:  # noqa: BLE001
             logger.exception("Vosk AcceptWaveform failed")
             return []
-        if is_final:
-            payload = self._recognizer.Result()
-        else:
-            payload = self._recognizer.PartialResult()
+        if payload is None:
+            return []
         try:
             parsed = json.loads(payload)
         except Exception:  # noqa: BLE001
@@ -309,6 +345,14 @@ class VoiceWordTranscriber:
     def close(self) -> None:
         self._recognizer = None
         self._enabled = False
+        # Release the decode thread. Don't block the caller (the WS
+        # close / unsubscribe path) waiting for an in-flight decode —
+        # cancel_futures drops any queued chunk and the worker exits
+        # once its current call returns.
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
