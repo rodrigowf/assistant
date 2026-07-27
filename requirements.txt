@@ -32,12 +32,6 @@ sentence-transformers>=3.0.0
 # Background file watching
 watchfiles>=1.0.0
 
-# Word-level transcription of outgoing voice audio for the avatar
-# observer. Uses the small English model (~40 MB) under
-# context/models/vosk-en-small/ — see orchestrator/voice_word_transcriber.py.
-# CPU-only; ~5–10× real-time on Jetson Nano's Cortex-A57 cores.
-vosk>=0.3.44
-
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
