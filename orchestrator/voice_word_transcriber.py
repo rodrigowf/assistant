@@ -423,13 +423,26 @@ async def subscribe(session_id: str, client_id: int, on_word: WordCallback) -> b
     subs = _SUBSCRIBERS.setdefault(session_id, set())
     first = not subs
     subs.add(client_id)
-    if first and session_id not in _TRANSCRIBERS:
+    # Ensure a working transcriber exists whenever there is at least one
+    # subscriber. We key creation on the transcriber's ACTUAL presence,
+    # not on ``first`` — otherwise a leaked subscriber id (an observer WS
+    # that dropped without a clean unsubscribe, or a prior attempt whose
+    # model load was watchdog-killed) leaves ``_SUBSCRIBERS`` non-empty
+    # while ``_TRANSCRIBERS`` is missing. In that state ``first`` is False,
+    # creation is skipped, ``is_active`` stays False, ``feed_if_active``
+    # no-ops, and no ``voice_word_out`` events are ever emitted — the
+    # "last words stopped coming through" symptom.
+    if session_id not in _TRANSCRIBERS:
         # Load the heavy shared model off the event loop.
         await asyncio.get_running_loop().run_in_executor(None, _get_model)
         t = VoiceWordTranscriber(source_sample_rate=24000, on_word=on_word)
         # Build the per-session recognizer off the loop too (~0.4s).
         await t.start()
         _TRANSCRIBERS[session_id] = t
+        logger.info(
+            "word transcriber ACTIVE session=%s enabled=%s subscribers=%d",
+            session_id, t.enabled, len(subs),
+        )
     return first
 
 
