@@ -244,6 +244,10 @@ class OrchestratorSession:
         # ``function_call_output`` items, then ask for one response over them.
         self._deferred_response_create: dict | None = None
         self._deferred_response_lock: asyncio.Lock = asyncio.Lock()
+        # Timer that drains a parked ``response.create`` when no further
+        # inbound event is coming. Owned by the route layer
+        # (``_arm_deferred_drain_watchdog``); cancelled in ``end_voice``.
+        self._deferred_drain_task: asyncio.Task | None = None
         self._history_summary: str | None = None
         self._audio_recorder: AudioRecorder | None = None  # Set in start() if recording enabled
 
@@ -1152,6 +1156,11 @@ class OrchestratorSession:
         # Drop any in-flight gated frame so the next voice session doesn't
         # inherit a stale ``response.create`` from the prior connection.
         self._deferred_response_create = None
+        # Stop the drain watchdog with it — the frame it was chasing is gone,
+        # and a surviving timer would poll a torn-down provider.
+        if self._deferred_drain_task is not None:
+            self._deferred_drain_task.cancel()
+            self._deferred_drain_task = None
 
         async with self._voice_lock:
             if self._voice_state == VoiceLifecycle.ENDING:

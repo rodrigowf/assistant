@@ -1423,6 +1423,71 @@ async def _drain_deferred_response_create(
     await _send_voice_command(pool, session, deferred)
 
 
+# Poll interval for the deferred-drain watchdog. The provider's staleness
+# threshold (``_RESPONSE_ACTIVE_STALE_SECONDS``, 15s) is evaluated *passively*
+# — only when something calls ``gate_cleared`` / ``should_gate_event``. With no
+# inbound events there is no such caller, so the watchdog supplies one.
+_DEFERRED_DRAIN_POLL_SECONDS = 2.0
+
+# Bound on how long the watchdog keeps polling a single parked frame. Comfortably
+# past the provider's staleness threshold, so a lost terminal event always
+# force-clears before we give up.
+_DEFERRED_DRAIN_MAX_SECONDS = 45.0
+
+
+async def _deferred_drain_watchdog(
+    pool: SessionPool,
+    session: OrchestratorSession,
+) -> None:
+    """Poll until a parked ``response.create`` ships or becomes moot.
+
+    Exists because every other drain trigger is edge-driven off an inbound
+    event, and the whole failure mode is "no inbound event will arrive".
+    """
+    waited = 0.0
+    try:
+        while waited < _DEFERRED_DRAIN_MAX_SECONDS:
+            await asyncio.sleep(_DEFERRED_DRAIN_POLL_SECONDS)
+            waited += _DEFERRED_DRAIN_POLL_SECONDS
+            # Session left voice mode (or the provider was torn down) —
+            # ``end_voice`` already dropped the slot; nothing to ship.
+            if session.voice_provider is None:
+                return
+            if session._deferred_response_create is None:
+                return
+            # Calling the drain is also what *evaluates* the provider's
+            # staleness watchdog, so a gate wedged by a lost terminal event
+            # gets force-cleared here rather than never.
+            await _drain_deferred_response_create(pool, session)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception("deferred-drain watchdog failed")
+    finally:
+        if session._deferred_drain_task is asyncio.current_task():
+            session._deferred_drain_task = None
+
+
+def _arm_deferred_drain_watchdog(
+    pool: SessionPool,
+    session: OrchestratorSession,
+) -> None:
+    """Start the drain watchdog unless one is already running for this session.
+
+    Single-flight: N parallel tool calls collapse onto one watchdog, matching
+    the single-slot semantics of the deferred frame itself.
+    """
+    if session._deferred_response_create is None:
+        return
+    existing = session._deferred_drain_task
+    if existing is not None and not existing.done():
+        return
+    session._deferred_drain_task = asyncio.create_task(
+        _deferred_drain_watchdog(pool, session),
+        name="voice-deferred-drain",
+    )
+
+
 def _tool_result_is_error(output: str) -> bool:
     """True when a tool's stringified JSON output carries an ``error`` field.
 
@@ -1505,6 +1570,17 @@ async def _handle_voice_tool_call(
                     })
 
         await _dispatch_voice_commands(pool, session, commands)
+        # This task dispatches OUTSIDE the inbound-event path, so the drain
+        # at the tail of ``_handle_voice_event`` never runs for it. Without
+        # the calls below a parked ``response.create`` waits for an inbound
+        # event that only arrives *because* that frame shipped — a circular
+        # wait that wedged the session until the user barged in. (2026-07-31.)
+        await _drain_deferred_response_create(pool, session)
+        # The drain above is best-effort: the gate may still be legitimately
+        # active at this instant (a response genuinely in flight), in which
+        # case the frame stays parked and there is still no inbound event
+        # guaranteed to come. Arm a timer so it drains regardless.
+        _arm_deferred_drain_watchdog(pool, session)
     except Exception as e:
         logger.exception("Voice tool call execution failed")
         await pool.broadcast_orchestrator({"type": "error", "error": "voice_event_failed", "detail": str(e)})

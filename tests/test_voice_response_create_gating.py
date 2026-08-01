@@ -22,12 +22,14 @@ These tests pin both layers.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 from api.routes.orchestrator import (
+    _arm_deferred_drain_watchdog,
     _dispatch_voice_commands,
     _drain_deferred_response_create,
 )
@@ -308,6 +310,156 @@ async def test_drain_is_noop_when_gate_still_active(tmp_path):
         b for b in pool.broadcasts if b["command"]["type"] == "response.create"
     ]
     assert response_creates == []
+
+
+@pytest.fixture
+def fast_watchdog(monkeypatch):
+    """Shrink the watchdog's poll/bound so tests don't wait real seconds.
+
+    Only the timing constants change — the drain logic under test is
+    untouched.
+    """
+    import api.routes.orchestrator as orch
+
+    monkeypatch.setattr(orch, "_DEFERRED_DRAIN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(orch, "_DEFERRED_DRAIN_MAX_SECONDS", 0.5)
+
+
+# ---------- Tool-call path drain (2026-07-31 wedge) -----------------------
+#
+# The dispatch/drain layers above were both correct in isolation; the wedge
+# was that the ONLY drain trigger sat at the tail of ``_handle_voice_event``,
+# while tool results dispatch from a separate background task that never
+# reaches it. Shipping the parked frame is what causes the next inbound
+# event, so "wait for an inbound event to drain" was a circular wait.
+
+
+@pytest.mark.asyncio
+async def test_tool_call_path_drains_parked_frame_without_inbound_event(tmp_path, fast_watchdog):
+    """A tool result must not leave ``response.create`` parked forever.
+
+    Regression for the wedge: 14 ``voice_command_deferred`` / 0 drains in
+    production. Fails against the pre-fix code, where the tool-call task
+    dispatched and returned without ever draining.
+    """
+    session = _make_session(tmp_path)
+    pool = _Pool()
+
+    # A response is in flight, so the tool result's response.create parks.
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session, [{"type": "response.create"}],
+    )
+    assert session._deferred_response_create is not None
+
+    # The in-flight response terminates. Crucially we do NOT route this
+    # through _handle_voice_event — mirroring the real path, where the gate
+    # clears but no drain trigger fires.
+    session.voice_provider.on_inbound_event({"type": "response.done"})
+
+    # Arm the watchdog as the tool-call path now does.
+    _arm_deferred_drain_watchdog(pool, session)
+    task = session._deferred_drain_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=10.0)
+
+    # The parked frame shipped with no inbound event to prompt it.
+    response_creates = [
+        b for b in pool.broadcasts if b["command"]["type"] == "response.create"
+    ]
+    assert len(response_creates) == 1
+    assert session._deferred_response_create is None
+
+
+@pytest.mark.asyncio
+async def test_watchdog_drains_via_provider_staleness_when_terminal_lost(
+    tmp_path, fast_watchdog,
+):
+    """Even with the terminal event lost entirely, the frame eventually ships.
+
+    The provider's staleness force-clear is evaluated only when something
+    calls ``gate_cleared``; with no inbound events the watchdog is that caller.
+    """
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    provider = session.voice_provider
+    provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session, [{"type": "response.create"}],
+    )
+    assert session._deferred_response_create is not None
+
+    # Age the gate past the staleness window by backdating its activation
+    # stamp. Patching ``time.monotonic`` module-wide would freeze the event
+    # loop's own clock and hang ``asyncio.sleep`` inside the watchdog.
+    provider._response_active_since -= (
+        provider._RESPONSE_ACTIVE_STALE_SECONDS + 1.0
+    )
+
+    # No terminal event ever arrives — only the watchdog can save this.
+    _arm_deferred_drain_watchdog(pool, session)
+    task = session._deferred_drain_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=10.0)
+
+    response_creates = [
+        b for b in pool.broadcasts if b["command"]["type"] == "response.create"
+    ]
+    assert len(response_creates) == 1
+    assert session._deferred_response_create is None
+
+
+@pytest.mark.asyncio
+async def test_watchdog_is_single_flight(tmp_path, fast_watchdog):
+    """N parallel tool results collapse onto one watchdog, matching the slot."""
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session, [{"type": "response.create"}],
+    )
+
+    _arm_deferred_drain_watchdog(pool, session)
+    first = session._deferred_drain_task
+    _arm_deferred_drain_watchdog(pool, session)
+    _arm_deferred_drain_watchdog(pool, session)
+    assert session._deferred_drain_task is first
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+
+@pytest.mark.asyncio
+async def test_watchdog_not_armed_when_nothing_parked(tmp_path):
+    """No parked frame → no timer. Keeps the happy path free of stray tasks."""
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    _arm_deferred_drain_watchdog(pool, session)
+    assert session._deferred_drain_task is None
+
+
+@pytest.mark.asyncio
+async def test_end_voice_cancels_drain_watchdog(tmp_path, fast_watchdog):
+    """Teardown must not leave a timer polling a torn-down provider."""
+    session = _make_session(tmp_path)
+    pool = _Pool()
+    session.voice_provider.on_inbound_event({"type": "response.created"})
+    await _dispatch_voice_commands(
+        pool, session, [{"type": "response.create"}],
+    )
+    _arm_deferred_drain_watchdog(pool, session)
+    task = session._deferred_drain_task
+    assert task is not None
+
+    await session.end_voice("test")
+    assert session._deferred_drain_task is None
+    # ``cancel()`` only *requests* cancellation — the task stays in the
+    # "cancelling" state until the loop gets a chance to deliver it, so
+    # await it here rather than asserting on done() immediately.
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
 
 
 @pytest.mark.asyncio
