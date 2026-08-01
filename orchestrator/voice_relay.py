@@ -64,6 +64,15 @@ _FRAME_HISTORY_SIZE = 24
 # chunks).
 _AUDIO_LOG_SAMPLE_EVERY = 50
 
+# Deferred-event drain watchdog. The receive loop drains the queue on every
+# inbound event, but a frame parked when no further inbound event is coming
+# would otherwise wait forever — and shipping it is often what *causes* the
+# next event. Poll interval + bound; the bound sits comfortably past the
+# providers' 15s gate-staleness threshold so a lost terminal event always
+# force-clears before we give up.
+_DEFERRED_DRAIN_POLL_SECONDS = 2.0
+_DEFERRED_DRAIN_MAX_SECONDS = 45.0
+
 # Where per-session voice logs land.  One file per session_id, written
 # alongside the api logs so /debug-app picks them up.
 _VOICE_LOG_DIR = PROJECT_ROOT / "logs" / "voice"
@@ -160,6 +169,10 @@ class VoiceRelay:
         # while another response is active) is now implemented entirely
         # inside :class:`QwenVoiceProvider` via the gate-hook pair.
         self._deferred_events: list[dict[str, Any]] = []
+        # Timer that retries the deferred queue when no inbound event is
+        # coming to trigger the drain in the receive loop. See
+        # :meth:`_arm_deferred_drain`.
+        self._deferred_drain_task: asyncio.Task[None] | None = None
 
         # Latched flag — set when the provider asked us to close the
         # upstream WS via :meth:`BaseVoiceProvider.should_close_after_event`
@@ -678,6 +691,14 @@ class VoiceRelay:
         if self._provider.should_gate_event(event):
             self._slog(f"defer event type={event.get('type')} (provider gate active)")
             self._deferred_events.append(event)
+            # The only other drain trigger lives in the inbound-event loop,
+            # so a frame parked here waits for an upstream event that often
+            # only arrives *because* this frame shipped (a tool result's
+            # ``response.create`` is what makes the model produce the next
+            # turn). Arm a timer so the gate's staleness escape actually
+            # gets evaluated instead of never being called. Mirrors the
+            # route-layer watchdog added for OpenAI in ``9ef6dc1``.
+            self._arm_deferred_drain()
             return
 
         self._record_sent(event)
@@ -688,6 +709,54 @@ class VoiceRelay:
         except Exception as e:  # noqa: BLE001
             # Upstream is gone; the drain task already surfaced the error.
             self._slog(f"WARN send dropped (upstream closed): type={event.get('type')} err={e}")
+
+    async def _deferred_drain_loop(self) -> None:
+        """Retry the deferred queue until it empties or the relay closes.
+
+        Calling ``gate_cleared`` is also what *evaluates* a provider's
+        staleness escape (both OpenAI and Qwen force-clear a gate that
+        outlived any plausible response), so this loop is what makes that
+        backstop reachable when no inbound events are arriving.
+        """
+        waited = 0.0
+        try:
+            while waited < _DEFERRED_DRAIN_MAX_SECONDS:
+                await asyncio.sleep(_DEFERRED_DRAIN_POLL_SECONDS)
+                waited += _DEFERRED_DRAIN_POLL_SECONDS
+                if self._closed.is_set():
+                    return
+                if not self._deferred_events:
+                    return
+                if not self._provider.gate_cleared():
+                    continue
+                queued = self._deferred_events[-1]
+                self._deferred_events.clear()
+                self._slog(f"drain deferred event type={queued.get('type')} (watchdog)")
+                await self.send_event(queued)
+                # ``send_event`` re-gates if the gate flipped back under us.
+                # Its ``_arm_deferred_drain`` call is a no-op while THIS task
+                # is still running, so keep looping rather than returning —
+                # otherwise the re-parked frame would be left with no
+                # watchdog at all, recreating the very wedge this fixes.
+                if not self._deferred_events:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("voice_relay deferred-drain watchdog failed")
+        finally:
+            if self._deferred_drain_task is asyncio.current_task():
+                self._deferred_drain_task = None
+
+    def _arm_deferred_drain(self) -> None:
+        """Start the deferred-drain watchdog unless one is already running."""
+        existing = self._deferred_drain_task
+        if existing is not None and not existing.done():
+            return
+        self._deferred_drain_task = asyncio.create_task(
+            self._deferred_drain_loop(),
+            name=f"voice-relay-drain-{self._provider.provider_name}",
+        )
 
     async def send_shutdown_frames(self, frames: list[dict[str, Any]]) -> None:
         """Send the provider's graceful-shutdown frames just before WS close.
@@ -892,6 +961,12 @@ class VoiceRelay:
 
     async def stop(self) -> None:
         """Cancel the drain task and close the upstream WS."""
+        if self._deferred_drain_task is not None and not self._deferred_drain_task.done():
+            self._deferred_drain_task.cancel()
+            try:
+                await self._deferred_drain_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if self._keepalive_task is not None and not self._keepalive_task.done():
             self._keepalive_task.cancel()
             try:

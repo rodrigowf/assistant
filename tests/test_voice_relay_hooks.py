@@ -308,6 +308,86 @@ async def test_should_gate_event_defers_outbound_until_cleared():
 
 
 @pytest.mark.asyncio
+async def test_deferred_event_drains_without_any_inbound_event(monkeypatch):
+    """A parked frame must ship even when NO further inbound event arrives.
+
+    Regression for the 2026-08-01 relay gap (same shape as the route-layer
+    wedge fixed in 9ef6dc1): the only drain trigger lived in the receive
+    loop, but shipping a tool result's ``response.create`` is what *causes*
+    the next inbound event — so waiting for one is a circular wait.
+    """
+    import orchestrator.voice_relay as vr
+
+    monkeypatch.setattr(vr, "_DEFERRED_DRAIN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(vr, "_DEFERRED_DRAIN_MAX_SECONDS", 1.0)
+
+    # Only a handshake frame — nothing afterwards to trigger the receive-loop
+    # drain. The gate clears on its own (as a provider staleness escape does).
+    ws = _FakeWS(frames=[json.dumps({"type": "session.created"})])
+    provider = _HookProvider([ws], gate_first_n=1)
+
+    async def on_audio(_):
+        pass
+
+    async def on_event(_):
+        pass
+
+    relay = VoiceRelay(
+        provider,
+        on_audio_out=on_audio,
+        on_event_for_frontend=on_event,
+        session_id="t-gate-watchdog",
+    )
+
+    await relay.start({"type": "session.update", "session": {}})
+    await relay.send_event({"type": "response.create"})
+    # Parked, and no inbound event is coming.
+    assert relay._deferred_events, "frame should be parked while the gate is active"
+
+    # Clear the gate the way a staleness force-clear would, then let the
+    # watchdog notice. Nothing else can ship this frame.
+    provider._response_active = False
+    for _ in range(200):
+        if not relay._deferred_events:
+            break
+        await asyncio.sleep(0.01)
+    await relay.stop()
+
+    response_create_frames = [s for s in ws.sent if "response.create" in s]
+    assert len(response_create_frames) == 1, (
+        f"watchdog must ship the parked frame with no inbound event. Sent: {ws.sent}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_relay_stop_cancels_deferred_drain_watchdog():
+    """Teardown must not leave the watchdog polling a stopped relay."""
+    ws = _FakeWS(frames=[json.dumps({"type": "session.created"})])
+    provider = _HookProvider([ws], gate_first_n=1)
+
+    async def on_audio(_):
+        pass
+
+    async def on_event(_):
+        pass
+
+    relay = VoiceRelay(
+        provider,
+        on_audio_out=on_audio,
+        on_event_for_frontend=on_event,
+        session_id="t-gate-watchdog-stop",
+    )
+
+    await relay.start({"type": "session.update", "session": {}})
+    await relay.send_event({"type": "response.create"})
+    task = relay._deferred_drain_task
+    assert task is not None
+
+    await relay.stop()
+    assert task.done()
+
+
+@pytest.mark.asyncio
 async def test_on_inbound_event_called_for_every_inbound():
     """The provider sees every inbound event in order (not just unrecognised ones)."""
     ws = _FakeWS(

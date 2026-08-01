@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -167,11 +168,15 @@ class QwenVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._current_transcript: str = ""
         # Tracks whether a ``response.created`` has fired without a
-        # matching ``response.done``.  Sending ``response.create`` while
+        # matching terminal event.  Sending ``response.create`` while
         # this is True triggers Qwen's "Conversation already has an
         # active response" error and (empirically) closes the WS.  The
         # relay defers gated events via :meth:`should_gate_event`.
         self._response_active = False
+        # Monotonic stamp of the last activation, for the staleness
+        # watchdog in ``gate_cleared`` / ``should_gate_event``. See
+        # ``_RESPONSE_ACTIVE_STALE_SECONDS``.
+        self._response_active_since: float = 0.0
 
     # --- identity ---------------------------------------------------------
 
@@ -778,25 +783,107 @@ class QwenVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         evt_type = event.get("type")
         return isinstance(evt_type, str) and evt_type in self._ACCEPTED_UPSTREAM_TYPES
 
+    # --- response.create gating ------------------------------------------
+    #
+    # Ported from ``OpenAIVoiceProvider`` on 2026-08-01. Qwen previously
+    # cleared this gate on ``response.done`` alone, so any path that loses
+    # the terminal event — a cancelled/failed response, a barge-in, a WS
+    # reconnect — left ``_response_active`` stuck True and parked every
+    # subsequent tool-result ``response.create`` forever. Tools still ran;
+    # their results just never reached the model. That is the same wedge
+    # fixed for OpenAI in ``9ef6dc1``, and Qwen was strictly weaker against
+    # it (no interrupt clearing, no staleness escape, no optimistic flip).
+
+    _RESPONSE_TERMINAL_TYPES = frozenset({
+        "response.done",
+        "response.cancelled",
+        "response.failed",
+    })
+
+    # ``DEFAULT_VAD`` sets ``interrupt_response: True``, so a barge-in tears
+    # the in-flight response down server-side exactly as it does on OpenAI.
+    # The terminal event that *should* follow is the fragile one, so treat
+    # the interruption itself as gate-clearing.
+    _RESPONSE_INTERRUPT_TYPES = frozenset({
+        "input_audio_buffer.speech_started",
+        "output_audio_buffer.cleared",
+    })
+
+    # Backstop: a gate active this long with no terminal/interrupt event is
+    # a lost event, not a genuinely in-flight response.
+    _RESPONSE_ACTIVE_STALE_SECONDS = 15.0
+
+    def _set_response_active(self, active: bool) -> None:
+        """Single writer for the gate flag so the staleness clock stays honest."""
+        self._response_active = active
+        self._response_active_since = time.monotonic() if active else 0.0
+
+    def _gate_is_stale(self) -> bool:
+        """True when the active gate has outlived any plausible real response."""
+        if not self._response_active:
+            return False
+        return (
+            time.monotonic() - self._response_active_since
+            >= self._RESPONSE_ACTIVE_STALE_SECONDS
+        )
+
     def should_gate_event(self, event: dict[str, Any]) -> bool:
         """Defer ``response.create`` while another response is in flight.
 
         Qwen rejects concurrent ``response.create`` with "Conversation
         already has an active response" and (empirically) closes the WS.
+        A stale gate is force-cleared so a fresh frame ships instead of
+        parking behind a phantom in-flight response.
         """
-        return event.get("type") == "response.create" and self._response_active
+        if event.get("type") != "response.create":
+            return False
+        if self._gate_is_stale():
+            logger.warning(
+                "qwen voice gate force-cleared (stale >%.0fs) at should_gate_event",
+                self._RESPONSE_ACTIVE_STALE_SECONDS,
+            )
+            self._set_response_active(False)
+        return self._response_active
 
     def on_inbound_event(self, event: dict[str, Any]) -> None:
         """Track the active-response window from upstream events."""
         evt_type = event.get("type", "")
         if evt_type == "response.created":
-            self._response_active = True
-        elif evt_type == "response.done":
-            self._response_active = False
+            self._set_response_active(True)
+        elif evt_type in self._RESPONSE_TERMINAL_TYPES:
+            self._set_response_active(False)
+        elif evt_type in self._RESPONSE_INTERRUPT_TYPES:
+            # Barge-in / buffer-clear: the response is being torn down.
+            # Clear now rather than waiting on a terminal event that may
+            # never arrive.
+            if self._response_active:
+                self._set_response_active(False)
 
     def gate_cleared(self) -> bool:
-        """True once no response is in flight, so deferred frames can ship."""
+        """True once no response is in flight, so deferred frames can ship.
+
+        Also force-clears a stale gate so a parked frame drains even if the
+        terminal event that should have cleared it was lost.
+        """
+        if self._gate_is_stale():
+            logger.warning(
+                "qwen voice gate force-cleared (stale >%.0fs) at gate_cleared",
+                self._RESPONSE_ACTIVE_STALE_SECONDS,
+            )
+            self._set_response_active(False)
         return not self._response_active
+
+    def mark_response_create_sent(self) -> None:
+        """Optimistically flip the gate at dispatch time.
+
+        The upstream's ``response.created`` is a round-trip away; without
+        this flip a concurrent dispatch on a parallel tool result would see
+        the gate clear and ship a second ``response.create`` that collides.
+        The staleness clock starts here too, so an optimistic flip whose
+        response is cancelled before ``response.created`` ever arrives still
+        gets force-cleared by the watchdog.
+        """
+        self._set_response_active(True)
 
     # --- connection metadata ---------------------------------------------
 

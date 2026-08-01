@@ -312,6 +312,93 @@ async def test_drain_is_noop_when_gate_still_active(tmp_path):
     assert response_creates == []
 
 
+# ---------- Qwen gate parity (2026-08-01) --------------------------------
+#
+# Qwen gates the same frame as OpenAI but originally cleared only on
+# ``response.done`` — no cancelled/failed, no barge-in, no staleness escape,
+# no optimistic flip. That made it strictly weaker against the same wedge
+# fixed for OpenAI in 9ef6dc1. These pin the ported behaviour.
+
+
+def _qwen():
+    from orchestrator.providers.qwen_voice import QwenVoiceProvider
+
+    return QwenVoiceProvider(model="qwen3.5-omni-plus-realtime")
+
+
+def test_qwen_gates_response_create_when_active():
+    p = _qwen()
+    assert p.should_gate_event({"type": "response.create"}) is False
+    p.on_inbound_event({"type": "response.created"})
+    assert p.should_gate_event({"type": "response.create"}) is True
+    # Non-response.create frames are never gated.
+    assert p.should_gate_event({"type": "conversation.item.create"}) is False
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    ["response.done", "response.cancelled", "response.failed"],
+)
+def test_qwen_gate_clears_on_all_terminal_events(terminal):
+    """Previously only ``response.done`` cleared it — the other two wedged."""
+    p = _qwen()
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+    p.on_inbound_event({"type": terminal})
+    assert p.gate_cleared() is True
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    ["input_audio_buffer.speech_started", "output_audio_buffer.cleared"],
+)
+def test_qwen_gate_clears_on_barge_in(interrupt):
+    """DEFAULT_VAD sets interrupt_response=True, so a barge-in really does
+    tear the response down server-side — the gate must follow."""
+    p = _qwen()
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+    p.on_inbound_event({"type": interrupt})
+    assert p.gate_cleared() is True
+    assert p.should_gate_event({"type": "response.create"}) is False
+
+
+def test_qwen_barge_in_noop_when_no_response_active():
+    p = _qwen()
+    assert p.gate_cleared() is True
+    p.on_inbound_event({"type": "input_audio_buffer.speech_started"})
+    assert p.gate_cleared() is True
+
+
+def test_qwen_gate_force_cleared_when_stale():
+    """With every event lost, the gate still self-heals."""
+    p = _qwen()
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+
+    # Backdate the activation stamp rather than patching time.monotonic
+    # module-wide (which would also freeze the event loop's clock).
+    p._response_active_since -= p._RESPONSE_ACTIVE_STALE_SECONDS - 0.1
+    assert p.gate_cleared() is False
+
+    p._response_active_since -= 0.2
+    assert p.gate_cleared() is True
+    assert p.should_gate_event({"type": "response.create"}) is False
+
+
+def test_qwen_mark_response_create_sent_flips_optimistically():
+    """Was a base-class no-op on Qwen, so parallel dispatches could collide."""
+    p = _qwen()
+    assert p.gate_cleared() is True
+    p.mark_response_create_sent()
+    assert p.gate_cleared() is False
+    # The eventual upstream response.created is a no-op (already True).
+    p.on_inbound_event({"type": "response.created"})
+    assert p.gate_cleared() is False
+    p.on_inbound_event({"type": "response.done"})
+    assert p.gate_cleared() is True
+
+
 @pytest.fixture
 def fast_watchdog(monkeypatch):
     """Shrink the watchdog's poll/bound so tests don't wait real seconds.
