@@ -581,6 +581,47 @@ async def shutdown_server() -> None:
             _server_ready = False
 
 
+def _current_session_uuid(context: dict[str, Any]) -> str | None:
+    """Return the UUID of the currently-running orchestrator session, if any.
+
+    The `history` collection indexes each session as `<uuid>.md`, so every
+    chunk's `file_path` ends with `<uuid>.md`. To prevent the in-progress
+    conversation from self-poisoning search results (its own denials/echoes
+    dominating the top-K), we exclude any chunk whose path contains this UUID.
+    """
+    session = context.get("session") if context else None
+    if session is None:
+        return None
+    # `jsonl_id` returns the resume_id (when resuming) or local_id (fresh).
+    for attr in ("jsonl_id", "_resume_id", "_local_id"):
+        val = getattr(session, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+def _filter_out_session(
+    results: list[dict[str, Any]], session_uuid: str | None
+) -> list[dict[str, Any]]:
+    if not session_uuid:
+        return results
+    out = []
+    for r in results:
+        fp = r.get("file_path")
+        if fp is None:  # error entries, or anything without a path — pass through
+            out.append(r)
+            continue
+        if session_uuid in fp:
+            continue
+        out.append(r)
+    return out
+
+
+# Over-fetch multiplier for history searches so post-filtering the current
+# session still leaves enough hits for the user's requested max_results.
+_HISTORY_OVERFETCH = 3
+
+
 @registry.register(
     name="search_history",
     description="Search conversation history using semantic search.",
@@ -602,7 +643,10 @@ async def shutdown_server() -> None:
 async def search_history(
     context: dict[str, Any], query: str, max_results: int = 5
 ) -> str:
-    results = await _do_search(query, "history", max_results)
+    session_uuid = _current_session_uuid(context)
+    fetch_n = max_results * _HISTORY_OVERFETCH if session_uuid else max_results
+    results = await _do_search(query, "history", fetch_n)
+    results = _filter_out_session(results, session_uuid)[:max_results]
     _enrich_history_results(results)
     return json.dumps({"query": query, "results": results, "count": len(results)})
 
