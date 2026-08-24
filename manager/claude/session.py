@@ -1008,6 +1008,14 @@ class ClaudeSessionManager(BaseSessionManager):
         env: dict[str, str] = {}
         if self._config.ssh_claude_config_dir:
             env["CLAUDE_CONFIG_DIR"] = self._config.ssh_claude_config_dir
+        # Forward the long-lived OAuth token (minted via `claude setup-token`,
+        # stored in context/.env) to the remote claude. It takes precedence over
+        # the remote's .credentials.json, so SSH-remote sessions authenticate
+        # with the 1-year token instead of the refreshable creds that keep
+        # expiring/corrupting. See feedback_jetson_oauth_token_expiry memory.
+        oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         remote_cmd = RemoteCommand(
             project_dir=self._config.project_dir,
             remote_cli=remote_claude,
