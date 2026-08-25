@@ -1,5 +1,5 @@
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-opus-5[1m]",
   "permission_mode": "default",
   "max_budget_usd": null,
   "max_turns": null

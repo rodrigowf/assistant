@@ -14,4 +14,14 @@
 # to live in manager/claude/session.py.  The 0.2.x branch has breaking
 # changes (MCP background-connect default, TodoWrite → Task tools);
 # evaluated separately.
+#
+# The floor is load-bearing, and a venv can silently drift below it: on
+# 2026-08-25 the installed SDK was 0.1.39, two fixes short of this pin.
+# The bundled CLI (2.1.240) emits `rate_limit_event` as a session nears a
+# usage limit; 0.1.39 has no case for it, so parse_message raised
+# MessageParseError, killed _receive_loop, and the reaper closed the
+# session as subprocess_crashed.  0.1.81 parses it into a RateLimitEvent
+# that _process_message ignores harmlessly.  If sessions start dying with
+# "Unknown message type", check the *installed* version before the pin:
+#   .venv/bin/python -c "import claude_agent_sdk; print(claude_agent_sdk.__version__)"
 claude-agent-sdk>=0.1.81,<0.2
