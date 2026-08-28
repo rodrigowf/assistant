@@ -13,8 +13,9 @@ Companion to [SPEC.md](SPEC.md).
 > - Live testing found two bugs the fixtures could not — reconnect storm and
 >   cross-snapshot ref reuse (see Deviations §8)
 >
-> **Not yet deployed to the Jetson**, which is the backend of record. See
-> "Stage 2" below. Deviations are listed at the bottom.
+> **Deployed.** The daemon runs on the machine Chrome is on (the laptop);
+> sessions elsewhere delegate over SSH. See "Stage 2" below. Deviations are
+> listed at the bottom.
 
 Ordering principle: transport first, so every later phase is testable
 end-to-end. Then cheap-to-verify tab commands, then capture, then interaction
@@ -250,32 +251,32 @@ cannot set it.
 
 ---
 
-## Phase 7 — Orchestrator tools
+## Phase 7 — Agent surface  *(revised: skill, not orchestrator tools)*
 
-- `orchestrator/tools/browser.py` — one tool per command, registered in the
-  `ToolRegistry` so both the Anthropic text path and the OpenAI voice path get
-  them
-- Graceful degradation when the extension is disconnected
+Originally specified as orchestrator tools. **Reverted** — the orchestrator was
+the wrong consumer. Claude Code sessions drive the browser; the orchestrator
+delegates to a session, or fires the same script via `run_script`.
+
+- `POST /api/browser/command` — one command per request, token-gated and
+  loopback-only
+- `default-scripts/browser_cmd.py` — the CLI, symlinked into `context/scripts/`
+- `default-skills/browser-control/` — teaches the look-then-act loop, the
+  ref-over-selector preference, active-tab-only, and the failure modes
+- `context/memory/ORCHESTRATOR_SCRIPTS.md` entry for `run_script`
 
 ### Delegation logic (approved 2026-08-27)
 
-The tool descriptions and the delegation skill must teach this loop explicitly,
-in this priority order:
+The skill teaches this loop explicitly, in priority order:
 
-1. **Start every task by capturing both** a screenshot *and* a text snapshot of
-   the page. Neither alone is sufficient — the screenshot gives visual context,
-   the snapshot gives actionable references.
-2. **Prefer references for navigation and interaction.** CSS selectors or `ref`
-   aliases from the snapshot map are the default targeting mechanism whenever
-   the element appears in the snapshot.
-3. **Proportional viewport coordinates are a fallback**, for position-targeted
-   actions that references can't express — subject to the `stale_viewport`
-   detection in §0.1.
+1. **Start every task with `look`** — screenshot *and* text snapshot. Neither
+   alone is sufficient: the screenshot gives visual context, the snapshot gives
+   actionable references.
+2. **Prefer references.** `ref` or `selector` from the snapshot is the default
+   targeting mechanism whenever the element appears there.
+3. **Proportional coordinates are a fallback**, subject to `stale_viewport`.
 
 Stated as a priority order because the failure mode is an agent that guesses
-selectors it never saw, or reuses coordinates after the page has scrolled.
-
-**Size:** small–medium.
+selectors it never saw, or reuses coordinates after the page scrolled.
 
 ---
 
@@ -378,85 +379,60 @@ Recorded so the plan stays an honest account of what was built.
 
    The fixtures only exercised single-snapshot flows, which is why both hid.
 
-## Stage 2 — deployment (COMPLETE, 2026-08-28)
+## Stage 2 — deployment (COMPLETE, revised 2026-08-28)
 
-Deployed as `8f7303a`. The Jetson (`server`, 192.168.0.200) runs the backend as
-the **system** unit `agentic-backend.service` (uvicorn on 127.0.0.1:8765,
-`Restart=on-failure`, `User=rodrigo`), fronted by a 443 listener.
+**The daemon runs on the machine Chrome is on.** That is the only co-location
+requirement: the extension holds one persistent WebSocket, so something
+long-lived must accept it, and the Claude sessions that drive the browser run
+on that same machine (the Jetson spawns them on the laptop over SSH).
 
-Verified in production: route live through 443, `token_configured: true`, WSS
-handshake accepted with a valid token and **refused** with an invalid one,
-screenshot upload through 443, and 55 tests passing on aarch64.
+    Claude session (laptop) → 127.0.0.1:8766 → browser_daemon.py → Chrome
 
-### The connection route: SSH tunnel, not `wss://`
+`browser_cmd.py` starts the daemon on demand — detached and idempotent, so a
+session cannot forget to and concurrent callers cannot double-start it.
 
-The obvious plan — point the extension at `wss://server.local/api/browser/ws` —
-**does not work**, and the reason is worth remembering:
+### What was wrong before
 
-- The Jetson's cert is issued by a private "Home CA" that the laptop does not
-  trust (`verify error:num=20: unable to get local issuer certificate`).
-- Rodrigo can browse `https://server.local/` because he clicked through the
-  interstitial once. **That exception applies only to page navigations.** A
-  `wss://` connection from an extension service worker has no UI to prompt
-  with, so it fails outright — surfacing as a bare transport error, with
-  nothing at all reaching the server.
+The hub originally lived in the Jetson backend because that is "the backend of
+record". A laptop session's request therefore crossed to the Jetson and came
+straight back down an SSH tunnel to reach a browser on the same machine it
+started from — two network hops for two co-located processes, plus a TLS
+problem, a tunnel, and a systemd unit to keep it alive. All of that was
+downstream of putting the hub in the wrong place.
 
-The working route is an SSH tunnel from the laptop:
+The tunnel (`archie-browser-tunnel.service`) and its cert workaround are gone.
+Kept for the record, because it is a real trap: the Jetson's cert is signed by
+a private "Home CA" the laptop doesn't trust, and while browsing
+`https://server.local/` works via a click-through exception, **that exception
+does not apply to a `wss://` connection from an extension service worker** —
+there is no UI to prompt with, so it fails as a bare transport error with
+nothing reaching the server. Diagnostic: a token failure says "Token rejected",
+a TLS failure says "websocket error".
 
-    ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-        -L 8765:127.0.0.1:8765 rodrigo@192.168.0.200
+### Sessions on a machine without Chrome
 
-with the extension left on its default `ws://127.0.0.1:8765/api/browser/ws`.
+`browser_cmd.py` re-runs itself over SSH on the browser host, so the same
+command works identically from either machine and the daemon stays
+loopback-only with no open port and nothing to keep alive. Configured in
+`context/.env` — tested by *hostname*, because that file is synced between
+machines and a plain flag would be true on both:
 
-This is also **strictly safer** than the `wss://` route, and retracts the
-LAN-exposure warning previously recorded here: the Jetson's backend stays bound
-to loopback, so nothing on the network can reach a socket that runs arbitrary
-JS in a logged-in browser — only an authenticated SSH session from the laptop.
+    BROWSER_HOST_NAME=rodrigo-laptop
+    BROWSER_HOST_SSH=rodrigo@192.168.0.28
+    BROWSER_HOST_PATH=~/assistant
 
-The tunnel is managed by a **systemd user service on the laptop**,
-`~/.config/systemd/user/archie-browser-tunnel.service` (enabled, `Restart=always`,
-`RestartSec=5`). Mirrors the existing `context-sync.service` pattern — the
-project's established way of doing cross-machine SSH plumbing.
+This also restores the orchestrator's `run_script` path, which executes on the
+Jetson and now delegates transparently.
 
-Why a user unit rather than logic inside the browser tools: **the tools run on
-the Jetson, but the tunnel must terminate on the laptop** where Chrome is. A
-tool that established it would be reaching across machines to mutate network
-topology as a side effect of a tool call — hidden state, and failures
-surfacing as confusing tool errors. A user unit also needs no sudo (unlike
-`agentic-backend`, a system unit) and no `autossh` (not installed):
-systemd's `Restart=always` plus SSH keepalives cover it. Its lifetime ties to
-the desktop session, which is exactly when Chrome exists.
+### Port
 
-The forward is bound explicitly to `127.0.0.1:8765` on the laptop side, so the
-port is not exposed on the laptop's LAN interfaces either — loopback-only on
-both ends.
+8766, deliberately not 8765. That port means "the main assistant backend" on
+both machines; reusing it is what let browser traffic loop through the Jetson
+unnoticed.
 
-Verified: killing the tunnel drops the extension, and it reconnects on its own
-backoff within ~5s of the tunnel returning (`systemctl --user restart
-archie-browser-tunnel`).
-
-Alternative, not taken: installing the Home CA into the system trust store *and*
-Chrome's NSS db (`libnss3-tools`) would enable direct `wss://`, at the cost of
-more moving parts and a worse security posture.
-
-    systemctl --user status archie-browser-tunnel     # check
-    systemctl --user disable --now archie-browser-tunnel   # undo
-
-Note: restarting the service needs `sudo` on the Jetson (no passwordless sudo,
-polkit refuses over SSH):
+The Jetson backend still carries the browser routes (harmless — nothing
+connects to them there). Restarting it needs sudo:
 
     ssh -t rodrigo@192.168.0.200 'sudo systemctl restart agentic-backend'
 
 ---
-
-## Awaiting approval
-
-Ready to start at Phase 1 on your go-ahead. Two things I'd surface at the
-moment of approval rather than bury:
-
-1. **Phase 4's output format is the one expensive decision left.** I'll stop and
-   show it to you before Phases 5–6 build on it.
-2. **Phase 6's CSP spike could change the stealth story.** If MAIN-world
-   injection turns out to be CSP-blocked on strict sites, the choice becomes
-   `USER_SCRIPT` (no page globals) or CSP-stripping (weakens the page). Worth
-   knowing before it's load-bearing.
