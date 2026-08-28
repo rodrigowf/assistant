@@ -62,8 +62,8 @@ No build step — plain JS, loaded unpacked.
 2. Enable **Developer mode** (top right)
 3. **Load unpacked** → select this `browser-extension/` directory
 4. Click the extension icon and set:
-   - **Backend WebSocket** — default `ws://127.0.0.1:8765/api/browser/ws`; use
-     `ws://192.168.0.200:8765/...` when the backend runs on the Jetson
+   - **Backend WebSocket** — `ws://127.0.0.1:8766/api/browser/ws` (the local
+     browser daemon; **not** 8765, which is the main assistant backend)
    - **Shared token** — the `BROWSER_CONTROL_TOKEN` value from `context/.env`
 5. For `execute_js` only: open `chrome://extensions/?id=<id>` and enable
    **Allow User Scripts**
@@ -149,9 +149,11 @@ normal; reconnects use exponential backoff with jitter (1s → 30s).
 
 `<all_urls>` is broad by design, and this extension has full access to every
 logged-in session in the profile, with no restrictions on what JS the agent may
-run. The backend WebSocket therefore requires a shared token and **fails
-closed**: with no `BROWSER_CONTROL_TOKEN` configured, nothing connects. Keep
-the backend bound to localhost or the trusted LAN.
+run. The daemon therefore requires a shared token and **fails closed**: with no
+`BROWSER_CONTROL_TOKEN` configured, nothing connects. It also binds loopback
+only, and the command endpoint refuses any request that arrived via a reverse
+proxy — so nothing on the LAN can reach it. A session on another machine goes
+through SSH instead of an open port.
 
 ## Testing
 

@@ -8,10 +8,13 @@
  * next wake — so treat disconnects as normal, not exceptional.
  */
 
-export const DEFAULT_BACKEND_URL = "ws://127.0.0.1:8765/api/browser/ws";
+export const DEFAULT_BACKEND_URL = "ws://127.0.0.1:8766/api/browser/ws";
 
 const BACKOFF_MIN_MS = 1_000;
-const BACKOFF_MAX_MS = 30_000;
+// Short ceiling on purpose: the daemon is a loopback process that Claude
+// sessions start on demand, so a 30s ceiling would put a cold-start stall in
+// front of the first command. Reconnecting fast is cheap over loopback.
+const BACKOFF_MAX_MS = 5_000;
 
 /** Backend rejection reasons, phrased for the popup. */
 const AUTH_ERRORS = {

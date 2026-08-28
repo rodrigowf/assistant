@@ -82,13 +82,24 @@ the scroll position where the snapshot was taken. Pass `--generation` from the
 `look` output. If the page scrolled since, the command fails with
 `stale_viewport` — re-run `look` instead of guessing.
 
+## Where it runs
+
+Chrome, the daemon that holds its WebSocket, and (normally) your session are
+all on the same machine, so commands are a loopback call — nothing crosses the
+network. The daemon starts automatically on first use; you never start it by
+hand.
+
+If your session happens to run on a *different* machine from Chrome, the script
+detects that and re-runs itself over SSH on the browser host. Same command,
+same output, just slower. Configured by `BROWSER_HOST_NAME` / `BROWSER_HOST_SSH`
+in `context/.env`.
+
 ## When it doesn't work
 
-- **`browser not connected`** — Chrome isn't running, the extension isn't
-  loaded, or the tunnel is down. Check `status`, then
-  `systemctl --user status archie-browser-tunnel` on the laptop.
-- **`cannot reach the backend`** — same tunnel check; the endpoint is
-  loopback-only by design.
+- **`browser not connected`** — the daemon is up but Chrome isn't attached.
+  Chrome may be closed, or the extension's popup may point at the wrong port
+  (it should be `ws://127.0.0.1:8766/api/browser/ws`). Run `status` to see.
+- **`daemon failed to start`** — check `logs/browser-daemon.log`.
 - **`cannot script restricted page`** — `chrome://` pages and the Web Store
   can't be scripted by any extension. Navigate somewhere else first.
 - **`unknown_ref`** — the snapshot moved on. Re-run `look`.

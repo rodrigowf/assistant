@@ -17,8 +17,10 @@ The loop that matters — the snapshot goes stale the moment the page changes:
     3. `--x/--y` proportional coordinates are a fallback, and are refused once
        the page scrolls.
 
-Endpoint is loopback-only by design; on the laptop that means going through the
-`archie-browser-tunnel` service. See browser-extension/PLAN.md.
+The daemon that terminates the extension's WebSocket runs on this machine
+(`browser_daemon.py`, loopback only) and is started automatically on first use.
+Chrome, the daemon and the session are all co-located, so nothing crosses the
+network. See browser-extension/PLAN.md.
 """
 
 from __future__ import annotations
@@ -26,13 +28,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import signal
+import subprocess
+import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_ENDPOINT = "http://127.0.0.1:8765"
+DAEMON = PROJECT_ROOT / "default-scripts" / "browser_daemon.py"
+DAEMON_LOG = PROJECT_ROOT / "logs" / "browser-daemon.log"
+DEFAULT_ENDPOINT = "http://127.0.0.1:8766"
 TOKEN_ENV_VAR = "BROWSER_CONTROL_TOKEN"
 
 # Truncate the element list by default: a busy page yields hundreds of entries
@@ -40,11 +49,11 @@ TOKEN_ENV_VAR = "BROWSER_CONTROL_TOKEN"
 DEFAULT_ELEMENT_LIMIT = 60
 
 
-def resolve_token() -> str | None:
-    """Prefer the environment, else parse context/.env (same as the backend)."""
-    token = os.environ.get(TOKEN_ENV_VAR)
-    if token and token.strip():
-        return token.strip()
+def env_value(key: str) -> str | None:
+    """Prefer the process environment, else parse context/.env."""
+    value = os.environ.get(key)
+    if value and value.strip():
+        return value.strip()
     env_path = PROJECT_ROOT / "context" / ".env"
     if not env_path.exists():
         return None
@@ -52,10 +61,122 @@ def resolve_token() -> str | None:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        name, _, value = line.partition("=")
-        if name.strip() == TOKEN_ENV_VAR:
-            return value.strip().strip('"').strip("'") or None
+        name, _, val = line.partition("=")
+        if name.strip() == key:
+            return val.strip().strip('"').strip("'") or None
     return None
+
+
+def resolve_token() -> str | None:
+    return env_value(TOKEN_ENV_VAR)
+
+
+def delegate_target() -> str | None:
+    """Return the ssh target when Chrome lives on a different machine.
+
+    The daemon must be co-located with Chrome. Rather than exposing it on the
+    LAN or maintaining a tunnel, a caller on another machine re-runs this same
+    command over SSH on the machine that has the browser — so the daemon stays
+    loopback-only and there is nothing to keep alive.
+
+    Configured in context/.env, which is synced between machines, so the
+    "am I the browser host?" test is by hostname rather than by a flag that
+    would be true on both:
+
+        BROWSER_HOST_NAME=rodrigo-laptop
+        BROWSER_HOST_SSH=rodrigo@192.168.0.28
+
+    Returns None when this machine is the browser host (or nothing is
+    configured, i.e. single-machine setups keep working untouched).
+    """
+    if os.environ.get("BROWSER_FORCE_LOCAL"):
+        return None
+    host_name = env_value("BROWSER_HOST_NAME")
+    if not host_name or host_name == socket.gethostname():
+        return None
+    target = env_value("BROWSER_HOST_SSH")
+    if not target:
+        die("BROWSER_HOST_NAME is set but BROWSER_HOST_SSH is missing in context/.env")
+    return target
+
+
+def delegate_over_ssh(target: str, argv: list[str]) -> int:
+    """Re-run this command on the browser host, streaming its output back."""
+    remote_root = env_value("BROWSER_HOST_PATH") or "~/assistant"
+    # Each arg is quoted individually: ssh space-joins its argv, so an unquoted
+    # multi-word arg (a JS snippet, a selector) would be re-split remotely.
+    inner = " ".join(shlex.quote(a) for a in argv)
+    remote = (
+        f"cd {remote_root} && BROWSER_FORCE_LOCAL=1 "
+        f"context/scripts/run.sh context/scripts/browser_cmd.py {inner}"
+    )
+    print(f"(running on {target} — the browser host)", file=sys.stderr)
+    return subprocess.call([
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, remote,
+    ])
+
+
+def endpoint() -> str:
+    return os.environ.get("BROWSER_ENDPOINT", DEFAULT_ENDPOINT).rstrip("/")
+
+
+def daemon_status(timeout: float = 2.0) -> dict | None:
+    """Return the hub status, or None if the daemon isn't answering."""
+    try:
+        with urllib.request.urlopen(f"{endpoint()}/api/browser/status", timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def ensure_daemon(quiet: bool = False, require_browser: bool = True) -> dict:
+    """Start the local daemon if it isn't up, then wait for Chrome to attach.
+
+    The daemon only has to live on the machine Chrome is on — which is also
+    where Claude Code sessions run — so this is a loopback call, not a network
+    round-trip. Starting it here rather than in a separate step means a session
+    can't forget to.
+
+    Detached via start_new_session so it outlives the session that started it,
+    and idempotent: a second caller finds the port taken and exits cleanly.
+    """
+    status = daemon_status()
+    if status is None:
+        if not quiet:
+            print("browser daemon not running — starting it…", file=sys.stderr)
+        DAEMON_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with DAEMON_LOG.open("a") as log:
+            subprocess.Popen(
+                [sys.executable, str(DAEMON)],
+                stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=str(PROJECT_ROOT),
+            )
+        for _ in range(40):  # ~20s
+            time.sleep(0.5)
+            status = daemon_status()
+            if status is not None:
+                break
+        if status is None:
+            die(f"daemon failed to start within 20s — see {DAEMON_LOG}")
+
+    if status.get("connected") or not require_browser:
+        return status
+
+    # The daemon is up but Chrome hasn't reattached yet. The extension
+    # reconnects on its own backoff, so this is a short wait, not a hang.
+    if not quiet:
+        print("waiting for Chrome extension to attach…", file=sys.stderr)
+    for _ in range(30):  # ~30s
+        time.sleep(1.0)
+        status = daemon_status() or status
+        if status.get("connected"):
+            return status
+
+    die("browser daemon is running but no Chrome extension attached.\n"
+        f"Check the extension popup points at ws://127.0.0.1:{endpoint().rsplit(':',1)[-1]}"
+        "/api/browser/ws, and that Chrome is running.")
+    return {}
 
 
 def call(command: str, params: dict, timeout: float = 60.0) -> dict:
@@ -63,10 +184,9 @@ def call(command: str, params: dict, timeout: float = 60.0) -> dict:
     if not token:
         die(f"{TOKEN_ENV_VAR} not found in environment or context/.env")
 
-    endpoint = os.environ.get("BROWSER_ENDPOINT", DEFAULT_ENDPOINT).rstrip("/")
     payload = json.dumps({"command": command, "params": params}).encode()
     req = urllib.request.Request(
-        f"{endpoint}/api/browser/command",
+        f"{endpoint()}/api/browser/command",
         data=payload,
         headers={"Content-Type": "application/json", "X-Browser-Token": token},
         method="POST",
@@ -84,17 +204,16 @@ def call(command: str, params: dict, timeout: float = 60.0) -> dict:
         # the failures a session will actually hit.
         if e.code == 503 and "not connected" in str(detail):
             die(f"browser not connected: {detail}\n"
-                "Is Chrome running with the Archie Browser Control extension, "
-                "and is the tunnel up? (systemctl --user status archie-browser-tunnel)")
+                "Is Chrome running, with the Archie Browser Control extension "
+                "loaded and pointed at this daemon?")
         if e.code == 403:
             die(f"refused: {detail}")
         if e.code == 401:
             die(f"auth failed: {detail}")
         die(f"HTTP {e.code}: {detail}")
     except urllib.error.URLError as e:
-        die(f"cannot reach the backend at {endpoint}: {e.reason}\n"
-            "On the laptop this needs the tunnel: "
-            "systemctl --user status archie-browser-tunnel")
+        die(f"cannot reach the browser daemon at {endpoint()}: {e.reason}\n"
+            f"Start it with: context/scripts/run.sh {DAEMON.relative_to(PROJECT_ROOT)}")
     return {}
 
 
@@ -201,18 +320,47 @@ def main() -> int:
     sp.add_argument("--world", choices=["MAIN", "USER_SCRIPT"])
     sp.add_argument("--timeout", type=float, default=15.0)
 
-    sub.add_parser("status", help="is the browser connected?")
+    sub.add_parser("status", help="is the daemon up and the browser connected?")
+
+    sp = sub.add_parser("daemon", help="manage the local browser daemon")
+    sp.add_argument("action", choices=["status", "start", "stop"])
 
     args = p.parse_args()
 
+    # If Chrome is on another machine, hand the whole invocation to it. Done
+    # before any local work so no subcommand needs to know about this.
+    target = delegate_target()
+    if target:
+        return delegate_over_ssh(target, sys.argv[1:])
+
     if args.cmd == "status":
-        endpoint = os.environ.get("BROWSER_ENDPOINT", DEFAULT_ENDPOINT).rstrip("/")
-        try:
-            with urllib.request.urlopen(f"{endpoint}/api/browser/status", timeout=10) as r:
-                print(json.dumps(json.loads(r.read()), indent=2))
-        except Exception as e:
-            die(f"cannot reach {endpoint}: {e}")
+        st = daemon_status(timeout=5)
+        if st is None:
+            print(json.dumps({"daemon": "not running", "endpoint": endpoint()}, indent=2))
+            return 1
+        print(json.dumps({"daemon": "running", "endpoint": endpoint(), **st}, indent=2))
         return 0
+
+    if args.cmd == "daemon":
+        if args.action == "status":
+            st = daemon_status(timeout=5)
+            print(json.dumps(st or {"daemon": "not running"}, indent=2))
+            return 0 if st else 1
+        if args.action == "start":
+            print(json.dumps(ensure_daemon(require_browser=False), indent=2))
+            return 0
+        if args.action == "stop":
+            pid_file = PROJECT_ROOT / "logs" / "browser-daemon.pid"
+            if not pid_file.exists():
+                die("no pidfile — daemon does not appear to be running")
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+            print(f"sent SIGTERM to browser daemon (pid {pid})")
+            return 0
+
+    # Every command below needs the daemon and an attached browser; doing it
+    # here means no subcommand can forget.
+    ensure_daemon()
 
     if args.cmd == "look":
         params = {}
