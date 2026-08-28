@@ -20,16 +20,21 @@ All eight phases implemented. Verified by 55 Python tests and 99 in-browser
 assertions. Two steps need you and cannot be automated: loading the unpacked
 extension, and the "Allow User Scripts" toggle.
 
-| Command | Tool | State |
+Agents reach it through the **`/browser-control` skill**, which wraps
+`context/scripts/browser_cmd.py` → `POST /api/browser/command`. It is
+deliberately *not* an orchestrator tool: Claude Code sessions are the intended
+consumer, and the orchestrator can fire the same script via `run_script`.
+
+| Command | CLI | State |
 |---|---|---|
-| `snapshot` + `capture_screenshot` | `browser_look` | Working |
-| `navigate` | `browser_navigate` | Working |
-| `list_tabs` | `browser_tabs` | Working |
-| `get_active_tab` / `switch_tab` | `browser_switch_tab` | Working |
-| `click` | `browser_click` | Working |
-| `fill` | `browser_fill` | Working |
-| `scroll` | `browser_scroll` | Working |
-| `execute_js` | `browser_execute_js` | Working; MAIN-world CSP behaviour needs one on-device check |
+| `snapshot` + `capture_screenshot` | `look` | Working |
+| `navigate` | `navigate <url>` | Working |
+| `list_tabs` | `tabs` | Working |
+| `get_active_tab` / `switch_tab` | `switch <id>` | Working |
+| `click` | `click` | Working |
+| `fill` | `fill` | Working |
+| `scroll` | `scroll` | Working |
+| `execute_js` | `js <code>` | Working (MAIN world, verified under strict CSP) |
 
 ## Layout
 
@@ -150,5 +155,5 @@ the backend bound to localhost or the trusted LAN.
 
 ## Testing
 
-- `context/scripts/run.sh -m pytest tests/test_api_browser.py tests/test_orchestrator_browser_tools.py -v`
+- `context/scripts/run.sh -m pytest tests/test_api_browser.py -v`
 - In-browser fixtures: see [test-fixtures/README.md](test-fixtures/README.md)

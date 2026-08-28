@@ -370,3 +370,131 @@ async def test_detach_of_stale_socket_is_a_noop():
 
     assert hub.connected is True
     assert hub.status()["client"] == {"client": "new"}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/browser/command — the channel Claude Code sessions use
+# ---------------------------------------------------------------------------
+
+class _StubHub:
+    """Hub stand-in for endpoint tests: records calls, replays canned outcomes."""
+
+    def __init__(self, result=None, raises=None, connected=True):
+        self.connected = connected
+        self.calls = []
+        self._result = result if result is not None else {"ok": True}
+        self._raises = raises
+
+    async def send_command(self, command, params=None, timeout=None):
+        self.calls.append((command, params, timeout))
+        if self._raises:
+            raise self._raises
+        return self._result
+
+    def status(self):
+        return {"connected": self.connected, "client": {}, "connected_at": None,
+                "pending_commands": 0}
+
+
+def _app_with(hub) -> FastAPI:
+    app = _make_app()
+    app.state.browser_hub = hub
+    return app
+
+
+def _post(client, body, token=TOKEN, headers=None):
+    h = {"X-Browser-Token": token} if token is not None else {}
+    h.update(headers or {})
+    return client.post("/api/browser/command", json=body, headers=h)
+
+
+def test_command_relays_to_hub_and_returns_result(token):
+    hub = _StubHub(result={"tabId": 5})
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "navigate", "params": {"url": "https://x"}})
+
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "command": "navigate", "result": {"tabId": 5}}
+    assert hub.calls[0][0] == "navigate"
+    assert hub.calls[0][1] == {"url": "https://x"}
+
+
+def test_command_requires_token(token):
+    hub = _StubHub()
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "ping"}, token=None)
+
+    assert r.status_code == 401
+    assert hub.calls == []  # never reached the browser
+
+
+def test_command_rejects_wrong_token(token):
+    hub = _StubHub()
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "ping"}, token="nope")
+
+    assert r.status_code == 401
+    assert hub.calls == []
+
+
+def test_command_refused_when_token_unconfigured(no_token):
+    with TestClient(_app_with(_StubHub())) as client:
+        assert _post(client, {"command": "ping"}).status_code == 503
+
+
+@pytest.mark.parametrize("header", ["X-Real-IP", "X-Forwarded-For"])
+def test_command_refuses_lan_requests_through_the_proxy(token, header):
+    """nginx sets X-Real-IP, so a LAN caller is distinguishable from a local
+    one even though both appear as 127.0.0.1 to the app."""
+    hub = _StubHub()
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "ping"}, headers={header: "192.168.0.55"})
+
+    assert r.status_code == 403
+    assert "loopback-only" in r.json()["detail"]
+    assert hub.calls == []
+
+
+@pytest.mark.parametrize("value", ["127.0.0.1", "::1"])
+def test_command_allows_loopback_forwarded_values(token, value):
+    hub = _StubHub()
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "ping"}, headers={"X-Real-IP": value})
+
+    assert r.status_code == 200
+
+
+def test_command_requires_a_command_field(token):
+    with TestClient(_app_with(_StubHub())) as client:
+        assert _post(client, {"params": {}}).status_code == 400
+
+
+def test_command_rejects_non_object_params(token):
+    with TestClient(_app_with(_StubHub())) as client:
+        assert _post(client, {"command": "ping", "params": [1]}).status_code == 400
+
+
+def test_disconnected_browser_is_503_not_500(token):
+    """The backend is healthy; only the browser is absent."""
+    hub = _StubHub(raises=BrowserNotConnected("no extension"), connected=False)
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "ping"})
+
+    assert r.status_code == 503
+    assert "not connected" in r.json()["detail"]
+
+
+def test_command_timeout_is_504(token):
+    hub = _StubHub(raises=BrowserCommandTimeout("timed out after 30s"))
+    with TestClient(_app_with(hub)) as client:
+        assert _post(client, {"command": "ping"}).status_code == 504
+
+
+def test_failed_command_is_422_not_500(token):
+    """A bad selector is a client error, distinct from a broken transport."""
+    hub = _StubHub(raises=BrowserCommandError("no_match: #nope"))
+    with TestClient(_app_with(hub)) as client:
+        r = _post(client, {"command": "click"})
+
+    assert r.status_code == 422
+    assert "no_match" in r.json()["detail"]

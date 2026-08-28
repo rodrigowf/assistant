@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import orjson
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["browser"])
@@ -222,6 +222,29 @@ def get_hub(request: Request) -> BrowserHub:
     return request.app.state.browser_hub
 
 
+def _is_proxied_from_lan(request: Request) -> str | None:
+    """Return the offending client address if the request came from the LAN.
+
+    The Jetson's nginx (``~/nginx-server.conf``) proxies 443 → 127.0.0.1:8765
+    and sets ``X-Real-IP`` to the true client address. A request made directly
+    to the loopback port carries no such header. So the header's presence — and
+    its value — reliably distinguishes "someone on the LAN" from "a process on
+    this machine", which app-level ``request.client.host`` cannot do behind a
+    proxy (everything looks like 127.0.0.1 there).
+
+    Returns None when the caller is local.
+    """
+    forwarded = (
+        request.headers.get("x-real-ip")
+        or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    )
+    if not forwarded:
+        return None
+    if forwarded in ("127.0.0.1", "::1", "localhost"):
+        return None
+    return forwarded
+
+
 @router.get("/api/browser/status")
 async def browser_status(request: Request) -> dict[str, Any]:
     """Report extension connectivity, so callers can tell 'browser offline'
@@ -229,6 +252,75 @@ async def browser_status(request: Request) -> dict[str, Any]:
     status = get_hub(request).status()
     status["token_configured"] = _resolve_token() is not None
     return status
+
+
+@router.post("/api/browser/command")
+async def browser_command(request: Request) -> dict[str, Any]:
+    """Run one browser command and return its result.
+
+    The command channel for Claude Code sessions, which reach it through
+    ``context/scripts/browser_cmd.py``. Sessions have Bash but no access to the
+    extension's WebSocket (single-client, held by the browser), so this is how
+    they drive the browser.
+
+    Two gates, both required:
+
+    * **Loopback only.** A request arriving via nginx from the LAN is refused.
+      This channel runs arbitrary JS in a logged-in browser, so it deliberately
+      does not inherit the rest of the API's open-to-the-LAN posture.
+    * **Shared token**, same ``BROWSER_CONTROL_TOKEN`` the extension presents,
+      in an ``X-Browser-Token`` header.
+    """
+    offender = _is_proxied_from_lan(request)
+    if offender:
+        logger.warning("Refusing browser command from LAN address %s", offender)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "browser commands are loopback-only; this request arrived from "
+                f"{offender} via the reverse proxy. Use an SSH tunnel."
+            ),
+        )
+
+    expected = _resolve_token()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{TOKEN_ENV_VAR} is not configured in context/.env",
+        )
+    presented = request.headers.get("x-browser-token") or ""
+    if not secrets.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="invalid or missing X-Browser-Token")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON") from None
+
+    command = body.get("command")
+    if not command or not isinstance(command, str):
+        raise HTTPException(status_code=400, detail="'command' is required")
+
+    params = body.get("params") or {}
+    if not isinstance(params, dict):
+        raise HTTPException(status_code=400, detail="'params' must be an object")
+
+    timeout = float(body.get("timeout") or DEFAULT_COMMAND_TIMEOUT_S)
+    hub: BrowserHub = request.app.state.browser_hub
+
+    try:
+        result = await hub.send_command(command, params, timeout=timeout)
+    except BrowserNotConnected as e:
+        # 503, not 500: the backend is fine, the browser just isn't attached.
+        raise HTTPException(status_code=503, detail=f"browser not connected: {e}") from e
+    except BrowserCommandTimeout as e:
+        raise HTTPException(status_code=504, detail=str(e)) from e
+    except BrowserCommandError as e:
+        # The command ran and failed — a client error (bad selector, stale
+        # ref), distinct from the transport being broken.
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    return {"ok": True, "command": command, "result": result}
 
 
 @router.websocket("/api/browser/ws")

@@ -664,10 +664,6 @@ async def _handle_start(
         "pool": pool,
         "project_dir": project_dir,
         "index_dir": str(Path(project_dir) / "index" / "chroma"),
-        # Chrome-extension transport (api/routes/browser.py). Always present;
-        # the browser_* tools report "browser_unavailable" when nothing is
-        # attached, which is distinct from a command that ran and failed.
-        "browser_hub": getattr(ws.app.state, "browser_hub", None),
     }
 
     session = OrchestratorSession(
