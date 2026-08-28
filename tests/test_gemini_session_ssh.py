@@ -96,8 +96,11 @@ def test_ssh_session_wraps_argv_with_ssh_prefix():
     # The remote command substitutes the LOCAL gemini path with the
     # resolved REMOTE path and forwards the rest of the flags.
     remote_cmd = argv[-1]
+    # PATH prepends the CLI's own dir so its `#!/usr/bin/env node` shebang
+    # resolves on a non-interactive remote shell.
     assert remote_cmd.startswith(
-        "cd '/remote/project' && exec '/remote/.local/bin/gemini'"
+        "cd '/remote/project' && PATH=/remote/.local/bin:$PATH "
+        "exec '/remote/.local/bin/gemini'"
     )
     assert "'--prompt'" in remote_cmd
     # Embedded space survives shell quoting across SSH.
@@ -108,9 +111,13 @@ def test_ssh_session_wraps_argv_with_ssh_prefix():
     assert "/local/gemini" not in remote_cmd
 
 
-def test_ssh_wrapping_resolves_remote_path_with_extra_search_paths():
-    """When ``which gemini`` returns nothing (cron-style shell), the
-    fallback chain must be searched."""
+def test_ssh_wrapping_resolves_remote_path_for_gemini():
+    """The SSH wrap must resolve the *remote* gemini path, keyed by cli name.
+
+    The fallback search chain itself is no longer passed from here -- it
+    lives in :func:`manager._ssh.default_cli_search_paths` so every harness
+    shares one list.  This pins only what the call site still owns.
+    """
     sm = GeminiSessionManager(config=_ssh_cfg())
     captured: dict = {}
 
@@ -125,11 +132,6 @@ def test_ssh_wrapping_resolves_remote_path_with_extra_search_paths():
         sm._maybe_wrap_with_ssh(["/local/gemini", "--flag"])
 
     assert captured["cli_name"] == "gemini"
-    assert captured["extra_search_paths"] == [
-        "~/.local/bin/gemini",
-        "/usr/local/bin/gemini",
-        "/usr/bin/gemini",
-    ]
 
 
 def test_ssh_wrapping_does_not_forward_local_env():
@@ -229,13 +231,10 @@ async def test_prewarm_resolves_remote_cli_path_for_ssh_sessions():
         # Positional: cli_name="gemini", target=SshTarget(...).
         assert call_args.args[0] == "gemini"
         assert call_args.args[1].host == "10.0.0.2"
-        # Keyword: extra_search_paths should be the same fallback chain
-        # the real send() uses, so the cache entry is identical.
-        assert call_args.kwargs["extra_search_paths"] == [
-            "~/.local/bin/gemini",
-            "/usr/local/bin/gemini",
-            "/usr/bin/gemini",
-        ]
+        # The fallback chain is no longer passed per call site (it is
+        # appended inside resolve_remote_cli_path), so prewarm and send()
+        # necessarily agree and the cache entry is identical.
+        assert "extra_search_paths" not in call_args.kwargs
     finally:
         await sm.stop()
 
