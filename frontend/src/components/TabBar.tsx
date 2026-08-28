@@ -71,10 +71,12 @@ export function TabBar({ sessions, onRename }: Props) {
 
   const cancelEdit = () => setEditingTabId(null);
 
-  const doClose = async (sessionId: string) => {
-    closeTab(sessionId);
+  const doClose = async (tab: TabState) => {
+    closeTab(tab.sessionId);
+    // Viz tabs have no pool session behind them — nothing to close.
+    if (tab.vizPath) return;
     try {
-      await closePoolSession(sessionId);
+      await closePoolSession(tab.sessionId);
     } catch {
       // Session may not have been in the pool (e.g., never connected) — ignore
     }
@@ -84,7 +86,7 @@ export function TabBar({ sessions, onRename }: Props) {
     if (ACTIVE_STATUSES.has(tab.status)) {
       setPendingClose(tab);
     } else {
-      doClose(tab.sessionId);
+      doClose(tab);
     }
   };
 
@@ -132,9 +134,11 @@ export function TabBar({ sessions, onRename }: Props) {
               ) : (
                 <span
                   className="tab-title"
-                  title={isActive && !tab.isOrchestrator ? "Double-click to rename" : undefined}
+                  title={isActive && !tab.isOrchestrator && !tab.vizPath ? "Double-click to rename" : undefined}
                   onDoubleClick={(e) => {
-                    if (tab.isOrchestrator) return;
+                    // Viz titles are renamed from the sidebar (they persist to
+                    // .titles.json under a viz: key, not via session rename).
+                    if (tab.isOrchestrator || tab.vizPath) return;
                     e.stopPropagation();
                     startEdit(tab);
                   }}
@@ -162,7 +166,7 @@ export function TabBar({ sessions, onRename }: Props) {
           tab={pendingClose}
           title={titleFor(pendingClose)}
           onConfirm={() => {
-            doClose(pendingClose.sessionId);
+            doClose(pendingClose);
             setPendingClose(null);
           }}
           onCancel={() => setPendingClose(null)}

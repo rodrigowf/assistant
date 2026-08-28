@@ -9,13 +9,15 @@ import { OrchestratorModal } from "./components/OrchestratorModal";
 import { ConfirmModal } from "./components/ConfirmModal";
 
 const ConfigPage = lazy(() => import("./components/ConfigPage").then(m => ({ default: m.ConfigPage })));
-import { TabsProvider, useTabsContext } from "./context/TabsContext";
+import { TabsProvider, useTabsContext, vizTabId } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
+import { useVisualizations } from "./hooks/useVisualizations";
 import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
 import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
   const { sessions, deleting, duplicating, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
+  const { visualizations, refresh: refreshVisualizations, renameVisualization } = useVisualizations();
   const { syncPoolSessions } = useReconnectPoolSessions();
 
   // A session opened/closed anywhere (pool-watcher push arriving on an
@@ -25,13 +27,35 @@ function AppContent() {
   // tab-focus. Closed sessions drop out of the list on the same refresh.
   const handlePoolChanged = useCallback(() => {
     refresh();
+    refreshVisualizations();
     syncPoolSessions();
-  }, [refresh, syncPoolSessions]);
+  }, [refresh, refreshVisualizations, syncPoolSessions]);
+
+  // Session list + visualization list refresh together on turn completion, so
+  // an HTML file an agent just wrote shows up without a page reload. The viz
+  // scan is a stat() over ~26 files — cheap enough to piggyback here.
+  const handleSessionChange = useCallback(() => {
+    refresh();
+    refreshVisualizations();
+  }, [refresh, refreshVisualizations]);
   // Mutation in flight from ChatPanelContainer (rewind / fork). Shown as a
   // whole-app spinner overlay so the user can't queue a second mutation
   // while the first is still talking to the backend + reopening tabs.
   const [chatMutationBusy, setChatMutationBusy] = useState<string | null>(null);
-  const { tabs, openTab, closeTab, hasActiveOrchestrator } = useTabsContext();
+  const { tabs, openTab, closeTab, updateTab, hasActiveOrchestrator } = useTabsContext();
+
+  // Renaming a viz from the sidebar also retitles its open tab, since a viz
+  // tab's title is its own state (unlike chat tabs, which derive theirs from
+  // the session list).
+  const handleRenameVisualization = useCallback(
+    (path: string, title: string) => {
+      updateTab(vizTabId(path), { title });
+      renameVisualization(path, title).catch((e) => {
+        console.error("Rename visualization failed:", e);
+      });
+    },
+    [updateTab, renameVisualization]
+  );
   const [showOrchestratorModal, setShowOrchestratorModal] = useState(false);
   // Pending orchestrator action: either open new or resume existing
   const [pendingOrchestrator, setPendingOrchestrator] = useState<
@@ -134,6 +158,9 @@ function AppContent() {
     <>
       <Sidebar
         sessions={sessions}
+        visualizations={visualizations}
+        onRenameVisualization={handleRenameVisualization}
+        onRefreshVisualizations={refreshVisualizations}
         deleting={deleting}
         onDelete={requestDeleteSession}
         onRename={renameSession}
@@ -154,7 +181,7 @@ function AppContent() {
           </button>
           <TabBar sessions={sessions} onRename={renameSession} />
         </div>
-        <ChatPanelContainer sessions={sessions} onSessionChange={refresh} onPoolChanged={handlePoolChanged} onMutationBusy={setChatMutationBusy} />
+        <ChatPanelContainer sessions={sessions} onSessionChange={handleSessionChange} onPoolChanged={handlePoolChanged} onMutationBusy={setChatMutationBusy} />
         {/* Config floats over everything — chat instances stay mounted */}
         <Suspense fallback={null}>
           <ConfigPage isOpen={showConfig} onClose={() => setShowConfig(false)} />

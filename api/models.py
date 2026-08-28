@@ -22,6 +22,19 @@ class SessionInfoResponse(BaseModel):
     local_id: str | None = None
 
 
+class VisualizationInfoResponse(BaseModel):
+    """An HTML artifact under context/public/, listed in the sidebar."""
+
+    # Path relative to context/public/ — the stable identity/join key.
+    path: str
+    # URL it's served at (the SPA catch-all resolves context/public/ first).
+    url: str
+    title: str
+    created: str
+    modified: str
+    size: int
+
+
 class ContentBlockResponse(BaseModel):
     type: str  # "text" | "tool_use" | "tool_result"
     text: str | None = None

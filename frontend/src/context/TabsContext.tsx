@@ -13,6 +13,7 @@ import type { TabState, TabsState } from "../types";
 
 type TabsAction =
   | { type: "OPEN_TAB"; sessionId: string; title: string; isOrchestrator?: boolean; resumeSdkId?: string }
+  | { type: "OPEN_VIZ_TAB"; vizPath: string; vizUrl: string; title: string }
   | { type: "CLOSE_TAB"; sessionId: string }
   | { type: "SWITCH_TAB"; sessionId: string }
   | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">> };
@@ -25,6 +26,12 @@ const INITIAL_STATE: TabsState = {
   tabs: [],
   activeTabId: null,
 };
+
+/** Stable tab id for a visualization, namespaced so it can't collide with a
+ *  session UUID. */
+export function vizTabId(vizPath: string): string {
+  return `viz:${vizPath}`;
+}
 
 function reducer(state: TabsState, action: TabsAction): TabsState {
   switch (action.type) {
@@ -44,6 +51,30 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
       return {
         tabs: [...state.tabs, tab],
         activeTabId: action.sessionId,
+      };
+    }
+
+    case "OPEN_VIZ_TAB": {
+      // Viz tabs are keyed by their file path so reopening the same file
+      // switches to the existing tab instead of duplicating it.
+      const sessionId = vizTabId(action.vizPath);
+      if (state.tabs.some((t) => t.sessionId === sessionId)) {
+        return { ...state, activeTabId: sessionId };
+      }
+      const tab: TabState = {
+        sessionId,
+        title: action.title || action.vizPath,
+        // No backing session — a viz tab is never "connecting". Marking it
+        // idle/connected keeps status-derived UI (tab dots, close guards)
+        // correct without special-casing them.
+        status: "idle",
+        connectionState: "connected",
+        vizPath: action.vizPath,
+        vizUrl: action.vizUrl,
+      };
+      return {
+        tabs: [...state.tabs, tab],
+        activeTabId: sessionId,
       };
     }
 
@@ -90,6 +121,8 @@ interface TabsContextValue {
   tabs: TabState[];
   activeTabId: string | null;
   openTab: (sessionId: string, title?: string, isOrchestrator?: boolean, resumeSdkId?: string) => void;
+  /** Open (or switch to) a visualization tab for a context/public/ HTML file. */
+  openVizTab: (vizPath: string, vizUrl: string, title: string) => void;
   closeTab: (sessionId: string) => void;
   switchTab: (sessionId: string) => void;
   updateTab: (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">>) => void;
@@ -106,6 +139,10 @@ export function TabsProvider({ children }: { children: ReactNode }) {
 
   const openTab = useCallback((sessionId: string, title = "New session", isOrchestrator?: boolean, resumeSdkId?: string) => {
     dispatch({ type: "OPEN_TAB", sessionId, title, isOrchestrator, resumeSdkId });
+  }, []);
+
+  const openVizTab = useCallback((vizPath: string, vizUrl: string, title: string) => {
+    dispatch({ type: "OPEN_VIZ_TAB", vizPath, vizUrl, title });
   }, []);
 
   const closeTab = useCallback((sessionId: string) => {
@@ -144,6 +181,7 @@ export function TabsProvider({ children }: { children: ReactNode }) {
         tabs: state.tabs,
         activeTabId: state.activeTabId,
         openTab,
+        openVizTab,
         closeTab,
         switchTab,
         updateTab,
@@ -168,6 +206,8 @@ export function useTabsContext(): TabsContextValue {
 // -------------------------------------------------------------------
 
 export function getTabStatusIcon(tab: TabState): string | null {
+  // Viz tabs have no backing session — no liveness to report.
+  if (tab.vizPath) return null;
   // No dot for disconnected/error/connecting — shown via tab opacity
   if (tab.connectionState !== "connected") return null;
 

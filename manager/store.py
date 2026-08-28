@@ -306,10 +306,25 @@ class SessionStore:
         """Store a custom title for a session. Returns True if the session exists."""
         if self._locate_jsonl(session_id) is None:
             return False
-        titles = self._load_titles()
-        titles[session_id] = title.strip()
-        self._save_titles(titles)
+        self.set_title(session_id, title)
         return True
+
+    def set_title(self, key: str, title: str) -> None:
+        """Store a custom title under an arbitrary key in ``.titles.json``.
+
+        Unlike :meth:`rename_session` this performs no JSONL existence check,
+        so it can title things that aren't conversations — visualizations are
+        stored under a ``viz:<relative-path>`` key.  Sharing one file is safe
+        because titles are only ever consumed via ``titles.get(session_id)``
+        in the provider adapters, so foreign keys are inert to session listing.
+        """
+        titles = self._load_titles()
+        titles[key] = title.strip()
+        self._save_titles(titles)
+
+    def get_titles(self) -> dict[str, str]:
+        """Read-only snapshot of ``.titles.json`` (all keys, all namespaces)."""
+        return self._load_titles()
 
     def delete_session(self, session_id: str, *, skip_index_cleanup: bool = False) -> bool:
         """Soft-delete a session: move its JSONL into context/trash/.

@@ -13,6 +13,18 @@ export interface SessionInfo {
   local_id?: string;
 }
 
+/** An HTML artifact under context/public/, listed in the sidebar. */
+export interface VisualizationInfo {
+  /** Path relative to context/public/ — the stable identity/join key. */
+  path: string;
+  /** URL it's served at. */
+  url: string;
+  title: string;
+  created: string;
+  modified: string;
+  size: number;
+}
+
 export interface ContentBlock {
   type: "text" | "tool_use" | "tool_result";
   text?: string | null;
@@ -275,6 +287,12 @@ export interface TabState {
   status: SessionStatus;
   connectionState: ConnectionState;
   isOrchestrator?: boolean;
+  /** Set only on visualization tabs — path relative to context/public/.
+   *  A tab is a viz tab iff this is set; it has no backing session, so it
+   *  must be skipped everywhere a chat instance would otherwise be created. */
+  vizPath?: string;
+  /** URL the viz iframe loads. Only set alongside vizPath. */
+  vizUrl?: string;
 }
 
 export interface TabsState {

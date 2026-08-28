@@ -21,7 +21,7 @@ from manager.store import SessionStore
 from .connections import ConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
 from .pool import SessionPool
-from .routes import agents, auth, browser, chat, config, debug, mcp, orchestrator, sessions, skills, uploads, voice
+from .routes import agents, auth, browser, chat, config, debug, mcp, orchestrator, sessions, skills, uploads, visualizations, voice
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,7 @@ def create_app() -> FastAPI:
     app.include_router(uploads.router)
     app.include_router(debug.router)
     app.include_router(browser.router)
+    app.include_router(visualizations.router)
 
     # index.html must never be cached — it's the bootstrap that points to
     # the hashed bundle, so a cached copy traps the device on old code

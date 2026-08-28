@@ -1,10 +1,16 @@
-import type { SessionInfo } from "../types";
-import { useTabsContext, getTabStatusIcon } from "../context/TabsContext";
+import { useState } from "react";
+import type { SessionInfo, VisualizationInfo } from "../types";
+import { useTabsContext, getTabStatusIcon, vizTabId } from "../context/TabsContext";
 import { SessionItem } from "./SessionItem";
+import { VizItem } from "./VizItem";
 import { generateUUID } from "../utils/uuid";
 
 interface Props {
   sessions: SessionInfo[];
+  /** HTML artifacts under context/public/, shown in the Visualizations tab. */
+  visualizations: VisualizationInfo[];
+  onRenameVisualization: (path: string, title: string) => void;
+  onRefreshVisualizations: () => void;
   /** True while a delete is in flight — dims the list and shows a spinner. */
   deleting?: boolean;
   onDelete: (id: string) => void;
@@ -18,8 +24,10 @@ interface Props {
   onClose?: () => void;
 }
 
-export function Sidebar({ sessions, deleting, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
-  const { tabs, activeTabId, openTab, switchTab, findTabByResumeId } = useTabsContext();
+export function Sidebar({ sessions, visualizations, onRenameVisualization, onRefreshVisualizations, deleting, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
+  const { tabs, activeTabId, openTab, openVizTab, switchTab, findTabByResumeId } = useTabsContext();
+  // Which list the sidebar is showing. Local UI state — nothing else needs it.
+  const [section, setSection] = useState<"sessions" | "visualizations">("sessions");
 
   const handleSelect = (sdkId: string, localId?: string) => {
     // Priority 1: If we know the local_id (pool-live session), find tab directly by sessionId.
@@ -87,23 +95,43 @@ export function Sidebar({ sessions, deleting, onDelete, onRename, onDuplicate, o
     {isOpen && <div className="sidebar-backdrop" onClick={onClose} />}
     <aside className={`sidebar${isOpen ? " sidebar-open" : ""}`}>
       <div className="sidebar-header">
-        <h2 className="sidebar-title">Sessions</h2>
+        <h2 className="sidebar-title">
+          {section === "sessions" ? "Sessions" : "Visualizations"}
+        </h2>
         <div className="sidebar-header-actions">
-          <button
-            className="new-orchestrator-btn"
-            onClick={onNewOrchestrator}
-            title="New orchestrator"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="12" cy="12" r="3" />
-              <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
-            </svg>
-          </button>
-          <button className="new-session-btn" onClick={onNew} title="New session">
-            +
-          </button>
+          {section === "sessions" ? (
+            <>
+              <button
+                className="new-orchestrator-btn"
+                onClick={onNewOrchestrator}
+                title="New orchestrator"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                </svg>
+              </button>
+              <button className="new-session-btn" onClick={onNew} title="New session">
+                +
+              </button>
+            </>
+          ) : (
+            // No file watcher on the backend, so an explicit refresh is the
+            // way to pick up a visualization an agent just wrote.
+            <button
+              className="new-orchestrator-btn"
+              onClick={onRefreshVisualizations}
+              title="Refresh visualizations"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M23 4v6h-6M1 20v-6h6" />
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
+
       <button className="sidebar-config-btn" onClick={onOpenConfig} title="Configuration">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <circle cx="12" cy="12" r="3" />
@@ -111,32 +139,85 @@ export function Sidebar({ sessions, deleting, onDelete, onRename, onDuplicate, o
         </svg>
         Configuration
       </button>
+
+      {/* Sits directly on top of the list it switches. */}
+      <div className="sidebar-tabs" role="tablist">
+        <button
+          role="tab"
+          aria-selected={section === "sessions"}
+          className={`sidebar-tab${section === "sessions" ? " active" : ""}`}
+          onClick={() => setSection("sessions")}
+        >
+          Sessions
+          <span className="sidebar-tab-count">{sessions.length}</span>
+        </button>
+        <button
+          role="tab"
+          aria-selected={section === "visualizations"}
+          className={`sidebar-tab${section === "visualizations" ? " active" : ""}`}
+          onClick={() => setSection("visualizations")}
+        >
+          Visualizations
+          <span className="sidebar-tab-count">{visualizations.length}</span>
+        </button>
+      </div>
+
       <div className="session-list-wrap">
         <div className={`session-list${deleting ? " session-list--busy" : ""}`}>
-          {sessions.map((s) => {
-            // A session item is active if the current tab matches by resumeSdkId or by local_id
-            const isActive =
-              activeTab?.resumeSdkId === s.session_id ||
-              (!!s.local_id && activeTab?.sessionId === s.local_id);
-            return (
-              <SessionItem
-                key={s.session_id}
-                session={s}
-                active={isActive}
-                tabOpen={sdkTabOpenSet.has(s.session_id)}
-                tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
-                onClick={() => handleSelect(s.session_id, s.local_id)}
-                onDelete={() => onDelete(s.session_id)}
-                onRename={(title) => onRename(s.session_id, title)}
-                onDuplicate={() => onDuplicate(s.session_id)}
-              />
-            );
-          })}
-          {sessions.length === 0 && (
-            <div className="sidebar-empty">No sessions yet</div>
+          {section === "sessions" ? (
+            <>
+              {sessions.map((s) => {
+                // A session item is active if the current tab matches by resumeSdkId or by local_id
+                const isActive =
+                  activeTab?.resumeSdkId === s.session_id ||
+                  (!!s.local_id && activeTab?.sessionId === s.local_id);
+                return (
+                  <SessionItem
+                    key={s.session_id}
+                    session={s}
+                    active={isActive}
+                    tabOpen={sdkTabOpenSet.has(s.session_id)}
+                    tabStatus={sdkTabStatusMap.get(s.session_id) ?? undefined}
+                    onClick={() => handleSelect(s.session_id, s.local_id)}
+                    onDelete={() => onDelete(s.session_id)}
+                    onRename={(title) => onRename(s.session_id, title)}
+                    onDuplicate={() => onDuplicate(s.session_id)}
+                  />
+                );
+              })}
+              {sessions.length === 0 && (
+                <div className="sidebar-empty">No sessions yet</div>
+              )}
+            </>
+          ) : (
+            <>
+              {visualizations.map((v) => {
+                const tabId = vizTabId(v.path);
+                return (
+                  <VizItem
+                    key={v.path}
+                    viz={v}
+                    active={activeTabId === tabId}
+                    tabOpen={tabs.some((t) => t.sessionId === tabId)}
+                    onClick={() => {
+                      openVizTab(v.path, v.url, v.title);
+                      onClose?.();
+                    }}
+                    onRename={(title) => onRenameVisualization(v.path, title)}
+                  />
+                );
+              })}
+              {visualizations.length === 0 && (
+                <div className="sidebar-empty">
+                  No visualizations yet.
+                  <br />
+                  HTML files under context/public/ appear here.
+                </div>
+              )}
+            </>
           )}
         </div>
-        {deleting && (
+        {deleting && section === "sessions" && (
           <div className="session-list-overlay" aria-busy="true" aria-live="polite">
             <div className="session-list-spinner" aria-hidden="true" />
             <span className="session-list-overlay-label">Deleting…</span>

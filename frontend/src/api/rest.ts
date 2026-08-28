@@ -1,4 +1,4 @@
-import type { SessionInfo, SessionDetail, MessagePreview, PaginatedMessages } from "../types";
+import type { SessionInfo, SessionDetail, MessagePreview, PaginatedMessages, VisualizationInfo } from "../types";
 
 const BASE = "/api";
 
@@ -31,6 +31,19 @@ export async function renameSession(id: string, title: string): Promise<void> {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title }),
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
+}
+
+export function listVisualizations(): Promise<VisualizationInfo[]> {
+  return json(`${BASE}/visualizations`);
+}
+
+export async function renameVisualization(path: string, title: string): Promise<void> {
+  const res = await fetch(`${BASE}/visualizations/rename`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, title }),
   });
   if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
 }

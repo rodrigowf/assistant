@@ -3,6 +3,7 @@ import { useTabsContext } from "../context/TabsContext";
 import { useChatInstance, type ChatInstance } from "../hooks/useChatInstance";
 import { useVoiceOrchestrator } from "../hooks/useVoiceOrchestrator";
 import { ChatPanel } from "./ChatPanel";
+import { VizPanel } from "./VizPanel";
 import { ConfirmModal } from "./ConfirmModal";
 import {
   closePoolSession,
@@ -334,7 +335,11 @@ export function ChatPanelContainer({
     [closeTab]
   );
 
+  const activeTab = activeTabId ? tabs.find((t) => t.sessionId === activeTabId) : undefined;
   const activeInstance = activeTabId ? instancesRef.current.get(activeTabId) : undefined;
+  // A viz tab renders its own panel and has no ChatInstance — without this it
+  // would fall through to the "No session open" empty state.
+  const hasActivePanel = !!activeInstance || !!activeTab?.vizPath;
 
   // Check if any model supports audio (show button if audio is available)
   const supportsAudio = (modelsInfo?.audio_capable_models?.length ?? 0) > 0;
@@ -344,8 +349,10 @@ export function ChatPanelContainer({
 
   return (
     <>
-      {/* Render a headless TabInstance for each open tab */}
-      {tabs.map((tab) => (
+      {/* Render a headless TabInstance for each open chat tab. Viz tabs are
+           backed by a static file, not a session — creating a ChatInstance for
+           one would open a WebSocket for a session id that doesn't exist. */}
+      {tabs.filter((tab) => !tab.vizPath).map((tab) => (
         <TabInstance
           key={tab.sessionId}
           sessionId={tab.sessionId}
@@ -364,15 +371,26 @@ export function ChatPanelContainer({
       {/* Render ChatPanels for ALL tabs — inactive ones hidden with display:none
            so hooks (including voice WebRTC) stay alive across tab switches. */}
       {tabs.map((tab) => {
+        const isActive = tab.sessionId === activeTabId;
+        const wrapperStyle = isActive
+          ? { flex: 1, display: "flex", flexDirection: "column" as const, minHeight: 0, minWidth: 0 }
+          : { display: "none" };
+
+        // Viz tab: a framed static file, no chat instance involved.
+        if (tab.vizPath) {
+          return (
+            <div key={tab.sessionId} style={wrapperStyle}>
+              <VizPanel title={tab.title} url={tab.vizUrl ?? `/${tab.vizPath}`} />
+            </div>
+          );
+        }
+
         const inst = instancesRef.current.get(tab.sessionId);
         if (!inst) return null;
-        const isActive = tab.sessionId === activeTabId;
         return (
           <div
             key={tab.sessionId}
-            style={isActive
-              ? { flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0 }
-              : { display: "none" }}
+            style={wrapperStyle}
           >
             {tab.isOrchestrator ? (
               <OrchestratorChatPanel
@@ -420,7 +438,7 @@ export function ChatPanelContainer({
       })}
 
       {/* Empty state when no active instance */}
-      {!activeInstance && (
+      {!hasActivePanel && (
         <main className="chat-panel">
           <div className="message-list empty">
             <div className="empty-state">
