@@ -25,6 +25,15 @@ export interface VisualizationInfo {
   size: number;
 }
 
+/** A node in the context/memory/ markdown tree. */
+export interface MemoryNode {
+  name: string;
+  /** Path relative to context/memory/ — identity and URL suffix. */
+  path: string;
+  is_dir: boolean;
+  children?: MemoryNode[] | null;
+}
+
 export interface ContentBlock {
   type: "text" | "tool_use" | "tool_result";
   text?: string | null;
@@ -293,6 +302,9 @@ export interface TabState {
   vizPath?: string;
   /** URL the viz iframe loads. Only set alongside vizPath. */
   vizUrl?: string;
+  /** Set only on memory tabs — path relative to context/memory/. Like
+   *  vizPath, marks a tab with no backing session. */
+  memoryPath?: string;
 }
 
 export interface TabsState {

@@ -1,9 +1,10 @@
 import { useRef, useEffect, useCallback, useState, lazy, Suspense } from "react";
-import { useTabsContext } from "../context/TabsContext";
+import { useTabsContext, isDocTab } from "../context/TabsContext";
 import { useChatInstance, type ChatInstance } from "../hooks/useChatInstance";
 import { useVoiceOrchestrator } from "../hooks/useVoiceOrchestrator";
 import { ChatPanel } from "./ChatPanel";
 import { VizPanel } from "./VizPanel";
+import { MemoryPanel } from "./MemoryPanel";
 import { ConfirmModal } from "./ConfirmModal";
 import {
   closePoolSession,
@@ -337,9 +338,9 @@ export function ChatPanelContainer({
 
   const activeTab = activeTabId ? tabs.find((t) => t.sessionId === activeTabId) : undefined;
   const activeInstance = activeTabId ? instancesRef.current.get(activeTabId) : undefined;
-  // A viz tab renders its own panel and has no ChatInstance — without this it
+  // A doc tab renders its own panel and has no ChatInstance — without this it
   // would fall through to the "No session open" empty state.
-  const hasActivePanel = !!activeInstance || !!activeTab?.vizPath;
+  const hasActivePanel = !!activeInstance || (!!activeTab && isDocTab(activeTab));
 
   // Check if any model supports audio (show button if audio is available)
   const supportsAudio = (modelsInfo?.audio_capable_models?.length ?? 0) > 0;
@@ -349,10 +350,11 @@ export function ChatPanelContainer({
 
   return (
     <>
-      {/* Render a headless TabInstance for each open chat tab. Viz tabs are
-           backed by a static file, not a session — creating a ChatInstance for
-           one would open a WebSocket for a session id that doesn't exist. */}
-      {tabs.filter((tab) => !tab.vizPath).map((tab) => (
+      {/* Render a headless TabInstance for each open chat tab. Doc tabs (viz,
+           memory) are backed by a static file, not a session — creating a
+           ChatInstance for one would open a WebSocket for a session id that
+           doesn't exist. */}
+      {tabs.filter((tab) => !isDocTab(tab)).map((tab) => (
         <TabInstance
           key={tab.sessionId}
           sessionId={tab.sessionId}
@@ -376,11 +378,18 @@ export function ChatPanelContainer({
           ? { flex: 1, display: "flex", flexDirection: "column" as const, minHeight: 0, minWidth: 0 }
           : { display: "none" };
 
-        // Viz tab: a framed static file, no chat instance involved.
+        // Doc tabs: a static file, no chat instance involved.
         if (tab.vizPath) {
           return (
             <div key={tab.sessionId} style={wrapperStyle}>
               <VizPanel title={tab.title} url={tab.vizUrl ?? `/${tab.vizPath}`} />
+            </div>
+          );
+        }
+        if (tab.memoryPath) {
+          return (
+            <div key={tab.sessionId} style={wrapperStyle}>
+              <MemoryPanel title={tab.title} path={tab.memoryPath} />
             </div>
           );
         }

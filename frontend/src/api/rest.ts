@@ -1,4 +1,4 @@
-import type { SessionInfo, SessionDetail, MessagePreview, PaginatedMessages, VisualizationInfo } from "../types";
+import type { SessionInfo, SessionDetail, MessagePreview, PaginatedMessages, VisualizationInfo, MemoryNode } from "../types";
 
 const BASE = "/api";
 
@@ -46,6 +46,18 @@ export async function renameVisualization(path: string, title: string): Promise<
     body: JSON.stringify({ path, title }),
   });
   if (!res.ok && res.status !== 404) throw new Error(`${res.status}`);
+}
+
+export function getMemoryTree(): Promise<MemoryNode[]> {
+  return json(`${BASE}/memory/tree`);
+}
+
+/** Raw markdown for a memory file. Served by the `/memory/<path>` static
+ *  route in api/app.py, not by an /api endpoint. */
+export async function getMemoryFile(path: string): Promise<string> {
+  const res = await fetch(`/memory/${path}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.text();
 }
 
 export async function deleteSession(id: string): Promise<void> {

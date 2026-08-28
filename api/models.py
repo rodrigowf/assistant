@@ -35,6 +35,20 @@ class VisualizationInfoResponse(BaseModel):
     size: int
 
 
+class MemoryNodeResponse(BaseModel):
+    """A node in the context/memory/ markdown tree.
+
+    Directories carry ``children``; files leave it None. ``path`` is relative
+    to context/memory/ and doubles as the node's identity and its URL suffix
+    (the ``/memory/<path>`` route in api/app.py serves the raw file).
+    """
+
+    name: str
+    path: str
+    is_dir: bool
+    children: list["MemoryNodeResponse"] | None = None
+
+
 class ContentBlockResponse(BaseModel):
     type: str  # "text" | "tool_use" | "tool_result"
     text: str | None = None

@@ -12,12 +12,14 @@ const ConfigPage = lazy(() => import("./components/ConfigPage").then(m => ({ def
 import { TabsProvider, useTabsContext, vizTabId } from "./context/TabsContext";
 import { useSessions } from "./hooks/useSessions";
 import { useVisualizations } from "./hooks/useVisualizations";
+import { useMemoryTree } from "./hooks/useMemoryTree";
 import { useReconnectPoolSessions } from "./hooks/useReconnectPoolSessions";
 import { generateUUID } from "./utils/uuid";
 
 function AppContent() {
   const { sessions, deleting, duplicating, refresh, deleteSession, renameSession, duplicateSession } = useSessions();
   const { visualizations, refresh: refreshVisualizations, renameVisualization } = useVisualizations();
+  const { memoryTree, refresh: refreshMemory } = useMemoryTree();
   const { syncPoolSessions } = useReconnectPoolSessions();
 
   // A session opened/closed anywhere (pool-watcher push arriving on an
@@ -161,6 +163,8 @@ function AppContent() {
         visualizations={visualizations}
         onRenameVisualization={handleRenameVisualization}
         onRefreshVisualizations={refreshVisualizations}
+        memoryTree={memoryTree}
+        onRefreshMemory={refreshMemory}
         deleting={deleting}
         onDelete={requestDeleteSession}
         onRename={renameSession}

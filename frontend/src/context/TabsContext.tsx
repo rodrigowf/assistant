@@ -14,6 +14,7 @@ import type { TabState, TabsState } from "../types";
 type TabsAction =
   | { type: "OPEN_TAB"; sessionId: string; title: string; isOrchestrator?: boolean; resumeSdkId?: string }
   | { type: "OPEN_VIZ_TAB"; vizPath: string; vizUrl: string; title: string }
+  | { type: "OPEN_MEMORY_TAB"; memoryPath: string; title: string }
   | { type: "CLOSE_TAB"; sessionId: string }
   | { type: "SWITCH_TAB"; sessionId: string }
   | { type: "UPDATE_TAB"; sessionId: string; updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">> };
@@ -31,6 +32,20 @@ const INITIAL_STATE: TabsState = {
  *  session UUID. */
 export function vizTabId(vizPath: string): string {
   return `viz:${vizPath}`;
+}
+
+/** Stable tab id for a memory file. Same namespacing rationale as vizTabId. */
+export function memoryTabId(memoryPath: string): string {
+  return `memory:${memoryPath}`;
+}
+
+/**
+ * True for tabs backed by a static file (visualization or memory doc) rather
+ * than a session. These must be skipped anywhere a ChatInstance would be
+ * created or a pool session closed — there's no session id behind them.
+ */
+export function isDocTab(tab: TabState): boolean {
+  return !!(tab.vizPath || tab.memoryPath);
 }
 
 function reducer(state: TabsState, action: TabsAction): TabsState {
@@ -71,6 +86,25 @@ function reducer(state: TabsState, action: TabsAction): TabsState {
         connectionState: "connected",
         vizPath: action.vizPath,
         vizUrl: action.vizUrl,
+      };
+      return {
+        tabs: [...state.tabs, tab],
+        activeTabId: sessionId,
+      };
+    }
+
+    case "OPEN_MEMORY_TAB": {
+      const sessionId = memoryTabId(action.memoryPath);
+      if (state.tabs.some((t) => t.sessionId === sessionId)) {
+        return { ...state, activeTabId: sessionId };
+      }
+      const tab: TabState = {
+        sessionId,
+        title: action.title || action.memoryPath,
+        // No backing session — see the OPEN_VIZ_TAB note.
+        status: "idle",
+        connectionState: "connected",
+        memoryPath: action.memoryPath,
       };
       return {
         tabs: [...state.tabs, tab],
@@ -123,6 +157,8 @@ interface TabsContextValue {
   openTab: (sessionId: string, title?: string, isOrchestrator?: boolean, resumeSdkId?: string) => void;
   /** Open (or switch to) a visualization tab for a context/public/ HTML file. */
   openVizTab: (vizPath: string, vizUrl: string, title: string) => void;
+  /** Open (or switch to) a tab rendering a context/memory/ markdown file. */
+  openMemoryTab: (memoryPath: string, title: string) => void;
   closeTab: (sessionId: string) => void;
   switchTab: (sessionId: string) => void;
   updateTab: (sessionId: string, updates: Partial<Pick<TabState, "status" | "connectionState" | "title" | "resumeSdkId">>) => void;
@@ -143,6 +179,10 @@ export function TabsProvider({ children }: { children: ReactNode }) {
 
   const openVizTab = useCallback((vizPath: string, vizUrl: string, title: string) => {
     dispatch({ type: "OPEN_VIZ_TAB", vizPath, vizUrl, title });
+  }, []);
+
+  const openMemoryTab = useCallback((memoryPath: string, title: string) => {
+    dispatch({ type: "OPEN_MEMORY_TAB", memoryPath, title });
   }, []);
 
   const closeTab = useCallback((sessionId: string) => {
@@ -182,6 +222,7 @@ export function TabsProvider({ children }: { children: ReactNode }) {
         activeTabId: state.activeTabId,
         openTab,
         openVizTab,
+        openMemoryTab,
         closeTab,
         switchTab,
         updateTab,
@@ -206,8 +247,8 @@ export function useTabsContext(): TabsContextValue {
 // -------------------------------------------------------------------
 
 export function getTabStatusIcon(tab: TabState): string | null {
-  // Viz tabs have no backing session — no liveness to report.
-  if (tab.vizPath) return null;
+  // Doc tabs have no backing session — no liveness to report.
+  if (isDocTab(tab)) return null;
   // No dot for disconnected/error/connecting — shown via tab opacity
   if (tab.connectionState !== "connected") return null;
 

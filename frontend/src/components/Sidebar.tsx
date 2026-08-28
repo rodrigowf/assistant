@@ -1,8 +1,9 @@
 import { useState } from "react";
-import type { SessionInfo, VisualizationInfo } from "../types";
+import type { SessionInfo, VisualizationInfo, MemoryNode } from "../types";
 import { useTabsContext, getTabStatusIcon, vizTabId } from "../context/TabsContext";
 import { SessionItem } from "./SessionItem";
 import { VizItem } from "./VizItem";
+import { MemoryTree } from "./MemoryTree";
 import { generateUUID } from "../utils/uuid";
 
 interface Props {
@@ -11,6 +12,9 @@ interface Props {
   visualizations: VisualizationInfo[];
   onRenameVisualization: (path: string, title: string) => void;
   onRefreshVisualizations: () => void;
+  /** Markdown tree under context/memory/, shown in the Memory tab. */
+  memoryTree: MemoryNode[];
+  onRefreshMemory: () => void;
   /** True while a delete is in flight — dims the list and shows a spinner. */
   deleting?: boolean;
   onDelete: (id: string) => void;
@@ -24,10 +28,18 @@ interface Props {
   onClose?: () => void;
 }
 
-export function Sidebar({ sessions, visualizations, onRenameVisualization, onRefreshVisualizations, deleting, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
-  const { tabs, activeTabId, openTab, openVizTab, switchTab, findTabByResumeId } = useTabsContext();
+export function Sidebar({ sessions, visualizations, onRenameVisualization, onRefreshVisualizations, memoryTree, onRefreshMemory, deleting, onDelete, onRename, onDuplicate, onNew, onNewOrchestrator, onSelectOrchestrator, onOpenConfig, isOpen, onClose }: Props) {
+  const { tabs, activeTabId, openTab, openVizTab, openMemoryTab, switchTab, findTabByResumeId } = useTabsContext();
   // Which list the sidebar is showing. Local UI state — nothing else needs it.
-  const [section, setSection] = useState<"sessions" | "visualizations">("sessions");
+  const [section, setSection] = useState<"sessions" | "memory" | "visualizations">("sessions");
+
+  // Which memory files are open in tabs, for the tree's open/active styling.
+  const openMemoryPaths = new Set(
+    tabs.map((t) => t.memoryPath).filter((p): p is string => !!p)
+  );
+  const activeMemoryPath = activeTabId
+    ? tabs.find((t) => t.sessionId === activeTabId)?.memoryPath
+    : undefined;
 
   const handleSelect = (sdkId: string, localId?: string) => {
     // Priority 1: If we know the local_id (pool-live session), find tab directly by sessionId.
@@ -96,7 +108,7 @@ export function Sidebar({ sessions, visualizations, onRenameVisualization, onRef
     <aside className={`sidebar${isOpen ? " sidebar-open" : ""}`}>
       <div className="sidebar-header">
         <h2 className="sidebar-title">
-          {section === "sessions" ? "Sessions" : "Visualizations"}
+          {section === "sessions" ? "Sessions" : section === "memory" ? "Memory" : "Visualizations"}
         </h2>
         <div className="sidebar-header-actions">
           {section === "sessions" ? (
@@ -117,11 +129,11 @@ export function Sidebar({ sessions, visualizations, onRenameVisualization, onRef
             </>
           ) : (
             // No file watcher on the backend, so an explicit refresh is the
-            // way to pick up a visualization an agent just wrote.
+            // way to pick up a file an agent just wrote.
             <button
               className="new-orchestrator-btn"
-              onClick={onRefreshVisualizations}
-              title="Refresh visualizations"
+              onClick={section === "memory" ? onRefreshMemory : onRefreshVisualizations}
+              title={section === "memory" ? "Refresh memory tree" : "Refresh visualizations"}
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M23 4v6h-6M1 20v-6h6" />
@@ -153,11 +165,20 @@ export function Sidebar({ sessions, visualizations, onRenameVisualization, onRef
         </button>
         <button
           role="tab"
+          aria-selected={section === "memory"}
+          className={`sidebar-tab${section === "memory" ? " active" : ""}`}
+          onClick={() => setSection("memory")}
+        >
+          Memory
+          <span className="sidebar-tab-count">{countFiles(memoryTree)}</span>
+        </button>
+        <button
+          role="tab"
           aria-selected={section === "visualizations"}
           className={`sidebar-tab${section === "visualizations" ? " active" : ""}`}
           onClick={() => setSection("visualizations")}
         >
-          Visualizations
+          Visuals
           <span className="sidebar-tab-count">{visualizations.length}</span>
         </button>
       </div>
@@ -187,6 +208,26 @@ export function Sidebar({ sessions, visualizations, onRenameVisualization, onRef
               })}
               {sessions.length === 0 && (
                 <div className="sidebar-empty">No sessions yet</div>
+              )}
+            </>
+          ) : section === "memory" ? (
+            <>
+              {memoryTree.length > 0 ? (
+                <MemoryTree
+                  nodes={memoryTree}
+                  activePath={activeMemoryPath}
+                  openPaths={openMemoryPaths}
+                  onSelect={(node) => {
+                    openMemoryTab(node.path, node.name.replace(/\.md$/i, ""));
+                    onClose?.();
+                  }}
+                />
+              ) : (
+                <div className="sidebar-empty">
+                  No memory files.
+                  <br />
+                  Markdown under context/memory/ appears here.
+                </div>
               )}
             </>
           ) : (
@@ -226,5 +267,13 @@ export function Sidebar({ sessions, visualizations, onRenameVisualization, onRef
       </div>
     </aside>
     </>
+  );
+}
+
+/** Total markdown files in the tree — the Memory tab's count badge. */
+function countFiles(nodes: MemoryNode[]): number {
+  return nodes.reduce(
+    (sum, n) => sum + (n.children ? countFiles(n.children) : 1),
+    0
   );
 }
