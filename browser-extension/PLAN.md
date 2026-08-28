@@ -378,26 +378,51 @@ Recorded so the plan stays an honest account of what was built.
 
    The fixtures only exercised single-snapshot flows, which is why both hid.
 
-## Stage 2 — deployment (not started)
+## Stage 2 — deployment (COMPLETE, 2026-08-28)
 
-The Jetson (`server`, 192.168.0.200) is the backend of record and is still on
-`local` @ `70f254f`; `api/routes/browser.py` and `browser-extension/` are absent
-there. All of this work is uncommitted on the laptop.
+Deployed as `8f7303a`. The Jetson (`server`, 192.168.0.200) runs the backend as
+the **system** unit `agentic-backend.service` (uvicorn on 127.0.0.1:8765,
+`Restart=on-failure`, `User=rodrigo`), fronted by a 443 listener.
 
-Deployment needs, in order:
+Verified in production: route live through 443, `token_configured: true`, WSS
+handshake accepted with a valid token and **refused** with an invalid one,
+screenshot upload through 443, and 55 tests passing on aarch64.
 
-1. Commit + push from the laptop, pull on the Jetson (needs Rodrigo's go-ahead)
-2. Restart the Jetson backend
-3. Repoint the extension at the Jetson. Note its backend binds **127.0.0.1:8765**
-   and is fronted by the 443 listener, so the URL is
-   `wss://192.168.0.200/api/browser/ws` — *not* `ws://…:8765`. Confirm that
-   proxy forwards WebSocket upgrades before relying on it.
-4. `BROWSER_CONTROL_TOKEN` is already present in the Jetson's `context/.env`
-   via context-sync — no action needed.
+### The connection route: SSH tunnel, not `wss://`
 
-Security note for step 3: moving off loopback puts a socket that can run
-unrestricted JS in a logged-in browser onto the LAN. The shared token is the
-only thing in front of it.
+The obvious plan — point the extension at `wss://server.local/api/browser/ws` —
+**does not work**, and the reason is worth remembering:
+
+- The Jetson's cert is issued by a private "Home CA" that the laptop does not
+  trust (`verify error:num=20: unable to get local issuer certificate`).
+- Rodrigo can browse `https://server.local/` because he clicked through the
+  interstitial once. **That exception applies only to page navigations.** A
+  `wss://` connection from an extension service worker has no UI to prompt
+  with, so it fails outright — surfacing as a bare transport error, with
+  nothing at all reaching the server.
+
+The working route is an SSH tunnel from the laptop:
+
+    ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+        -L 8765:127.0.0.1:8765 rodrigo@192.168.0.200
+
+with the extension left on its default `ws://127.0.0.1:8765/api/browser/ws`.
+
+This is also **strictly safer** than the `wss://` route, and retracts the
+LAN-exposure warning previously recorded here: the Jetson's backend stays bound
+to loopback, so nothing on the network can reach a socket that runs arbitrary
+JS in a logged-in browser — only an authenticated SSH session from the laptop.
+
+Caveat: the tunnel is `ssh -f -N`, so it does not survive a reboot or a long
+network drop. A systemd user unit with `autossh` is the durable form if this
+becomes daily-use. The alternative — installing the Home CA into the system
+trust store *and* Chrome's NSS db (`libnss3-tools`) — would enable direct
+`wss://`, at the cost of more moving parts and a worse security posture.
+
+Note: restarting the service needs `sudo` on the Jetson (no passwordless sudo,
+polkit refuses over SSH):
+
+    ssh -t rodrigo@192.168.0.200 'sudo systemctl restart agentic-backend'
 
 ---
 
