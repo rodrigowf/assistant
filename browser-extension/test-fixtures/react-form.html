@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Controlled Form</title>
+</head>
+<body>
+  <h1>Sign up</h1>
+
+  <!-- Hashed class names, as Tailwind / CSS-in-JS produce. Selector
+       generation must not depend on these. -->
+  <form class="css-1x2y3z4">
+    <input class="css-a1b2c3" type="text" name="email" placeholder="Email address" />
+    <textarea class="css-d4e5f6" name="bio" placeholder="About you"></textarea>
+    <select name="plan">
+      <option value="free">Free</option>
+      <option value="pro">Pro</option>
+    </select>
+    <input type="checkbox" name="tos" />
+    <button type="button" class="css-g7h8i9">Create account</button>
+  </form>
+
+  <div id="state-mirror">state:</div>
+
+  <script>
+    // Faithful reproduction of React's value tracker (ReactDOM's
+    // inputValueTracking). React defines an *instance* value property that
+    // records the last value it observed. Writing `el.value = x` goes through
+    // that setter, so the tracker's recorded value updates too and React
+    // concludes nothing changed — the input event is swallowed and component
+    // state stays stale.
+    //
+    // Writing through the *prototype* setter (what setNativeValue does)
+    // bypasses the instance property, leaving the tracker stale, so the change
+    // is detected. This fixture fails for naive `.value =` assignment and
+    // passes only for the native-setter approach.
+    const componentState = {};
+
+    // Mirror state into the DOM so a snapshot can verify it without needing
+    // execute_js — otherwise a fill/click test would depend on the injection
+    // feature it is not trying to test.
+    function render() {
+      document.getElementById("state-mirror").textContent =
+        "state:" + JSON.stringify(componentState);
+    }
+
+    function track(node) {
+      const proto = node instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      let tracked = "" + node.value;
+
+      Object.defineProperty(node, "value", {
+        configurable: true,
+        get() { return descriptor.get.call(this); },
+        set(v) { tracked = "" + v; descriptor.set.call(this, v); },
+      });
+
+      node.addEventListener("input", () => {
+        const current = descriptor.get.call(node);
+        if ("" + current === tracked) return;  // React ignores it
+        tracked = "" + current;
+        componentState[node.name] = current;
+        render();
+      });
+    }
+
+    track(document.querySelector('input[name="email"]'));
+    track(document.querySelector('textarea[name="bio"]'));
+
+    document.querySelector('select[name="plan"]').addEventListener("change", (e) => {
+      componentState.plan = e.target.value;
+      render();
+    });
+    document.querySelector('input[name="tos"]').addEventListener("change", (e) => {
+      componentState.tos = e.target.checked;
+      render();
+    });
+    document.querySelector("button").addEventListener("click", () => {
+      componentState.submitted = true;
+      render();
+    });
+
+    window.__componentState = componentState;
+  </script>
+
+  <script src="../src/content/snapshot-core.js"></script>
+  <script src="./assert.js"></script>
+  <script>
+    window.__runTests = () => {
+      const t = new Harness();
+      const core = window.__archieCore;
+      const snap = core.snapshot({});
+
+      // Selectors must come from stable attributes, never hashed classes.
+      const email = snap.elements.find((e) => e.role === "input:text");
+      t.ok(email, "text input captured");
+      t.ok(email && !/css-/.test(email.selector),
+           `selector avoids hashed class (got ${email && email.selector})`);
+      t.ok(email && email.selector.includes("email"), "selector uses the name attribute");
+
+      // THE test: filling must update component state, not just the DOM.
+      core.fill({ selector: 'input[name="email"]', value: "user@example.com" });
+      t.eq(document.querySelector('input[name="email"]').value,
+           "user@example.com", "DOM value updated");
+      t.eq(window.__componentState.email,
+           "user@example.com", "component state updated (React value tracker defeated)");
+
+      core.fill({ selector: 'textarea[name="bio"]', value: "hello there" });
+      t.eq(window.__componentState.bio, "hello there", "textarea component state updated");
+
+      // Select by value and by visible label.
+      core.fill({ selector: 'select[name="plan"]', value: "pro" });
+      t.eq(window.__componentState.plan, "pro", "select filled by value");
+      core.fill({ selector: 'select[name="plan"]', value: "Free" });
+      t.eq(window.__componentState.plan, "free", "select filled by visible label");
+      t.throws(() => core.fill({ selector: 'select[name="plan"]', value: "nope" }),
+               "no_option", "unknown select option rejected");
+
+      // Checkbox
+      core.fill({ selector: 'input[name="tos"]', checked: true });
+      t.eq(window.__componentState.tos, true, "checkbox checked");
+
+      // Click
+      core.click({ selector: "button" });
+      t.eq(window.__componentState.submitted, true, "click handler fired");
+
+      // Fill on a non-fillable element is rejected rather than silently ignored.
+      t.throws(() => core.fill({ selector: "h1", value: "x" }),
+               "not_fillable", "filling a heading rejected");
+
+      // Targeting errors
+      t.throws(() => core.click({ selector: "#does-not-exist" }),
+               "no_match", "missing selector rejected");
+      t.throws(() => core.click({ ref: "e999" }),
+               "unknown_ref", "unknown ref rejected");
+      t.throws(() => core.click({}), "target required", "no target rejected");
+
+      // Ref-based targeting works.
+      const button = snap.elements.find((e) => e.role === "button");
+      window.__componentState.submitted = false;
+      core.click({ ref: button.ref });
+      t.eq(window.__componentState.submitted, true, "click by ref works");
+
+      return t.report();
+    };
+  </script>
+</body>
+</html>

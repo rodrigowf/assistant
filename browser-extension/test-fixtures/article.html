@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Test Article</title>
+  <style>
+    .hidden-display { display: none; }
+    .hidden-vis { visibility: hidden; }
+    .zero { width: 0; height: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <h1>Main Heading</h1>
+  <p>An introductory paragraph with some text.</p>
+
+  <h2>Subsection</h2>
+  <ul>
+    <li>First item</li>
+    <li>Second item with a <a href="https://example.com/link">link</a></li>
+  </ul>
+
+  <button id="submit-btn">Submit</button>
+  <button disabled data-testid="disabled-btn">Disabled Action</button>
+
+  <img src="data:image/gif;base64,R0lGODlhZABkAIAAAP///wAAACH5BAEAAAAALAAAAABkAGQAAAIshI+py+0Po5y02ouz3rz7D4biSJbmiabqyrbuC8fyTNf2jef6zvf+DwwKAQA7"
+       alt="A test image" width="100" height="100" />
+  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+       alt="tracking pixel" width="1" height="1" />
+
+  <p class="hidden-display">This text is display:none and must not appear.</p>
+  <p class="hidden-vis">This text is visibility:hidden and must not appear.</p>
+  <p aria-hidden="true">This text is aria-hidden and must not appear.</p>
+  <div class="zero"><span>zero sized content</span></div>
+  <script>var notRendered = "script contents must not appear";</script>
+
+  <script src="../src/content/snapshot-core.js"></script>
+  <script src="./assert.js"></script>
+  <script>
+    window.__runTests = () => {
+      const t = new Harness();
+      const snap = window.__archieCore.snapshot({});
+
+      t.ok(snap.generation === 1, "first snapshot is generation 1");
+      t.ok(snap.markdown.includes("# Main Heading"), "h1 rendered as markdown heading");
+      t.ok(snap.markdown.includes("## Subsection"), "h2 rendered at correct level");
+      t.ok(snap.markdown.includes("- First item"), "li rendered as list item");
+      t.ok(snap.markdown.includes("introductory paragraph"), "paragraph text present");
+
+      // Exclusions
+      t.no(snap.markdown, "display:none", "display:none text excluded");
+      t.no(snap.markdown, "visibility:hidden", "visibility:hidden text excluded");
+      t.no(snap.markdown, "aria-hidden and must not", "aria-hidden text excluded");
+      t.no(snap.markdown, "zero sized content", "zero-size text excluded");
+      t.no(snap.markdown, "notRendered", "script contents excluded");
+
+      // Interactive elements
+      const submit = snap.elements.find((e) => e.selector === "#submit-btn");
+      t.ok(submit, "button captured with its id selector");
+      t.ok(submit && submit.role === "button", "button role correct");
+      t.ok(submit && submit.name === "Submit", "button accessible name correct");
+
+      const disabled = snap.elements.find((e) => e.state && e.state.disabled);
+      t.ok(disabled, "disabled state captured");
+      t.ok(disabled && /data-testid/.test(disabled.selector),
+           "stable attribute preferred over structural path");
+
+      const link = snap.elements.find((e) => e.role === "link");
+      t.ok(link && link.href === "https://example.com/link", "link href captured");
+
+      // Images
+      const img = snap.elements.find((e) => e.tag === "img" && e.name === "A test image");
+      t.ok(img, "real image captured");
+      t.ok(img && img.src, "image src captured");
+      t.ok(!snap.elements.some((e) => e.name === "tracking pixel"),
+           "1x1 tracking pixel filtered out");
+
+      // Every selector must resolve to exactly one element.
+      for (const e of snap.elements) {
+        if (!e.selector) continue;
+        t.ok(document.querySelectorAll(e.selector).length === 1,
+             `selector resolves uniquely: ${e.selector}`);
+      }
+
+      // Bounding boxes are proportions in [0,1].
+      for (const e of snap.elements) {
+        t.ok(e.box.x >= 0 && e.box.x <= 1 && e.box.y >= 0 && e.box.y <= 1,
+             `box within [0,1]: ${e.ref}`);
+      }
+
+      // Generation increments per snapshot.
+      t.ok(window.__archieCore.snapshot({}).generation === 2, "generation increments");
+
+      return t.report();
+    };
+  </script>
+</body>
+</html>

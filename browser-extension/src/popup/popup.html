@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Archie Browser Control</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1>Archie Browser Control</h1>
+
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <span id="status">checking…</span>
+    </div>
+
+    <label for="url">Backend WebSocket</label>
+    <input id="url" type="text" spellcheck="false" placeholder="ws://127.0.0.1:8765/api/browser/ws" />
+
+    <label for="token">Shared token</label>
+    <input id="token" type="password" spellcheck="false" placeholder="BROWSER_CONTROL_TOKEN from context/.env" />
+
+    <div class="buttons">
+      <button id="save">Save &amp; reconnect</button>
+      <button id="reconnect" class="secondary">Reconnect</button>
+    </div>
+
+    <p class="error" id="error" hidden></p>
+    <p class="hint" id="commands"></p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

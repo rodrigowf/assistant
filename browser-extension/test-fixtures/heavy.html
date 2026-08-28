@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Heavy Page</title>
+</head>
+<body>
+  <h1>Heavy Page</h1>
+  <div id="bulk"></div>
+
+  <script>
+    const bulk = document.getElementById("bulk");
+    for (let i = 0; i < 400; i += 1) {
+      const p = document.createElement("p");
+      p.textContent =
+        `Paragraph ${i}: ` + "lorem ipsum dolor sit amet consectetur ".repeat(6);
+      bulk.appendChild(p);
+
+      // Interactive elements scattered through the bulk, so the "elements
+      // survive truncation" assertion is testing something real rather than
+      // comparing zero to zero.
+      if (i % 40 === 0) {
+        const b = document.createElement("button");
+        b.id = `action-${i}`;
+        b.textContent = `Action ${i}`;
+        bulk.appendChild(b);
+      }
+    }
+  </script>
+
+  <script src="../src/content/snapshot-core.js"></script>
+  <script src="./assert.js"></script>
+  <script>
+    window.__runTests = () => {
+      const t = new Harness();
+      const core = window.__archieCore;
+
+      // A generous budget leaves the page intact.
+      const full = core.snapshot({ maxChars: 500_000 });
+      t.ok(full.markdown.length > 90_000, "heavy page produces ~100k chars of markdown");
+      t.eq(full.truncated, false, "not truncated under a generous budget");
+      t.ok(full.elements.length >= 10, "interactive elements captured");
+
+      // This page exceeds the 40k default — which is the point: an ordinary
+      // content-heavy page overruns the default budget, so truncation is the
+      // common path, not an edge case.
+      const dflt = core.snapshot({});
+      t.eq(dflt.truncated, true, "default 40k budget truncates a heavy page");
+      t.ok(dflt.markdown.length < 41_000, "default-budget output respects the cap");
+
+      const small = core.snapshot({ maxChars: 500 });
+      t.eq(small.truncated, true, "truncated when over budget");
+      t.ok(small.markdown.includes("truncated at 500 chars"),
+           "truncation marker present");
+      t.ok(small.markdown.length < 700, "truncated output respects the budget");
+
+      // Truncating the markdown must not drop the actionable element list —
+      // the agent still needs references for what it can see.
+      t.eq(small.elements.length, full.elements.length,
+           "element list unaffected by markdown truncation");
+      t.ok(small.elements.length > 0, "element list is non-empty (assertion is meaningful)");
+
+      return t.report();
+    };
+  </script>
+</body>
+</html>

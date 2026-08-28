@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Injection Wrapper</title>
+</head>
+<body>
+  <h1 id="target">Injection target</h1>
+  <button id="btn">A button</button>
+
+  <script src="./assert.js"></script>
+  <script type="module">
+    // buildWrapper touches no chrome.* API at module scope, so it imports
+    // cleanly into a plain page. This exercises the serialization contract
+    // without needing the extension loaded — the userScripts.execute() call
+    // that consumes the wrapper still requires a real Chrome profile.
+    import { buildWrapper } from "../src/background/commands.js";
+
+    /** Run agent code through the wrapper exactly as the extension would. */
+    const run = async (code, maxChars = 20000) =>
+      JSON.parse(await eval(buildWrapper(code, maxChars)));
+
+    window.__runTests = async () => {
+      const t = new Harness();
+
+      // Primitives and expressions
+      let r = await run("return 1 + 1;");
+      t.eq(r.ok, true, "simple expression succeeds");
+      t.eq(JSON.parse(r.json), 2, "arithmetic result returned");
+
+      r = await run("return document.title;");
+      t.eq(JSON.parse(r.json), "Injection Wrapper", "page globals reachable");
+
+      // Objects
+      r = await run("return { a: 1, b: [2, 3] };");
+      t.eq(JSON.stringify(JSON.parse(r.json)), '{"a":1,"b":[2,3]}', "object round-trips");
+
+      // await support
+      r = await run("await new Promise(res => setTimeout(res, 10)); return 'awaited';");
+      t.eq(JSON.parse(r.json), "awaited", "await is supported");
+
+      // undefined normalises to null rather than breaking the envelope
+      r = await run("return undefined;");
+      t.eq(r.ok, true, "undefined return succeeds");
+      t.eq(JSON.parse(r.json), null, "undefined becomes null");
+
+      // DOM elements become actionable descriptors, not empty objects
+      r = await run("return document.getElementById('btn');");
+      const el = JSON.parse(r.json);
+      t.eq(el.__element, true, "element serialised as descriptor");
+      t.eq(el.tag, "button", "element tag captured");
+      t.eq(el.selector, "#btn", "element selector captured and usable");
+      t.eq(el.text, "A button", "element text captured");
+
+      // NodeList becomes an array of descriptors
+      r = await run("return document.querySelectorAll('h1, button');");
+      const list = JSON.parse(r.json);
+      t.ok(Array.isArray(list), "NodeList becomes an array");
+      t.eq(list.length, 2, "NodeList fully enumerated");
+      t.eq(list[0].__element, true, "NodeList entries are descriptors");
+
+      // Functions and circular structures degrade instead of throwing
+      r = await run("return { fn: function named() {} };");
+      t.ok(/\[Function/.test(JSON.parse(r.json).fn), "function degraded to a marker");
+
+      r = await run("const a = {}; a.self = a; return a;");
+      t.eq(r.ok, true, "circular reference does not throw");
+      t.eq(JSON.parse(r.json).self, "[Circular]", "circular reference marked");
+
+      r = await run("return window;");
+      t.eq(r.ok, true, "returning window does not throw");
+
+      // Errors are captured with a stack rather than lost
+      r = await run("throw new Error('boom');");
+      t.eq(r.ok, false, "thrown error reported as failure");
+      t.ok(/boom/.test(r.error), "error message preserved");
+      t.ok(r.stack && r.stack.length > 0, "stack trace preserved");
+
+      r = await run("return notDefinedAnywhere;");
+      t.eq(r.ok, false, "ReferenceError reported as failure");
+      t.ok(/not defined/.test(r.error), "ReferenceError message preserved");
+
+      // Truncation
+      r = await run("return 'x'.repeat(5000);", 500);
+      t.eq(r.truncated, true, "oversized result flagged as truncated");
+      t.ok(r.json.length <= 500, "truncated payload respects the budget");
+
+      r = await run("return 'short';", 500);
+      t.eq(r.truncated, false, "small result not flagged");
+
+      // Mutations actually land on the page
+      await run("document.getElementById('target').textContent = 'mutated';");
+      t.eq(document.getElementById("target").textContent, "mutated",
+           "injected code mutates the real DOM");
+
+      return t.report();
+    };
+  </script>
+</body>
+</html>

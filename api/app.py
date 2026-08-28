@@ -21,7 +21,7 @@ from manager.store import SessionStore
 from .connections import ConnectionManager
 from .indexer import HistoryIndexer, MemoryWatcher
 from .pool import SessionPool
-from .routes import agents, auth, chat, config, debug, mcp, orchestrator, sessions, skills, uploads, voice
+from .routes import agents, auth, browser, chat, config, debug, mcp, orchestrator, sessions, skills, uploads, voice
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,11 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="Assistant API", lifespan=lifespan)
 
+    # Browser-control extension hub.  Plain object with no async startup, so
+    # it's built here rather than in lifespan — that also keeps it available
+    # to tests that mount the router without running the full lifespan.
+    app.state.browser_hub = browser.BrowserHub()
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],  # Allow all origins for Android app and local dev
@@ -164,6 +169,7 @@ def create_app() -> FastAPI:
     app.include_router(agents.router)
     app.include_router(uploads.router)
     app.include_router(debug.router)
+    app.include_router(browser.router)
 
     # index.html must never be cached — it's the bootstrap that points to
     # the hashed bundle, so a cached copy traps the device on old code

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Shadow DOM and Scrolling</title>
+  <style>
+    #filler { height: 3000px; background: linear-gradient(#eee, #ccc); }
+  </style>
+</head>
+<body>
+  <h1>Shadow Host Page</h1>
+  <div id="host"></div>
+  <div id="filler">Tall filler to make the page scrollable.</div>
+  <button id="bottom-btn">Bottom Button</button>
+
+  <script>
+    const host = document.getElementById("host");
+    const root = host.attachShadow({ mode: "open" });
+    root.innerHTML = `
+      <p>Text inside the shadow root.</p>
+      <button id="shadow-btn">Shadow Button</button>
+    `;
+    window.__shadowClicked = false;
+    root.getElementById("shadow-btn")
+        .addEventListener("click", () => { window.__shadowClicked = true; });
+  </script>
+
+  <script src="../src/content/snapshot-core.js"></script>
+  <script src="./assert.js"></script>
+  <script>
+    window.__runTests = () => {
+      const t = new Harness();
+      const core = window.__archieCore;
+
+      window.scrollTo(0, 0);
+      const snap = core.snapshot({});
+
+      // Shadow DOM traversal
+      t.ok(snap.markdown.includes("Text inside the shadow root"),
+           "open shadow root content included");
+      const shadowBtn = snap.elements.find((e) => e.name === "Shadow Button");
+      t.ok(shadowBtn, "shadow-root button captured");
+      // document.querySelector cannot pierce shadow boundaries, so claiming a
+      // selector here would be a lie the agent would act on.
+      t.eq(shadowBtn && shadowBtn.selector, null,
+           "shadow element has no document selector");
+      core.click({ ref: shadowBtn.ref });
+      t.eq(window.__shadowClicked, true, "shadow element clickable by ref");
+
+      // --- position targeting and stale-viewport detection ---------------
+      const target = snap.elements.find((e) => e.selector === "#bottom-btn") ||
+                     snap.elements.find((e) => e.name === "Bottom Button");
+      t.ok(target, "bottom button captured");
+
+      const heading = snap.elements.find((e) => e.tag === "h1") ||
+                      { box: { x: 0.01, y: 0.01, w: 0.1, h: 0.02 } };
+      const centre = {
+        x: heading.box.x + heading.box.w / 2,
+        y: heading.box.y + heading.box.h / 2,
+      };
+
+      // A position from the current snapshot resolves.
+      const before = core.click({ position: centre, generation: snap.generation });
+      t.ok(before && before.clicked, "position targeting resolves an element");
+
+      // Scrolling must invalidate positional coordinates.
+      const scrolled = core.scroll({ to: "bottom" });
+      t.ok(scrolled.generation > snap.generation,
+           "scroll bumps the snapshot generation");
+      t.throws(() => core.click({ position: centre, generation: snap.generation }),
+               "stale_viewport", "stale generation rejected after scroll");
+      t.throws(() => core.click({ position: centre }),
+               "stale_viewport", "scroll drift rejected even without a generation");
+
+      // Re-snapshotting makes positions valid again.
+      const snap2 = core.snapshot({});
+      t.ok(snap2.generation > scrolled.generation, "re-snapshot bumps generation");
+      const after = core.click({ position: { x: 0.5, y: 0.5 }, generation: snap2.generation });
+      t.ok(after && after.clicked, "position targeting works again after re-snapshot");
+
+      // Selector targeting is unaffected by scroll drift.
+      core.scroll({ to: "top" });
+      const byRef = core.click({ selector: "#bottom-btn" });
+      t.ok(byRef && byRef.clicked, "selector targeting immune to scroll drift");
+
+      // Scroll variants
+      core.scroll({ to: "top" });
+      t.eq(Math.round(window.scrollY), 0, "scroll to top");
+      core.scroll({ pages: 1 });
+      t.ok(window.scrollY > 0, "scroll by pages");
+      core.scroll({ selector: "#bottom-btn" });
+      t.ok(window.scrollY > 0, "scrollIntoView by selector");
+      t.throws(() => core.scroll({}), "scroll requires", "scroll with no target rejected");
+
+      // Viewport metrics
+      const vp = core.get_viewport();
+      t.ok(vp.cssWidth > 0 && vp.cssHeight > 0, "viewport dimensions reported");
+      t.ok(vp.devicePixelRatio > 0, "devicePixelRatio reported");
+
+      return t.report();
+    };
+  </script>
+</body>
+</html>
