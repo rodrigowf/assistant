@@ -1,0 +1,28 @@
+[Unit]
+Description=Archie browser-control tunnel (laptop:8765 -> Jetson:8765)
+Documentation=file:///home/rodrigo/assistant/browser-extension/PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Forwards the laptop's loopback 8765 to the Jetson's loopback 8765, so the
+# extension can keep its default ws://127.0.0.1:8765 URL. Avoids wss://
+# entirely: the Jetson's cert is signed by a private CA this machine doesn't
+# trust, and an extension service worker has no UI to accept it.
+#
+# Bound explicitly to 127.0.0.1 so the forwarded port is NOT exposed on the
+# laptop's LAN interfaces — this socket can run arbitrary JS in a logged-in
+# browser, so it stays loopback-only on both ends.
+ExecStart=/usr/bin/ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o BatchMode=yes \
+  -L 127.0.0.1:8765:127.0.0.1:8765 \
+  rodrigo@192.168.0.200
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

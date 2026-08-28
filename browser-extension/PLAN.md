@@ -413,11 +413,34 @@ LAN-exposure warning previously recorded here: the Jetson's backend stays bound
 to loopback, so nothing on the network can reach a socket that runs arbitrary
 JS in a logged-in browser — only an authenticated SSH session from the laptop.
 
-Caveat: the tunnel is `ssh -f -N`, so it does not survive a reboot or a long
-network drop. A systemd user unit with `autossh` is the durable form if this
-becomes daily-use. The alternative — installing the Home CA into the system
-trust store *and* Chrome's NSS db (`libnss3-tools`) — would enable direct
-`wss://`, at the cost of more moving parts and a worse security posture.
+The tunnel is managed by a **systemd user service on the laptop**,
+`~/.config/systemd/user/archie-browser-tunnel.service` (enabled, `Restart=always`,
+`RestartSec=5`). Mirrors the existing `context-sync.service` pattern — the
+project's established way of doing cross-machine SSH plumbing.
+
+Why a user unit rather than logic inside the browser tools: **the tools run on
+the Jetson, but the tunnel must terminate on the laptop** where Chrome is. A
+tool that established it would be reaching across machines to mutate network
+topology as a side effect of a tool call — hidden state, and failures
+surfacing as confusing tool errors. A user unit also needs no sudo (unlike
+`agentic-backend`, a system unit) and no `autossh` (not installed):
+systemd's `Restart=always` plus SSH keepalives cover it. Its lifetime ties to
+the desktop session, which is exactly when Chrome exists.
+
+The forward is bound explicitly to `127.0.0.1:8765` on the laptop side, so the
+port is not exposed on the laptop's LAN interfaces either — loopback-only on
+both ends.
+
+Verified: killing the tunnel drops the extension, and it reconnects on its own
+backoff within ~5s of the tunnel returning (`systemctl --user restart
+archie-browser-tunnel`).
+
+Alternative, not taken: installing the Home CA into the system trust store *and*
+Chrome's NSS db (`libnss3-tools`) would enable direct `wss://`, at the cost of
+more moving parts and a worse security posture.
+
+    systemctl --user status archie-browser-tunnel     # check
+    systemctl --user disable --now archie-browser-tunnel   # undo
 
 Note: restarting the service needs `sudo` on the Jetson (no passwordless sudo,
 polkit refuses over SSH):
