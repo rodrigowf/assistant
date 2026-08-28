@@ -96,7 +96,13 @@ def test_ssh_session_wraps_argv_with_ssh_prefix():
     # The remote command (last arg) substitutes the LOCAL qwen path with
     # the resolved REMOTE path and forwards the rest of the flags.
     remote_cmd = argv[-1]
-    assert remote_cmd.startswith("cd '/remote/project' && exec '/remote/.local/bin/qwen'")
+    # PATH prepends the CLI's own dir so its `#!/usr/bin/env node` shebang
+    # resolves on a non-interactive remote shell -- see
+    # test_remote_command_puts_cli_dir_on_path.
+    assert remote_cmd.startswith(
+        "cd '/remote/project' && PATH=/remote/.local/bin:$PATH "
+        "exec '/remote/.local/bin/qwen'",
+    )
     assert "'--input-format'" in remote_cmd
     assert "'stream-json'" in remote_cmd
     assert "'--resume'" in remote_cmd
@@ -106,9 +112,14 @@ def test_ssh_session_wraps_argv_with_ssh_prefix():
     assert "/local/qwen" not in remote_cmd
 
 
-def test_ssh_wrapping_resolves_remote_path_with_extra_search_paths():
-    """When ``which qwen`` returns nothing (cron-style shell), the
-    fallback chain must be searched."""
+def test_ssh_wrapping_resolves_remote_path_for_qwen():
+    """The SSH wrap must resolve the *remote* qwen path, keyed by cli name.
+
+    The fallback search chain itself is no longer passed from here — it
+    lives in :func:`manager._ssh.default_cli_search_paths` so every harness
+    shares one list (see the dedicated tests below).  This test pins only
+    what the call site still owns: the cli name.
+    """
     sm = QwenSessionManager(config=_ssh_cfg())
     captured: dict = {}
 
@@ -121,11 +132,62 @@ def test_ssh_wrapping_resolves_remote_path_with_extra_search_paths():
         sm._maybe_wrap_with_ssh(["/local/qwen", "--flag"])
 
     assert captured["cli_name"] == "qwen"
-    assert captured["extra_search_paths"] == [
-        "~/.local/bin/qwen",
-        "/usr/local/bin/qwen",
-        "/usr/bin/qwen",
-    ]
+
+
+def test_default_search_paths_include_nvm_glob():
+    """When ``which qwen`` returns nothing, the fallback chain must still
+    find an nvm-installed CLI.
+
+    Regression test for the 2026-08-28 outage: the probe shell is
+    non-interactive, and Ubuntu's stock ``~/.bashrc`` returns early for
+    non-interactive shells *before* the nvm block loads.  So ``which``
+    finds nothing for an nvm-installed qwen, the probe fell through to the
+    bare name ``"qwen"``, and every remote turn died with exit 127
+    (``qwen: command not found``).  The glob entry is what fixes it, and it
+    must stay a glob so a later ``nvm install`` doesn't re-break it.
+    """
+    from manager._ssh import default_cli_search_paths
+
+    for cli in ("qwen", "gemini", "claude"):
+        paths = default_cli_search_paths(cli)
+        assert f"~/.nvm/versions/node/*/bin/{cli}" in paths
+        # Every entry must be for this CLI -- no cross-harness leakage.
+        assert all(p.endswith(f"/{cli}") for p in paths)
+
+
+def test_probe_command_sorts_nvm_matches_newest_first():
+    """The fallback ``ls`` must use ``-t`` (newest mtime first).
+
+    With several node versions installed, a plain ``ls`` sorts lexically
+    and ``head -1`` picks the OLDEST (v16 before v22) -- usually a stale
+    CLI or a dead path.  ``-t`` picks what the newest ``nvm install`` wrote.
+    """
+    import subprocess as _sp
+    from manager import _ssh
+
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "/r/qwen\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return _Result()
+
+    target = _ssh.SshTarget(
+        host="h", user="u", key=None, control_path_prefix="qwen",
+    )
+    with patch.object(_ssh, "probe_host_reachable", return_value=True), \
+            patch.object(_sp, "run", side_effect=fake_run), \
+            patch.object(_ssh, "get_cached_remote_cli_path", return_value=None), \
+            patch.object(_ssh, "set_cached_remote_cli_path"):
+        _ssh.resolve_remote_cli_path("qwen", target)
+
+    probe_cmd = captured["argv"][-1]
+    assert "ls -t " in probe_cmd
+    assert "~/.nvm/versions/node/*/bin/qwen" in probe_cmd
 
 
 def test_ssh_wrapping_does_not_forward_local_env():
@@ -202,3 +264,50 @@ async def test_local_session_skips_probe():
         await sm.start()
     mock_probe.assert_not_called()
     await sm.stop()
+
+
+def test_remote_command_puts_cli_dir_on_path():
+    """The remote command must prepend the CLI's own dir to PATH.
+
+    Second half of the 2026-08-28 outage.  Resolving the absolute CLI path
+    was necessary but not sufficient: these CLIs are Node scripts with a
+    ``#!/usr/bin/env node`` shebang, and for an nvm install ``node`` lives
+    in the *same* bin dir as the CLI.  The remote shell is non-interactive
+    so nvm never loaded, and exec'ing the correctly-resolved qwen still
+    died with::
+
+        /usr/bin/env: 'node': No such file or directory   (exit 127)
+
+    -- indistinguishable, from the logs, from the CLI itself being missing.
+    """
+    from manager._ssh import RemoteCommand
+
+    cli = "/home/rodrigo/.nvm/versions/node/v22.21.1/bin/qwen"
+    rendered = RemoteCommand(project_dir="/p", remote_cli=cli).render_shell()
+
+    assert "PATH=/home/rodrigo/.nvm/versions/node/v22.21.1/bin:$PATH" in rendered
+    # $PATH must stay UNQUOTED so it expands remotely; quoting it would
+    # clobber the inherited PATH and break git/rg lookups from the CLI.
+    assert "'$PATH'" not in rendered
+
+
+def test_remote_command_still_quotes_other_env_values():
+    """PATH is special-cased as unquoted; everything else must stay quoted
+    so a value containing spaces or quotes can't break out of the command."""
+    from manager._ssh import RemoteCommand
+
+    rendered = RemoteCommand(
+        project_dir="/p", remote_cli="/usr/bin/qwen", env={"FOO": "ba r"},
+    ).render_shell()
+
+    assert "FOO='ba r'" in rendered
+
+
+def test_remote_command_skips_path_for_bare_cli_name():
+    """When the probe fell back to a bare name there's no directory to add,
+    and emitting ``PATH=.:$PATH`` would put CWD on PATH -- don't."""
+    from manager._ssh import RemoteCommand
+
+    rendered = RemoteCommand(project_dir="/p", remote_cli="qwen").render_shell()
+
+    assert "PATH=" not in rendered

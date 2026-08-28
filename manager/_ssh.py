@@ -46,7 +46,7 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
 
@@ -364,8 +364,29 @@ class RemoteCommand:
     env: dict[str, str] = field(default_factory=dict)
 
     def render_shell(self) -> str:
+        env = dict(self.env)
+
+        # Put the CLI's own directory on PATH.  These CLIs are Node scripts
+        # with a `#!/usr/bin/env node` shebang, and for an nvm install the
+        # `node` binary lives in the *same* bin dir as the CLI itself.  The
+        # remote shell here is non-interactive, so nvm never loaded and that
+        # dir isn't on PATH -- resolving an absolute CLI path is then not
+        # enough: exec'ing it fails with
+        #     /usr/bin/env: 'node': No such file or directory   (exit 127)
+        # which looks just like the CLI being missing.  Prepending the dir
+        # fixes the shebang lookup without needing nvm on the remote.
+        cli_dir = str(PurePosixPath(self.remote_cli).parent)
+        if cli_dir not in ("", ".", "/"):
+            # Append the inherited PATH rather than replacing it -- the CLI
+            # shells out to git, rg, etc. and must still find them.
+            env["PATH"] = f"{cli_dir}:$PATH"
+
         env_prefix = "".join(
-            f"{k}={_shell_single_quote(v)} " for k, v in self.env.items()
+            # PATH is the one value we must NOT single-quote: it contains a
+            # deliberate `$PATH` that has to expand on the remote.  cli_dir
+            # comes from our own `which`/`ls` probe output, not user input.
+            f"{k}={v} " if k == "PATH" else f"{k}={_shell_single_quote(v)} "
+            for k, v in env.items()
         )
         return (
             "cd " + _shell_single_quote(self.project_dir)
