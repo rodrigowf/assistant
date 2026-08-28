@@ -684,11 +684,6 @@ class GeminiSessionManager(BaseSessionManager):
         remote_gemini = resolve_remote_cli_path(
             "gemini",
             target,
-            extra_search_paths=[
-                "~/.local/bin/gemini",
-                "/usr/local/bin/gemini",
-                "/usr/bin/gemini",
-            ],
         )
         remote_cmd = RemoteCommand(
             project_dir=self._config.project_dir,
@@ -752,11 +747,6 @@ class GeminiSessionManager(BaseSessionManager):
                     lambda: resolve_remote_cli_path(
                         "gemini",
                         target,
-                        extra_search_paths=[
-                            "~/.local/bin/gemini",
-                            "/usr/local/bin/gemini",
-                            "/usr/bin/gemini",
-                        ],
                     ),
                 )
             except Exception:

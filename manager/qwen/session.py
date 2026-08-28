@@ -198,11 +198,6 @@ class QwenSessionManager(BaseSessionManager):
                     lambda: resolve_remote_cli_path(
                         "qwen",
                         target,
-                        extra_search_paths=[
-                            "~/.local/bin/qwen",
-                            "/usr/local/bin/qwen",
-                            "/usr/bin/qwen",
-                        ],
                     ),
                 )
             except Exception:
@@ -739,11 +734,6 @@ class QwenSessionManager(BaseSessionManager):
         remote_qwen = resolve_remote_cli_path(
             "qwen",
             target,
-            extra_search_paths=[
-                "~/.local/bin/qwen",
-                "/usr/local/bin/qwen",
-                "/usr/bin/qwen",
-            ],
         )
         remote_cmd = RemoteCommand(
             project_dir=self._config.project_dir,

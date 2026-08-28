@@ -999,11 +999,6 @@ class ClaudeSessionManager(BaseSessionManager):
         remote_claude = resolve_remote_cli_path(
             "claude",
             target,
-            extra_search_paths=[
-                "~/.local/bin/claude",
-                "/usr/local/bin/claude",
-                "/usr/bin/claude",
-            ],
         )
         env: dict[str, str] = {}
         if self._config.ssh_claude_config_dir:

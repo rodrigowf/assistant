@@ -223,6 +223,33 @@ def build_ssh_argv(target: SshTarget) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def default_cli_search_paths(cli_name: str) -> list[str]:
+    """Standard fallback install locations to probe for *cli_name*.
+
+    Used when ``which`` comes up empty on the remote host.  That happens
+    routinely: the probe shell is non-interactive, and the stock Ubuntu
+    ``~/.bashrc`` returns early for non-interactive shells (``case $- in
+    *i*) ;; *) return;;``) *before* reaching the nvm block near the bottom
+    of the file.  So an nvm-installed CLI — which is how ``qwen``,
+    ``gemini``, and often ``claude`` are installed — is invisible to
+    ``which`` even though it works fine in the user's real terminal.
+
+    The nvm entry is a glob because the node version in the path changes
+    on every ``nvm install``.  Hardcoding one (or symlinking into
+    ``/usr/local/bin``) breaks silently the next time node is upgraded;
+    the glob self-heals.  Callers may prepend their own entries — this is
+    the shared tail, not the whole list.
+    """
+    return [
+        f"~/.local/bin/{cli_name}",
+        f"/usr/local/bin/{cli_name}",
+        f"/usr/bin/{cli_name}",
+        # Newest node version wins — see the ``ls -t`` note in
+        # resolve_remote_cli_path.
+        f"~/.nvm/versions/node/*/bin/{cli_name}",
+    ]
+
+
 def resolve_remote_cli_path(
     cli_name: str,
     target: SshTarget,
@@ -238,10 +265,13 @@ def resolve_remote_cli_path(
     attempt re-probes after the host comes back online instead of being
     stuck on the fallback forever.
 
-    *extra_search_paths* is an ordered list of absolute paths to try as a
-    fallback when ``which`` returns nothing (e.g. ``~/.local/bin/claude``,
-    ``/usr/local/bin/claude``).  Useful when ``which`` runs without the
-    user's full PATH (cron-like shell).
+    *extra_search_paths* is an ordered list of paths to try as a fallback
+    when ``which`` returns nothing (e.g. ``~/.local/bin/claude``).  Useful
+    when ``which`` runs without the user's full PATH — which is the common
+    case, not an edge case: see :func:`default_cli_search_paths`.  Entries
+    from :func:`default_cli_search_paths` are always appended, so callers
+    only pass paths unique to their harness; passing ``None`` gets the
+    defaults alone.  Globs are allowed (they expand on the remote shell).
     """
     cached = get_cached_remote_cli_path(cli_name, target.host, target.user, target.key)
     if cached is not None:
@@ -259,9 +289,20 @@ def resolve_remote_cli_path(
         )
         return cli_name
 
-    fallback_chain = " ".join(extra_search_paths or [])
+    # Caller-specific entries first, then the shared defaults, minus dupes
+    # (dict.fromkeys preserves order).  The defaults are always included so
+    # a harness can't silently miss the nvm location by forgetting it.
+    search_paths = list(
+        dict.fromkeys((extra_search_paths or []) + default_cli_search_paths(cli_name)),
+    )
+    fallback_chain = " ".join(search_paths)
+    # ``ls -t`` sorts newest-mtime first.  This matters for the nvm glob:
+    # with several node versions installed, plain ``ls`` sorts lexically
+    # and ``head -1`` would pick the OLDEST (v16 before v22), which is
+    # usually a stale CLI or a dead path.  Newest-first picks the version
+    # the most recent ``nvm install`` wrote.
     fallback_clause = (
-        f" || ls {fallback_chain} 2>/dev/null | head -1"
+        f" || ls -t {fallback_chain} 2>/dev/null | head -1"
         if fallback_chain
         else ""
     )
