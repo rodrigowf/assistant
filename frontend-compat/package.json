@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "./scripts-typecheck.sh && vite build",
+    "preview": "vite preview",
+    "typecheck": "./scripts-typecheck.sh"
   },
   "dependencies": {
     "diff": "^8.0.4",
