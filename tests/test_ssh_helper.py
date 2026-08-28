@@ -280,7 +280,9 @@ def test_build_remote_argv_emits_single_quoted_command():
     assert argv[-2] == "h"  # the host argument
     remote_cmd_str = argv[-1]
     # cd + exec + args all in one trailing string
-    assert remote_cmd_str.startswith("cd '/p' && exec '/r/qwen'")
+    # PATH prepends the CLI's own dir so a `#!/usr/bin/env node` shebang
+    # resolves on a non-interactive remote shell.
+    assert remote_cmd_str.startswith("cd '/p' && PATH=/r:$PATH exec '/r/qwen'")
     assert "'--input-format'" in remote_cmd_str
     assert "'stream-json'" in remote_cmd_str
     assert "'--resume'" in remote_cmd_str
