@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live end-to-end check against the real Chrome extension.
 
-Runs the *production* transport in-process (`api.routes.browser`) against
-whatever browser is currently attached. Not a unit test: this needs a real
-Chrome with the extension loaded and configured.
+Drives the *running* browser daemon over HTTP, exactly as `browser_cmd.py`
+does. Not a unit test: this needs a real Chrome with the extension loaded and
+attached, and the fixture server on :8899.
 
     context/scripts/run.sh browser-extension/tools/live_check.py recon
     context/scripts/run.sh browser-extension/tools/live_check.py full
@@ -11,8 +11,7 @@ Chrome with the extension loaded and configured.
 `recon` is strictly read-only. `full` navigates the active tab to local fixture
 pages (served from browser-extension/ on :8899) and restores the original URL.
 
-Note this binds :8765 itself, so stop the tunnel first if one is running —
-otherwise it tests against the Jetson rather than its own hub.
+The daemon is started automatically if it isn't already up.
 """
 
 from __future__ import annotations
@@ -24,12 +23,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import uvicorn
-from fastapi import FastAPI
+import json
+import urllib.error
+import urllib.request
 
-from api.routes import browser as browser_route
-from api.routes import uploads as uploads_route
-from api.routes.browser import BrowserCommandError, BrowserCommandTimeout
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "default-scripts"))
+import browser_cmd  # noqa: E402  (path set above)
 
 FIXTURES = "http://127.0.0.1:8899/test-fixtures"
 
@@ -54,36 +53,29 @@ def record(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def build_app() -> FastAPI:
-    """Minimal app: the real browser router, none of the heavy lifespan.
-
-    The uploads router is included too — the extension POSTs screenshots to
-    /api/uploads on the origin it derives from its WebSocket URL, which is this
-    harness. Without it every capture 404s at the upload step.
-    """
-    app = FastAPI()
-    app.state.browser_hub = browser_route.BrowserHub()
-    app.include_router(browser_route.router)
-    app.include_router(uploads_route.router)
-    return app
-
-
-async def wait_for_extension(hub, timeout: float = 60.0) -> bool:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if hub.connected:
-            return True
-        await asyncio.sleep(0.5)
-    return False
-
-
 async def send(hub, command: str, params: dict | None = None, timeout: float = 30.0):
-    """Send a command, returning ``(result, error_string)``."""
+    """POST one command to the daemon, returning ``(result, error_string)``.
+
+    ``hub`` is unused — kept so the check bodies read the same as before.
+    """
+    payload = json.dumps({"command": command, "params": params or {}}).encode()
+    req = urllib.request.Request(
+        f"{browser_cmd.endpoint()}/api/browser/command",
+        data=payload,
+        headers={"Content-Type": "application/json",
+                 "X-Browser-Token": browser_cmd.resolve_token() or ""},
+        method="POST",
+    )
     try:
-        return await hub.send_command(command, params or {}, timeout=timeout), None
-    except (BrowserCommandError, BrowserCommandTimeout) as e:
-        return None, str(e)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())["result"], None
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail).get("detail", detail)
+        except Exception:
+            pass
+        return None, str(detail)
     except Exception as e:  # noqa: BLE001
         return None, f"{type(e).__name__}: {e}"
 
@@ -276,27 +268,14 @@ async def full(hub, original_url: str | None) -> None:
 async def main() -> int:
     mode = sys.argv[1] if len(sys.argv) > 1 else "recon"
 
-    app = build_app()
-    hub = app.state.browser_hub
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8765,
-                                           log_level="error"))
-    serve_task = asyncio.create_task(server.serve())
+    status = browser_cmd.ensure_daemon()
+    print(f"Daemon up at {browser_cmd.endpoint()}; "
+          f"extension attached: {status.get('client')}", flush=True)
+    hub = None
 
-    print("Waiting for the extension to connect…", flush=True)
-    if not await wait_for_extension(hub):
-        print("TIMEOUT: no extension connected within 60s", flush=True)
-        server.should_exit = True
-        await serve_task
-        return 2
-    print(f"Extension attached: {hub.status()['client']}", flush=True)
-
-    try:
-        info = await recon(hub)
-        if mode == "full":
-            await full(hub, (info.get("active") or {}).get("url"))
-    finally:
-        server.should_exit = True
-        await serve_task
+    info = await recon(hub)
+    if mode == "full":
+        await full(hub, (info.get("active") or {}).get("url"))
 
     passed = sum(1 for _, ok, _ in results if ok)
     failed = [r for r in results if not r[1]]
