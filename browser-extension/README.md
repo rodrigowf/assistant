@@ -29,6 +29,7 @@ consumer, and the orchestrator can fire the same script via `run_script`.
 |---|---|---|
 | `snapshot` + `capture_screenshot` | `look` | Working |
 | `navigate` | `navigate <url>` | Working |
+| `open_tab` | `newtab <url>` | Working |
 | `list_tabs` | `tabs` | Working |
 | `get_active_tab` / `switch_tab` | `switch <id>` | Working |
 | `click` | `click` | Working |

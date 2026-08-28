@@ -293,8 +293,13 @@ def main() -> int:
     sp.add_argument("--limit", type=int, default=DEFAULT_ELEMENT_LIMIT)
     sp.add_argument("--raw", action="store_true", help="full JSON")
 
-    sp = sub.add_parser("navigate", help="open a URL in the active tab")
+    sp = sub.add_parser("navigate", help="open a URL in the active tab (replaces it)")
     sp.add_argument("url")
+
+    sp = sub.add_parser("newtab", help="open a URL in a NEW tab (keeps the current one)")
+    sp.add_argument("url")
+    sp.add_argument("--background", action="store_true",
+                    help="open without focusing it; you must `switch` before acting on it")
 
     sub.add_parser("tabs", help="list open tabs and windows")
 
@@ -379,6 +384,9 @@ def main() -> int:
 
     if args.cmd == "navigate":
         out = call("navigate", {"url": args.url}, timeout=90)["result"]
+    elif args.cmd == "newtab":
+        out = call("open_tab", {"url": args.url, "background": args.background},
+                   timeout=90)["result"]
     elif args.cmd == "tabs":
         out = call("list_tabs", {})["result"]
     elif args.cmd == "switch":

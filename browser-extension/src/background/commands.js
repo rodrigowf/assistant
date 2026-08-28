@@ -301,6 +301,34 @@ const handlers = {
     return tabInfo(settled);
   },
 
+  /**
+   * Open a URL in a NEW tab, rather than replacing the active one.
+   *
+   * Active by default, which keeps the active-tab constraint coherent: the new
+   * tab becomes the target of every subsequent command with no `switch` step.
+   * `background: true` opens it without focus — useful for staging tabs, but
+   * then you must `switch_tab` to it before acting, since commands still go to
+   * whatever is active.
+   */
+  async open_tab(params) {
+    if (!params.url) throw new Error("open_tab requires 'url'");
+    const active = params.background !== true;
+
+    const tab = await chrome.tabs.create({ url: params.url, active });
+    // A backgrounded tab still loads, so waiting is meaningful either way.
+    await waitForTabLoad(tab.id);
+
+    if (active) {
+      // chrome.tabs.create puts the tab in the current window, but that window
+      // may not be the focused one; without this, captureVisibleTab and the
+      // active-tab lookups could still resolve elsewhere.
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+
+    const settled = await chrome.tabs.get(tab.id);
+    return { ...tabInfo(settled), opened: true, background: !active };
+  },
+
   /** Navigate the active tab and wait for the load to complete. */
   async navigate(params) {
     if (!params.url) throw new Error("navigate requires 'url'");

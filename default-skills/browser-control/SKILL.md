@@ -13,6 +13,11 @@ All commands go through one script:
 
     context/scripts/run.sh context/scripts/browser_cmd.py <command> [options]
 
+That path is relative to the project root. If your shell is anywhere else,
+use the absolute form — a stray `cd` silently breaks it:
+
+    /home/rodrigo/assistant/context/scripts/run.sh /home/rodrigo/assistant/context/scripts/browser_cmd.py look
+
 ## The loop: look, then act
 
 **Always start with `look`.** It returns a screenshot, the page as markdown,
@@ -36,12 +41,30 @@ build-generated class names (Tailwind, CSS-in-JS) that change between deploys.
 Elements inside a shadow root have no selector at all and print
 `(shadow DOM — use ref)`.
 
+### Actually seeing the screenshot
+
+The `Screenshot:` line is a **URL path, not a file path**. To look at the
+image, read it from disk — drop the leading slash and prefix `context/`:
+
+    Screenshot: /uploads/20260828T0513-screenshot.jpg
+    → Read      context/uploads/20260828T0513-screenshot.jpg
+
+It is **not** under `context/public/`. The extension POSTs the capture to
+`/api/uploads`, which writes it to `context/uploads/` and hands back the
+serving URL, which is what gets printed.
+
+Pass `--no-screenshot` when you only need the text. The markdown and the
+element list carry most of the information, and skipping the capture makes
+`look` noticeably cheaper — worth defaulting to on repeat looks at a page
+whose layout you already understand.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `look` | Screenshot + markdown + element refs. **Do this first.** |
-| `navigate <url>` | Open a URL in the active tab; waits for load |
+| `navigate <url>` | Open a URL in the active tab — **replaces** what's there |
+| `newtab <url>` | Open a URL in a **new** tab; it becomes active |
 | `tabs` | List open tabs and windows |
 | `switch <tab_id>` | Make another tab active |
 | `click` | Click, by `--ref` / `--selector` / `--x --y` |
@@ -59,6 +82,24 @@ length), `look --no-screenshot`.
 Every command acts on the **active tab**. To work on another tab, `tabs` to
 find its id, then `switch`, then `look`. There is no per-command tab argument.
 
+### `newtab` vs `navigate`
+
+`navigate` **replaces** the page in the active tab. If Rodrigo was looking at
+something, it's gone — so prefer `newtab` whenever you don't specifically need
+to reuse the current tab, and note the original URL if you do.
+
+    context/scripts/run.sh context/scripts/browser_cmd.py newtab https://example.com
+
+The new tab becomes active, so it is already the target of your next command —
+no `switch` needed. Then `look` as usual.
+
+`--background` opens it unfocused. Commands still go to whatever is *actually*
+active, so you must `switch <tab_id>` to it before acting; the id is in the
+`newtab` output. Only worth it when staging several tabs at once.
+
+Tabs you open stay open. There is no close command, so don't open one per
+iteration in a loop — reuse a tab with `navigate` once you have it.
+
 ## Running JavaScript
 
 `js` takes an async function body — use `return` to get a value, and `await`
@@ -74,6 +115,31 @@ be fed straight back into `click` or `fill`.
 Use it for what the dedicated commands don't cover. Prefer `click`/`fill` for
 ordinary interaction: they handle scroll-into-view, visibility and enabled
 checks, and the event sequences frameworks listen for.
+
+### Reading a list: extract with `js`, don't re-`look`
+
+`look` is for orienting yourself and for getting refs to act on. For
+*enumerating* something — search results, a repo list, a table, any paginated
+set — `js` is the right tool and is dramatically cheaper: it returns only the
+fields you name, as JSON, instead of a whole page render per screenful.
+
+    ... js "return [...document.querySelectorAll('#user-repositories-list li')]
+              .map(li => li.querySelector('h3 a'))
+              .filter(Boolean)
+              .map(a => a.textContent.trim());"
+
+Because `js` resolves through the live DOM and never touches refs, it is
+**immune to generation staleness**. That means you can paginate entirely
+inside `js` — click through and re-extract with no `look` in between:
+
+    ... js "const n = document.querySelector('a.next_page');
+            if (!n) return 'no next'; n.click(); return location.href;"
+
+Then re-run the extraction. Do re-run `look` before you next target anything
+by `--ref`, though: refs you are still holding belong to the old snapshot.
+
+Long JSON results are easier to handle if you redirect them to a file and
+post-process, rather than eyeballing a truncated dump.
 
 ## Position targeting is a fallback
 
