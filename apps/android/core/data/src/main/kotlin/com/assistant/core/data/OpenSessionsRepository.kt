@@ -1,6 +1,7 @@
 package com.assistant.core.data
 
 import com.assistant.core.conversation.ConversationState
+import com.assistant.core.conversation.Termination
 import com.assistant.core.model.HarnessProvider
 import com.assistant.core.model.LiveStatus
 import com.assistant.core.model.PoolSession
@@ -263,7 +264,7 @@ class OpenSessionsRepository(
     private fun onClosedByServer(e: ConversationEvent.Closed) {
         val key = if (e.key == ConversationKey.ARCHIE) ItemKey.Archie else ItemKey.Agent(e.key)
         if (key is ItemKey.Agent && _active.value == key) {
-            _notices.tryEmit(closedNotice(history.titleFor(e.ref.sdkId, e.ref.localId, AGENT_PLACEHOLDER), e.detail))
+            _notices.tryEmit(closedNotice(history.titleFor(e.ref.sdkId, e.ref.localId, AGENT_PLACEHOLDER), e.termination))
         }
         dropLocal(key)
     }
@@ -353,9 +354,21 @@ class OpenSessionsRepository(
          * conversation "Orchestrator", and the placeholder is "Archie": both show as
          * "New conversation" (same rule as `SessionTitles.conversationTitle` and the web).
          */
-        /** Same wording as the web (spec 12 OPEN-3). */
-        fun closedNotice(title: String, why: String?): String =
-            if (why.isNullOrBlank()) "$title was closed elsewhere" else "$title ended: $why"
+        /** Same wording as the web (spec 12 OPEN-3, §6.13). */
+        fun closedNotice(title: String, termination: Termination?): String {
+            if (termination == null) return "$title was closed elsewhere"
+            val how = ENDED[termination.reason] ?: "ended"
+            return if (termination.detail.isNullOrBlank()) "$title $how" else "$title $how: ${termination.detail}"
+        }
+
+        /** How a terminated session ended, by `session_terminated.reason`. */
+        private val ENDED = mapOf(
+            "subprocess_crashed" to "crashed",
+            "subprocess_lost" to "ended unexpectedly",
+            "unreachable" to "can't reach its host",
+            "replaced" to "was replaced",
+            "closed_by_user" to "was closed",
+        )
 
         fun archieTitle(raw: String): String = raw.trim().let { if (GENERIC_ARCHIE.matches(it)) NEW_CONVERSATION else it }
         const val AGENT_PLACEHOLDER = "New agent session"

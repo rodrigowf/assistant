@@ -970,7 +970,7 @@ class Machine extends Draft {
           this.s.expectStopAck = false; // reply to our own stop / close
           return;
         }
-        return this.closedByServer(); // OPEN-3: a server stop (close, termination) closes the view
+        return this.stoppedByServer(); // the view closes on the watcher's agent_session_closed (OPEN-3)
 
       case 'voice_event':
         return this.onVoiceEvent(f.event);
@@ -1117,13 +1117,6 @@ class Machine extends Draft {
   }
 
   /** §4.4.4 start / voice / protocol errors (T-12). */
-  /** OPEN-3: the server closed this conversation; the session directory closes its view (watcher effect). */
-  private closedByServer(): void {
-    this.stoppedByServer();
-    const ref = this.s.ref;
-    this.effects.push({ type: 'watcher', frame: { type: 'agent_session_closed', session_id: ref.localId, is_orchestrator: ref.kind === 'orchestrator' } });
-  }
-
   private nonTurnError(code: string, detail: string | null): void {
     if (VOICE_ERRORS.indexOf(code) >= 0) return; // the voice controller shows these (§7.7)
     if (code === 'not_started') {
@@ -1133,7 +1126,10 @@ class Machine extends Draft {
     if (code === 'session_closed') {
       // OPEN-3: the answer to a `reattach` start, the conversation is not open on the server
       this.endStartWait();
-      return this.closedByServer();
+      this.stoppedByServer();
+      const ref = this.s.ref;
+      this.effects.push({ type: 'watcher', frame: { type: 'agent_session_closed', session_id: ref.localId, is_orchestrator: ref.kind === 'orchestrator' } });
+      return;
     }
     if (START_ERRORS.indexOf(code) < 0) {
       this.effects.push({ type: 'protocol_error', code, detail });

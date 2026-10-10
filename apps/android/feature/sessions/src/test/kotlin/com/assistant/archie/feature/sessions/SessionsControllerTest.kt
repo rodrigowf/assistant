@@ -71,8 +71,12 @@ class SessionsControllerTest {
         val c = controller(f)
         f.notices.emit(com.assistant.core.data.OpenSessionsRepository.closedNotice("Energy dashboard", null))
         assertEquals("Energy dashboard was closed elsewhere", c.state.value.snack?.message)
-        f.notices.emit(com.assistant.core.data.OpenSessionsRepository.closedNotice("Energy dashboard", "claude exited with code 1"))
-        assertEquals("Energy dashboard ended: claude exited with code 1", c.state.value.snack?.message)
+        f.notices.emit(
+            com.assistant.core.data.OpenSessionsRepository.closedNotice(
+                "Energy dashboard", com.assistant.core.conversation.Termination("subprocess_crashed", "claude exited with code 1", null),
+            ),
+        )
+        assertEquals("Energy dashboard crashed: claude exited with code 1", c.state.value.snack?.message)
     }
 
     @Test fun beforeTheFirstReply_actionsSayWhy_insteadOfDoingNothing() = runTest(UnconfinedTestDispatcher()) {

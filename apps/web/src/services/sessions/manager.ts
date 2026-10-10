@@ -389,11 +389,21 @@ function closedByServer(rt: AnyRuntime): void {
   if (getSessionRuntime(rt.localId) !== rt || rt.readOnly || !rt.conv.reattach) return;
   const active = tabsStore.getState().activeId === rt.localId;
   const title = titleOf(rt.localId);
-  const why = rt.conv.termination?.detail;
+  const term = rt.conv.termination;
   dropView(rt.localId);
   // Archie: no notice, a switch (§6.11a) announces itself right after
-  if (active && rt.kind === 'agent') showSnackbar(why ? `${title} ended: ${why}` : `${title} was closed elsewhere`);
+  if (!active || rt.kind !== 'agent') return;
+  showSnackbar(term ? `${title} ${ENDED[term.reason] ?? 'ended'}${term.detail ? `: ${term.detail}` : ''}` : `${title} was closed elsewhere`);
 }
+
+/** §6.13: how a terminated session ended, by `session_terminated.reason`. */
+const ENDED: Record<string, string> = {
+  subprocess_crashed: 'crashed',
+  subprocess_lost: 'ended unexpectedly',
+  unreachable: "can't reach its host",
+  replaced: 'was replaced',
+  closed_by_user: 'was closed',
+};
 
 // ───────────────────────── agent-initiated switch (§6.11a) ─────────────────────────
 

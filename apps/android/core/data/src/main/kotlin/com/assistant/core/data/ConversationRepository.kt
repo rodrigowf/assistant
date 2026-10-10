@@ -4,6 +4,7 @@ import com.assistant.core.conversation.ConversationEffect
 import com.assistant.core.conversation.ConversationInput
 import com.assistant.core.conversation.ConversationReducer
 import com.assistant.core.conversation.ConversationState
+import com.assistant.core.conversation.Termination
 import com.assistant.core.conversation.PageMode
 import com.assistant.core.conversation.RewindIndex
 import com.assistant.core.model.ConnectionState
@@ -64,7 +65,7 @@ sealed interface ConversationEvent {
      * found missing on a read). Its view is already gone; the workspace moves focus as after a close.
      * [detail]: why it ended, when it was terminated rather than closed.
      */
-    data class Closed(override val key: ConversationKey, val ref: SessionRef, val detail: String?) : ConversationEvent
+    data class Closed(override val key: ConversationKey, val ref: SessionRef, val termination: Termination?) : ConversationEvent
 
     /** `error{orchestrator_active}` while the user asked to start/attach (§6.11 conflict dialog, B-06). */
     data class OrchestratorConflict(val detail: String?) : ConversationEvent {
@@ -164,21 +165,21 @@ class ConversationRepository(
     private fun reconcile(read: HistoryRepository.PoolRead) {
         val live = read.rows.mapTo(HashSet()) { it.localId }
         agentHandles().filter { it.subscribedBefore(read.requestedAt) && it.state.value.ref.localId !in live }
-            .forEach { closedByServer(it.key, detail = null) }
+            .forEach { closedByServer(it.key, termination = null) }
     }
 
     private fun closeAgentView(localId: String) {
-        agentHandles().firstOrNull { it.state.value.ref.localId == localId }?.let { closedByServer(it.key, detail = it.state.value.termination?.detail) }
+        agentHandles().firstOrNull { it.state.value.ref.localId == localId }?.let { closedByServer(it.key, it.state.value.termination) }
     }
 
     /** OPEN-3: the session is gone from the server; its view closes here, with no close request. */
-    private fun closedByServer(key: ConversationKey, detail: String?) {
+    private fun closedByServer(key: ConversationKey, termination: Termination?) {
         val h = handle(key) ?: return
         val ref = h.state.value.ref
         history.dropFromPool(ref.localId)
         remove(key)
         history.refreshListSoon()
-        _events.tryEmit(ConversationEvent.Closed(key, ref, detail))
+        _events.tryEmit(ConversationEvent.Closed(key, ref, termination))
     }
 
     // ───────────────────────── observation ─────────────────────────
@@ -632,7 +633,7 @@ class ConversationRepository(
                 }
                 is ConversationEffect.SideError -> _events.tryEmit(ConversationEvent.SideError(key, e.code, e.detail))
                 // OPEN-3; launched so the close does not cancel this consumer mid-step.
-                is ConversationEffect.Closed -> scope.launch { if (handle(key) === this@Handle) closedByServer(key, e.detail) }
+                is ConversationEffect.Closed -> scope.launch { if (handle(key) === this@Handle) closedByServer(key, e.termination) }
             }
         }
     }

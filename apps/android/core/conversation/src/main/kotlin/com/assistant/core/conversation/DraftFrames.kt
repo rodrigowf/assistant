@@ -212,7 +212,7 @@ private fun Draft.closedByServer() {
         preStart.clear()
         for (g in held) dispatch(g)
     }
-    effects += ConversationEffect.Closed(termination?.detail)
+    effects += ConversationEffect.Closed(termination)
 }
 
 /** SEQ-8: a start error ends the wait for `session_started` and releases the held frames in order (L-2). */

@@ -227,7 +227,7 @@ sealed interface ConversationEffect {
      * `agent_session_closed` for this view, `error{session_closed}`): the view closes, no close request.
      * [detail]: the `session_terminated` detail when the session ended (crash, lost host) rather than closed.
      */
-    data class Closed(val detail: String?) : ConversationEffect
+    data class Closed(val termination: Termination?) : ConversationEffect
 }
 
 data class ReduceResult(val state: ConversationState, val effects: List<ConversationEffect>)

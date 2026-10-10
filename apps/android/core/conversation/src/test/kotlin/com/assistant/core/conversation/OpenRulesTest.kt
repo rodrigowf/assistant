@@ -43,7 +43,7 @@ class OpenRulesTest {
         assertTrue("another session", agent().closes(ServerFrame.AgentSessionClosed("OTHER", isOrchestrator = false)).isEmpty())
         assertTrue("our own stop ack", agent().input(ConversationInput.LocalStop).closes(ServerFrame.SessionStopped()).isEmpty())
         val crashed = agent().closes(ServerFrame.SessionTerminated("subprocess_crashed", "claude exited with code 1"), ServerFrame.SessionStopped())
-        assertEquals(listOf(ConversationEffect.Closed("claude exited with code 1")), crashed)
+        assertEquals(listOf(ConversationEffect.Closed(Termination("subprocess_crashed", "claude exited with code 1", null))), crashed)
     }
 
     @Test

@@ -498,15 +498,18 @@ describe('explicit actions', () => {
     expect(rt.isDisposed).toBe(false);
   });
 
-  it('a terminated session closes its view with the reason as the notice (§6.13, OPEN-3)', async () => {
-    h.fetch.on('GET', /\/messages/, { messages: [], total_count: 0, has_more: false, start_index: 0 });
+  it('a terminated session closes with its reason in the notice (§6.13, OPEN-3)', () => {
+    startServices({ skipInitialSync: true });
+    const watcher = FakeWebSocket.last(ORCH);
+    watcher.open();
     openSession({ kind: 'agent', localId: 'T1', focus: true });
     const ws = FakeWebSocket.last(CHAT);
     subscribe(ws, 'T1');
-    ws.emit({ type: 'session_terminated', reason: 'subprocess_crashed', detail: 'boom', sdk_session_id: 'sdk-t' });
+    ws.emit({ type: 'session_terminated', reason: 'subprocess_crashed', detail: 'exit code 1', sdk_session_id: 'sdk-t' });
     ws.emit({ type: 'session_stopped' });
-    expect(tabsStore.getState().tabs.map((t) => t.id)).not.toContain('T1');
+    watcher.emit({ type: 'agent_session_closed', session_id: 'T1', is_orchestrator: false });
     expect(getSessionRuntime('T1')).toBeUndefined();
+    expect(snackbarStore.getState().queue.map((q) => q.message).pop()).toBe('New agent session crashed: exit code 1');
     expect(closeCalls()).toEqual([]);
   });
 });

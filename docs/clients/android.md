@@ -211,7 +211,7 @@ same set and never revives a closed conversation.
   or `error{session_closed}` make the reducer emit `ConversationEffect.Closed`; the repository
   removes the view (no close request) and emits `ConversationEvent.Closed`, and
   `OpenSessionsRepository` moves focus to the neighbour as after an explicit close. If it was the
-  active agent view, the snackbar says "<title> was closed elsewhere" or "<title> ended: <detail>"
+  active agent view, the snackbar says "<title> was closed elsewhere" or "<title> crashed: <detail>" (how it ended, by reason; spec 12 §6.13)
   for a terminated session (the web's wording; none for Archie). A terminated session is reopened
   from History; there is no "Continue in new session" card any more. Agent views
   also close on the watcher frame (`ConversationRepository`), and the row leaves `history.pool` at

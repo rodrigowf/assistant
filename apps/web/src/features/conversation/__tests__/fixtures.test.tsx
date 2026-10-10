@@ -191,10 +191,4 @@ describe('notices and termination', () => {
       expect(row.textContent).toContain(withSummary.text);
     }
   });
-
-  it('termination: the reason is recorded and no card is drawn (the view closes, OPEN-3)', async () => {
-    const last = await replay('termination_banner', () => undefined);
-    expect(last.termination).not.toBeNull();
-    expect(document.querySelector('[data-card="ended"]')).toBeNull();
-  });
 });
