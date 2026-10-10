@@ -215,7 +215,7 @@ const TYPE_ROLES: [TypeRoleClass, string][] = [
   ['body-large', 'Dim the lights in the living room and put the news on the TV. Ação e informação também funcionam.'],
   ['body-medium', 'The agent process exited (code 0) after 41 turns. Memory files are kept.'],
   ['body-small', 'Port 8765 is added for you · 2 min ago'],
-  ['label-large', 'Continue in new session'],
+  ['label-large', 'Open from History'],
   ['label-medium', 'Listening 4 s'],
   ['label-small', 'CLAUDE · QWEN · GEMINI'],
 ];

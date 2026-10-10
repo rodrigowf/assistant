@@ -3,7 +3,7 @@ name: decisions
 category: archie/overview
 tags: [decisions, adr, architecture, rationale, ideas]
 created: 2026-02-23
-modified: 2026-10-07
+modified: 2026-10-10
 summary: Cross-cutting architecture decisions with dates and reasons, plus ideas considered but not planned.
 source: curated (consolidated from memory notes assistant/architecture/project-overview.md "Architecture Decisions Log", assistant/architecture/orchestrator-vision.md, docs/projects/frontend-refactor/README.md decisions D1–D8, and the writers' reports while building docs/, 2026-10-07)
 references:
@@ -61,6 +61,8 @@ effect; see the [timeline](../history/timeline.md) for the surrounding events.
 | 2026-05-15 | **Pluggable harnesses through a registry** (Claude Code, Qwen Code, Gemini CLI) | Choice of provider; adding a harness is one spec plus a manager | [harnesses](../harnesses/registry.md) |
 | 2026-08-28 | **Browser control is done by Claude sessions with a skill**, not by orchestrator tools | Browsing needs judgment and many steps; the orchestrator keeps only a one-shot `run_script` path | [browser-extension](../clients/browser-extension.md) |
 | 2026-08-24 | **Claude CLI auth via a long-lived `CLAUDE_CODE_OAUTH_TOKEN` in `context/.env`**, not copied credential files | Copied OAuth grants broke the other machine's refresh | [deployment](../infrastructure/deployment.md) |
+| 2026-10-10 | **The server owns the open set**: "Open now" on every device is the pool; a conversation closed anywhere closes its view everywhere at once (even on screen); the pool survives restarts (persisted, restored); automatic starts only `reattach` | Devices kept "Stopped" tabs with nothing behind them and re-created closed sessions; Rodrigo's rule: the backend is the ground truth and all UIs follow it immediately | [spec 12 OPEN-1..4](../specs/12-client-protocol.md), [agent-sessions](../architecture/agent-sessions.md#sessionpool-backendapipoolpy) |
+| 2026-10-10 | **Delegated agent turns belong to the conversation, not the orchestrator session**: ending the orchestrator never stops them; the runner stops a turn only after 30 min without progress | A fixed 600 s limit killed a working session mid-edit, and closing/switching the orchestrator cancelled every agent it had started | [orchestrator](../architecture/orchestrator.md#fire-and-forget-agent-turns-backendorchestratorrunnerpy) |
 
 ## Voice
 

@@ -192,14 +192,9 @@ describe('notices and termination', () => {
     }
   });
 
-  it('termination: the view stays with the card and "Continue in new session"', async () => {
+  it('termination: the reason is recorded and no card is drawn (the view closes, OPEN-3)', async () => {
     const last = await replay('termination_banner', () => undefined);
     expect(last.termination).not.toBeNull();
-    const card = document.querySelector('[data-card="ended"]') as HTMLElement;
-    expect(card).not.toBeNull();
-    expect(card.textContent).toMatch(/crashed|ended|closed|unreachable|replaced/);
-    expect(within(card).getByRole('button', { name: 'Continue in new session' })).toBeTruthy();
-    // the timeline is kept: the prompt and the tool card are still there
-    expect(document.querySelectorAll('[data-entry-id]').length).toBe(last.entries.length);
+    expect(document.querySelector('[data-card="ended"]')).toBeNull();
   });
 });

@@ -40,7 +40,6 @@ export { OrchestratorChannel, type AgentTurnFrame } from './sessions/orchestrato
 export {
   closeSession,
   closeTab,
-  continueTerminated,
   deleteSession,
   fetchPool,
   forkSession,

@@ -5,8 +5,8 @@
  * only its own slice of the session store.
  */
 import { memo, useState } from 'react';
-import { busy, type ConnectionBanner, type SessionKind, type StallInfo, type TerminationInfo } from '@/protocol';
-import { continueTerminated, getSessionRuntime } from '@/services';
+import { busy, type ConnectionBanner, type SessionKind, type StallInfo } from '@/protocol';
+import { getSessionRuntime } from '@/services';
 import { getSessionEntry, useSession, useShallow } from '@/stores';
 import { Button } from '@/ui/controls';
 import { InlineCard } from './InlineCard';
@@ -145,47 +145,3 @@ export const ErrorCards = memo(function ErrorCards({ localId }: { localId: strin
   );
 });
 
-// ───────────────────────── termination (§6.13, F-15) ─────────────────────────
-
-/** Headline by reason (inv02 F-15, ChatPanel.tsx:21-34). */
-export function terminationHeadline(t: TerminationInfo): string {
-  switch (t.reason) {
-    case 'subprocess_crashed':
-      return 'This session crashed';
-    case 'subprocess_lost':
-      return 'The session ended unexpectedly';
-    case 'unreachable':
-      return 'The host is unreachable';
-    case 'replaced':
-      return 'This session was replaced';
-    case 'closed_by_user':
-      return 'This session was closed';
-    default:
-      return 'Session ended';
-  }
-}
-
-/**
- * The view stays open with this card (W-9: the old tab closed right after the banner, inv02
- * §6.3 #9). "Continue in new session" replaces the view in place: new local id, the same sdk id,
- * the same kind, canonical cold open (§6.13, A-8.5).
- */
-export const TerminationCard = memo(function TerminationCard({ localId }: { localId: string }) {
-  const term = useSession(localId, (s) => s.conv.termination);
-  if (!term) return null;
-  return (
-    <InlineCard
-      tone="ended"
-      icon="logout"
-      role="status"
-      title={terminationHeadline(term)}
-      actions={
-        <Button variant="tonal" disabled={!term.sdk_session_id} onClick={() => continueTerminated(localId)}>
-          Continue in new session
-        </Button>
-      }
-    >
-      <span className={styles.muted}>{term.detail || 'The agent process is no longer running. The conversation is kept.'}</span>
-    </InlineCard>
-  );
-});

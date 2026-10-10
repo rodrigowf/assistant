@@ -158,3 +158,12 @@ Commit hashes are in the public repo unless they refer to the private context re
   five `context/` dirs unwatched; context-sync rebuilt (tombstones, manifest + reconcile, trash,
   mass-delete brake) and the laptop's watch limit raised. Android Notifications page found
   unreachable from Settings and fixed (`7fd6e99`). [Handoff](HANDOFF-2026-10-10.md).
+- **10-10** — **(incident)** A delegated digest session was killed mid-edit by the runner's fixed
+  600 s limit; the phone kept showing "Using tools…" and the orchestrator answered with its own
+  summary. Fixed: delegated turns belong to the conversation (stopping the orchestrator never
+  stops them), the limit counts time without progress (30 min), every runner-ended turn is
+  signalled to the tabs, failed turns are reported (`b1dd5b0`, `df2025f`). **(incident)** Sessions
+  closed on the web stayed "Open now" on the phone, and returning devices re-created closed
+  conversations → **the server owns the open set** (spec 12 OPEN-1..4): `pool/live` is "Open now"
+  on every device, closed anywhere = closed everywhere at once, the pool survives restarts
+  (`state/open_sessions.json`), automatic starts only `reattach` (`a4768aa`).

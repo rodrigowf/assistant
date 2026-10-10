@@ -2,7 +2,7 @@
  * Conversation gallery section (W-09, dev only): the conversation view in every state the mockups
  * show (desktop conversation, Archie with an agent approval, voice transcripts with the live caret,
  * stall + error, connection lost, background / compaction dividers, a visual with Open / Show on
- * TV, termination, empty Archie and agent, a long conversation scrolled up with buffered messages).
+ * TV, empty Archie and agent, a long conversation scrolled up with buffered messages).
  *
  * Screen mode for screenshots: `#/dev/gallery/conversation?screen=<scene>&theme=dark` renders one
  * scene full-viewport. `screen=live&scenario=<fixture>` runs a shared protocol fixture live
@@ -247,13 +247,6 @@ function dividers(): Conversation {
   ]);
 }
 
-function terminated(): Conversation {
-  return conv('g-ended', 'agent', [user('Run the full test suite.'), run(tool('Bash', { command: 'npm test' }, null, 'no_result'))], {
-    status: 'terminated',
-    termination: { reason: 'subprocess_crashed', detail: 'The agent process exited (code 1) after 41 turns.', sdk_session_id: 'sdk-g-ended' },
-  });
-}
-
 function long(): Conversation {
   const entries: Entry[] = [];
   for (let i = 1; i <= 40; i++) {
@@ -275,7 +268,6 @@ const SCENES: Record<string, { title: string; note: string; make: () => Conversa
     note: 'Compaction, Background update (BG-1), inline visual (tablet frame), interrupted, turn error',
     make: dividers,
   },
-  ended: { title: 'Session ended', note: 'Termination card; the tab stays (W-9)', make: terminated },
   long: { title: 'Long conversation', note: 'Scroll up: "Scroll up for older messages", freeze buffer, Jump to latest', make: long },
   'empty-archie': { title: 'Empty Archie', note: 'Mockups phone (i)', make: () => conv('g-empty-a', 'orchestrator', []), voice: true },
   'empty-agent': { title: 'Empty agent session', note: 'Start a conversation', make: () => conv('g-empty-g', 'agent', []) },

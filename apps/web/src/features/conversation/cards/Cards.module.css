@@ -29,10 +29,6 @@
   background: var(--md-sys-color-error-container);
 }
 
-.ended {
-  background: var(--md-sys-color-surface-container-highest);
-}
-
 .head {
   display: flex;
   align-items: flex-start;

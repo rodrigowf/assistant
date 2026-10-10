@@ -2,15 +2,13 @@
  * Inline cards and message actions against the real SessionRuntime (fake WebSocket and fetch,
  * W-06 test doubles): permission (request_id matching, one-click, typing = deny with feedback,
  * ExitPlanMode plan inline), stall (provider-neutral copy, Interrupt, Keep waiting), connection
- * errors (human copy, Details, Retry, dismiss), "Connection lost at …", turn errors, termination
- * (the tab stays; Continue in new session), rewind / fork entry points with the server-derived
+ * errors (human copy, Details, Retry, dismiss), "Connection lost at …", turn errors, rewind / fork entry points with the server-derived
  * `drop_last_n` (spec 12 §6.5), and the empty states.
  */
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { getSessionEntry, tabsStore } from '@/stores';
 import { openSession, type SessionRuntime } from '@/services';
-import { EMPTY, FakeWebSocket, flushPromises, jsonResponse, setupServices, teardownServices, type Harness } from '../../../services/__tests__/fakes';
+import { FakeWebSocket, flushPromises, jsonResponse, setupServices, teardownServices, type Harness } from '../../../services/__tests__/fakes';
 import { ConversationPanel } from '../ConversationPanel';
 import { preloadRich } from '../lazyRich';
 import { PLAN_HINT, PLAN_TITLE } from '../cards/copy';
@@ -159,31 +157,6 @@ describe('stall, errors and connection', () => {
     await pump();
     expect(screen.getByText(/Connection lost at \d\d:\d\d:\d\d/)).toBeTruthy();
     expect(document.querySelectorAll('[data-entry-id]')).toHaveLength(2);
-  });
-});
-
-describe('termination (W-9)', () => {
-  it('keeps the tab and the card; "Continue in new session" replaces the view in place', async () => {
-    h.fetch.on('GET', /\/messages/, EMPTY);
-    const { rt, ws } = await openAgent('T1');
-    rt.send('work');
-    await emit(
-      ws,
-      { type: 'status', status: 'processing' },
-      { type: 'session_terminated', reason: 'subprocess_crashed', detail: 'exit code 1', sdk_session_id: 'sdk-t' },
-      { type: 'session_stopped' },
-    );
-    const c = card('ended') as HTMLElement;
-    expect(c.textContent).toContain('This session crashed');
-    expect(c.textContent).toContain('exit code 1');
-    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['T1']);
-    fireEvent.click(within(c).getByRole('button', { name: 'Continue in new session' }));
-    await pump();
-    const tabs = tabsStore.getState().tabs;
-    expect(tabs).toHaveLength(1);
-    expect(tabs[0]?.id).not.toBe('T1');
-    expect(tabs[0]?.sdkId).toBe('sdk-t');
-    expect(getSessionEntry('T1')).toBeUndefined();
   });
 });
 

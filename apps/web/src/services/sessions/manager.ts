@@ -542,13 +542,6 @@ export function replaceInPlace(localId: string, sdkId: string): AnyRuntime {
   return rt;
 }
 
-/** §6.13: the termination banner's "Continue in a new view". */
-export function continueTerminated(localId: string): AnyRuntime | null {
-  const rt = getSessionRuntime(localId);
-  const sdk = rt?.conv.termination?.sdk_session_id ?? rt?.conv.ref.sdkId ?? null;
-  return sdk ? replaceInPlace(localId, sdk) : null;
-}
-
 export class SessionActionError extends Error {}
 
 /**

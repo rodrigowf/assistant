@@ -1120,7 +1120,7 @@ A small instrumented smoke subset runs on `POCO_X7`.
 | `ToolOrderingFixtureUiTest` | for each fixture tagged `r4`, rendered item order equals the fixture's expected order (text/tool interleaving in orchestrator voice and text turns) |
 | `ToolResultVisibleUiTest` | for fixtures tagged `r7`, every completed tool card shows its output, live and after refetch |
 | `ComposerStatesUiTest` | Voice → Send → Stop morph; queued send while working; disabled states with reasons |
-| `InlineCardsUiTest` | permission Approve, Reject, and type-to-reject; stall Interrupt; termination "Continue in new session" uses the **correct endpoint** (fixes inv03 §8 bug 5) |
+| `InlineCardsUiTest` | permission Approve, Reject, and type-to-reject; stall Interrupt (the termination card was removed 2026-10-10: a terminated session's view closes, spec 12 OPEN-3; it had fixed inv03 §8 bug 5) |
 | `SessionSwitcherUiTest`, `DrawerUiTest` | Open-now list, close, new Archie/agent session |
 | `MemoryLinkNavigationUiTest` | tapping `../folder/x.md` opens that doc; Back returns |
 | `SettingsSaveUiTest` | snackbar "Saved" / server error verbatim + Retry; MCP toggle semantics |

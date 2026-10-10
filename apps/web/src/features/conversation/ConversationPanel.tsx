@@ -16,7 +16,7 @@ import { memo, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { setSessionHidden } from '@/services';
 import { createSessionStore, getSessionEntry, useSession, useSessionRegistryVersion, type SessionStore } from '@/stores';
 import { initialConversation } from '@/protocol';
-import { ErrorCards, StallCard, TerminationCard } from './cards/cards';
+import { ErrorCards, StallCard } from './cards/cards';
 import { useRichModule } from './lazyRich';
 import { ConversationEmpty } from './ConversationEmpty';
 import { MessageActionHost } from './MessageActionHost';
@@ -58,7 +58,6 @@ export const InlineCards = memo(function InlineCards({ localId }: { localId: str
       <ErrorCards localId={localId} />
       <StallCard localId={localId} />
       {rich ? <rich.RichPermissionCards localId={localId} /> : null}
-      <TerminationCard localId={localId} />
     </div>
   );
 });

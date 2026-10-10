@@ -16,7 +16,7 @@ export { MessageList, type MessageListProps } from './MessageList';
 export { ConversationEmpty, ARCHIE_SUGGESTIONS, type ConversationEmptyProps } from './ConversationEmpty';
 export { MessageActions, MessageActionsContext, type MessageActionKind, type MessageActionRequest, type MessageActionsContextValue } from './MessageActions';
 export { MessageActionHost, ACTION_COPY } from './MessageActionHost';
-export { ErrorCards, StallCard, TerminationCard, bannerText, formatStall, stallText, terminationHeadline } from './cards/cards';
+export { ErrorCards, StallCard, bannerText, formatStall, stallText } from './cards/cards';
 export { PLAN_HINT, PLAN_TITLE, FEEDBACK_HINT } from './cards/copy';
 export { preloadRich } from './lazyRich';
 export { InlineCard, type InlineCardProps, type InlineCardTone } from './cards/InlineCard';

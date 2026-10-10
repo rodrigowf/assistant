@@ -11,7 +11,6 @@ import {
   ArchieRuntime,
   closeSession,
   closeTab,
-  continueTerminated,
   deleteSession,
   forkSession,
   getArchieRuntime,
@@ -499,17 +498,15 @@ describe('explicit actions', () => {
     expect(rt.isDisposed).toBe(false);
   });
 
-  it('termination recovery replaces the view in place with the terminated sdk id (§6.13)', async () => {
+  it('a terminated session closes its view with the reason as the notice (§6.13, OPEN-3)', async () => {
     h.fetch.on('GET', /\/messages/, { messages: [], total_count: 0, has_more: false, start_index: 0 });
-    const rt = openSession({ kind: 'agent', localId: 'T1', focus: true }) as SessionRuntime;
+    openSession({ kind: 'agent', localId: 'T1', focus: true });
     const ws = FakeWebSocket.last(CHAT);
     subscribe(ws, 'T1');
     ws.emit({ type: 'session_terminated', reason: 'subprocess_crashed', detail: 'boom', sdk_session_id: 'sdk-t' });
     ws.emit({ type: 'session_stopped' });
-    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['T1']); // W-9: the tab stays
-    expect(rt.conv.termination?.reason).toBe('subprocess_crashed');
-    const next = continueTerminated('T1');
-    expect(next?.conv.ref.sdkId).toBe('sdk-t');
+    expect(tabsStore.getState().tabs.map((t) => t.id)).not.toContain('T1');
+    expect(getSessionRuntime('T1')).toBeUndefined();
     expect(closeCalls()).toEqual([]);
   });
 });
