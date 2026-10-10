@@ -55,11 +55,12 @@ describe('expanded: documents open as tabs', () => {
     });
   });
 
-  it('visual → a tab whose iframe survives switching to another tab', () => {
+  it('visual → a tab whose iframe survives switching to another tab', async () => {
     const { getByRole, container } = renderUi(<App services={false} />);
     fireEvent.click(getByRole('button', { name: 'Visuals' }));
     fireEvent.click(within(getByRole('complementary', { name: 'Visuals' })).getByRole('button', { name: /Weekly energy usage/ }));
     expect(tabsStore.getState().activeId).toBe('viz:charts/weekly.html');
+    await waitFor(() => expect(container.querySelector('iframe')).toBeTruthy()); // lazy viewer chunk
     const frame = container.querySelector('iframe');
     expect(frame?.getAttribute('src')).toBe('http://backend.test/charts/weekly.html');
     fireEvent.click(getByRole('button', { name: 'Memory' }));

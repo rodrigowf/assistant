@@ -62,7 +62,11 @@ sealed interface ChannelEvent {
     /** `error{orchestrator_active}` while the user had an intent in flight: show the conflict dialog (§6.11). */
     data class Conflict(val detail: String?) : ChannelEvent
 
-    /** WATCH-1: the attached orchestrator was closed elsewhere (`agent_session_closed{is_orchestrator}`). */
+    /**
+     * OPEN-3: the attached orchestrator left the server's pool: `agent_session_closed{is_orchestrator}`,
+     * `error{session_closed}`, or a `pool/live` read without it. For the last two the channel first
+     * publishes a synthesized `agent_session_closed`, so every frame consumer sees one signal.
+     */
     data class OrchestratorClosed(val localId: String) : ChannelEvent
 
     /**
@@ -80,7 +84,7 @@ sealed interface ChannelEvent {
         val fromLocalId: String?,
     ) : ChannelEvent
 
-    /** T-9: the app came to the foreground with the socket open; consumers re-send `start`. */
+    /** T-9: foreground with the socket open and the orchestrator still in the pool; consumers re-send `start`. */
     data object Resync : ChannelEvent
     data class Disconnected(val willReconnect: Boolean) : ChannelEvent
 }
@@ -88,8 +92,11 @@ sealed interface ChannelEvent {
 /**
  * Owns the app's **single** orchestrator socket (T-6), in a process-scoped runtime (spec 14 §2.5).
  *
- * - Adoption on every socket open: `GET /api/sessions/pool/live` for the `is_orchestrator` row,
- *   retried once after [SessionTuning.POOL_PROBE_RETRY_MS] (cold-start empty pool).
+ * - The server's pool is the truth (spec 12 OPEN-1..4): every socket open and every foreground read
+ *   `GET /api/sessions/pool/live` (retried once after [SessionTuning.POOL_PROBE_RETRY_MS] when it has
+ *   no orchestrator). Its `is_orchestrator` row is adopted; without one the attached conversation
+ *   was closed ([ChannelEvent.OrchestratorClosed]). Every automatic `start` carries `reattach`
+ *   (OPEN-2); only the user's own (a new conversation, a switch) may create one.
  * - Genuine-reconnect gating (`initialConnectionDone`), reset on a server change (T-15; fixes the
  *   dead `teardownForServerUrlChange`, inv03 §8).
  * - `orchestrator_active` recovery: single-flight, one attempt per error at
@@ -147,6 +154,8 @@ class OrchestratorChannel(
         data class ArmNew(val localId: String) : Cmd
         data class Inject(val text: String) : Cmd
         data class ProbeDone(val generation: Int, val found: PoolSession?) : Cmd
+        /** [rows] `null`: the read failed. */
+        data class ForegroundProbeDone(val generation: Int, val rows: List<PoolSession>?) : Cmd
         data class RecoveryStep(val generation: Int, val found: PoolSession?) : Cmd
         data object RecoveryAborted : Cmd
         data object UserIntent : Cmd
@@ -165,6 +174,7 @@ class OrchestratorChannel(
     private var recoveryAttempt = 0
     private var recoveryJob: Job? = null
     private var probeJob: Job? = null
+    private var foregroundJob: Job? = null
     private var userIntent = false
     private val outbox = ArrayDeque<String>()
     /** `orchestrator_switch` frames already acted on, as "sdkId|fromId" (SW-1). */
@@ -198,10 +208,13 @@ class OrchestratorChannel(
     /** Raw send (voice frames, `send`, `interrupt`, …). */
     fun send(frame: ClientFrame): SendResult = socket.send(frame)
 
-    /** `start` for the adopted orchestrator (T-9/T-10: [resumeFrom] only from an in-memory checkpoint). */
-    fun sendStart(resumeFrom: ResumeCursor? = null): SendResult {
+    /**
+     * `start` for the held orchestrator (T-10: `resume_from` only from an in-memory checkpoint).
+     * [reattach] on every automatic start (OPEN-2); `false` only for the user's new / switched one.
+     */
+    private fun sendStart(reattach: Boolean = true): SendResult {
         val ref = _state.value.orchestrator ?: return SendResult.NOT_CONNECTED
-        return socket.send(ClientFrame.Start(ref.localId, ref.sdkId, resumeFrom ?: config.resumeCursor(ref.localId)))
+        return socket.send(ClientFrame.Start(ref.localId, ref.sdkId, config.resumeCursor(ref.localId), reattach = true.takeIf { reattach }))
     }
 
     /** onStart/onResume (spec 12 §3.5). */
@@ -267,7 +280,7 @@ class OrchestratorChannel(
                 if (socketOpen) {
                     probeJob?.cancel()
                     emit(ChannelEvent.NewSessionArmed(ref))
-                    if (config.autoStart) sendStart()
+                    if (config.autoStart) sendStart(reattach = false)
                 } else {
                     armedNew = ref
                 }
@@ -283,16 +296,19 @@ class OrchestratorChannel(
             is Cmd.Foreground -> if (cmd.value) {
                 socket.setReconnectAllowed(true)
                 if (socketOpen) {
-                    emit(ChannelEvent.Resync)
-                    if (config.autoStart && _state.value.orchestrator != null) sendStart()
+                    // OPEN-4: re-read the pool first; the socket may have stayed open across a missed close.
+                    val gen = connGeneration
+                    foregroundJob?.cancel()
+                    foregroundJob = scope.launch { inbox.send(Cmd.ForegroundProbeDone(gen, pool.livePool())) }
                 } else {
-                    socket.reconnectNow()
+                    socket.reconnectNow()           // the reopen reads the pool
                 }
             } else {
                 socket.setReconnectAllowed(cmd.keepAliveInBackground)
             }
             is Cmd.Socket -> onSocket(cmd.event)
             is Cmd.ProbeDone -> if (cmd.generation == connGeneration) onProbe(cmd.found)
+            is Cmd.ForegroundProbeDone -> if (cmd.generation == connGeneration && socketOpen) onForegroundProbe(cmd.rows)
             is Cmd.RecoveryStep -> onRecoveryStep(cmd.found)
             Cmd.RecoveryAborted -> _state.update { it.copy(recovering = false) }
         }
@@ -303,16 +319,17 @@ class OrchestratorChannel(
             SocketEvent.Opened -> {
                 socketOpen = true
                 connGeneration++
+                foregroundJob?.cancel()
                 _state.update { it.copy(subscribed = false) }
                 val armed = armedNew
+                val gen = connGeneration
+                probeJob?.cancel()
                 if (armed != null) {
                     armedNew = null
                     initialConnectionDone = true
                     emit(ChannelEvent.NewSessionArmed(armed))
-                    if (config.autoStart) sendStart()
+                    if (config.autoStart) sendStart(reattach = false)
                 } else {
-                    val gen = connGeneration
-                    probeJob?.cancel()
                     probeJob = scope.launch {
                         var found = pool.livePool()?.firstOrNull { it.isOrchestrator }
                         if (found == null) {
@@ -326,6 +343,7 @@ class OrchestratorChannel(
             is SocketEvent.Closed -> {
                 socketOpen = false
                 probeJob?.cancel()
+                foregroundJob?.cancel()
                 _state.update { it.copy(subscribed = false) }
                 emit(ChannelEvent.Disconnected(e.willReconnect))
             }
@@ -333,27 +351,54 @@ class OrchestratorChannel(
         }
     }
 
+    /** OPEN-4 on every socket open: the pool's orchestrator is the one; none means ours was closed. */
     private suspend fun onProbe(found: PoolSession?) {
         val mine = _state.value.orchestrator
-        if (found == null && mine != null) {
-            // Reconnect with no live orchestrator in the pool, e.g. the backend restarted and its
-            // pool is empty. The conversation this device was showing still exists on disk:
-            // `start` with its ids resumes it, as the web does on every reopen. Without this the
-            // view stayed "Reconnecting…" forever (2026-10-04, POCO X7 Pro). Having a conversation
-            // makes this a reconnect even when the first probe found none and the user then
-            // opened one from History (initialConnectionDone is still false in that case).
-            initialConnectionDone = true
-            emit(ChannelEvent.Adopted(mine, reconnect = true))
-            emit(ChannelEvent.Reconnected(mine))
-            if (config.autoStart) sendStart()
-            return
+        when {
+            found != null -> adopt(OrchestratorRef(found.localId, found.sdkId), reconnect = initialConnectionDone)
+            mine != null && userIntent -> userStartAgain(mine)
+            mine != null -> closedElsewhere(mine)
+            else -> {
+                _state.update { it.copy(noOrchestrator = true) }
+                emit(ChannelEvent.NoOrchestrator)
+            }
         }
-        if (found == null) {
-            _state.update { it.copy(noOrchestrator = true) }
-            emit(ChannelEvent.NoOrchestrator)
-            return
+    }
+
+    /** OPEN-4 on foreground with the socket open (see [Cmd.Foreground]); a failed read keeps T-9. */
+    private suspend fun onForegroundProbe(rows: List<PoolSession>?) {
+        val mine = _state.value.orchestrator
+        val found = rows?.firstOrNull { it.isOrchestrator }
+        when {
+            rows == null || userIntent || armedNew != null -> resync()
+            found != null && found.localId == mine?.localId -> resync()
+            found != null -> adopt(OrchestratorRef(found.localId, found.sdkId), reconnect = false)   // opened elsewhere
+            mine != null -> closedElsewhere(mine)
         }
-        adopt(OrchestratorRef(found.localId, found.sdkId), reconnect = initialConnectionDone)
+    }
+
+    /** T-9: only with an orchestrator. */
+    private fun resync() {
+        if (_state.value.orchestrator == null) return
+        emit(ChannelEvent.Resync)
+        if (config.autoStart) sendStart()
+    }
+
+    /**
+     * The user's own new / resumed conversation was not started yet when the socket dropped: send its
+     * `start` again, still as the user's (it may create the conversation, OPEN-2).
+     */
+    private fun userStartAgain(mine: OrchestratorRef) {
+        emit(ChannelEvent.Adopted(mine, reconnect = false))
+        if (config.autoStart) sendStart(reattach = false)
+    }
+
+    /** OPEN-3: [ref] left the pool. Every frame consumer gets the same `agent_session_closed`. */
+    private suspend fun closedElsewhere(ref: OrchestratorRef) {
+        _state.update { it.copy(orchestrator = null, subscribed = false, noOrchestrator = true) }
+        ids.clear()
+        framesOut.publish(ServerFrame.AgentSessionClosed(sessionId = ref.localId, isOrchestrator = true))
+        emit(ChannelEvent.OrchestratorClosed(ref.localId))
     }
 
     private suspend fun adopt(ref: OrchestratorRef, reconnect: Boolean) {
@@ -383,7 +428,11 @@ class OrchestratorChannel(
                 flushOutbox()
                 return
             }
-            is ServerFrame.Error -> if (f.error == "orchestrator_active") onOrchestratorActive(f.detail)
+            is ServerFrame.Error -> when (f.error) {
+                "orchestrator_active" -> onOrchestratorActive(f.detail)
+                // OPEN-3: a reattach `start` / `voice_start` found the conversation closed.
+                "session_closed" -> _state.value.orchestrator?.let { closedElsewhere(it); return }
+            }
             is ServerFrame.OrchestratorSwitch -> {
                 framesOut.publish(f)
                 onSwitch(f)
@@ -406,13 +455,8 @@ class OrchestratorChannel(
             }
             is ServerFrame.AgentSessionClosed -> {
                 val ref = _state.value.orchestrator
-                if (f.isOrchestrator && ref != null && f.sessionId == ref.localId) {   // FOCUS-2, WATCH-1
-                    // noOrchestrator: the socket is open and healthy, there is just no conversation;
-                    // without it the connection status read "connecting" forever (2026-10-04).
-                    _state.update { it.copy(orchestrator = null, subscribed = false, noOrchestrator = true) }
-                    ids.clear()
-                    framesOut.publish(f)
-                    emit(ChannelEvent.OrchestratorClosed(ref.localId))
+                if (f.isOrchestrator && ref != null && f.sessionId == ref.localId) {   // FOCUS-2, OPEN-3
+                    closedElsewhere(ref)
                     return
                 }
             }
@@ -436,7 +480,7 @@ class OrchestratorChannel(
         ids.save(ref.localId)
         _state.update { it.copy(orchestrator = ref, subscribed = false, noOrchestrator = false) }
         emit(ChannelEvent.SwitchRequested(ref, f.title, f.voice, f.fromSessionId))
-        if (config.autoStart && socketOpen) sendStart()
+        if (config.autoStart && socketOpen) sendStart(reattach = false)
     }
 
     private fun onOrchestratorActive(detail: String?) {
@@ -472,7 +516,7 @@ class OrchestratorChannel(
             socket.reconnectNow()
             return
         }
-        socket.send(ClientFrame.Start(ref.localId, ref.sdkId, config.resumeCursor(ref.localId)))
+        sendStart()
     }
 
     private fun flushOutbox() {
@@ -484,7 +528,7 @@ class OrchestratorChannel(
     }
 
     private fun cancelJobs() {
-        probeJob?.cancel(); recoveryJob?.cancel()
+        probeJob?.cancel(); recoveryJob?.cancel(); foregroundJob?.cancel()
     }
 
     private fun emit(e: ChannelEvent) = eventsOut.publish(e)

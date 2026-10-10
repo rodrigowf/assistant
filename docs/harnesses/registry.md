@@ -7,6 +7,7 @@ modified: 2026-10-08
 summary: The pluggable agent-CLI harness layer — HarnessRegistry, HarnessSpec, adapters, SessionStore, dispatch sites, and how to add one.
 source: curated (consolidated from memory notes assistant/providers/provider_generalization.md, assistant/providers/qwen_code_adaptation.md, assistant/providers/gemini_cli_adaptation.md; verified against code 2026-10-06)
 references:
+  - authentication.md
   - claude-code.md
   - qwen-code.md
   - gemini-cli.md
@@ -18,6 +19,7 @@ references:
   - ../infrastructure/installation.md
   - ../infrastructure/ssh-remote-execution.md
   - ../voice/architecture.md
+  - ../architecture/memory-and-search.md
 ---
 
 # Harness registry
@@ -133,6 +135,10 @@ spec's `jsonl_path_resolver`. Delete is a soft-delete into the store's own `cont
 left behind; a name collision adds the same `.<timestamp>` suffix to all three). Titles for every
 harness live in one `context/.titles.json`.
 
+Memory is shared the same way: every harness gets `context/memory/MEMORY.md` in its context
+when working in the repo and writes notes into `context/memory/` per `AGENTS.md` — how each CLI
+gets there is in [memory and search](../architecture/memory-and-search.md#every-harness-reads-and-writes-the-same-memory).
+
 ## Dispatch sites (all registry lookups)
 
 | Site | What it does |
@@ -208,7 +214,7 @@ These still name harnesses literally. None of them blocks a new harness.
 | `install/{linux,apple}/install.sh`, `install/windows/install.ps1` — `WITH_CLAUDE` / `WITH_QWEN` / `WITH_GEMINI` / `WITH_CODEX`, `--with-<x>` / `--without-<x>`, `--qwen-only`, per-harness symlink steps, pinned CLI versions; the `install-with-agent.*` harness → npm package maps | Runs before the venv exists, so it cannot import the registry. A new harness adds its own block ([installation](../infrastructure/installation.md)). |
 | `install/cli-runtime/<cli>/` | Per-CLI starter files seeded into `.claude/`, `.qwen/`, `.gemini/` at the repo root |
 | `ManagerConfig.provider = "claude"`, `types.py` defaults, `backend/api/routes/sessions.py` `s.get("provider", "claude")` | Fallbacks for records older than per-session provider tracking |
-| `backend/manager/auth.py` + `/api/auth/*` | Claude-only OAuth helper; other harnesses authenticate through their own CLI or env keys |
+| `backend/manager/auth.py` + `/api/auth/*` | Claude-only OAuth helper behind the first-run AuthGate. Sign-in for every harness lives in `backend/manager/accounts/` (one `AccountService` per service, not part of `HarnessSpec`; see [authentication.md](authentication.md)) |
 | `backend/api/session_factory.py` chrome flag / MCP servers | Only `ClaudeSessionManager` consumes `extra_args` and `mcp_servers`; the other harnesses ignore them |
 | `apps/web/src/features/history/HistoryPane.tsx` `PROVIDER` label map | Short tag text; unknown ids fall back to the raw id |
 | `backend/orchestrator/config.py` `mid.startswith("qwen")` etc. | Orchestrator text-model routing — a different axis |

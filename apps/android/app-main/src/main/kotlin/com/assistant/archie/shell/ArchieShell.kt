@@ -50,7 +50,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
@@ -65,6 +68,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
+import com.assistant.archie.feature.chat.ui.observeVoiceOverlayActivity
 import com.assistant.archie.feature.sessions.SessionsIntent
 import com.assistant.archie.feature.sessions.ui.HistoryListState
 import com.assistant.archie.feature.sessions.ui.HistoryScreen
@@ -72,6 +76,7 @@ import com.assistant.archie.feature.sessions.ui.SessionMenuButton
 import com.assistant.archie.feature.sessions.ui.SessionSwitcherContent
 import com.assistant.archie.feature.sessions.ui.SessionsHost
 import com.assistant.core.data.ConnectionStatus
+import com.assistant.core.data.ItemKey
 import com.assistant.core.data.ItemKind
 import com.assistant.core.data.WorkspaceItem
 import com.assistant.core.design.components.ArchieButton
@@ -123,15 +128,24 @@ fun ArchieShell(
     destinations: ShellDestinations,
     modifier: Modifier = Modifier,
     overlays: ShellOverlays = ShellOverlays(),
+    voiceOverlay: ShellVoiceOverlay? = null,
 ) {
-    BoxWithConstraints(modifier.fillMaxSize().testTag("shell")) {
+    // The floating voice controls fade when the app sits still: every touch is activity (observed, never consumed).
+    val activity = voiceOverlay?.let { Modifier.observeVoiceOverlayActivity(it.activity) } ?: Modifier
+    BoxWithConstraints(modifier.fillMaxSize().testTag("shell").then(activity)) {
         when (val layout = LayoutClass.of(maxWidth)) {
-            LayoutClass.Compact -> CompactShell(state, onAction, backStack, destinations, overlays)
-            else -> WideShell(layout, state, onAction, backStack, destinations, overlays)
+            LayoutClass.Compact -> CompactShell(state, onAction, backStack, destinations, overlays, voiceOverlay)
+            else -> WideShell(layout, state, onAction, backStack, destinations, overlays, voiceOverlay)
         }
         // B-06: session dialogs (rename, delete, fork, close, the Archie conflict), busy overlay, snackbar.
         SessionsHost(state.sessions, { onAction(ShellAction.Sessions(it)) })
     }
+}
+
+/** The floating voice controls' state text: back to the workspace with the Archie conversation focused. */
+private fun openArchie(backStack: MutableList<NavKey>, onAction: (ShellAction) -> Unit): () -> Unit = {
+    while (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+    onAction(ShellAction.Select(ItemKey.Archie))
 }
 
 /** ×, swipe, the ⋮ menu's Close: the B-06 flow decides whether to ask first (§6.7, P-1). */
@@ -145,7 +159,6 @@ private fun ShellHistoryScreen(state: ShellUiState, onAction: (ShellAction) -> U
         state = HistoryListState(
             items = state.items,
             active = state.active,
-            liveElsewhere = state.liveElsewhere,
             groups = state.history,
             loading = state.historyLoading,
             error = state.historyError,
@@ -153,7 +166,6 @@ private fun ShellHistoryScreen(state: ShellUiState, onAction: (ShellAction) -> U
         ),
         onQuery = { onAction(ShellAction.Search(it)) },
         onSelect = { onAction(ShellAction.Select(it)) },
-        onOpenLive = { onAction(ShellAction.OpenLive(it)) },
         onIntent = { onAction(ShellAction.Sessions(it)) },
         onRefresh = { onAction(ShellAction.RefreshHistory) },
         onBack = onBack,
@@ -171,8 +183,10 @@ private fun CompactShell(
     backStack: MutableList<NavKey>,
     destinations: ShellDestinations,
     overlays: ShellOverlays,
+    voiceOverlay: ShellVoiceOverlay?,
 ) {
     val c = ArchieTheme.colors
+    var region by remember { mutableStateOf<Rect?>(null) }
     val drawer = rememberDrawerState(if (overlays.drawerOpen) DrawerValue.Open else DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     var switcherOpen by rememberSaveable { mutableStateOf(overlays.switcherOpen) }
@@ -200,14 +214,18 @@ private fun CompactShell(
             }
         },
     ) {
-        ShellNavDisplay(backStack, destinations, history = { pop -> ShellHistoryScreen(state, onAction, pop) }) {
-            CompactWorkspace(
-                state, onAction, destinations,
-                onMenu = { scope.launch { drawer.open() } },
-                onTitle = { switcherOpen = true },
-                switcherOpen = switcherOpen,
-                onSessionSettings = { backStack.add(SessionSettings(it)) },
-            )
+        // The voice overlay floats over every compact screen; the modal drawer covers it.
+        Box(Modifier.fillMaxSize().onGloballyPositioned { region = it.boundsInRoot() }) {
+            ShellNavDisplay(backStack, destinations, history = { pop -> ShellHistoryScreen(state, onAction, pop) }) {
+                CompactWorkspace(
+                    state, onAction, destinations,
+                    onMenu = { scope.launch { drawer.open() } },
+                    onTitle = { switcherOpen = true },
+                    switcherOpen = switcherOpen,
+                    onSessionSettings = { backStack.add(SessionSettings(it)) },
+                )
+            }
+            voiceOverlay?.Overlay(region, compact = true, state.active, backStack.lastOrNull(), openArchie(backStack, onAction))
         }
     }
 
@@ -224,9 +242,7 @@ private fun CompactShell(
             SessionSwitcherContent(
                 items = state.items,
                 active = state.active,
-                liveElsewhere = state.liveElsewhere,
                 onSelect = { onAction(ShellAction.Select(it)) },
-                onOpenLive = { onAction(ShellAction.OpenLive(it)) },
                 onRequestClose = requestClose(onAction),
                 onNewArchie = { onAction(ShellAction.NewArchie) },
                 onNewAgent = { onAction(ShellAction.NewAgent) },
@@ -333,8 +349,10 @@ private fun WideShell(
     backStack: MutableList<NavKey>,
     destinations: ShellDestinations,
     overlays: ShellOverlays,
+    voiceOverlay: ShellVoiceOverlay?,
 ) {
     val c = ArchieTheme.colors
+    var region by remember { mutableStateOf<Rect?>(null) }
     var rail by rememberSaveable { mutableStateOf(RailDestination.Chats) }
     var overlay by rememberSaveable { mutableStateOf(overlays.listOverlayOpen) }
     val expanded = layout == LayoutClass.Expanded
@@ -371,6 +389,7 @@ private fun WideShell(
                     .padding(top = 8.dp, end = 8.dp, bottom = 8.dp)
                     .clip(RoundedCornerShape(24.dp))
                     .background(c.surface)
+                    .onGloballyPositioned { region = it.boundsInRoot() }
                     .testTag("workspace"),
             ) {
                 ShellNavDisplay(backStack, destinations, history = { pop -> ShellHistoryScreen(state, onAction, pop) }) {
@@ -383,6 +402,8 @@ private fun WideShell(
                 }
             }
         }
+        // Above the rail, list pane and workspace (Settings included); under the medium list overlay.
+        voiceOverlay?.Overlay(region, compact = false, state.active, backStack.lastOrNull(), openArchie(backStack, onAction))
         if (!expanded && overlay) {
             BackHandler { overlay = false }
             Box(
@@ -653,7 +674,9 @@ private fun ShellNavDisplay(
             entry<Workspace> { workspace() }
             entry<History> { history(pop) }
             entry<MemoryTree> { destinations.MemoryScreen(onBack = pop, onOpenDoc = { backStack.add(MemoryDoc(it)) }) }
-            entry<MemoryDoc> { k -> destinations.MemoryDocScreen(k.path, onBack = pop, onOpenDoc = { backStack.add(MemoryDoc(it)) }) }
+            entry<MemoryDoc> { k ->
+                destinations.MemoryDocScreen(k.path, onBack = pop, onOpenDoc = { backStack.add(MemoryDoc(it)) }, onOpenVisual = { backStack.add(VisualDoc(it)) })
+            }
             entry<VisualsList> { destinations.VisualsScreen(onBack = pop, onOpen = { backStack.add(VisualDoc(it)) }) }
             entry<VisualDoc> { k -> destinations.VisualScreen(k.path, onBack = pop) }
             entry<SettingsHome> { destinations.SettingsScreen(onBack = pop, onOpenPage = { backStack.add(SettingsPage(it)) }) }

@@ -9,6 +9,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,11 +37,13 @@ import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -165,7 +168,8 @@ enum class VoiceDockState(val label: String) { Listening("Listening"), Speaking(
 /**
  * Voice dock (IA §6, mockup `.dock`): the composer becomes this while voice is on — level orb
  * (live when [level] answers, see [VoiceOrb]), state word and hint, then controls ([controls]: mic
- * mute, speaker mute, end). r32 on surface-container-high, 84 dp tall.
+ * mute, speaker mute, end). r32 on surface-container-high, 84 dp tall. [onLabelClick]: the
+ * floating controls make the state text open the Archie conversation.
  */
 @Composable
 fun VoiceDock(
@@ -173,15 +177,19 @@ fun VoiceDock(
     hint: String,
     modifier: Modifier = Modifier,
     level: (() -> Float?)? = null,
+    onLabelClick: (() -> Unit)? = null,
     controls: @Composable RowScope.() -> Unit,
 ) {
     val tone = if (state == VoiceDockState.Speaking) OrbTone.Speaking else OrbTone.Listening
     DockFrame(modifier.semantics { liveRegion = LiveRegionMode.Polite }, minHeight = 84.dp) {
         VoiceOrb(tone, level = level)
-        DockLabel(state.label, hint, titleSize = 18)
+        DockLabel(state.label, hint, titleSize = 18, onClick = onLabelClick)
         controls()
     }
 }
+
+/** The click label of a dock's state text in the floating controls. */
+const val OPEN_CONVERSATION_LABEL = "Open the Archie conversation"
 
 /** The standard dock controls: mic mute (toggle), speaker mute (toggle), end. */
 @Composable
@@ -323,10 +331,16 @@ private fun RowScope.DockLabel(
     hint: String,
     titleSize: Int,
     wrapHint: Boolean = false,
+    onClick: (() -> Unit)? = null,
     titleTrailing: (@Composable RowScope.() -> Unit)? = null,
 ) {
     val c = ArchieTheme.colors
-    Column(Modifier.weight(1f).padding(start = 6.dp)) {
+    val click = if (onClick != null) {
+        Modifier.clip(RoundedCornerShape(16.dp)).clickable(onClickLabel = OPEN_CONVERSATION_LABEL, role = Role.Button, onClick = onClick)
+    } else {
+        Modifier
+    }
+    Column(Modifier.weight(1f).then(click).padding(start = 6.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 title,

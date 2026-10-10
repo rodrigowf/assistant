@@ -10,7 +10,10 @@ import kotlinx.serialization.json.JsonObject
 sealed interface ClientFrame {
     val type: String
 
-    /** Chat or orchestrator `start` (spec 12 §3.3). `resumeFrom` only per T-10. */
+    /**
+     * Chat or orchestrator `start` (spec 12 §3.3). `resumeFrom` only per T-10. [reattach] (OPEN-2) on
+     * every automatic start: the server only subscribes to an open conversation, never creates one.
+     */
     data class Start(
         val localId: String,
         val resumeSdkId: String? = null,
@@ -19,6 +22,7 @@ sealed interface ClientFrame {
         val fork: Boolean? = null,
         /** Chat only: literal `{name: config}` map overriding the MCP selection. */
         val mcpServers: JsonObject? = null,
+        val reattach: Boolean? = null,
     ) : ClientFrame { override val type get() = "start" }
 
     /** Orchestrator voice start / re-arm (spec 12 §7.3). Null voice fields are omitted (V-1). */
@@ -26,6 +30,8 @@ sealed interface ClientFrame {
         val localId: String,
         val resumeSdkId: String? = null,
         val voice: VoiceConfig = VoiceConfig(),
+        /** OPEN-2: the re-arm after a reconnect; a voice start the user pressed has none. */
+        val reattach: Boolean? = null,
     ) : ClientFrame { override val type get() = "voice_start" }
 
     data class Send(val text: String) : ClientFrame { override val type get() = "send" }

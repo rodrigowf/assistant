@@ -49,14 +49,20 @@ import com.assistant.core.design.icons.ArchieIcon
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import com.assistant.archie.feature.settings.AccountsModel
+import kotlinx.coroutines.delay
 
 /**
- * The sign-in flows (inv02 §1.11), shared by the AuthGate and Settings → Account (web `AuthPanel`):
- * - **Server with a screen** (not headless): "Sign in with Claude" runs `claude setup-token` on the
- *   server (`POST /api/auth/login`, blocks until it exits); "Paste credentials instead" opens the
- *   manual flow.
- * - **Headless server**, or the manual view: paste `~/.claude/.credentials.json` from a signed-in
- *   machine (`POST /api/auth/credentials`), with an optional link to the Claude Console.
+ * The Claude sign-in flows of the AuthGate (inv02 §1.11, web `AuthPanel`); Settings → Accounts has every
+ * service's methods (`AccountsPage`):
+ * - **Sign in with a link** (any server, also headless): `POST /api/accounts/claude/login` runs
+ *   `claude setup-token` on the server; the URL opens in the browser, the user pastes back the
+ *   code; the 1-year token is saved on the server. Older servers fall back to the blocking
+ *   `POST /api/auth/login` when they have a screen.
+ * - **Paste credentials**: `~/.claude/.credentials.json` from a signed-in machine
+ *   (`POST /api/auth/credentials`), with an optional link to the Claude Console.
  */
 @Composable
 internal fun AuthPanel(auth: AuthModel, host: String, startWithPaste: Boolean = false, onSignedIn: () -> Unit = {}) {
@@ -64,36 +70,66 @@ internal fun AuthPanel(auth: AuthModel, host: String, startWithPaste: Boolean = 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val c = ArchieTheme.colors
-    val headless = st.status?.headless == true
-    var pasteChosen by rememberSaveable { mutableStateOf(startWithPaste) }
-    var text by rememberSaveable { mutableStateOf("") }
-    val paste = pasteChosen || headless
+    var paste by rememberSaveable { mutableStateOf(startWithPaste) }
+    // Secrets stay out of saved state (`remember`).
+    var text by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    val flow = st.flow
     DisposableEffect(auth) { onDispose { auth.clearError() } }
+    LaunchedEffect(flow?.id, flow?.active) {
+        while (flow?.active == true) {
+            delay(AccountsModel.FLOW_POLL_MS)
+            auth.pollLink()
+        }
+    }
 
     if (!paste) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.testTag("auth-panel-login")) {
-            Text("Sign in with your Claude account. A sign-in window opens on $host; finish there and this page updates.", style = ArchieTheme.typography.bodyMedium, color = c.onSurface)
-            if (st.phase == AuthPhase.SIGNING_IN) {
+            val live = flow?.takeIf { it.active && it.url != null }
+            if (live == null) {
+                Text("Sign in with your Claude subscription: open a link on any device, sign in, and paste back the code it shows. The token is saved on $host.", style = ArchieTheme.typography.bodyMedium, color = c.onSurface)
+            } else {
+                val url = live.url.orEmpty()
+                Text("1. Open the link and sign in with your Claude account.\n2. Copy the code the page shows and paste it below.", style = ArchieTheme.typography.bodyMedium, color = c.onSurface)
+                Text(url, Modifier.fillMaxWidth().testTag("auth-link-url"), style = ArchieTheme.typography.bodySmall, color = c.onSurfaceVariant, maxLines = 3)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ArchieButton("Open link", { context.launch(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }, Modifier.testTag("auth-link-open"), icon = ArchieIcons.OpenInNew)
+                }
+                ArchieTextField(
+                    code, { code = it }, "Code", Modifier.fillMaxWidth().testTag("auth-link-code"),
+                    enabled = live.status == "waiting", keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
+                )
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ArchieButton(
+                        if (st.phase == AuthPhase.SIGNING_IN || live.status == "verifying") "Checking…" else "Finish sign-in",
+                        { scope.launch { auth.submitLinkCode(code); code = "" } },
+                        Modifier.testTag("auth-link-submit"), icon = ArchieIcons.Check,
+                        enabled = code.isNotBlank() && st.phase != AuthPhase.SIGNING_IN && live.status == "waiting",
+                    )
+                    ArchieButton("Cancel", { scope.launch { auth.cancelLink() } }, style = ButtonStyle.Text)
+                }
+            }
+            if (st.phase == AuthPhase.SIGNING_IN && flow == null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Spinner(size = 16.dp)
-                    Text("Waiting for sign-in to finish on $host…", style = ArchieTheme.typography.bodySmall, color = c.onSurfaceVariant)
+                    Text("Waiting for $host…", style = ArchieTheme.typography.bodySmall, color = c.onSurfaceVariant)
                 }
             }
             st.actionError?.let { Text(it, style = ArchieTheme.typography.bodySmall, color = c.error, modifier = Modifier.testTag("auth-error")) }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                ArchieButton("Sign in with Claude", { scope.launch { if (auth.signIn()) onSignedIn() } }, icon = ArchieIcons.AccountCircle, enabled = st.phase != AuthPhase.SIGNING_IN, modifier = Modifier.testTag("auth-sign-in"))
-                ArchieButton("Paste credentials instead", { auth.clearError(); pasteChosen = true }, style = ButtonStyle.Text, icon = ArchieIcons.ContentPaste, enabled = st.phase != AuthPhase.SIGNING_IN)
+            if (flow?.active != true) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ArchieButton("Sign in with Claude", { scope.launch { auth.startLink(); if (auth.state.value.status?.authenticated == true) onSignedIn() } }, icon = ArchieIcons.AccountCircle, enabled = st.phase != AuthPhase.SIGNING_IN, modifier = Modifier.testTag("auth-sign-in"))
+                    ArchieButton("Paste credentials instead", { auth.clearError(); paste = true }, style = ButtonStyle.Text, icon = ArchieIcons.ContentPaste, enabled = st.phase != AuthPhase.SIGNING_IN)
+                }
             }
         }
         return
     }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.testTag("auth-panel-paste")) {
         Text("1. On a computer where Claude Code is signed in, open ~/.claude/.credentials.json.\n2. Copy the whole file and paste it below.", style = ArchieTheme.typography.bodyMedium, color = c.onSurface)
-        if (headless) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                ArchieIcon(ArchieIcons.Info, null, size = 16.dp, tint = c.onSurfaceVariant)
-                Text("$host runs without a screen, so it can't open a sign-in window.", style = ArchieTheme.typography.bodySmall, color = c.onSurfaceVariant)
-            }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            ArchieIcon(ArchieIcons.Info, null, size = 16.dp, tint = c.onSurfaceVariant)
+            Text("Don't paste a login another machine keeps using: refresh tokens rotate and one of the two stops working.", style = ArchieTheme.typography.bodySmall, color = c.onSurfaceVariant)
         }
         ArchieTextField(
             text, { text = it; if (st.actionError != null) auth.clearError() }, "Credentials JSON",
@@ -113,58 +149,8 @@ internal fun AuthPanel(auth: AuthModel, host: String, startWithPaste: Boolean = 
             st.status?.authUrl?.let { url ->
                 ArchieButton("Claude Console", { context.launch(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }, style = ButtonStyle.Text, icon = ArchieIcons.OpenInNew)
             }
-            if (!headless && !startWithPaste) {
-                ArchieButton("Back", { auth.clearError(); pasteChosen = false }, style = ButtonStyle.Text, icon = ArchieIcons.ArrowBack)
-            }
-        }
-    }
-}
-
-/** Settings → Archie (server) → Account: the backend's Claude CLI sign-in (web `AccountPage`). */
-@Composable
-internal fun AccountPage(feature: SettingsFeature, onBack: (() -> Unit)?) {
-    val st by feature.auth.state.collectAsStateWithLifecycle()
-    val conn by feature.connection.state.collectAsStateWithLifecycle()
-    val host = conn.status.serverUrl?.let(ConnectionRepository::hostOf).orEmpty().ifEmpty { "the server" }
-    androidx.compose.runtime.LaunchedEffect(feature) { feature.auth.check() }
-    var replacing by rememberSaveable { mutableStateOf(false) }
-    SettingsPageFrame("Account", feature.messages, onBack, scope = ScopeLabel.server(conn.status.serverLabel.ifEmpty { host })) {
-        st.checkError?.let { Notice(NoticeTone.ERROR, "Couldn't check the sign-in", body = it) }
-        val status = st.status
-        val state = when {
-            status == null -> if (st.phase == AuthPhase.CHECKING) "Checking…" else "Unknown"
-            status.authenticated -> "Signed in"
-            else -> "Not signed in"
-        }
-        Section("Claude Code on the server") {
-            FieldBlock(Modifier.testTag("account-status")) {
-                KeyValues(
-                    listOf(
-                        "Status" to state,
-                        "Server" to host,
-                        "Sign-in method" to when {
-                            status == null -> "—"
-                            status.headless -> "Paste credentials (no screen on the server)"
-                            else -> "Sign-in window on the server"
-                        },
-                    ),
-                )
-                ArchieButton("Check again", feature.auth::check, style = ButtonStyle.Text, icon = ArchieIcons.Refresh, enabled = st.phase != AuthPhase.CHECKING)
-            }
-        }
-        if (status != null && !status.authenticated) {
-            Section("Sign in") { FieldBlock { AuthPanel(feature.auth, host) } }
-        }
-        if (status?.authenticated == true) {
-            Section(null) {
-                FieldBlock {
-                    if (!replacing) {
-                        ArchieButton("Replace credentials", { replacing = true }, style = ButtonStyle.Text, icon = ArchieIcons.ContentPaste, modifier = Modifier.testTag("auth-replace"))
-                        HelpLine("Use this when agent sessions fail with “Invalid authentication credentials”: the token may have expired.")
-                    } else {
-                        AuthPanel(feature.auth, host, startWithPaste = true, onSignedIn = { replacing = false })
-                    }
-                }
+            if (!startWithPaste) {
+                ArchieButton("Back", { auth.clearError(); paste = false }, style = ButtonStyle.Text, icon = ArchieIcons.ArrowBack)
             }
         }
     }

@@ -122,6 +122,13 @@ object ProtocolCodec {
             "orchestrator_switch" -> ServerFrame.OrchestratorSwitch(
                 o.str("sdk_session_id"), o.str("title"), o.bool("voice") == true, o.str("from_session_id"), seq, sid,
             )
+            "agent_turn_started" -> ServerFrame.AgentTurnStarted(o.str("session_id"), o.str("sdk_session_id"), o.str("provider"), seq, sid)
+            "agent_turn_finished" -> ServerFrame.AgentTurnFinished(
+                o.str("session_id"), o.str("sdk_session_id"), o.str("provider"), o.str("title"),
+                o.str("status") ?: ServerFrame.AgentTurnFinished.STATUS_OK, o.str("preview"), o.str("error"), seq, sid,
+            )
+            "visualization_changed" -> ServerFrame.VisualizationChanged(changes(o.arr("visualizations")), changes(o.arr("files")), seq, sid)
+            "memory_changed" -> ServerFrame.MemoryChanged(changes(o.arr("changes")), seq, sid)
             "audio_upload" -> ServerFrame.AudioUpload(o.str("audio"), o.str("format"), o.str("text"), o.long("size_bytes"), seq, sid)
             "ping" -> ServerFrame.Ping(seq, sid)
             "voice_event" -> {
@@ -138,6 +145,17 @@ object ProtocolCodec {
             else -> ServerFrame.Unknown(type, o, seq, sid)
         }
     }
+
+    /** §9.3 change entries; malformed ones (no string `path`) are dropped. */
+    private fun changes(list: JsonArray?): List<ContentChange> =
+        list?.mapNotNull { e ->
+            val c = e as? JsonObject ?: return@mapNotNull null
+            val path = c.str("path")?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            ContentChange(path, ContentChange.Kind.of(c.str("kind")))
+        } ?: emptyList()
+
+    private fun encodeChanges(list: List<ContentChange>): JsonArray =
+        JsonArray(list.map { jsonObject { put("path", it.path); put("kind", it.kind.wire) } })
 
     /**
      * Canonical JSON of a server frame (used by fakes and the round-trip tests). Fields that are
@@ -232,6 +250,17 @@ object ProtocolCodec {
                     put("sdk_session_id", frame.sdkSessionId); put("title", frame.title)
                     put("voice", frame.voice); put("from_session_id", frame.fromSessionId)
                 }
+                is ServerFrame.AgentTurnStarted -> {
+                    put("session_id", frame.sessionId); put("sdk_session_id", frame.sdkSessionId); put("provider", frame.provider)
+                }
+                is ServerFrame.AgentTurnFinished -> {
+                    put("session_id", frame.sessionId); put("sdk_session_id", frame.sdkSessionId); put("provider", frame.provider)
+                    put("title", frame.title); put("status", frame.status); put("preview", frame.preview); put("error", frame.error)
+                }
+                is ServerFrame.VisualizationChanged -> {
+                    put("visualizations", encodeChanges(frame.visualizations)); put("files", encodeChanges(frame.files))
+                }
+                is ServerFrame.MemoryChanged -> put("changes", encodeChanges(frame.changes))
                 is ServerFrame.AudioUpload -> {
                     put("audio", frame.audio); put("format", frame.format); put("text", frame.text); put("size_bytes", frame.sizeBytes)
                 }
@@ -265,6 +294,7 @@ object ProtocolCodec {
                 }
                 put("fork", frame.fork)
                 put("mcp_servers", frame.mcpServers)
+                put("reattach", frame.reattach)
             }
             is ClientFrame.VoiceStart -> {
                 put("local_id", frame.localId)
@@ -274,6 +304,7 @@ object ProtocolCodec {
                 put("voice_name", frame.voice.voice)
                 put("voice_transcription_language", frame.voice.transcriptionLanguage)
                 put("voice_endpoint", frame.voice.endpoint)
+                put("reattach", frame.reattach)
             }
             is ClientFrame.Send -> put("text", frame.text)
             is ClientFrame.InjectText -> put("text", frame.text)
@@ -309,6 +340,7 @@ object ProtocolCodec {
                 },
                 fork = o.bool("fork"),
                 mcpServers = o.obj("mcp_servers"),
+                reattach = o.bool("reattach"),
             )
             "voice_start" -> ClientFrame.VoiceStart(
                 localId = o.str("local_id") ?: return null,
@@ -320,6 +352,7 @@ object ProtocolCodec {
                     transcriptionLanguage = o.str("voice_transcription_language"),
                     endpoint = o.str("voice_endpoint"),
                 ),
+                reattach = o.bool("reattach"),
             )
             "send" -> ClientFrame.Send(o.str("text") ?: "")
             "inject_text" -> ClientFrame.InjectText(o.str("text") ?: "")

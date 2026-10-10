@@ -554,7 +554,8 @@ def _guidelines_section() -> str:
 - **Match MCPs to tasks**: Load only the MCPs an agent needs
 
 ### Background Events
-- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — call `read_agent_session(session_id)` for the actual content; it works both while a turn is still running (live tail in `live.events`) and after it finishes (persisted messages).
+- After every fire-and-forget turn, you'll receive a structured `[SESSION xxx event: turn <id> <status>, ...]` line (succeeded / failed / cancelled / timeout). Status only — call `read_agent_session(session_id)` for the actual content; it works both while a turn is still running (live tail in `live.events`) and after it finishes (persisted messages). Never describe or summarise an agent's results without reading them first.
+- A turn that did **not** succeed (failed / cancelled / timeout) must be reported to the user as such, first: say it stopped and why (the `error`), then read the session to tell them how far it got. Don't present unfinished work as done.
 - Permission events also arrive as structured lines: `[SESSION xxx event: <user|orchestrator> <approved|denied> <ToolName> — "<message>"]`. Typically the user answered in their tab; only call `respond_to_agent_permission` when they're unavailable, the agent has explicitly asked you to decide, or you have a specific reason to overrule.
 - Agents announce intent BEFORE calling gated tools (per their system prompt). When you see one of those announcements in `read_agent_session`'s `live.events` while a turn is running, you can respond via the agent's chat — the user's chat reply also auto-denies the pending popup with their prose as the rejection reason, prompting the agent to refine.
 

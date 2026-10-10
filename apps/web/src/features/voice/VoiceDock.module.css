@@ -27,6 +27,33 @@
   padding-left: 6px;
 }
 
+/* floating controls: the state text opens the Archie conversation */
+.textButton {
+  align-self: stretch;
+  justify-content: center;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding: 0 4px 0 6px;
+  border: 0;
+  border-radius: 16px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.textButton:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
+.textLive {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .title {
   overflow: hidden;
   font-family: var(--md-sys-typescale-title-large-font);

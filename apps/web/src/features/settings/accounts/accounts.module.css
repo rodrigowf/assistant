@@ -1,0 +1,418 @@
+/* Settings → Accounts: service cards, sign-in panels, env keys. No flex gap (Safari 12). */
+
+.card {
+  padding: var(--app-space-4) 18px;
+  border-radius: 4px;
+  background: var(--md-sys-color-surface-container);
+}
+
+.cards > .card + .card {
+  margin-top: 2px;
+}
+
+.cards > .card:first-child {
+  border-top-left-radius: 20px;
+  border-top-right-radius: 20px;
+}
+
+.cards > .card:last-child {
+  border-bottom-left-radius: 20px;
+  border-bottom-right-radius: 20px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+}
+
+.headIcon {
+  flex: 0 0 auto;
+  margin-right: var(--app-space-3);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.headText {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.title {
+  margin: 0;
+  font-size: var(--md-sys-typescale-title-medium-size);
+  line-height: var(--md-sys-typescale-title-medium-line-height);
+  font-weight: var(--md-sys-typescale-title-medium-weight);
+  color: var(--md-sys-color-on-surface);
+}
+
+.desc {
+  margin: 2px 0 0;
+  font-size: var(--md-sys-typescale-body-small-size);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.headEnd {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  margin-left: var(--app-space-2);
+}
+
+.headEnd > * + * {
+  margin-left: var(--app-space-1);
+}
+
+/* status chip */
+.state {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px 2px 6px;
+  border-radius: 999px;
+  font-size: var(--md-sys-typescale-label-medium-size);
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.state > svg {
+  margin-right: 4px;
+}
+
+.state[data-tone="ok"] {
+  background: var(--md-ext-color-success-container);
+  color: var(--md-ext-color-on-success-container);
+}
+
+.state[data-tone="off"] {
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.state[data-tone="bad"] {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
+
+.state[data-tone="unknown"] {
+  background: var(--md-ext-color-warning-container);
+  color: var(--md-ext-color-on-warning-container);
+}
+
+.facts {
+  margin: var(--app-space-3) 0 0;
+}
+
+.facts > div {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  font-size: var(--md-sys-typescale-body-medium-size);
+}
+
+.facts > div + div {
+  border-top: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.facts dt {
+  flex: 0 0 auto;
+  margin-right: var(--app-space-3);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+  color: var(--md-sys-color-on-surface);
+}
+
+.panelTitle {
+  display: flex;
+  align-items: center;
+  margin: 0;
+  font-size: var(--md-sys-typescale-title-small-size);
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+}
+
+.panelTitle > svg {
+  flex: 0 0 auto;
+  margin-right: var(--app-space-2);
+}
+
+.lines {
+  margin: var(--app-space-3) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.line {
+  display: flex;
+  align-items: flex-start;
+  margin: 0;
+  font-size: var(--md-sys-typescale-body-small-size);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.line + .line {
+  margin-top: var(--app-space-1);
+}
+
+.line > svg {
+  flex: 0 0 auto;
+  margin: 1px var(--app-space-2) 0 0;
+}
+
+.line[data-tone="warning"] > svg {
+  color: var(--md-ext-color-warning);
+}
+
+.line[data-tone="ok"] > svg {
+  color: var(--md-ext-color-success);
+}
+
+.line[data-tone="error"],
+.line[data-tone="error"] > svg {
+  color: var(--md-sys-color-error);
+}
+
+.methods {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: var(--app-space-3);
+}
+
+.methods > * {
+  margin: 0 var(--app-space-2) var(--app-space-2) 0;
+}
+
+.panel {
+  margin-top: var(--app-space-2);
+  padding: var(--app-space-4);
+  border-radius: var(--md-sys-shape-corner-large);
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.panel > * + * {
+  margin-top: var(--app-space-3);
+}
+
+.panelText {
+  margin: 0;
+  font-size: var(--md-sys-typescale-body-medium-size);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.panelText code,
+.mono {
+  font-family: var(--md-ref-typeface-code);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
+.steps {
+  margin: 0;
+  padding-left: var(--app-space-6);
+  font-size: var(--md-sys-typescale-body-medium-size);
+  color: var(--md-sys-color-on-surface);
+}
+
+/* beats the reset's `ol[class] { list-style: none }` */
+.panel .steps {
+  list-style: decimal;
+}
+
+.steps li + li {
+  margin-top: var(--app-space-1);
+}
+
+.steps code {
+  font-family: var(--md-ref-typeface-code);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
+.linkBox {
+  padding: var(--app-space-2) var(--app-space-3);
+  border-radius: var(--md-sys-shape-corner-medium);
+  background: var(--md-sys-color-surface-container-highest);
+  font-family: var(--md-ref-typeface-code);
+  font-size: var(--md-sys-typescale-body-small-size);
+  line-height: 1.45;
+  color: var(--md-sys-color-on-surface);
+  word-break: break-all;
+  max-height: 4.5em;
+  overflow: auto;
+}
+
+.code {
+  display: inline-block;
+  padding: var(--app-space-2) var(--app-space-4);
+  border-radius: var(--md-sys-shape-corner-medium);
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+  font-family: var(--md-ref-typeface-code);
+  font-size: var(--md-sys-typescale-headline-small-size);
+  letter-spacing: 0.08em;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.actions > * {
+  margin: 0 var(--app-space-2) var(--app-space-2) 0;
+}
+
+.alert {
+  margin: 0;
+  padding: var(--app-space-2) var(--app-space-3);
+  border-radius: var(--md-sys-shape-corner-medium);
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+  font-size: var(--md-sys-typescale-body-medium-size);
+  overflow-wrap: anywhere;
+}
+
+.caution {
+  margin: 0;
+  padding: var(--app-space-2) var(--app-space-3);
+  border-radius: var(--md-sys-shape-corner-medium);
+  background: var(--md-ext-color-warning-container);
+  color: var(--md-ext-color-on-warning-container);
+  font-size: var(--md-sys-typescale-body-small-size);
+}
+
+/* env rows (in cards and in the Environment keys list) */
+
+.envRow {
+  padding: var(--app-space-2) var(--app-space-1) var(--app-space-2) var(--app-space-3);
+  border-radius: 4px;
+  background: var(--md-sys-color-surface-container);
+}
+
+.panel .envRow {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+.envList > .envRow + .envRow {
+  margin-top: 2px;
+}
+
+.envList > .envRow:first-child {
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+}
+
+.envList > .envRow:last-child {
+  border-bottom-left-radius: 16px;
+  border-bottom-right-radius: 16px;
+}
+
+.envMain {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+}
+
+.envText {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.envName {
+  display: block;
+  font-family: var(--md-ref-typeface-code);
+  font-size: var(--md-sys-typescale-body-medium-size);
+  color: var(--md-sys-color-on-surface);
+  overflow-wrap: anywhere;
+}
+
+.envLabel {
+  display: block;
+  font-size: var(--md-sys-typescale-body-medium-size);
+  color: var(--md-sys-color-on-surface);
+}
+
+.envValue {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--md-ref-typeface-code);
+  font-size: var(--md-sys-typescale-body-small-size);
+  color: var(--md-sys-color-on-surface-variant);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.envValue[data-unset] {
+  font-family: inherit;
+  font-style: italic;
+}
+
+.envHelp {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--md-sys-typescale-body-small-size);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.envActions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  margin-left: var(--app-space-2);
+}
+
+.envEdit {
+  padding: var(--app-space-2) var(--app-space-2) var(--app-space-1) 0;
+}
+
+.envEdit > * + * {
+  margin-top: var(--app-space-2);
+}
+
+.tag {
+  display: inline-block;
+  margin-left: var(--app-space-2);
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+  font-family: inherit;
+  font-size: var(--md-sys-typescale-label-small-size);
+  font-weight: 600;
+  line-height: 18px;
+  vertical-align: 1px;
+}
+
+.tag[data-tone="warning"] {
+  background: var(--md-ext-color-warning-container);
+  color: var(--md-ext-color-on-warning-container);
+}
+
+.sectionHelp {
+  margin: 0 0 var(--app-space-3);
+  font-size: var(--md-sys-typescale-body-small-size);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.sectionHelp code {
+  font-family: var(--md-ref-typeface-code);
+  overflow-wrap: anywhere;
+}
+
+.envToolbar {
+  margin-top: var(--app-space-3);
+}
+
+.formGrid > * + * {
+  margin-top: var(--app-space-4);
+}
+
+.spaced {
+  margin-top: var(--app-space-3);
+}

@@ -9,6 +9,10 @@ import com.assistant.core.model.ServerConfig
 import com.assistant.core.model.SessionConfig
 import com.assistant.core.model.SessionSummary
 import com.assistant.core.model.VisualInfo
+import com.assistant.core.protocol.AccountActionDto
+import com.assistant.core.protocol.AccountCredentialsRequest
+import com.assistant.core.protocol.AccountServiceDto
+import com.assistant.core.protocol.AccountsDto
 import com.assistant.core.protocol.AgentsDto
 import com.assistant.core.protocol.AuthStatusDto
 import com.assistant.core.protocol.CastProbeDto
@@ -18,11 +22,19 @@ import com.assistant.core.protocol.CredentialsRequest
 import com.assistant.core.protocol.DebugLogRequest
 import com.assistant.core.protocol.CastResponse
 import com.assistant.core.protocol.DropLastNRequest
+import com.assistant.core.protocol.EnvChangeDto
+import com.assistant.core.protocol.EnvCreateRequest
+import com.assistant.core.protocol.EnvListDto
+import com.assistant.core.protocol.EnvRevealDto
+import com.assistant.core.protocol.EnvValueRequest
 import com.assistant.core.protocol.GoogleVoiceModelsDto
 import com.assistant.core.protocol.HarnessProvidersDto
 import com.assistant.core.protocol.HarnessesDto
 import com.assistant.core.protocol.InjectRequest
 import com.assistant.core.protocol.InjectResponse
+import com.assistant.core.protocol.LoginCodeRequest
+import com.assistant.core.protocol.LoginFlowDto
+import com.assistant.core.protocol.LoginRequest
 import com.assistant.core.protocol.McpServersDto
 import com.assistant.core.protocol.MemoryNodeDto
 import com.assistant.core.protocol.MessagePreviewDto
@@ -68,6 +80,53 @@ class ArchieApi(private val rest: RestCaller) {
     suspend fun authCredentials(credentialsJson: String): ApiResult<AuthStatus> =
         rest.sendJson<AuthStatusDto>("POST", rest.url("/api/auth/credentials"), json(CredentialsRequest(credentialsJson)))
             .map { it.toModel() }
+
+    // ───────────── Settings → Accounts (spec 12 §8.1) ─────────────
+    suspend fun accounts(): ApiResult<AccountsDto> = rest.getJson(rest.url("/api/accounts"))
+
+    suspend fun account(id: String): ApiResult<AccountServiceDto> = rest.getJson(accountUrl(id))
+
+    /** Starts the CLI login on the server; answers once the URL is known (≤ ~12 s). 409 = another flow. */
+    suspend fun startLogin(id: String, method: String): ApiResult<LoginFlowDto> =
+        rest.sendJson("POST", accountUrl(id, "login"), json(LoginRequest(method)))
+
+    suspend fun loginFlow(id: String): ApiResult<LoginFlowDto> = rest.getJson(accountUrl(id, "login"))
+
+    /** Waits ≤ ~15 s for the CLI's verdict. */
+    suspend fun submitLoginCode(id: String, code: String): ApiResult<LoginFlowDto> =
+        rest.sendJson("POST", accountUrl(id, "login", "code"), json(LoginCodeRequest(code)))
+
+    suspend fun cancelLogin(id: String): ApiResult<LoginFlowDto> =
+        rest.call(Request.Builder().url(accountUrl(id, "login")).delete().build()) { RestJson.decodeFromString<LoginFlowDto>(it.body!!.string()) }
+
+    suspend fun saveAccountCredentials(id: String, method: String, content: String): ApiResult<AccountActionDto> =
+        rest.sendJson("POST", accountUrl(id, "credentials"), json(AccountCredentialsRequest(method, content)))
+
+    suspend fun signOutAccount(id: String): ApiResult<AccountActionDto> = rest.sendJson("POST", accountUrl(id, "logout"), null)
+
+    suspend fun verifyAccount(id: String): ApiResult<AccountServiceDto> = rest.sendJson("POST", accountUrl(id, "verify"), null)
+
+    suspend fun envKeys(): ApiResult<EnvListDto> = rest.getJson(rest.url("/api/env"))
+
+    /** The only call that returns a full value (spec 12 ACC-1). */
+    suspend fun revealEnv(name: String): ApiResult<EnvRevealDto> = rest.sendJson("POST", envUrl(name, "reveal"), null)
+
+    suspend fun createEnv(name: String, value: String): ApiResult<EnvChangeDto> =
+        rest.sendJson("POST", rest.url("/api/env"), json(EnvCreateRequest(name, value)))
+
+    /** Create or update. */
+    suspend fun putEnv(name: String, value: String): ApiResult<EnvChangeDto> = rest.sendJson("PUT", envUrl(name), json(EnvValueRequest(value)))
+
+    suspend fun deleteEnv(name: String): ApiResult<EnvChangeDto> =
+        rest.call(Request.Builder().url(envUrl(name)).delete().build()) { RestJson.decodeFromString<EnvChangeDto>(it.body!!.string()) }
+
+    private fun accountUrl(id: String, vararg tail: String) = rest.url("/api/accounts") {
+        addPathSegment(id); tail.forEach { addPathSegment(it) }
+    }
+
+    private fun envUrl(name: String, vararg tail: String) = rest.url("/api/env") {
+        addPathSegment(name); tail.forEach { addPathSegment(it) }
+    }
 
     // ───────────── sessions (inv01 §3.2) ─────────────
     suspend fun listSessions(): ApiResult<List<SessionSummary>> =

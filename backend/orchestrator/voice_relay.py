@@ -76,6 +76,14 @@ _DEFERRED_DRAIN_MAX_SECONDS = 45.0
 # Where per-session voice logs land.  One file per session_id, written
 # alongside the api logs so /debug-app picks them up.
 _VOICE_LOG_DIR = PROJECT_ROOT / "logs" / "voice"
+# Silence gating (``BaseVoiceProvider.gate_silence_upstream``): how much
+# held-back mic audio to send ahead of a detected speech onset. Covers
+# Silero's onset latency (min_speech 200ms + a chunk) with room to spare
+# for a soft first syllable.
+_PREROLL_S = 1.0
+# Commits shorter than this don't create an upstream item (DashScope
+# rejects an empty buffer), so they're not queued for item tracking.
+_MIN_COMMIT_S = 0.05
 
 # Increment F (plan §F) — the timeout constants previously declared
 # here are now ``VoiceTimeouts`` fields:
@@ -287,6 +295,26 @@ class VoiceRelay:
         self._mic_dump_path: Path | None = None
         self._mic_dump_file = None  # type: ignore[assignment]
         self._mic_dump_bytes: int = 0
+
+        # --- silence gating + audio history budget (provider opt-in) ---
+        # ``gate_silence_upstream``: silent mic chunks wait in a short
+        # pre-roll instead of being appended upstream, so committed turns
+        # carry speech, not the minutes of silence between turns.
+        self._preroll: deque[str] = deque()
+        self._preroll_bytes = 0
+        self._audio_held_bytes = 0  # silence never sent upstream (observability)
+        # ``audio_history_budget_s``: appended-but-uncommitted bytes, the
+        # durations of commits waiting for their ``input_audio_buffer.committed``
+        # ack (which names the item), and the user audio items in the current
+        # upstream conversation
+        # (oldest first) with their durations. Reset on reconnect (new
+        # upstream conversation).
+        self._uncommitted_audio_bytes = 0
+        self._pending_commit_s: deque[float] = deque()
+        self._audio_items: deque[tuple[str, float]] = deque()
+        self._audio_items_s = 0.0
+        self._audio_evicted_items = 0
+        self._audio_evicted_s = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -640,6 +668,7 @@ class VoiceRelay:
         the per-type counter and slogs a one-line summary.
         """
         self._sent_history.append(_redact_for_log(event))
+        self._account_upstream_frame(event)
         evt_type = event.get("type", "?")
         self._sent_counts[evt_type] += 1
         size = len(json.dumps(event))
@@ -715,6 +744,9 @@ class VoiceRelay:
         except Exception as e:  # noqa: BLE001
             # Upstream is gone; the drain task already surfaced the error.
             self._slog(f"WARN send dropped (upstream closed): type={event.get('type')} err={e}")
+            return
+        if event.get("type") == "input_audio_buffer.commit":
+            await self._enforce_audio_budget()
 
     async def _deferred_drain_loop(self) -> None:
         """Retry the deferred queue until it empties or the relay closes.
@@ -796,6 +828,10 @@ class VoiceRelay:
         The provider's :meth:`BaseVoiceProvider.format_audio_in` decides
         the on-the-wire shape (Qwen: ``input_audio_buffer.append``;
         Gemini Live: ``realtimeInput.audio``).
+
+        With manual VAD active and ``gate_silence_upstream`` set, chunks
+        that arrive while the VAD hears silence are held in a short
+        pre-roll instead (see :meth:`_hold_silent_chunk`).
         """
         if self._ws is None or self._closed.is_set():
             return  # Drop silently after upstream close — frontend already notified.
@@ -809,38 +845,26 @@ class VoiceRelay:
             except asyncio.TimeoutError:
                 self._slog("WARN handshake gate timeout dropping audio_in chunk")
                 return
-        try:
-            async with self._send_lock:
-                await self._ws.send(json.dumps(self._provider.format_audio_in(pcm_b64)))
-            now = time.monotonic()
-            self._last_send_at = now
-            self._last_audio_in_at = now
-            self._audio_in_chunks += 1
-            # base64 encodes 3 bytes → 4 chars; PCM byte size ≈ len * 3/4.
-            self._audio_in_bytes += (len(pcm_b64) * 3) // 4
-            if self._first_audio_in_at is None:
-                self._first_audio_in_at = self._now_rel()
-                self._slog(f"first audio_in at t+{self._first_audio_in_at:.2f}s")
-                logger.info(
-                    "voice_relay first audio_in session_id=%s in %.2fs",
-                    self._session_id, self._first_audio_in_at,
-                )
-            elif self._audio_in_chunks % _AUDIO_LOG_SAMPLE_EVERY == 0:
-                self._slog(
-                    f"audio_in chunks={self._audio_in_chunks}"
-                    f" bytes={self._audio_in_bytes}"
-                )
-        except Exception as e:  # noqa: BLE001
-            self._slog(f"WARN audio_in dropped (upstream closed): err={e}")
-            return
 
         # Mirror to the WAV dump (cheap, infrequent decode — only when
-        # VOICE_DEBUG_DUMP_MIC=1 opened the file).
+        # VOICE_DEBUG_DUMP_MIC=1 opened the file). Every received chunk,
+        # held or sent, so the dump is what the mic heard.
         if self._mic_dump_file is not None:
             try:
                 self._write_mic_dump(base64.b64decode(pcm_b64))
             except Exception:  # noqa: BLE001
                 pass
+
+        if (
+            self._manual_vad is not None
+            and getattr(self._provider, "gate_silence_upstream", False) is True
+            and not self._manual_vad.is_speech
+        ):
+            await self._hold_silent_chunk(pcm_b64)
+            return
+
+        if not await self._forward_audio(pcm_b64):
+            return
 
         # Manual-VAD path: feed the same chunk to our local VAD and
         # commit + response.create when the user stops speaking. We do
@@ -852,6 +876,178 @@ class VoiceRelay:
             except Exception:  # noqa: BLE001
                 logger.exception("manual_vad processing failed; disabling for this session")
                 self._manual_vad = None
+
+    async def _forward_audio(self, pcm_b64: str) -> bool:
+        """Append one mic chunk upstream. Returns False if the WS is gone."""
+        if self._ws is None:
+            return False
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps(self._provider.format_audio_in(pcm_b64)))
+        except Exception as e:  # noqa: BLE001
+            self._slog(f"WARN audio_in dropped (upstream closed): err={e}")
+            return False
+        now = time.monotonic()
+        self._last_send_at = now
+        self._last_audio_in_at = now
+        self._audio_in_chunks += 1
+        # base64 encodes 3 bytes → 4 chars; PCM byte size ≈ len * 3/4.
+        n_bytes = (len(pcm_b64) * 3) // 4
+        self._audio_in_bytes += n_bytes
+        self._uncommitted_audio_bytes += n_bytes
+        if self._first_audio_in_at is None:
+            self._first_audio_in_at = self._now_rel()
+            self._slog(f"first audio_in at t+{self._first_audio_in_at:.2f}s")
+            logger.info(
+                "voice_relay first audio_in session_id=%s in %.2fs",
+                self._session_id, self._first_audio_in_at,
+            )
+        elif self._audio_in_chunks % _AUDIO_LOG_SAMPLE_EVERY == 0:
+            self._slog(
+                f"audio_in chunks={self._audio_in_chunks}"
+                f" bytes={self._audio_in_bytes}"
+            )
+        return True
+
+    async def _hold_silent_chunk(self, pcm_b64: str) -> None:
+        """Keep a silent chunk in the pre-roll; release it if speech starts.
+
+        DashScope counts every committed second against a per-conversation
+        audio cap, and with manual VAD a commit carries everything appended
+        since the previous one — so streaming the silence between turns
+        filled the cap with silence. Instead the last ``_PREROLL_S`` of
+        silence waits here; when the VAD flips to speech on this chunk the
+        whole pre-roll goes upstream in order, then audio streams normally
+        until the turn is committed.
+        """
+        assert self._manual_vad is not None
+        self._preroll.append(pcm_b64)
+        self._preroll_bytes += (len(pcm_b64) * 3) // 4
+        sr = self._in_sample_rate()
+        max_bytes = int(_PREROLL_S * sr * 2)
+        while self._preroll_bytes > max_bytes and len(self._preroll) > 1:
+            dropped = (len(self._preroll.popleft()) * 3) // 4
+            self._preroll_bytes -= dropped
+            self._audio_held_bytes += dropped
+        try:
+            await self._run_manual_vad(pcm_b64)
+        except Exception:  # noqa: BLE001
+            logger.exception("manual_vad processing failed; disabling for this session")
+            self._manual_vad = None
+        # Speech started (or the VAD died → stream everything again).
+        if self._manual_vad is None or self._manual_vad.is_speech:
+            await self._flush_preroll()
+
+    async def _flush_preroll(self) -> None:
+        chunks = list(self._preroll)
+        self._preroll.clear()
+        self._preroll_bytes = 0
+        for chunk in chunks:
+            if not await self._forward_audio(chunk):
+                return
+
+    # --- audio history budget ---------------------------------------------
+
+    def _audio_budget_s(self) -> float | None:
+        # getattr + type check: test doubles (MagicMock providers) must
+        # read as "no budget", not as a truthy mock attribute.
+        budget = getattr(self._provider, "audio_history_budget_s", None)
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            return None
+        return float(budget)
+
+    def _in_sample_rate(self) -> int:
+        sr = getattr(self._provider, "audio_in_sample_rate", None)
+        return sr if isinstance(sr, int) and sr > 0 else 16000
+
+    def _audio_s(self, n_bytes: int) -> float:
+        return n_bytes / (2 * self._in_sample_rate())
+
+    def _account_upstream_frame(self, frame: dict[str, Any]) -> None:
+        """Track buffer state from an upstream control frame (OpenAI-Realtime shape)."""
+        evt_type = frame.get("type")
+        if evt_type == "input_audio_buffer.append":
+            audio = frame.get("audio")
+            if isinstance(audio, str):
+                self._uncommitted_audio_bytes += (len(audio) * 3) // 4
+        elif evt_type == "input_audio_buffer.commit":
+            secs = self._audio_s(self._uncommitted_audio_bytes)
+            self._uncommitted_audio_bytes = 0
+            if secs >= _MIN_COMMIT_S:
+                self._pending_commit_s.append(secs)
+        elif evt_type == "input_audio_buffer.clear":
+            self._uncommitted_audio_bytes = 0
+
+    def _reset_audio_tracking(self) -> None:
+        """Forget the old upstream conversation's items (called on reconnect)."""
+        self._preroll.clear()
+        self._preroll_bytes = 0
+        self._uncommitted_audio_bytes = 0
+        self._pending_commit_s.clear()
+        self._audio_items.clear()
+        self._audio_items_s = 0.0
+
+    def _on_audio_committed(self, event: dict[str, Any]) -> None:
+        """Pair a commit ack with the duration we counted for that commit.
+
+        Pairs on ``input_audio_buffer.committed`` (it names the item and
+        arrives in commit order), not on ``conversation.item.created``:
+        DashScope creates the user item as soon as audio starts streaming
+        (``status: in_progress``), before the commit, so pairing on
+        creation shifts every duration by one turn.
+        """
+        if self._audio_budget_s() is None:
+            return
+        item_id = event.get("item_id")
+        if not isinstance(item_id, str):
+            return
+        if self._pending_commit_s:
+            secs = self._pending_commit_s.popleft()
+        else:
+            secs = 0.0
+            self._slog(f"WARN commit ack for {item_id} has no counted commit; counted as 0s")
+        self._audio_items.append((item_id, secs))
+        self._audio_items_s += secs
+
+    def _on_commit_rejected(self, event: dict[str, Any]) -> None:
+        """A rejected commit ("buffer too small") creates no item: drop its duration."""
+        message = str((event.get("error") or {}).get("message", "")).lower()
+        if "committing input audio buffer" in message and self._pending_commit_s:
+            self._pending_commit_s.popleft()
+
+    async def _enforce_audio_budget(self) -> None:
+        """Delete the oldest user audio items until the rest fit the budget.
+
+        Keeps the same upstream conversation — and the model's memory of
+        how the recent turns sounded — instead of hitting the provider's
+        cap and reopening with a text-only history. Runs right after each
+        commit (counting the turn just committed, so the deletes go out
+        before that turn's ``response.create``) and on ``response.done``.
+        The newest turn is never deleted.
+        """
+        budget = self._audio_budget_s()
+        if budget is None:
+            return
+        pending_s = sum(self._pending_commit_s)
+        while (
+            self._audio_items_s + pending_s > budget
+            and self._audio_items
+            and (len(self._audio_items) > 1 or self._pending_commit_s)
+        ):
+            item_id, secs = self._audio_items[0]
+            frame = self._provider.delete_item_frame(item_id)
+            if not isinstance(frame, dict):
+                return
+            self._audio_items.popleft()
+            self._audio_items_s -= secs
+            self._audio_evicted_items += 1
+            self._audio_evicted_s += secs
+            self._slog(
+                f"audio budget: deleting oldest user audio item {item_id} ({secs:.1f}s); "
+                f"keeping {len(self._audio_items)} items / "
+                f"{self._audio_items_s + pending_s:.1f}s of {budget:.0f}s"
+            )
+            await self.send_event(frame)
 
     async def _run_manual_vad(self, pcm_b64: str) -> None:
         """Feed a mic chunk through the local VAD; emit events on transitions.
@@ -1030,6 +1226,9 @@ class VoiceRelay:
             f" recv={recv_d}"
             f" audio_in=(chunks={self._audio_in_chunks},bytes={self._audio_in_bytes})"
             f" audio_out=(chunks={self._audio_out_chunks},bytes={self._audio_out_bytes})"
+            f" audio_held_silence={self._audio_s(self._audio_held_bytes):.1f}s"
+            f" audio_items=(kept={len(self._audio_items)},{self._audio_items_s:.1f}s,"
+            f"evicted={self._audio_evicted_items},{self._audio_evicted_s:.1f}s)"
             f" first_audio_in={self._first_audio_in_at}"
             f" first_audio_out={self._first_audio_out_at}"
             f" last_send={last_send}s_ago"
@@ -1070,6 +1269,7 @@ class VoiceRelay:
                         return
                     async with self._send_lock:
                         await self._ws.send(json.dumps(self._provider.format_audio_in(chunk)))
+                    self._uncommitted_audio_bytes += (len(chunk) * 3) // 4
                     self._last_send_at = time.monotonic()
                     self._slog(f"keepalive sent (idle={idle:.1f}s)")
                 except Exception as e:  # noqa: BLE001
@@ -1203,9 +1403,24 @@ class VoiceRelay:
                         err.get("message"),
                     )
 
+                if evt_type == "input_audio_buffer.committed":
+                    self._on_audio_committed(event)
+                elif evt_type == "error":
+                    self._on_commit_rejected(event)
+                elif evt_type == "response.done":
+                    await self._enforce_audio_budget()
+
                 # Control events → orchestrator pipeline + frontend mirror.
+                # Upstream ``error`` events stay backend-side: clients
+                # treat a voice ``error`` as "the relay gave up" and tear
+                # down (spec 12 §7.7), but most upstream errors are
+                # either harmless or followed by a reconnect that the
+                # relay announces with ``voice_status: reconnecting``. A
+                # real give-up still reaches clients as
+                # ``voice_relay_failed`` + ``voice_error``.
                 await self._provider.inject_event(event)
-                await self._on_event_for_frontend(event)
+                if evt_type != "error":
+                    await self._on_event_for_frontend(event)
 
                 # Some inbound signals require the client to close the
                 # upstream WS per protocol — Gemini Live's ``goAway`` is
@@ -1652,6 +1867,8 @@ class VoiceRelay:
         # gating state resets itself naturally as the new session
         # delivers fresh events through :meth:`on_inbound_event`.
         self._deferred_events.clear()
+        # New upstream conversation → none of the old items exist there.
+        self._reset_audio_tracking()
         # Re-close the handshake gate so the new upstream gets a fresh
         # setup → setupComplete round trip before audio/events resume.
         self._handshake_complete.clear()

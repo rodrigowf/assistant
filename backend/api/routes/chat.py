@@ -300,12 +300,24 @@ async def _handle_start(
     mcp_servers = msg.get("mcp_servers")  # Optional: dict of MCP servers to load
     resume_from = msg.get("resume_from")  # Optional resume-protocol checkpoint
 
+    # Spec 12 OPEN-2: an automatic (re)start only re-attaches to an open session;
+    # it never re-creates one that was closed (only a user action does that).
+    if msg.get("reattach") and not (local_id and pool.is_open(local_id)):
+        await ws.send_bytes(orjson.dumps({
+            "type": "error", "error": "session_closed",
+            "detail": "This session is no longer open.",
+        }))
+        return None, None
+
     # Check if this session already exists in the pool (re-subscribing)
     if local_id and pool.has(local_id):
         sm = pool.get(local_id)
         pool.subscribe(local_id, ws)
         await _send_session_started(ws, pool, sm, local_id, resume_from)
         return sm, local_id
+    # Restored after a restart and not spawned yet: resume it under the same local id.
+    if local_id and pool.is_open(local_id):
+        resume_sdk_id = pool.restored_sdk_id(local_id) or resume_sdk_id
 
     # Create a new session via the pool.
     #

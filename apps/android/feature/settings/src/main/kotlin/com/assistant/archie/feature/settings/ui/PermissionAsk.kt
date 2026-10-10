@@ -30,7 +30,7 @@ internal fun rationale(p: AppPermission): Pair<String, String> = when (p) {
     AppPermission.MICROPHONE -> "Allow the microphone" to
         "Archie listens for your wake phrases and hears you in voice conversations. Audio goes only to your Archie server, and only while you talk."
     AppPermission.NOTIFICATIONS -> "Allow notifications" to
-        "While Archie listens in the background, Android shows a notification. It carries Pause, Resume and Talk, and approval requests from agents."
+        "While Archie listens in the background, Android shows a notification. It carries Pause, Resume and Talk, approval requests from agents, and a note when an agent session finishes."
     AppPermission.NEARBY_DEVICES -> "Allow Nearby devices" to
         "Android needs this to send Archie's voice to a Bluetooth headset."
 }

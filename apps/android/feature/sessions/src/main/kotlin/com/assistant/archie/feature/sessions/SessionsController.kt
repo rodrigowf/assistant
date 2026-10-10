@@ -49,6 +49,7 @@ class SessionsController(
 
     init {
         scope.launch { backend.conflicts.collect { onConflict() } }
+        scope.launch { backend.notices.collect { snack(it) } }
     }
 
     fun onIntent(i: SessionsIntent) {
@@ -56,7 +57,6 @@ class SessionsController(
             SessionsIntent.NewArchie -> requestNewArchie()
             SessionsIntent.NewAgent -> backend.newAgent()
             is SessionsIntent.OpenHistory -> openFromHistory(i.session)
-            is SessionsIntent.OpenLive -> backend.openLive(i.session)
             is SessionsIntent.RequestClose -> requestClose(i.item)
             SessionsIntent.ConfirmClose -> confirmClose()
             is SessionsIntent.RequestRename -> requestRename(i.target)

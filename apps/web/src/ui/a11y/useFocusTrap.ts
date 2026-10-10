@@ -1,7 +1,7 @@
 /**
  * Focus trap (spec 13 §3.5; fixes inv02 §6.2 "no focus trap"). While active and on top of the
  * overlay stack, Tab / Shift+Tab cycle inside the container and focus that escapes (a click on the
- * page behind, a programmatic focus) is pulled back. Initial focus: `initialFocus` → the first
+ * page behind, a programmatic focus) is pulled back, except into `allowFocusIn` (a selector). Initial focus: `initialFocus` → the first
  * element with `data-autofocus` → the first tabbable → the container itself (give it tabIndex=-1).
  *
  * Only the topmost layer traps: a menu opened from a dialog lives in its own portal, and the
@@ -17,6 +17,8 @@ export interface FocusTrapOptions {
   initialFocus?: RefObject<HTMLElement | null>;
   /** Is this layer the topmost overlay? (default: always). */
   isTop?: () => boolean;
+  /** Selector of a region outside the container that may keep focus (left exposed by the layer). */
+  allowFocusIn?: string;
 }
 
 export function initialFocusTarget(container: HTMLElement, initial?: HTMLElement | null): HTMLElement {
@@ -26,8 +28,15 @@ export function initialFocusTarget(container: HTMLElement, initial?: HTMLElement
   return tabbableIn(container)[0] ?? container;
 }
 
-export function useFocusTrap(ref: RefObject<HTMLElement | null>, { active, initialFocus, isTop }: FocusTrapOptions): void {
+function inside(node: Node, selector: string | undefined): boolean {
+  if (!selector) return false;
+  const el = node.nodeType === 1 ? (node as Element) : node.parentElement;
+  return !!el && typeof el.closest === 'function' && el.closest(selector) !== null;
+}
+
+export function useFocusTrap(ref: RefObject<HTMLElement | null>, { active, initialFocus, isTop, allowFocusIn }: FocusTrapOptions): void {
   const isTopRef = useLatest(isTop);
+  const allowRef = useLatest(allowFocusIn);
 
   useEffect(() => {
     if (!active) return undefined;
@@ -61,7 +70,9 @@ export function useFocusTrap(ref: RefObject<HTMLElement | null>, { active, initi
     const onFocusIn = (e: FocusEvent): void => {
       if (!top()) return;
       const target = e.target as Node | null;
-      if (target && !container.contains(target)) {
+      // A region the layer leaves exposed (`allowFocusIn`, e.g. the floating voice controls over a
+      // compact screen) keeps the focus a click or a tap gave it.
+      if (target && !container.contains(target) && !inside(target, allowRef.current)) {
         focusElement(tabbableIn(container)[0] ?? container);
       }
     };

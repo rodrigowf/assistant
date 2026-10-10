@@ -3,7 +3,7 @@ name: skills
 category: archie/integrations
 tags: [skills, slash-commands, skill-md, agents, scripts, run-script, orchestrator-scripts, scaffold-skill, self-modification, catalog]
 created: 2026-04-15
-modified: 2026-10-06
+modified: 2026-10-09
 summary: How skills, agents and scripts work in Archie (format, locations, discovery, run_script allowlist) plus the catalog of every skill.
 source: curated (consolidated from memory notes assistant/utilities/project_skills_not_registered.md, assistant/infrastructure/features_and_integrations_summary.md §15, projects/home-automation/tuya_local_control.md, ORCHESTRATOR_SCRIPTS.md, context/AGENTS.md; verified against code 2026-10-06)
 references:
@@ -171,7 +171,7 @@ private devices, accounts or paths), so their files are not public.
 | `wrapper-guide` | shared | Navigate and debug the wrapper application (manager, API, frontend) |
 | `android-dev` | personal | Build, install and debug the Android apps (main + lite), logcat, ADB UI control — [android](../clients/android.md) |
 | `connect-tv` | personal | Discover the Fire TV on the LAN and connect over ADB — [fire-tv](../devices/fire-tv.md) |
-| `create-viz` | personal | HTML visualizations from templates into `context/public/visualizations/`, optionally shown on the TV — [visualizations](visualizations-and-sharing.md) |
+| `create-viz` | personal | Interactive HTML canvases (project interfaces, explainers, review pages) under `context/public/`, edited in place and reloaded live in the apps, shown on the TV — [visualizations](visualizations-and-sharing.md) |
 | `generate-image` | personal | Text-to-image with Google's Nano Banana (Gemini Image) API |
 | `generate-video` | personal | Text/image-to-video with Seedance 2.0 on BytePlus ModelArk |
 | `google-photos` | personal | Google Photos Picker downloads + Google Drive search/download — [google-photos](google-photos.md) |

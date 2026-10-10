@@ -272,3 +272,129 @@ export interface VoiceSessionToken {
   connection_info?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+// ───────────── Settings → Accounts (`/api/accounts`, `/api/env`; spec 12 §8.1) ─────────────
+
+export type AccountGroup = 'harness' | 'api' | 'other';
+export type AccountState = 'signed_in' | 'signed_out' | 'expired' | 'unavailable' | 'unknown';
+export type AccountMethodKind = 'link' | 'credentials' | 'env' | 'signout';
+
+/** One `context/.env` key a method sets. Secret fields carry a masked preview only. */
+export interface AccountEnvField {
+  name: string;
+  label: string;
+  secret: boolean;
+  help: string;
+  placeholder: string;
+  /** Mode switches: the allowed values ("" = unset). */
+  choices: { value: string; label: string }[] | null;
+  set: boolean;
+  preview: string;
+  /** Non-secret fields only. */
+  value: string | null;
+}
+
+export interface AccountMethod {
+  id: string;
+  kind: AccountMethodKind;
+  label: string;
+  description: string;
+  recommended: boolean;
+  active: boolean;
+  available: boolean;
+  unavailable_reason: string;
+  needs_code: boolean;
+  code_label: string;
+  code_help: string;
+  /** credentials: a file's JSON, or one secret line handed to the CLI's own login. */
+  input: 'json' | 'secret';
+  path: string;
+  source_hint: string;
+  placeholder: string;
+  warning: string;
+  fields: AccountEnvField[];
+}
+
+export type LoginFlowStatus = 'starting' | 'waiting' | 'verifying' | 'succeeded' | 'failed' | 'cancelled' | 'expired';
+
+export interface LoginFlow {
+  id: string;
+  service: string;
+  method: string;
+  status: LoginFlowStatus;
+  url: string | null;
+  user_code: string | null;
+  needs_code: boolean;
+  code_label: string;
+  code_help: string;
+  message: string;
+  started_at: string;
+  expires_at: string;
+  finished_at: string | null;
+}
+
+export interface AccountVerification {
+  ok: boolean;
+  message: string;
+  checked_at: string;
+}
+
+export interface AccountService {
+  id: string;
+  label: string;
+  group: AccountGroup;
+  description: string;
+  state: AccountState;
+  method: string | null;
+  account: string | null;
+  plan: string | null;
+  /** ISO-8601 UTC. */
+  expires_at: string | null;
+  detail: string | null;
+  warnings: string[];
+  methods: AccountMethod[];
+  used_by: string[];
+  docs: string | null;
+  flow: LoginFlow | null;
+  verified: AccountVerification | null;
+  /** The service can test its credential (`POST …/verify`). */
+  can_verify: boolean;
+}
+
+export interface AccountsResponse {
+  services: AccountService[];
+  env_path: string;
+}
+
+export interface AccountActionResponse {
+  message: string;
+  service: AccountService;
+}
+
+export interface EnvKey {
+  name: string;
+  set: boolean;
+  /** "••••abcd" for long values, "••••" for short ones; never the value. */
+  preview: string;
+  length: number;
+  line: number;
+  exported: boolean;
+  duplicates: number;
+  /** The running backend has this exact value (false = edited by hand since it started). */
+  in_process: boolean;
+}
+
+export interface EnvListResponse {
+  path: string;
+  exists: boolean;
+  keys: EnvKey[];
+}
+
+export interface EnvChangeResponse {
+  /** `now`: the backend and new agent sessions see it; `backend_restart`: restart needed. */
+  applies: 'now' | 'backend_restart';
+  note: string;
+  key?: EnvKey;
+  name?: string;
+  removed?: number;
+}

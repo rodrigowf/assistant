@@ -1,0 +1,9 @@
+7[r8[?25h[?25lWelcome[9Gto[12GClaude[19GCode[24Gv2.1.295
+
+[2GThis[7Gwill[12Gguide[18Gyou
+[2G·[4GOpening[12Gbrowser[20Gto[23Gsign[28Gin…
+[1C[1ABrowser didn't open?[23GUse the url[35Gbelow
+
+]8;id=13kfl8u;https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=CHALLENGE&code_challenge_method=S256&state=STATEhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=CHALLENGE&code_challenge_method=S256&state=STATE]8;;
+
+[2GPaste[8Gcode[13Ghere[18Gif[21Gprompted[30G>

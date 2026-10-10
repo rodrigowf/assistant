@@ -1,6 +1,7 @@
 package com.assistant.archie.feature.chat.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +20,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -27,6 +29,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -48,6 +51,7 @@ import com.assistant.core.design.components.ComposerShell
 import com.assistant.core.design.components.ComposerTextField
 import com.assistant.core.design.components.ContextRing
 import com.assistant.core.design.components.IconButtonStyle
+import com.assistant.core.design.components.OPEN_CONVERSATION_LABEL
 import com.assistant.core.design.components.OrbTone
 import com.assistant.core.design.components.ReconnectOutcome
 import com.assistant.core.design.components.VoiceDock
@@ -88,31 +92,8 @@ fun ComposerArea(
     Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
         if (queue.isNotEmpty()) QueueTray(queue)
         when (voice) {
-            is VoiceUi.Active -> VoiceDock(
-                state = dockState(voice.phase),
-                hint = dockHint(voice.phase, voice.micMuted),
-                modifier = Modifier.testTag("voice-dock"),
-                level = voiceLevel,
-            ) {
-                VoiceDockControls(
-                    micMuted = voice.micMuted,
-                    onToggleMic = { onAction(ChatAction.ToggleMic) },
-                    speakerMuted = voice.speakerMuted,
-                    onToggleSpeaker = { onAction(ChatAction.ToggleSpeaker) },
-                    onEnd = { onAction(ChatAction.EndVoice) },
-                )
-            }
-            is VoiceUi.Connecting -> ConnectingDock(voice.label) { onAction(ChatAction.EndVoice) }
-            is VoiceUi.Reconnecting -> {
-                var now by remember { mutableLongStateOf(clock()) }
-                LaunchedEffect(voice.since) { while (true) { now = clock(); delay(1_000) } }
-                VoiceDockReconnecting(elapsed = mmss(((now - voice.since) / 1000).coerceAtLeast(0)), onEnd = { onAction(ChatAction.EndVoice) })
-            }
-            is VoiceUi.Reconnected -> VoiceDockOutcome(
-                ReconnectOutcome.Reconnected,
-                "Reconnected",
-                "Back after ${mmss(voice.afterSeconds.toLong())} · dock returns to Listening",
-            )
+            is VoiceUi.Active, is VoiceUi.Connecting, is VoiceUi.Reconnecting, is VoiceUi.Reconnected ->
+                VoiceControls(voice, onAction, clock = clock, voiceLevel = voiceLevel)
             else -> {
                 if (voice is VoiceUi.Elsewhere) {
                     VoiceDockElsewhere(
@@ -121,18 +102,66 @@ fun ComposerArea(
                         hint = if (voice.mirrored) "Transcripts mirror here" else "Live transcript is only on the device that started voice",
                     )
                 }
-                if (voice is VoiceUi.ReconnectFailed) {
-                    VoiceDockOutcome(
-                        ReconnectOutcome.Failed,
-                        "Couldn't reconnect",
-                        voice.message ?: "Retries ran out",
-                        onReconnect = { onAction(ChatAction.StartVoice) },
-                        onEnd = { onAction(ChatAction.EndVoice) },
-                    )
-                }
+                if (voice is VoiceUi.ReconnectFailed) VoiceControls(voice, onAction, clock = clock)
                 Composer(composer, counters, draft, onAction, onAttach)
             }
         }
+    }
+}
+
+/**
+ * This device's voice controls for [voice]: the dock (Active), Connecting / Preparing / Ending,
+ * Reconnecting… with its timer, and the two reconnect outcomes. Shared by the composer slot
+ * ([ComposerArea]) and the floating controls ([VoiceOverlay]), so mute, speaker, End and
+ * Reconnect act the same in both. [onOpenConversation] (floating only) makes the state text open
+ * the Archie conversation. Off and "Active elsewhere" render nothing.
+ */
+@Composable
+fun VoiceControls(
+    voice: VoiceUi,
+    onAction: (ChatAction) -> Unit,
+    modifier: Modifier = Modifier,
+    clock: () -> Long = System::currentTimeMillis,
+    voiceLevel: (() -> Float?)? = null,
+    onOpenConversation: (() -> Unit)? = null,
+) {
+    when (voice) {
+        is VoiceUi.Active -> VoiceDock(
+            state = dockState(voice.phase),
+            hint = dockHint(voice.phase, voice.micMuted),
+            modifier = modifier.testTag("voice-dock"),
+            level = voiceLevel,
+            onLabelClick = onOpenConversation,
+        ) {
+            VoiceDockControls(
+                micMuted = voice.micMuted,
+                onToggleMic = { onAction(ChatAction.ToggleMic) },
+                speakerMuted = voice.speakerMuted,
+                onToggleSpeaker = { onAction(ChatAction.ToggleSpeaker) },
+                onEnd = { onAction(ChatAction.EndVoice) },
+            )
+        }
+        is VoiceUi.Connecting -> ConnectingDock(voice.label, modifier, onOpenConversation) { onAction(ChatAction.EndVoice) }
+        is VoiceUi.Reconnecting -> {
+            var now by remember { mutableLongStateOf(clock()) }
+            LaunchedEffect(voice.since) { while (true) { now = clock(); delay(1_000) } }
+            VoiceDockReconnecting(elapsed = mmss(((now - voice.since) / 1000).coerceAtLeast(0)), onEnd = { onAction(ChatAction.EndVoice) }, modifier = modifier)
+        }
+        is VoiceUi.Reconnected -> VoiceDockOutcome(
+            ReconnectOutcome.Reconnected,
+            "Reconnected",
+            "Back after ${mmss(voice.afterSeconds.toLong())} · dock returns to Listening",
+            modifier,
+        )
+        is VoiceUi.ReconnectFailed -> VoiceDockOutcome(
+            ReconnectOutcome.Failed,
+            "Couldn't reconnect",
+            voice.message ?: "Retries ran out",
+            modifier,
+            onReconnect = { onAction(ChatAction.StartVoice) },
+            onEnd = { onAction(ChatAction.EndVoice) },
+        )
+        VoiceUi.Off, is VoiceUi.Elsewhere -> Unit
     }
 }
 
@@ -281,10 +310,10 @@ private fun QueueTray(queue: ImmutableList<QueuedPrompt>) {
 
 /** Connecting / preparing / ending: the dock's frame with a still orb and End. */
 @Composable
-private fun ConnectingDock(label: String, onEnd: () -> Unit) {
+private fun ConnectingDock(label: String, modifier: Modifier, onOpen: (() -> Unit)?, onEnd: () -> Unit) {
     val c = ArchieTheme.colors
     Row(
-        Modifier
+        modifier
             .fillMaxWidth()
             .heightIn(min = 84.dp)
             .testTag("voice-dock")
@@ -294,7 +323,12 @@ private fun ConnectingDock(label: String, onEnd: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         VoiceOrb(OrbTone.Idle)
-        Column(Modifier.weight(1f).padding(start = 6.dp)) {
+        val open = if (onOpen != null) {
+            Modifier.clip(RoundedCornerShape(16.dp)).clickable(onClickLabel = OPEN_CONVERSATION_LABEL, role = Role.Button, onClick = onOpen)
+        } else {
+            Modifier
+        }
+        Column(Modifier.weight(1f).then(open).padding(start = 6.dp)) {
             Text(label, style = ArchieTheme.typography.titleMedium, color = c.onSurface)
             Text("Voice starts in a moment", style = ArchieTheme.typography.bodySmall, color = c.onSurfaceVariant)
         }
@@ -302,7 +336,7 @@ private fun ConnectingDock(label: String, onEnd: () -> Unit) {
     }
 }
 
-private fun dockState(p: SessionPhase): VoiceDockState = when (p) {
+internal fun dockState(p: SessionPhase): VoiceDockState = when (p) {
     SessionPhase.SPEAKING -> VoiceDockState.Speaking
     SessionPhase.THINKING -> VoiceDockState.Thinking
     SessionPhase.TOOL_USE -> VoiceDockState.UsingTools

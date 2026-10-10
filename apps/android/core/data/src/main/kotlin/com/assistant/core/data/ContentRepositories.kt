@@ -52,8 +52,14 @@ class VisualsRepository(private val api: ArchieApi, private val scope: Coroutine
     private var debounce: Job? = null
 
     fun refresh() {
+        scope.launch { refreshNow() }
+    }
+
+    /** [refresh], awaited (the reconnect catch-up compares the list before and after, VZ-6). */
+    suspend fun refreshNow() {
         _list.update { it.loading() }
-        scope.launch { val r = api.visualizations(); _list.update { LoadState.of(r, it) } }
+        val r = api.visualizations()
+        _list.update { LoadState.of(r, it) }
     }
 
     /** After a view's `endTurn` and on `agent_session_opened/closed` (§9.1). */

@@ -48,4 +48,7 @@ object SettingsKeys {
     val SERVER_PINS = stringPreferencesKey("server_pins_v1")
     val LIST_PANE_COLLAPSED = booleanPreferencesKey("list_pane_collapsed")
     val STAY_CONNECTED = booleanPreferencesKey("stay_connected_background")
+    /** Settings → Notifications → "Agent session finished" (spec 12 §8.2). */
+    val NOTIFY_AGENT_TURNS = booleanPreferencesKey("notify_agent_turns")
+    val VOICE_OVERLAY_ANCHOR = stringPreferencesKey("voice_overlay_anchor")
 }

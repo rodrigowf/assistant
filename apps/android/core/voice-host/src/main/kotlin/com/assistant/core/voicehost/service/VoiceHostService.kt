@@ -133,7 +133,8 @@ class VoiceHostService : Service() {
             else -> StartOrigin.BACKGROUND
         }
         val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        val decision = FgsPolicy.decide(Build.VERSION.SDK_INT, origin, granted, foreground, currentMask)
+        // Hold-only (agent notifications) never opens the mic: no microphone type then.
+        val decision = FgsPolicy.decide(Build.VERSION.SDK_INT, origin, granted && rt.micTypeWanted(), foreground, currentMask)
         if (decision.callStartForeground) {
             val model = NotificationPolicy.model(rt.state.value, rt.config.notification, rt.wakeService.currentConfig.wakeWord)
             try {

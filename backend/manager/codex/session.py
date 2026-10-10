@@ -24,13 +24,15 @@ Per-run configuration
 
 Nothing is written to ``config.toml``.  Fixed overrides go on argv
 (``-c project_doc_max_bytes=…`` so the 51 KB ``AGENTS.md`` is not
-truncated, ``--disable plugins --disable apps`` so the user's ChatGPT
+truncated, ``--disable plugins --disable apps --disable memories`` so the user's ChatGPT
 plugins don't add ~10 KB of instructions to every turn); the harness
 options become thread ``config`` overrides (``model_verbosity``,
 ``web_search``) or ``turn/start`` params (``effort``, ``summary``).  The
 model is always passed explicitly: the chosen one, else the account's
 default from ``model/list`` — a stale ``model`` in the user's
-``config.toml`` must not break Archie.
+``config.toml`` must not break Archie.  In the Archie repo a new thread
+also gets Archie's memory index as ``developerInstructions``
+(:mod:`manager.memory_context`).
 
 Approvals
 ---------
@@ -64,6 +66,7 @@ from .._ssh import (
 from ..base_session import BaseSessionManager, SessionDeadError, TurnAbandoned
 from ..config import ManagerConfig
 from ..harness_catalog import EFFORT
+from ..memory_context import memory_instructions
 from ..types import (
     CompactComplete,
     Event,
@@ -99,7 +102,7 @@ _REPLAY_BUFFER_SIZE = 500
 
 # Fixed per-process overrides (see module docstring).
 _PROJECT_DOC_MAX_BYTES = 131_072
-_DISABLED_FEATURES = ("plugins", "apps")
+_DISABLED_FEATURES = ("plugins", "apps", "memories")
 
 SANDBOX = "danger-full-access"
 APPROVAL_POLICY = "never"
@@ -262,6 +265,14 @@ class CodexSessionManager(BaseSessionManager):
         self._model = configured or default_model
 
         params = self._thread_params()
+        if not self._resume_id:
+            # Archie's memory index (context/memory/MEMORY.md), read live at
+            # thread start the way Claude Code's auto-memory loads it.  Codex
+            # records it once, as a developer message at the head of the
+            # rollout; a resumed or forked thread already carries it.
+            memory = memory_instructions(self._config.project_dir)
+            if memory:
+                params["developerInstructions"] = memory
         if self._resume_id and self._fork:
             result = await rpc.request("thread/fork", {
                 "threadId": self._resume_id, "excludeTurns": True, **params,

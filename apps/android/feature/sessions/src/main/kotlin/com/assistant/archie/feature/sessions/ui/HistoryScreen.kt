@@ -43,14 +43,12 @@ import com.assistant.core.design.components.ButtonStyle
 import com.assistant.core.design.icons.ArchieIcon
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
-import com.assistant.core.model.PoolSession
 
 /** What the History screen and the list sections render (mapped by the shell from its state). */
 @Immutable
 data class HistoryListState(
     val items: List<WorkspaceItem> = emptyList(),
     val active: ItemKey? = null,
-    val liveElsewhere: List<PoolSession> = emptyList(),
     val groups: List<HistoryGroup> = emptyList(),
     val loading: Boolean = false,
     val error: String? = null,
@@ -68,7 +66,6 @@ fun HistoryScreen(
     state: HistoryListState,
     onQuery: (String) -> Unit,
     onSelect: (ItemKey) -> Unit,
-    onOpenLive: (PoolSession) -> Unit,
     onIntent: (SessionsIntent) -> Unit,
     onRefresh: () -> Unit,
     onBack: () -> Unit,
@@ -96,15 +93,14 @@ fun HistoryScreen(
         Box(Modifier.fillMaxWidth().padding(horizontal = 12.dp), contentAlignment = Alignment.TopCenter) {
             Column(Modifier.widthIn(max = 840.dp).fillMaxSize()) {
                 SessionSearchField(state.query, onQuery, "Search conversations")
-                val hasRows = state.groups.isNotEmpty() || state.items.isNotEmpty() || state.liveElsewhere.isNotEmpty()
+                val hasRows = state.groups.isNotEmpty() || state.items.isNotEmpty()
                 LazyColumn(
                     Modifier.weight(1f).padding(top = 2.dp).testTag("history-list"),
                     contentPadding = PaddingValues(bottom = 24.dp),
                 ) {
                     openNowSection(
-                        state.items, state.liveElsewhere, state.active, ListDensity.TwoLine,
+                        state.items, state.active, ListDensity.TwoLine,
                         onSelect = { onSelect(it); onOpened() },
-                        onOpenLive = { onOpenLive(it); onOpened() },
                         onIntent = routed,
                     )
                     historySection(state.groups, ListDensity.TwoLine, routed, showMenuButton = true)

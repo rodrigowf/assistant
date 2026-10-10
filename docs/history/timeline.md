@@ -3,7 +3,7 @@ name: timeline
 category: archie/history
 tags: [timeline, changelog, history, milestones, incidents]
 created: 2026-10-07
-modified: 2026-10-07
+modified: 2026-10-10
 summary: Dated milestones and incidents in Archie's development, February–October 2026, with commits where known.
 source: curated (timeline entries collected from every memory note consolidated into docs/, 2026-10-07)
 references:
@@ -147,3 +147,23 @@ Commit hashes are in the public repo unless they refer to the private context re
 - **10-07** — Archie's documentation consolidated from ~45 scattered memory notes into `docs/`,
   linked into memory as `context/memory/archie`; the rebuild specs moved to `docs/specs/` and the
   workstreams to `docs/projects/`; memory reorganized (`people/`, `identity/`, `deployment/`).
+
+- **10-09/10** — Agent-finished notifications (web + Android), floating voice controls, Settings →
+  Accounts with every sign-in method and an `.env` key manager, live reload of visuals and memory
+  docs, in-app links, the `create-viz` canvas skill; built in four parallel worktrees with review
+  agents. **(incident)** The SPA catch-all served any file (`//etc/x`), `context/.env` included —
+  fixed and deployed the same hour (`683c4f4`); then a cross-site request guard for the whole API.
+  **(incident)** Probing `codex login` wiped the laptop's Archie Codex login (CLIs log out when a
+  login *starts*) → logins run in a temp home. **(incident)** VS Code held ~51k inotify watches →
+  five `context/` dirs unwatched; context-sync rebuilt (tombstones, manifest + reconcile, trash,
+  mass-delete brake) and the laptop's watch limit raised. Android Notifications page found
+  unreachable from Settings and fixed (`7fd6e99`). [Handoff](HANDOFF-2026-10-10.md).
+- **10-10** — **(incident)** A delegated digest session was killed mid-edit by the runner's fixed
+  600 s limit; the phone kept showing "Using tools…" and the orchestrator answered with its own
+  summary. Fixed: delegated turns belong to the conversation (stopping the orchestrator never
+  stops them), the limit counts time without progress (30 min), every runner-ended turn is
+  signalled to the tabs, failed turns are reported (`b1dd5b0`, `df2025f`). **(incident)** Sessions
+  closed on the web stayed "Open now" on the phone, and returning devices re-created closed
+  conversations → **the server owns the open set** (spec 12 OPEN-1..4): `pool/live` is "Open now"
+  on every device, closed anywhere = closed everywhere at once, the pool survives restarts
+  (`state/open_sessions.json`), automatic starts only `reattach` (`a4768aa`).

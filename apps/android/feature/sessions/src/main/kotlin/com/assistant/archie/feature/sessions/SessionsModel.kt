@@ -10,7 +10,6 @@ import com.assistant.core.data.OpenSessionsRepository
 import com.assistant.core.data.TabStatus
 import com.assistant.core.data.WorkspaceItem
 import com.assistant.core.model.HarnessProvider
-import com.assistant.core.model.PoolSession
 import com.assistant.core.model.SessionSummary
 import java.time.Instant
 import java.time.ZoneId
@@ -162,7 +161,6 @@ sealed interface SessionsIntent {
     data object NewArchie : SessionsIntent
     data object NewAgent : SessionsIntent
     data class OpenHistory(val session: SessionSummary) : SessionsIntent
-    data class OpenLive(val session: PoolSession) : SessionsIntent
     data class RequestClose(val item: WorkspaceItem) : SessionsIntent
     data object ConfirmClose : SessionsIntent
     data class RequestRename(val target: SessionTarget) : SessionsIntent
@@ -181,7 +179,7 @@ sealed interface SessionsIntent {
 
 /**
  * The history list (IA §3/§5, web `groupSessions`): every word of the query must appear in the title;
- * sessions already in "Open now" (open here, or live on another device) are left out; the rest is
+ * sessions already in "Open now" (the server's open set, OPEN-1) are left out; the rest is
  * grouped by **local** calendar day with offset-correct parsing (B-03 [HistoryGrouping], fixes the
  * old app's UTC skew, inv03 §1.5).
  */
@@ -196,14 +194,13 @@ object HistoryList {
     fun groups(
         sessions: List<SessionSummary>,
         open: List<WorkspaceItem>,
-        liveElsewhere: List<PoolSession>,
         query: String,
         now: Instant,
         zone: ZoneId,
         locale: Locale = Locale.getDefault(),
     ): List<HistoryGroup> {
-        val openSdk = open.mapNotNull { it.sdkId }.toSet() + liveElsewhere.mapNotNull { it.sdkId }
-        val openLocal = open.mapNotNull { it.localId }.toSet() + liveElsewhere.map { it.localId }
+        val openSdk = open.mapNotNull { it.sdkId }.toSet()
+        val openLocal = open.mapNotNull { it.localId }.toSet()
         val rows = sessions.filter { s ->
             s.sdkId !in openSdk && (s.localId == null || s.localId !in openLocal) &&
                 matchesQuery(SessionTitles.conversationTitle(s.title, s.isOrchestrator), query)

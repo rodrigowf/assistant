@@ -214,6 +214,37 @@ export interface AgentSessionClosedFrame extends Sequenced {
 }
 
 /**
+ * §3.7 turn watcher events: an agent session (any harness, never the orchestrator) started or
+ * ended a turn, from any device or delegated by the orchestrator. Pool watchers only (every
+ * orchestrator socket); handled at the channel level (device notifications), never by a reducer.
+ */
+export interface AgentTurnStartedFrame extends Sequenced {
+  type: 'agent_turn_started';
+  /** The agent's `localId`. */
+  session_id: string;
+  sdk_session_id?: string | null;
+  provider?: string | null;
+}
+
+export type AgentTurnStatus = 'ok' | 'error' | 'interrupted';
+
+export interface AgentTurnFinishedFrame extends Sequenced {
+  type: 'agent_turn_finished';
+  /** The agent's `localId`. */
+  session_id: string;
+  sdk_session_id?: string | null;
+  provider?: string | null;
+  /** The session's title when the server knows it (custom title or first prompt). */
+  title?: string | null;
+  /** `interrupted` = stopped by someone: no notification. Unknown values read as `ok`. */
+  status: string;
+  /** One line from the turn's final assistant text (≤ 200 chars). */
+  preview?: string | null;
+  /** Failure detail when `status == "error"`. */
+  error?: string | null;
+}
+
+/**
  * §6.11a: the orchestrator's `switch_conversation` tool moved the user into a past orchestrator
  * conversation. Sent to ONE socket (the voice owner, else the last text sender) after the server
  * ended voice and stopped the old orchestrator; handled at the channel level (SW-1).
@@ -227,6 +258,31 @@ export interface OrchestratorSwitchFrame extends Sequenced {
   voice?: boolean | null;
   /** The old (now stopped) orchestrator's `localId`. */
   from_session_id?: string | null;
+}
+
+/** `created` | `modified` | `deleted` (advisory: an atomic save or rsync reports a create). */
+export type ContentChangeKind = 'created' | 'modified' | 'deleted';
+
+export interface ContentChange {
+  path: string;
+  kind: ContentChangeKind;
+}
+
+/**
+ * §9.3: files under `context/public/` changed (content watcher, pushed to every orchestrator
+ * socket like the watcher events). `visualizations` are list paths (`GET /api/visualizations`)
+ * whose page or assets changed; `files` the raw changed paths. Handled at the channel level.
+ */
+export interface VisualizationChangedFrame extends Sequenced {
+  type: 'visualization_changed';
+  visualizations?: ContentChange[] | null;
+  files?: ContentChange[] | null;
+}
+
+/** §9.3: markdown under the memory tree changed (paths as in `GET /api/memory/tree`). */
+export interface MemoryChangedFrame extends Sequenced {
+  type: 'memory_changed';
+  changes?: ContentChange[] | null;
 }
 
 export interface AudioUploadFrame extends Sequenced {
@@ -313,6 +369,10 @@ export type ServerFrame =
   | AgentSessionOpenedFrame
   | AgentSessionClosedFrame
   | OrchestratorSwitchFrame
+  | AgentTurnStartedFrame
+  | AgentTurnFinishedFrame
+  | VisualizationChangedFrame
+  | MemoryChangedFrame
   | AudioUploadFrame
   | PingFrame
   | VoiceEventFrame

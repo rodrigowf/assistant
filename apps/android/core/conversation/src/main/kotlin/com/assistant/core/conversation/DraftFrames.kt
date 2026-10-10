@@ -37,8 +37,7 @@ internal fun Draft.reduceFrame(f: ServerFrame) {
         }
         is ServerFrame.SessionStopped -> {
             if (expectStopAck) { expectStopAck = false; return }               // our own stop / close
-            if (status != SessionStatus.TERMINATED) status = SessionStatus.STOPPED
-            endTurn("stopped"); endVoice()                                     // the view is NOT closed (W-9)
+            closedByServer()
         }
         is ServerFrame.VoiceEvent -> onVoiceEvent(f.event)
         is ServerFrame.VoiceOwnerActive -> if (f.active) voiceActive = true else endVoice()
@@ -46,11 +45,8 @@ internal fun Draft.reduceFrame(f: ServerFrame) {
         is ServerFrame.SessionStarted -> if (f.voice == true) voiceActive = true
         is ServerFrame.NestedSessionEvent -> onNestedSessionEvent(f)
         is ServerFrame.AgentSessionClosed -> {
-            // WATCH-1: this conversation itself left the pool (FOCUS-2: the flag must match its kind)
-            if (f.sessionId == ref.localId && f.isOrchestrator == isOrchestrator) {
-                if (status != SessionStatus.TERMINATED) status = SessionStatus.STOPPED
-                endTurn("stopped"); endVoice()
-            }
+            // OPEN-3: this conversation itself left the pool (FOCUS-2: the flag must match its kind)
+            if (f.sessionId == ref.localId && f.isOrchestrator == isOrchestrator) closedByServer()
         }
         is ServerFrame.ModelChanged -> f.modelInfo?.modelInfo?.contextWindow?.let { counters = counters.copy(contextWindow = it) }
         is ServerFrame.ModelInfo -> f.modelInfo?.modelInfo?.contextWindow?.let { counters = counters.copy(contextWindow = it) }
@@ -200,9 +196,23 @@ internal fun Draft.onError(code: String?, detail: String?) {
 private fun Draft.connectionOrSideError(code: String, detail: String?) {
     when (code) {
         in ConversationReducer.START_ERRORS -> onStartError(code, detail)
-        "not_started" -> sendStart()                                          // T-12: re-send start
+        "not_started" -> sendStart()                                          // T-12: re-send start (reattach)
+        "session_closed" -> closedByServer()                                  // OPEN-3: the reattach found it closed
         else -> effects += ConversationEffect.SideError(code, detail)
     }
+}
+
+/** OPEN-3: the session is gone from the server. The view stops here and the repository closes it. */
+private fun Draft.closedByServer() {
+    if (status != SessionStatus.TERMINATED) status = SessionStatus.STOPPED
+    endTurn("stopped"); endVoice()
+    if (awaitingSessionStarted) {                                            // no session_started will come (L-2)
+        awaitingSessionStarted = false
+        val held = preStart.toList()
+        preStart.clear()
+        for (g in held) dispatch(g)
+    }
+    effects += ConversationEffect.Closed(termination)
 }
 
 /** SEQ-8: a start error ends the wait for `session_started` and releases the held frames in order (L-2). */

@@ -25,9 +25,10 @@ class MemoryLinkResolverTest {
             val got = MemoryLinkResolver.resolve(c.from, c.href)
             val expected: MemoryLink = when (c.kind) {
                 "memory" -> MemoryLink.Document(c.target, c.fragment.ifEmpty { null })
-                "external" -> MemoryLink.External(c.target)
+                "external" -> inApp(c.target) ?: MemoryLink.External(c.target)
                 "anchor" -> MemoryLink.Anchor(c.target)
-                "backend", "outside" -> MemoryLink.Server(c.target)
+                // What MEM-2 leaves to the server is then subject to the internal-link rules (§9.4).
+                "backend", "outside" -> inApp(c.target) ?: MemoryLink.Server(c.target)
                 else -> error("unknown kind ${c.kind}")
             }
             if (got == expected) null else "${c.from} → ${c.href}: expected $expected, got $got"
@@ -69,12 +70,33 @@ class MemoryLinkResolverTest {
         assertEquals(MemoryLink.External("https://github.com/x"), MemoryLinkResolver.resolve("a.md", "https://github.com/x"))
         assertEquals(MemoryLink.External("mailto:me@example.com"), MemoryLinkResolver.resolve("a.md", "mailto:me@example.com"))
         assertEquals(MemoryLink.External("//cdn.example.com/x.md"), MemoryLinkResolver.resolve("a.md", "//cdn.example.com/x.md"))
-        assertEquals(MemoryLink.Server("/markdown_reader.html?file=memory/a.md"), MemoryLinkResolver.resolve("a.md", "/markdown_reader.html?file=memory/a.md"))
+        assertEquals(MemoryLink.Server("/uploads/a.png"), MemoryLinkResolver.resolve("a.md", "/uploads/a.png"))
         assertEquals(MemoryLink.Server("/memory/p/v.mp4#t=10"), MemoryLinkResolver.resolve("p/a.md", "/memory/p/v.mp4#t=10"))
+    }
+
+    @Test fun `internal links (spec 12 section 9-4) open in the app`() {
+        val ctx = com.assistant.core.markdown.InternalLinks.Context("https://192.168.0.200")
+        assertEquals(MemoryLink.Document("a.md"), MemoryLinkResolver.resolve("p/b.md", "/markdown_reader.html?file=memory/a.md", ctx))
+        assertEquals(MemoryLink.Visual("avatar-pipeline/index.html"), MemoryLinkResolver.resolve("p/b.md", "https://192.168.0.200/avatar-pipeline/", ctx))
+        assertEquals(MemoryLink.Visual("visualizations/x.html"), MemoryLinkResolver.resolve("p/b.md", "/visualizations/x.html", ctx))
+        assertEquals(MemoryLink.Document("projects/x.md"), MemoryLinkResolver.resolve("p/b.md", "https://192.168.0.200/memory/projects/x.md", ctx))
+        // An explicit relative markdown link is MEM-2 (relative to this file, like the web)...
+        assertEquals(MemoryLink.Document("p/docs/x.md"), MemoryLinkResolver.resolve("p/b.md", "docs/x.md", ctx))
+        // ...while an auto-linked printed path carries its canonical URL and lands on the docs file.
+        val auto = com.assistant.core.markdown.autoLinkPaths(listOf(com.assistant.core.markdown.MdInline.Code("docs/specs/x.md")))
+        val href = (auto.single() as com.assistant.core.markdown.MdInline.Link).href
+        assertEquals(MemoryLink.Document("archie/specs/x.md"), MemoryLinkResolver.resolve("p/b.md", href, ctx))
+        assertEquals(MemoryLink.External("https://example.com/x.html"), MemoryLinkResolver.resolve("p/b.md", "https://example.com/x.html", ctx))
     }
 
     @Test fun `raw file URL encodes every segment`() {
         assertEquals("/memory/projects/my%20notes%23v2.md", MemoryLinkResolver.memoryFileUrl("projects/my notes#v2.md"))
         assertEquals("/memory/MEMORY.md", MemoryLinkResolver.memoryFileUrl("/MEMORY.md"))
+    }
+
+    private fun inApp(href: String): MemoryLink? = when (val t = com.assistant.core.markdown.InternalLinks.resolve(href)) {
+        is com.assistant.core.markdown.InternalLinks.Target.Memory -> MemoryLink.Document(t.path, t.fragment)
+        is com.assistant.core.markdown.InternalLinks.Target.Visual -> MemoryLink.Visual(t.path)
+        null -> null
     }
 }

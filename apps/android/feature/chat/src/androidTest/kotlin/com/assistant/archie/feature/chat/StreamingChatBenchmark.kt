@@ -199,7 +199,6 @@ private class BenchBackend : ChatBackend {
     override fun retry() = Unit
     override suspend fun rewind(entryId: String): CutResult = CutResult.Failed("")
     override suspend fun fork(entryId: String): CutResult = CutResult.Failed("")
-    override fun continueTerminated(target: ContinueTarget) = Unit
     override suspend fun upload(source: UploadSource, onProgress: (Long, Long) -> Unit): ApiResult<UploadResult> = ApiResult.NetworkError(Exception())
     override fun inject(text: String) = Unit
     override fun touch() = Unit

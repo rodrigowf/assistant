@@ -30,7 +30,7 @@ internal fun AppPermission.icon() = when (this) {
 
 internal fun AppPermission.usedFor() = when (this) {
     AppPermission.MICROPHONE -> "Voice, voice messages and the wake word"
-    AppPermission.NOTIFICATIONS -> "Background listening and approval requests"
+    AppPermission.NOTIFICATIONS -> "Finished agent sessions, approval requests and background listening"
     AppPermission.NEARBY_DEVICES -> "Bluetooth headset output"
 }
 

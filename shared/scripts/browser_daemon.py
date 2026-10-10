@@ -30,6 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "backend"))  # backend packages (api, …)
 import uvicorn
 from fastapi import FastAPI
 
+from api.guard import RequestGuardMiddleware
 from api.routes import browser as browser_route
 from api.routes import uploads as uploads_route
 
@@ -45,6 +46,9 @@ PID_FILE = LOG_DIR / "browser-daemon.pid"
 
 def build_app() -> FastAPI:
     app = FastAPI(title="Archie Browser Daemon")
+    # Same browser-origin guard as the main backend (api/guard.py): a web page in this Chrome
+    # cannot POST uploads or open the socket here; the extension's chrome-extension:// origin passes.
+    app.add_middleware(RequestGuardMiddleware)
     app.state.browser_hub = browser_route.BrowserHub()
     app.include_router(browser_route.router)
     app.include_router(uploads_route.router)

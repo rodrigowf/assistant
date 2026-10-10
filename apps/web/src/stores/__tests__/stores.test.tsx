@@ -226,13 +226,13 @@ describe('tabs', () => {
 
   it('FOCUS-1: background opens never change the active tab; user activation clears the badge', () => {
     openTab(agent('A'), { focus: true });
-    openTab(agent('B', { openedBySync: true }), { focus: false });
+    openTab(agent('B'), { focus: false });
     expect(tabsStore.getState().activeId).toBe('A');
-    expect(findTab('B')).toMatchObject({ unseen: true, everFocused: false });
+    expect(findTab('B')).toMatchObject({ unseen: true });
     openTab(agent('B'), { focus: false }); // updating keeps the badge and the focus
     expect(tabsStore.getState().activeId).toBe('A');
     activateTab('B');
-    expect(findTab('B')).toMatchObject({ unseen: false, everFocused: true });
+    expect(findTab('B')).toMatchObject({ unseen: false });
     activateTab('nope');
     markTabUnseen('B'); // active: no badge
     markTabUnseen('A');
@@ -287,7 +287,7 @@ describe('tabs', () => {
   });
 
   it('titles are derived from the session list (sdk id, then local id, then hint/placeholder)', () => {
-    const a: Tab = { id: 'L1', kind: 'agent', localId: 'L1', sdkId: 'sdk-1', unseen: false, openedBySync: false, everFocused: true };
+    const a: Tab = { id: 'L1', kind: 'agent', localId: 'L1', sdkId: 'sdk-1', unseen: false };
     expect(tabTitle(a)).toBe('New agent session');
     setCatalogItems('sessions', [
       { session_id: 'sdk-1', title: 'By sdk', local_id: null } as never,

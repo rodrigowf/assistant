@@ -8,10 +8,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -19,18 +21,27 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.navigation3.runtime.rememberNavBackStack
+import com.assistant.archie.feature.chat.VoiceOverlayModel
+import com.assistant.archie.feature.chat.ui.ComposerBounds
+import com.assistant.archie.feature.chat.ui.LocalComposerBounds
+import com.assistant.archie.feature.chat.ui.OverlayAnchor
+import com.assistant.archie.feature.chat.ui.VoiceOverlayActivity
 import com.assistant.archie.graph.GraphOwner
 import com.assistant.archie.graph.MainAppGraph
 import com.assistant.archie.system.ShellCommand
 import com.assistant.archie.system.SystemApprovalSink
 import com.assistant.archie.system.SystemIntents
+import com.assistant.archie.system.SystemTurnSink
 import com.assistant.archie.system.SystemOverlays
 import com.assistant.archie.system.applyAppNightMode
 import com.assistant.core.data.ConversationEvent
 import com.assistant.core.data.SharePayload
+import com.assistant.core.model.SessionKind
+import com.assistant.core.model.SessionRef
 import com.assistant.core.design.theme.ArchieTheme
 import com.assistant.archie.feature.settings.ui.AuthGate
 import com.assistant.archie.feature.settings.ui.ProvideTextSize
+import kotlinx.coroutines.launch
 
 /**
  * The single Activity (spec 14 §2.8). It holds no domain state: everything lives in the
@@ -57,6 +68,20 @@ class MainActivity : ComponentActivity() {
         setContent { ArchieApp(graph) }
     }
 
+    // "Looking at it" (AN-1, agent-finished and approval notifications) follows the activity being
+    // resumed: it ends the moment Home is pressed, the shade is pulled or the screen locks. The
+    // process lifecycle's ON_STOP arrives ~1 s later, and a turn finishing in that gap was wrongly
+    // treated as seen (2026-10-10).
+    override fun onResume() {
+        super.onResume()
+        graph.approvals.foreground.value = true
+    }
+
+    override fun onPause() {
+        graph.approvals.foreground.value = false
+        super.onPause()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleIntent(intent)
@@ -64,10 +89,12 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         ShellIntents.parseShare(intent)?.let { graph.share.offer(it) }
-        // OI-6: a tap on an approval notification focuses that agent session.
+        // OI-6: a tap on an approval or "agent finished" notification focuses that agent session.
         intent?.getStringExtra(SystemApprovalSink.EXTRA_OPEN_AGENT)?.let { localId ->
+            val sdkId = intent.getStringExtra(SystemTurnSink.EXTRA_OPEN_AGENT_SDK)
             intent.removeExtra(SystemApprovalSink.EXTRA_OPEN_AGENT)
-            graph.approvals.requestOpen(localId)
+            intent.removeExtra(SystemTurnSink.EXTRA_OPEN_AGENT_SDK)
+            graph.approvals.requestOpen(localId, sdkId)
         }
         // B-09: launcher shortcuts, and a voice start deferred until the mic is allowed (tile /
         // assist / shortcut without RECORD_AUDIO land here; spec 14 §2.8-§2.9).
@@ -99,9 +126,12 @@ fun ArchieApp(graph: MainAppGraph) {
     }
     val openRequest by graph.approvals.openRequest.collectAsStateWithLifecycle()
     LaunchedEffect(openRequest) {
-        val localId = graph.approvals.takeOpenRequest() ?: return@LaunchedEffect
+        val req = graph.approvals.takeOpenRequest() ?: return@LaunchedEffect
         while (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
-        graph.openSessions.openAgentByLocalId(localId)
+        if (!graph.openSessions.openAgentByLocalId(req.localId) && req.sdkId != null) {
+            // It left the pool (closed, backend restart): reopen it from history (`start{resume_sdk_id}`).
+            graph.openSessions.openRef(SessionRef(req.localId, req.sdkId, SessionKind.AGENT, provider = null))
+        }
     }
     // §6.11a: Archie switched to a past conversation at the user's request; the Archie view is
     // focused by OpenSessionsRepository, and a screen on top of the workspace (Settings, …) goes.
@@ -110,9 +140,22 @@ fun ArchieApp(graph: MainAppGraph) {
             if (e is ConversationEvent.ArchieSwitched) while (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
         }
     }
+    // The floating voice controls (over every view but the Archie conversation while a call runs).
+    val overlayScope = rememberCoroutineScope()
+    val overlayModel = remember(graph) { VoiceOverlayModel(graph.voiceDock, overlayScope) }
+    val overlayActivity = remember { VoiceOverlayActivity() }
+    val composerBounds = remember { ComposerBounds() }
+    val anchorKey = graph.settings.settings.collectAsStateWithLifecycle().value?.voiceOverlayAnchor
+    val voiceOverlay = ShellVoiceOverlay(
+        overlayModel, overlayActivity, composerBounds,
+        anchor = OverlayAnchor.parse(anchorKey),
+        onAnchorChange = { a -> graph.scope.launch { graph.settings.setVoiceOverlayAnchor(a.key) } },
+    )
     ArchieTheme(mode = state.themeMode.toDesign(), reduceMotion = appearance.reduceMotion) {
         ProvideTextSize(appearance.textSize) {
-            AuthGate(settings) { ArchieShell(state, vm::onAction, backStack, destinations) }
+            CompositionLocalProvider(LocalComposerBounds provides composerBounds) {
+                AuthGate(settings) { ArchieShell(state, vm::onAction, backStack, destinations, voiceOverlay = voiceOverlay) }
+            }
         }
         // B-09: system-bar icon contrast (OI-1), share sheet, mic rationale, shortcut commands.
         SystemOverlays(graph) { cmd ->

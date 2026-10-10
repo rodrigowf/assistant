@@ -3,7 +3,7 @@ name: fire-tv
 category: archie/devices
 tags: [fire-tv, tvserverhub, adb, launcher, screensaver, webview, visualizations, show-on-tv]
 created: 2026-02-23
-modified: 2026-10-07
+modified: 2026-10-09
 summary: Fire TV integration — TvServerHub launcher, its screensaver service, ADB connection, the TV skills and "Show on TV".
 source: curated (consolidated from memory notes assistant/devices/television_integration_project.md, assistant/infrastructure/features_and_integrations_summary.md §6; verified against code 2026-10-06)
 references:
@@ -87,7 +87,7 @@ Commands in the skills assume `192.168.0.16:5555`; if the IP changed, discover i
 | `/connect-tv` | (Re)establish ADB after a power cycle or IP change |
 | `/tv-remote` | Remote-control actions: launch/close apps (YouTube, Netflix, Prime Video, TvServerHub), open URLs in `WebPageViewActivity`, media keys (85 play/pause, 126/127, 87/88, 89/90), D-pad (19–23), back/home (4/3), volume (24/25/164), screenshots (`exec-out screencap -p`), current app (`dumpsys activity activities \| grep mResumedActivity`) |
 | `/tv-dev` | Build, deploy and debug TvServerHub itself: WebView DevTools via `adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>`, logcat tags `TvServerHub`, `WebViewScreen`, `ScreensaverMonitor`, screensaver troubleshooting, changing the timeout or launcher tiles |
-| `/create-viz` | Generate an HTML visualization under `context/public/visualizations/` and optionally display it on the TV |
+| `/create-viz` | Build interactive HTML canvases under `context/public/`; show one on the TV with "Show on TV" or `POST /api/visualizations/cast` |
 
 Skills live in `context/skills/<name>/SKILL.md`. When delegating TV work to a session, load
 `/tv-remote` (or `/tv-dev` for app debugging). YouTube results can be played on the TV through

@@ -272,7 +272,7 @@ async def orchestrator_ws(ws: WebSocket):
                         "detail": "No active voice session",
                     }))
                     continue
-                await _handle_voice_event(pool, session, msg.get("event", {}))
+                await _handle_voice_event(pool, session, msg.get("event", {}), sender=ws)
 
             elif msg_type == "voice_audio_in":
                 # WS-provider mic chunk → forward upstream.
@@ -437,6 +437,8 @@ async def _handle_start(
     """
     local_id: str | None = msg.get("local_id")
     resume_id: str | None = msg.get("resume_sdk_id") or msg.get("session_id")
+    # Spec 12 OPEN-2: an automatic (re)start only re-attaches, never re-creates.
+    reattach = bool(msg.get("reattach"))
     voice_provider_req: str | None = msg.get("voice_provider") if voice else None
     voice_model_req: str | None = msg.get("voice_model") if voice else None
     voice_name_req: str | None = msg.get("voice_name") if voice else None
@@ -472,6 +474,13 @@ async def _handle_start(
             return None, False
 
     # --- Reconnect: an orchestrator with this local_id is already running ---
+    if reattach and not (local_id and pool.orchestrator_open(local_id)):
+        await _safe_send_bytes(ws, orjson.dumps({
+            "type": "error", "error": "session_closed",
+            "detail": "This conversation is no longer open.",
+        }))
+        return None, False
+
     if pool.has_orchestrator() and local_id and pool.orchestrator_id == local_id:
         session = pool.get_orchestrator()
         current_voice = getattr(session, "is_voice", False)
@@ -488,7 +497,7 @@ async def _handle_start(
                 local_id,
             )
             try:
-                await pool.stop_orchestrator()
+                await pool.stop_orchestrator(replacing=True)
             except Exception:  # noqa: BLE001
                 logger.exception("stop_orchestrator during ENDING-drop failed")
             await pool.await_orchestrator_stop(local_id, timeout=_VOICE_TIMEOUTS.await_orchestrator_stop_s)
@@ -547,12 +556,8 @@ async def _handle_start(
             )
             return session, True
         elif not voice and current_voice:
-            # Text WS reconnecting while voice is active — subscribe without
+            # Text ``start`` while voice is active — subscribe without
             # disrupting the voice session (the text WS auto-connects on mount).
-            # Not the initiator: another client owns the live voice
-            # connection. Carry voice metadata so this client's UI can
-            # reflect that voice is active, but don't let it try to open
-            # its own provider transport.
             pool.subscribe_orchestrator(local_id, ws)
             reconnect_payload: dict = {
                 "type": "session_started",
@@ -563,6 +568,28 @@ async def _handle_start(
                 "voice": current_voice,
                 "model_info": session.get_model_info(),
             }
+            if session.voice_owner_ws is ws:
+                # The voice OWNER re-sent a plain ``start`` on its own socket
+                # (spec 12 T-9: every foreground / resync; Android also sends
+                # one beside its reconnect ``voice_start``). It still owns the
+                # call, so it must hear ``voice_initiator: true`` — answering
+                # false demoted the device that holds the WebRTC peer: it then
+                # dropped every ``voice_command`` (tool results never reached
+                # the model) and ignored ``voice_ended`` (the call outlived
+                # ``end_voice_session``). 2026-10-08, POCO X7 Pro.
+                # Metadata only: its provider is already configured, so no
+                # session.update to re-apply and no new ephemeral token.
+                _attach_voice_metadata(reconnect_payload, session, initiator=True)
+                logger.info(
+                    "plain start from the voice owner session=%s — ownership kept",
+                    local_id,
+                )
+                await _safe_send_bytes(ws, orjson.dumps(reconnect_payload))
+                return session, True
+            # Not the initiator: another client owns the live voice
+            # connection. Carry voice metadata so this client's UI can
+            # reflect that voice is active, but don't let it try to open
+            # its own provider transport.
             await _attach_voice_payload(
                 reconnect_payload, session,
                 initiator=False, initiator_ws=None,
@@ -601,7 +628,7 @@ async def _handle_start(
                         "voice config drift on reconnect (%s) — tearing down to rebuild",
                         drift,
                     )
-                    await pool.stop_orchestrator()
+                    await pool.stop_orchestrator(replacing=True)
                     await pool.await_orchestrator_stop(local_id, timeout=_VOICE_TIMEOUTS.await_orchestrator_stop_s)
                     # Fall through to the new-session creation path below.
                 else:
@@ -636,7 +663,10 @@ async def _handle_start(
                 return session, True
 
     # --- A different orchestrator is already active ---
-    if pool.has_orchestrator():
+    restored = pool.restored_orchestrator
+    if restored is not None and local_id == restored[0]:
+        resume_id = restored[1]  # open across a restart or an in-place rebuild: resume it
+    if pool.has_orchestrator() or (restored is not None and local_id != restored[0]):
         await _safe_send_bytes(ws, orjson.dumps({
             "type": "error", "error": "orchestrator_active",
             "detail": "An orchestrator session is already active. Stop it first.",
@@ -686,6 +716,8 @@ async def _handle_start(
     context: dict = {
         "store": ws.app.state.store,
         "pool": pool,
+        # Agent turns belong to the conversation, not to this session object.
+        "agent_runtimes": getattr(pool, "agent_runtimes", None),
         "project_dir": project_dir,
         "index_dir": str(Path(project_dir) / "index"),
     }
@@ -761,7 +793,12 @@ async def _handle_start(
                 )
             return _wake
 
-        session.notifications.set_wake_callback(_make_wake(pool, session))
+        wake = _make_wake(pool, session)
+        session.notifications.set_wake_callback(wake, owner=session)
+        # Agent turns finished while this conversation had no session (closed,
+        # switched away, rebuilt): report them now instead of on the next prompt.
+        if session.notifications.has_pending():
+            asyncio.create_task(wake(), name="orchestrator-wake-pending")
 
     # Background history-summary refresh on session reopen. The chat WS
     # `start` arrives whenever the user opens a session from history (or
@@ -806,6 +843,24 @@ async def _handle_start(
     return session, True
 
 
+def _attach_voice_metadata(
+    payload: dict,
+    session: OrchestratorSession,
+    *,
+    initiator: bool,
+) -> None:
+    """The voice fields of ``session_started`` that describe the live call
+    (provider, model, voice, language, ownership, recording) — no
+    session.update, no connection info, no relay side effects."""
+    payload["voice_provider"] = session.voice_provider_id
+    payload["voice_model"] = session.voice_model_id
+    payload["voice_name"] = session.voice_name_id
+    payload["voice_transcription_language"] = session.voice_transcription_language
+    payload["voice_initiator"] = initiator
+    # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
+    payload["voice_recording_enabled"] = session.audio_recorder is not None
+
+
 async def _attach_voice_payload(
     payload: dict,
     session: OrchestratorSession,
@@ -834,13 +889,7 @@ async def _attach_voice_payload(
     swallowed and reported back as ``voice_connection_error`` so the
     frontend can surface them; the session itself stays alive.
     """
-    payload["voice_provider"] = session.voice_provider_id
-    payload["voice_model"] = session.voice_model_id
-    payload["voice_name"] = session.voice_name_id
-    payload["voice_transcription_language"] = session.voice_transcription_language
-    payload["voice_initiator"] = initiator
-    # Tell frontend whether to record audio (relevant for WebRTC where audio bypasses backend)
-    payload["voice_recording_enabled"] = session.audio_recorder is not None
+    _attach_voice_metadata(payload, session, initiator=initiator)
 
     # Sub-step timing inside _attach_voice_payload — when start is slow,
     # the cost is almost always in get_session_update (system prompt +
@@ -1221,8 +1270,60 @@ async def _handle_compact(
         })
 
 
+# Inbound OpenAI (WebRTC) data-channel events the conversation reducer turns
+# into transcript entries (spec 12 §4.7). The owner device mirrors every
+# data-channel event here; these are the ones the other devices need.
+_PASSIVE_TRANSCRIPT_TYPES = frozenset({
+    "input_audio_buffer.speech_started",
+    "conversation.item.input_audio_transcription.completed",
+    "response.output_audio_transcript.delta",
+    "response.output_audio_transcript.done",
+    "response.audio_transcript.delta",
+    "response.audio_transcript.done",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.text.delta",
+    "response.text.done",
+    "response.done",
+})
+
+# User-side events fired by audio that listen_recording replays; never shown.
+_INJECTED_USER_TYPES = frozenset({
+    "input_audio_buffer.speech_started",
+    "conversation.item.input_audio_transcription.completed",
+})
+
+
+async def _mirror_to_passive_viewers(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    event: dict,
+    sender: WebSocket | None,
+) -> None:
+    """Re-broadcast an owner-mirrored WebRTC transcript event (VT-2).
+
+    With WebRTC the audio and the provider events flow between the owner
+    device and OpenAI directly; the backend only sees them because the owner
+    mirrors them up as ``voice_event``. WS providers already broadcast every
+    provider event from the relay, but nothing forwarded these, so the other
+    devices showed only the tool cards of a live OpenAI voice turn. The owner
+    is excluded: it feeds its own timeline from the data channel.
+    """
+    event_type = event.get("type")
+    if event_type not in _PASSIVE_TRANSCRIPT_TYPES:
+        return
+    if session.is_injecting and event_type in _INJECTED_USER_TYPES:
+        return
+    await pool.broadcast_orchestrator(
+        {"type": "voice_event", "event": event}, exclude=sender,
+    )
+
+
 async def _handle_voice_event(
-    pool: SessionPool, session: OrchestratorSession, event: dict,
+    pool: SessionPool,
+    session: OrchestratorSession,
+    event: dict,
+    sender: WebSocket | None = None,
 ) -> None:
     """Process a mirrored realtime event and send back any voice commands.
 
@@ -1270,8 +1371,8 @@ async def _handle_voice_event(
         # For WS providers (Qwen / Gemini / locals), client-originated
         # control events need to be forwarded upstream.  WebRTC providers
         # (OpenAI) skip this path — the frontend talks to the provider
-        # directly via the data channel and only mirrors events here for
-        # backend persistence.
+        # directly via the data channel and mirrors events here for backend
+        # persistence; the transcript ones go on to the other devices.
         #
         # Filter through the provider's ``accepts_upstream_event`` first:
         # if the client is still mirroring events shaped for a previously
@@ -1295,6 +1396,8 @@ async def _handle_voice_event(
                     await session.send_voice_event_upstream(event)
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to forward client voice event upstream")
+        else:
+            await _mirror_to_passive_viewers(pool, session, event, sender)
 
         commands = await session.process_voice_event(event)
         await _dispatch_voice_commands(pool, session, commands)

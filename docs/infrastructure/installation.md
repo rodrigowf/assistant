@@ -1,10 +1,10 @@
 ---
 name: installation
 category: archie/infrastructure
-tags: [install, installer, setup-context, symlinks, venv, npm, migration, certificates, parallel-install, doctor, harness-versions, no-node, modelstudio]
+tags: [install, installer, setup-context, symlinks, venv, npm, migration, certificates, parallel-install, doctor, harness-versions, no-node, modelstudio, memory, history]
 created: 2026-04-15
 modified: 2026-10-08
-summary: What the installers do, the version pins, every per-harness symlink, install/doctor.sh, backend-only (no-Node) hosts, migrating to a new machine, certificates, and running a second install.
+summary: What the installers do, the version pins, every per-harness symlink, memory/history wiring per harness, install/doctor.sh, backend-only (no-Node) hosts, migrating to a new machine, certificates, and running a second install.
 source: curated (consolidated from INSTALL.md, install/README.md, install/linux/install.sh, shared/scripts/setup-context.sh, shared/scripts/run.sh, start.sh, memory notes assistant/infrastructure/repo_layout_cutover_2026_10.md and a private parallel-installation note (generic mechanics only); verified against code 2026-10-06)
 references:
   - topology.md
@@ -23,6 +23,7 @@ references:
   - ../architecture/orchestrator.md
   - ../overview/archie.md
   - ../architecture/system-overview.md
+  - ../architecture/memory-and-search.md
 ---
 
 # Installation
@@ -42,7 +43,8 @@ symlinks that let each agent CLI read and write inside `context/`. The step-by-s
 | `install/<os>/install-prerequisites.*` | Checks Python ≥ 3.11, Node ≥ `NODE_MIN_MAJOR` (22), npm, git (Linux prints package hints; macOS offers Homebrew; Windows offers winget); the bash ones take `--no-node` |
 | `install/` (templates) | `AGENTS.md`, `MEMORY.md`, `ORCHESTRATOR_MEMORY.md`, `ORCHESTRATOR_SCRIPTS.md`, `context.env`, `assistant_config.json`, `manager.json`, `sync.env`, `cli-runtime/<cli>/`, `cli-runtime/codex-home/config.toml` — user-agnostic seeds, see `install/README.md` |
 | `install/harness-versions.env` | The CLI pins (`QWEN_CLI_VERSION`, `GEMINI_CLI_VERSION`, `CODEX_CLI_VERSION`) and `NODE_MIN_MAJOR` — sourced by the bash installers, parsed by the PowerShell ones, compared by the doctor. The claude-agent-sdk pin stays in `backend/requirements-claude.txt`; `QWEN_CLI_VERSION` in `backend/manager/qwen/adapter.py` must match (the doctor warns) |
-| `install/doctor.sh` | Per-harness check of an install; `--fix` / `--dry-run` repair symlinks and seed files only — see [The doctor](#the-doctor-installdoctorsh) |
+| `install/doctor.sh` | Per-harness check of an install; `--fix` / `--dry-run` repair symlinks, seed files and seed keys only — see [The doctor](#the-doctor-installdoctorsh) |
+| `install/gemini-project.py`, `install/codex-home-config.py` | Stdlib helpers shared by the three installers and the doctor: pin Gemini's project label (`projects.json` entry + `context/.project_root` marker), and add/replace `[features] memories = false` in a Codex `config.toml` — see [Memory and history wiring](#memory-and-history-wiring-per-harness) |
 | `shared/scripts/setup-context.sh` | Standalone, idempotent (re)creation of the `context/` structure and symlinks; `--force` relinks |
 
 Prerequisites per `INSTALL.md`: Python 3.11+ (3.12 recommended; the backend has no 3.12-only syntax
@@ -73,7 +75,8 @@ or import the context.
 `resolve_path`, `sed_inplace`, `ensure_dir_link` — are portable across GNU/BSD and bash 3.2; port a
 change by copying the Linux file). `install/windows/install.ps1` mirrors the steps in PowerShell —
 symlinks need Developer Mode or Administrator, else directory junctions and file copies; the Gemini
-settings merge (3e) runs after the venv exists; no `--no-node` mode and no doctor (its verification
+settings merge (3e), the Gemini label registration, the Codex `memories` key and the Qwen memory-key
+merge run after the venv exists (with the venv's Python and the same helpers); no `--no-node` mode and no doctor (its verification
 step lists every link instead); see [Pitfalls](#pitfalls).
 
 Every link step follows one rule (`ensure_dir_link`, and the doctor's `--fix`): a correct link is
@@ -88,11 +91,11 @@ overwriting, the directory backed up / moved aside) and then linked.
 | 2 | Context: keep an existing configured `context/` (or back it up to `context.bak/`); **new**: `mkdir context/{memory,skills,scripts,agents,secrets,certs}`, seed `context/memory/{MEMORY,ORCHESTRATOR_MEMORY,ORCHESTRATOR_SCRIPTS}.md`, `context/AGENTS.md`, `context/.env` from `install/` (uncommenting keys for the chosen axes: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DASHSCOPE_API_KEY` for Qwen, `GEMINI_API_KEY` for Gemini); **import**: `git clone`, add missing folders. Both create the `shared/` symlinks (below). Every path, including a kept context, then links `context/memory/archie` → `../../docs` |
 | 3 | Claude **and Model Studio** (same bundled CLI, same `CLAUDE_CONFIG_DIR`): `.claude_config/projects/<mangled-cwd>` → `../../context` (migrating any JSONL from a real directory there; the key replaces every non-alphanumeric character with `-`, like the CLI), `.claude_config/skills` → `../context/skills`, `.claude_config/agents` → `../context/agents` (the CLI loads user agents from `$CLAUDE_CONFIG_DIR/agents`) |
 | 3b | Qwen: `~/.qwen/projects/<mangled-cwd>` → `<repo>/context`, chats into `context/chats/` (JSONL only — since 0.25 `*.runtime.json` is a liveness marker, not session data); `~/.qwen/skills` → `context/skills` (an empty real dir is replaced) |
-| 3c | Gemini: `~/.gemini/tmp/<label>` → `<repo>/context` (label from `~/.gemini/projects.json`, else the cwd basename); offers to copy `GEMINI_API_KEY` into `~/.gemini/.env` (mode 600) for hosts other machines reach over SSH |
-| 3c2 | Codex: seed `~/.codex-archie/config.toml` from `install/cli-runtime/codex-home/` (never overwritten: `project_doc_max_bytes = 131072`, plugins/apps off), `~/.codex-archie/sessions` → `<repo>/context/codex/sessions` (a real directory there is copied in and moved aside). `auth.json` is never copied ([codex-cli](../harnesses/codex-cli.md)) |
+| 3c | Gemini: `~/.gemini/tmp/<label>` → `<repo>/context` (label from `~/.gemini/projects.json`, else the one the CLI would claim — `install/gemini-project.py … label`), then registers `<repo> → <label>` in `projects.json` and makes `context/.project_root` name the repo (`… apply`), reports whether `~/.gemini/tmp/<label>/memory/MEMORY.md` resolves to `context/memory/MEMORY.md`, and warns about `~/.gemini/GEMINI.md`; offers to copy `GEMINI_API_KEY` into `~/.gemini/.env` (mode 600) for hosts other machines reach over SSH |
+| 3c2 | Codex: seed `~/.codex-archie/config.toml` from `install/cli-runtime/codex-home/` (never overwritten: `project_doc_max_bytes = 131072`, plugins/apps/memories off; an existing file only gets `[features] memories = false` added or replaced by `install/codex-home-config.py`), `~/.codex-archie/sessions` → `<repo>/context/codex/sessions` (a real directory there is copied in and moved aside). `auth.json` is never copied ([codex-cli](../harnesses/codex-cli.md)) |
 | 3c3 | When Codex, Gemini or Qwen is enabled: `.agents/skills` → `../context/skills` — Codex 0.161 lists skills from `<repo>/.agents/skills` (verified with `codex debug prompt-input`), Gemini CLI reads it as its workspace-skills alias, Qwen as a project skill dir |
 | 3d | `CLAUDE.md`, `QWEN.md`, `GEMINI.md` and `AGENTS.md` (read by Codex) at the repo root → `context/AGENTS.md` (committed; missing ones re-created; migrates a legacy root `AGENTS.md`/`CLAUDE.md`) |
-| 3e | Seed `.claude/`, `.qwen/`, `.gemini/` from `install/cli-runtime/` without overwriting; then merge Archie's keys into an existing `.gemini/settings.json` (`backend/manager/gemini/workspace_settings.py`: session retention off, `context.fileFiltering`, API-key auth, thinking overrides — [gemini-cli](../harnesses/gemini-cli.md)) |
+| 3e | Seed `.claude/`, `.qwen/`, `.gemini/` from `install/cli-runtime/` without overwriting; set the three Qwen memory keys to `false` in an existing `.qwen/settings.json`; then merge Archie's keys into an existing `.gemini/settings.json` (`backend/manager/gemini/workspace_settings.py`: session retention off, `context.fileFiltering`, API-key auth, thinking overrides — [gemini-cli](../harnesses/gemini-cli.md)) |
 | 4–6 | `python3 -m venv .venv`, upgrade pip, `pip install -r backend/requirements.txt` (or `-dev`) plus `requirements-claude.txt` (claude or modelstudio) / `-anthropic.txt` / `-openai.txt` per axis |
 | 7 | `npm install` in `apps/web` and `apps/design-tokens` (the web build's token gate needs the latter); skipped without Node |
 | 7b | `npm install -g` each chosen CLI that is not on `PATH` yet, and check auth. Pins from `install/harness-versions.env`: `@qwen-code/qwen-code@0.25.0` (= `QWEN_CLI_VERSION`; needs Node 22+), `@google/gemini-cli@0.63.0`, `@openai/codex@0.161.0`; `@anthropic-ai/claude-code` is unpinned and optional (login only — the backend runs the CLI bundled with `claude-agent-sdk==0.2.164`). An already-installed CLI at another version only gets a warning with the `npm install -g …@<pin>` command. Without npm, Codex comes from its static GitHub release binary. Model Studio: nothing to install, `DASHSCOPE_API_KEY` checked. Login: Claude `CLAUDE_CODE_OAUTH_TOKEN` / `claude auth login` / `ANTHROPIC_API_KEY`; Qwen OAuth (`qwen`) or `DASHSCOPE_API_KEY`; Gemini **only** `GEMINI_API_KEY` (Google stopped serving Gemini CLI to personal-account OAuth on 2026-06-18 — [gemini-cli](../harnesses/gemini-cli.md)); Codex `CODEX_HOME=~/.codex-archie codex login --device-auth` (the shared `~/.codex` login also works; no API-key fallback) |
@@ -135,8 +138,32 @@ CLAUDE.md, QWEN.md, GEMINI.md, AGENTS.md → context/AGENTS.md   (committed; the
 context/memory/archie   → ../../docs   (these docs inside the memory wiki; every install)
 ```
 
-`.agents/skills` is not committed or gitignored yet — a fresh install creates it as an untracked
-link (commit it like the root `*.md` links, or add `.agents/` to `.gitignore`).
+`.agents/skills` is committed like the root `*.md` links; the installers re-create it when missing.
+
+## Memory and history wiring per harness
+
+Every harness must (1) write its conversations into `context/` — the history indexer scans
+`context/*.jsonl`, `context/chats/*.jsonl` and the Codex rollouts under `context/codex/sessions/` —
+and (2) read `context/memory/MEMORY.md` and write memory into the wiki per `AGENTS.md`
+([memory and search](../architecture/memory-and-search.md#every-harness-reads-and-writes-the-same-memory)).
+What the install provides for each:
+
+| Harness | History | Memory index | Own memory store off | Installed by |
+|---|---|---|---|---|
+| Claude Code, Model Studio | `.claude_config/projects/<key>` → `context` | backend appends `MEMORY.md` | backend sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the repo (`autoMemoryEnabled` in `.claude_config/settings.json` never reached SDK sessions; the doctor reports it as INFO only) | step 3 |
+| Qwen Code | `~/.qwen/projects/<key>` → `context` (chats in `context/chats/`) | backend `--append-system-prompt` | per-run settings file, and `.qwen/settings.json` memory keys `false` as the fallback | 3b, 3e |
+| Gemini CLI | `~/.gemini/tmp/<label>` → `context` (chats in `context/chats/`) | natively: `~/.gemini/tmp/<label>/memory/MEMORY.md` is `context/memory/MEMORY.md` through the link | 0.63 has no `save_memory`; `~/.gemini/GEMINI.md` (global tier outside `context/`) is warned about | 3c |
+| Codex | `~/.codex-archie/sessions` → `context/codex/sessions` (only once `~/.codex-archie` has its own login) | backend `developerInstructions` | `[features] memories = false` in `~/.codex-archie/config.toml` | 3c2 |
+
+Gemini's label needs pinning, not just a link: the CLI keeps `~/.gemini/projects.json` (repo path →
+label) and an ownership marker `.project_root` in `~/.gemini/tmp/<label>/` (that is
+`context/.project_root`) and `~/.gemini/history/<label>/`. An unregistered repo gets a label on its
+next run — the basename, or `<basename>-1`… when taken — and a marker naming another path makes the
+CLI drop the mapping and claim a new label; either way its chats and its memory index silently leave
+`context/`. `install/gemini-project.py` reproduces the CLI's rules (`label`), reports (`check`) and
+registers + rewrites the context-side marker (`apply`); a foreign `history/<label>` marker is left
+for a hand fix. On Windows the `projects.json` key is the lower-cased path (the CLI's rule).
+`context/.project_root` syncs with `context/`, which is fine while both machines use the same path.
 
 Public, general-purpose tools live in `shared/`; personal ones live directly in `context/`; both are
 reachable from `context/{skills,scripts,agents}/`. `shared/scripts/setup-context.sh` links every
@@ -154,20 +181,23 @@ prints one OK / WARN / FAIL / SKIP row per check and exits 1 if any row is FAIL:
 
 | Area | Checks |
 |---|---|
-| common | `context/`, `context/AGENTS.md`, `context/.env`, `context/memory/ORCHESTRATOR_MEMORY.md` (`--fix` seeds it from `install/`), the `context/memory/archie` link; Node vs `NODE_MIN_MAJOR`; the four root `*.md` links; every `shared/{skills,scripts,agents}` entry linked from `context/` (and dangling links there) |
-| claude | venv `claude-agent-sdk` version vs `requirements-claude.txt` (from its `dist-info`, nothing imported), the bundled CLI, auth (`CLAUDE_CODE_OAUTH_TOKEN`, `.claude_config/.credentials.json` link or copy, or `ANTHROPIC_API_KEY`), the three `.claude_config` links |
+| common | `context/`, `context/AGENTS.md`, `context/.env`, `context/memory/ORCHESTRATOR_MEMORY.md` and `context/memory/MEMORY.md` (`--fix` seeds a missing one from `install/`), the `context/memory/archie` link, the backend's memory block (`backend/manager/memory_context.py`); Node vs `NODE_MIN_MAJOR`; the four root `*.md` links; every `shared/{skills,scripts,agents}` entry linked from `context/` (and dangling links there) |
+| claude | venv `claude-agent-sdk` version vs `requirements-claude.txt` (from its `dist-info`, nothing imported), the bundled CLI, auth (`CLAUDE_CODE_OAUTH_TOKEN`, `.claude_config/.credentials.json` link or copy, or `ANTHROPIC_API_KEY`), the three `.claude_config` links, auto-memory (INFO: off in repo sessions when the backend sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY`; the `autoMemoryEnabled` value is shown but not judged) |
 | modelstudio | the same SDK + `DASHSCOPE_API_KEY` |
 | qwen | `qwen --version` vs pin (also `QWEN_CLI_PATH`), the backend's `QWEN_CLI_VERSION` vs the pins file, Node 22+, auth (`DASHSCOPE_API_KEY` or `~/.qwen/oauth_creds.json`), both `~/.qwen` links, `.qwen/settings.json` memory keys false |
-| gemini | `gemini --version` vs pin, `GEMINI_API_KEY`, `~/.gemini/.env` key + mode 600 (WARN: only SSH-remote hosts need it), the `projects.json` label, the `tmp/<label>` link, `.gemini/settings.json` = `workspace_settings.merge_archie_settings()` of itself |
-| codex | `codex --version` vs pin (also `CODEX_CLI_PATH`), auth (`ARCHIE_CODEX_HOME`, `~/.codex-archie/auth.json`, else WARN for the shared `~/.codex`), `config.toml`, the `sessions` link, `.agents/skills` |
+| gemini | `gemini --version` vs pin, `GEMINI_API_KEY`, `~/.gemini/.env` key + mode 600 (WARN: only SSH-remote hosts need it), the `tmp/<label>` link, the `projects.json` label (WARN when unregistered, `--fix` registers it), the `.project_root` markers (FAIL when one names another path; `--fix` rewrites `context/.project_root`, a foreign `history/<label>` one needs a hand fix), the memory index resolving to `context/memory/MEMORY.md`, `~/.gemini/GEMINI.md` (WARN when present), `.gemini/settings.json` = `workspace_settings.merge_archie_settings()` of itself |
+| codex | `codex --version` vs pin (also `CODEX_CLI_PATH`), auth (`ARCHIE_CODEX_HOME`, `~/.codex-archie/auth.json`, else WARN for the shared `~/.codex`), `config.toml`, `[features] memories = false` (WARN when not pinned, FAIL when on; `--fix` sets it), the `sessions` link, `.agents/skills` |
 
 Env keys and auth are checked by name / file existence only; no value is printed. By default a
 harness whose CLI is not on this host is a SKIP row (with the no-Node note when Node is missing);
-`--harness` makes the listed ones required. `--fix` repairs only symlinks and seed files with the
+`--harness` makes the listed ones required. `--fix` repairs only symlinks, seed files and seed keys
+(Qwen's memory keys, Codex's `memories`, Gemini's `projects.json` entry and context marker) with the
 installers' rule above (a migrated real directory is moved to `<name>.bak-<timestamp>`); it never
 installs packages or touches auth, and `--dry-run` prints what it would do. The script is bash 3.2
 compatible (macOS) and self-contained — copy it to another host and point `--repo` at the checkout
-(it falls back to built-in pins when that checkout has no `install/harness-versions.env`).
+(it falls back to built-in pins when that checkout has no `install/harness-versions.env`, and looks
+for `gemini-project.py` / `codex-home-config.py` next to itself first, then in the checkout's
+`install/`; without them those rows degrade to WARN).
 
 ## Backend-only hosts (no Node.js)
 
@@ -228,9 +258,9 @@ Two installs can coexist on one machine in different directories (e.g. `~/assist
   strict, so run one dev server at a time or change the ports). Clients (Android apps) can connect to
   either backend by changing the server URL in their settings.
 - **Project keys.** The different path gives a different mangled cwd, so `.claude_config/projects/…`
-  and `~/.qwen/projects/…` don't collide. Gemini's default label is the directory basename, so two
-  dirs both named `assistant` collide in `~/.gemini/tmp/assistant`; the installer leaves an existing
-  link alone and warns. `~/.qwen/skills` is global and stays pointed at the first install.
+  and `~/.qwen/projects/…` don't collide. Gemini's default label is the directory basename; the
+  installer registers the second install under the next free label (`assistant-1`), like the CLI
+  would. `~/.gemini/GEMINI.md` is global to both. `~/.qwen/skills` is global and stays pointed at the first install.
 - **Keys and MCPs** are per install (`context/.env`, `.claude_config/.claude.json`) — a fresh one
   needs its own.
 - **context-sync**: the context-sync unit (`context-sync.service`, the only one) hard-codes

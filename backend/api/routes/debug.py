@@ -21,7 +21,9 @@ async def collect_log(request: Request):
         level = body.get("level", "log")
         msg = body.get("msg", "")
         ts = body.get("ts", datetime.utcnow().isoformat())
-        line = f"[{ts}] [{level.upper()}] {msg}\n"
+        # Behind the nginx proxy the socket peer is 127.0.0.1; nginx passes the device in X-Real-IP.
+        ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "?")
+        line = f"[{ts}] [{ip}] [{level.upper()}] {msg}\n"
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a") as f:
             f.write(line)

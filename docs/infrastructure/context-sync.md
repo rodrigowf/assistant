@@ -1,9 +1,9 @@
 ---
 name: context-sync
 category: archie/infrastructure
-tags: [context-sync, rsync, inotifywait, systemd, git, delete-gating, inotify, vscode, large-files]
+tags: [context-sync, rsync, inotifywait, systemd, git, delete-gating, tombstones, inotify, vscode, large-files]
 created: 2026-04-17
-modified: 2026-10-07
+modified: 2026-10-09
 summary: The context-sync service that mirrors context/ between laptop and Jetson — design, install, delete gating, git rule, pitfalls.
 source: curated (consolidated from memory notes assistant/infrastructure/server_hub_project.md, project_context_sync_delete_gating.md, feedback_jetson_main_repo_normal_git.md, assistant/utilities/review_artifacts_location.md, projects/video-editing/large_assets_outside_context.md, assistant/infrastructure/repo_layout_cutover_2026_10.md; verified against infra/sync/ 2026-10-06)
 references:
@@ -44,29 +44,101 @@ changes to the other. Code is not synced this way — see [topology.md](topology
 | `SSH_KEY` | Passphrase-less private key authorized on the other side |
 | `DEBOUNCE_SECONDS` | Default `2` |
 | `RETRY_INTERVAL` | Default `30` — wait between reachability checks at startup |
+| `TOMBSTONE_SECONDS` | Default `120` — how long a deleted path stays tombstoned (see step 5) |
+| `RECONCILE_SECONDS`, `TICK_SECONDS` | Default `600` / `30` — periodic reconcile; how often decisions are checked |
+| `MAX_DELETES`, `MAX_DELETE_PERCENT` | Default `50` / `25` — the brake: more deletions than this wait for approval |
+| `TRASH_DAYS` | Default `30` — `.sync-trash/<date>/` folders older than this are purged |
+| `REMOTE_SCRIPT` | Default `assistant/infra/sync/context-sync.sh` (relative to the remote `$HOME`) |
+| `WATCH_FAIL_DELAY` | Default `30` — pause before exiting when a directory can't be watched |
+| `STATE_DIR`, `REMOTE_STATE_DIR` | Tombstones, manifest, held deletions; default `~/.local/state/context-sync` on both sides |
+| `LOG_TAG` | Journal tag, default `context-sync` (tests use another tag) |
 
 ## How it works
 
-1. **Startup.** Waits until the remote answers (`ssh … true`, retrying every `RETRY_INTERVAL`), then
-   runs one full `rsync -az --update --delete` to catch up on anything missed while offline. This is
-   the **only** place `--delete` is used — at startup there are no concurrent writers on this side.
+1. **Startup: reconcile.** Waits until the remote answers (`ssh … true`, retrying every
+   `RETRY_INTERVAL`), then runs a full **reconcile** (below). Never `rsync --delete`: the other
+   machine is live (the Jetson's backend writes all the time), so a blind `--delete` would remove
+   whatever it created that this side hadn't received yet.
 2. **Watch.** `inotifywait --monitor --recursive` on `LOCAL_DIR` for
-   `close_write,moved_to,moved_from,delete,create`, excluding `/.git/`, sync-conflict and Syncthing
-   files, `.stfolder` and `*.tmp`. inotifywait honours only its last `--exclude`, so all exclusions
-   are one regex alternation.
+   `close_write,moved_to,moved_from,delete,create`, excluding `/.git/`, `/.sync-trash/`,
+   sync-conflict and Syncthing files, `.stfolder` and `*.tmp`. inotifywait honours only its last
+   `--exclude`, so all exclusions are one regex alternation.
 3. **Debounce.** After the first event it keeps draining events until `DEBOUNCE_SECONDS` pass with
    none, so a streaming JSONL write becomes one sync.
-4. **Push content.** `rsync -az --update` **without** `--delete` (rsync excludes: `.git/`,
-   Syncthing artifacts, `*.tmp`, `.DS_Store`). `--update` skips files that are newer on the receiver,
-   which together with both sides pushing gives last-write-wins.
-5. **Apply deletions per path.** Every `DELETE` / `MOVED_FROM` path seen during the window is
-   collected; after the window, only paths that are **really gone locally** are kept (an atomic
-   rename fires `MOVED_FROM` for a file that reappears under the same name). Those are sent
-   NUL-delimited to the remote and removed with `rm -rf` under `REMOTE_DIR`.
-6. **Remote offline.** The change is skipped and logged; the next restart's full sync catches up.
+4. **Push what changed.** `rsync -az --update --prune-empty-dirs --files-from=<this batch's paths> -r`
+   **without** `--delete` (rsync excludes: `.git/`, `/.sync-trash/`, Syncthing artifacts, `*.tmp`,
+   `.DS_Store`, active tombstones and held deletions). Only the paths from this batch's events are
+   sent (a new directory with its contents) — **never the whole tree**: a file this machine has and
+   the other lacks may have been deleted there while this side wasn't looking (its service stopped),
+   and a whole-tree push from the busy Jetson silently undid exactly such deletes. Copying anything
+   else that's missing on one side is the reconcile's job, which can tell new from deleted.
+   `--update` skips files that are newer on the receiver (last-write-wins). The log line names what
+   was pushed.
+5. **Apply deletions per path, with tombstones, into the trash.** Every `DELETE` / `MOVED_FROM` path
+   seen during the window is collected; after the window, only paths that are **really gone
+   locally** are kept (an atomic rename fires `MOVED_FROM` for a file that reappears under the same
+   name), minus rsync's own temp files (`.<name>.XXXXXX` whose `<name>` now exists). Each kept path is
+   written as a *tombstone* (`<epoch>\t<path>`) on **both** machines, then **moved to the remote's
+   trash** (`context/.sync-trash/<date>/<path>`; never `rm`). For `TOMBSTONE_SECONDS`:
+   - pushes on either side skip tombstoned paths, so neither machine sends a deleted file back;
+   - a tombstoned file that reappears with an mtime **older** than its delete is a stale copy from a
+     push that was already in flight; it goes to the trash again;
+   - a local delete of a path the other side already tombstoned (it deleted it here) is not echoed
+     back (this ended a delete ping-pong between the machines);
+   - a path re-created on purpose (mtime at or after the delete) is a new file and syncs normally.
+   More than `MAX_DELETES` live deletes at once (or `MAX_DELETE_PERCENT` of the files) are **not**
+   replicated: they are held for approval by the reconcile (step 8).
+6. **Manifest.** After each successful sync the *manifest* (`~/.local/state/context-sync/manifest`,
+   `path\tsize\tmtime`) is updated: what this batch changed now exists on both sides; deletions the
+   remote applied are dropped. It is the "last agreed" state the reconcile compares against.
+7. **Remote offline.** The batch is skipped and logged; deletes stay in the manifest; the reconcile
+   after the remote is back replays them.
+8. **Reconcile** — at startup, after an outage, when an approve/reject decision is waiting, and every
+   `RECONCILE_SECONDS` (checked every `TICK_SECONDS` even when busy). It lists both sides
+   (`context-sync.sh --list` over ssh; the remote runs the same script) and compares them with the
+   manifest:
 
-`inotifywait`'s own stderr (other than the "Setting up watches" banners) goes to the journal as
-`inotifywait: …` errors, so a watch-limit failure is visible in `journalctl`.
+   | In the manifest, and now… | Meaning | Action |
+   |---|---|---|
+   | gone here, **unchanged** there | deleted here while apart (remote off, service down) | delete there (to its trash) |
+   | gone there, **unchanged** here | deleted there | delete here (to our trash) |
+   | gone on one side, **changed** on the other | delete vs. edit | **the edit wins**: copied back, logged |
+   | not in the manifest | new on one side | copied, never deleted |
+
+   Then both directions are copied (`rsync --update`, no `--delete`) and the manifest is rewritten.
+   With no manifest yet (first run) nothing is deleted, only copied both ways.
+   **Brake:** if the inferred deletions exceed `MAX_DELETES` (50) or `MAX_DELETE_PERCENT` (25 %) of
+   the manifest, none is applied. They are written to `pending-deletes`, logged once as an `ERROR`
+   ("holding N deletion(s) for approval"), sent to the other machine (`remote-held`) so neither side's
+   pushes undo the hold, and left alone (not copied either way) until a decision:
+   - `infra/sync/context-sync.sh --status` — what is held, what's in the trash;
+   - `--approve-deletes` — apply them (to the trash of the machine they're removed from);
+   - `--reject-deletes` — keep the files: they are restored on both sides.
+   Decisions are per path and picked up by the running service within `TICK_SECONDS`, even if more
+   deletions were held meanwhile. This is what protects against a wiped or half-restored
+   `context/`: everything missing shows up as a held mass deletion, not as deletes on the other side.
+9. **Trash.** Every removal the service makes (replicated deletes, reconcile deletes, stale copies)
+   moves the file to `context/.sync-trash/<date>/<path>` on that machine — not synced, not in git
+   (`.gitignore`), purged after `TRASH_DAYS` (30). Restore = move it back.
+10. **Watch failures restart the service.** `inotifywait` never retries a directory it couldn't
+    watch (out of inotify watches, permissions), so that directory stayed blind. Any `Couldn't watch
+    …` / `upper limit on inotify watches` line is logged with "A directory is not being watched;
+    restarting in 30s", and the script exits with a failure (SIGUSR1) so systemd
+    (`Restart=on-failure`) starts it again with a complete set of watches.
+
+`inotifywait`'s own stderr (other than the "Setting up watches" banners and the harmless "remove
+watch" messages for deleted directories) goes to the journal as `inotifywait: …` errors, so a
+watch-limit failure is visible in `journalctl -t context-sync`. A reconcile with nothing to do logs
+nothing.
+
+**Testing.** `infra/sync/test/run-suite.sh` (≈5 min, exit status = failures; run it after any change
+to the script, on the laptop and on the Jetson). Every behaviour above was checked with two instances syncing two local folders through
+a fake `ssh` (which runs the remote command locally and can simulate the remote being offline), on
+the laptop and on the Jetson (mawk 1.3.3, bash 4.4, rsync 3.1.2): live create/delete, delete and
+create while offline, delete while the service is stopped, edit beats delete, brake + approve, brake
++ reject, a wiped `context/`, a live mass delete while the other side keeps pushing, a delete while
+this side's service is stopped and the other side keeps writing, a folder moved in with its contents,
+and no log noise when idle.
 
 ### Why deletes are per-path (never `rsync --delete` on incremental syncs)
 
@@ -76,9 +148,9 @@ new files vanished. Gating `--delete` on seeing a delete event did not help, bec
 JSONL writer and most editors write via `tmp → rename`, so almost every burst contains a
 `MOVED_FROM`. The fix (2026-05-19) dropped `--delete` semantics entirely: a path is deleted remotely
 only because *this* machine saw it deleted, so a file the other side just created can never be on
-the list. Trade-off: a deletion made while the service is down propagates only at the next restart's
-full sync — resurrected old files are far less harmful than vanished new ones. **Don't "simplify"
-this back to `rsync --delete`.**
+the list. Deletes made while the machines were apart are replayed by the reconcile, which infers them
+from the manifest (2026-10-09) instead of trusting a `--delete`. **Don't "simplify" this back to
+`rsync --delete`.**
 
 ## Install
 
@@ -134,8 +206,12 @@ propagating or the Jetson has real local edits — investigate before resetting.
 
 ## Pitfalls
 
-- **inotify budget.** Watches are a per-user limit (`fs.inotify.max_user_watches`, 65,536 on the
-  laptop) shared by every watcher. On 2026-10-05 VS Code, open on the repo, used almost all of it
+- **inotify budget.** Watches are a per-user limit (`fs.inotify.max_user_watches`) shared by every
+  watcher. The laptop's is raised to 524,288 in `/etc/sysctl.d/60-inotify.conf` (2026-10-09; it
+  was 65,536 and ran out again when a VS Code instance with a large JS project open held ~51k
+  watches — five `context/` directories created meanwhile went unwatched; global
+  `files.watcherExclude` for `node_modules`/build dirs is set in the user's VS Code settings).
+  Earlier: On 2026-10-05 VS Code, open on the repo, used almost all of it
   (node_modules, Gradle build dirs, the index, `legacy/`), so `inotifywait --recursive` could not
   start and the service crash-looped for ~3.5 hours (`Initial sync complete.` then
   `status=1/FAILURE` every ~15 s). The checked-in `.vscode/settings.json` sets
@@ -171,3 +247,8 @@ propagating or the Jetson has real local edits — investigate before resetting.
   `.vscode/settings.json` excludes; inotifywait errors now reach the journal.
 - 2026-10-07: removed the unused duplicate `context-sync.jetson.service` (both machines install
   `context-sync.service`); the README no longer claims `config.env` ships configured.
+- 2026-10-09: no `--delete` at startup; tombstones (no resurrected deletes, no delete ping-pong);
+  restart on unwatched directories; rsync temp names ignored; pushed/deleted paths logged; laptop
+  `max_user_watches` raised to 524,288. Same day: manifest + reconcile (deletes made while apart are
+  replayed; edit beats delete), trash instead of `rm`, mass-delete brake with
+  `--status` / `--approve-deletes` / `--reject-deletes`.

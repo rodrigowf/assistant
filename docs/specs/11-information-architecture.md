@@ -121,11 +121,16 @@ Tabs as in Expanded, with the overflow menu kicking in earlier.
   message (parity with web). Gear (session settings) moves to the ⋮ menu.
 - **Inline cards above the composer** (not banners stuck to edges): permission request
   (Approve / Reject / type to give feedback), stall ("Bash silent for 2 min" · Interrupt),
-  error with dismiss + detail, termination with "Continue in new session".
+  error with dismiss + detail. A session closed or terminated on the server closes its view on
+  every device (spec 12 OPEN-3); the active one shows a one-line notice with the reason.
 - **Voice mode** (Archie): the composer morphs into a **voice dock**: animated level orb, state
   label (Listening · Speaking · Thinking · Using tools), mic mute, speaker mute, end. Transcripts
   stream into the conversation. On another device's voice session: dock shows "Voice active on
   <device>" read-only, transcripts still mirror, text input remains usable (fixes web bug 1).
+  While this device has a call and another view is open (agent session, memory, visual,
+  settings), the same controls **float** above it (default where the dock sits, above any
+  composer; draggable to a corner), fading to a small orb + mic pill after a few still seconds
+  and returning on any touch, move, scroll or key. Its state text returns to the Archie view.
 - **Empty states**: new Archie conversation shows a greeting + suggestion chips + big voice
   button; a blank screen is never shown (fixes A6).
 
@@ -148,7 +153,7 @@ Settings
 │   ├── Agent sessions         default provider, harness model, Chrome flag
 │   ├── Working directories    full list CRUD incl. SSH host/user (now on Android too)
 │   ├── MCP servers            per-server switches with "all enabled" semantics shown correctly
-│   └── Account                Claude sign-in / credentials (AuthGate flows)
+│   └── Accounts               sign-in of every harness / API (link, device code, credentials paste, API key, sign out) + context/.env keys
 └── ABOUT                  app version (real), backend version/host, remote logging, licenses
 ```
 

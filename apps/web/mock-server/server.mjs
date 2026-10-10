@@ -632,6 +632,8 @@ class Engine {
       if (kind === 'agent' && type === 'voice_start') return send({ type: 'error', error: 'unknown_type', detail: `Unknown message type: '${type}'` });
       if (run && run.localId !== localId) run.detach(ws);
       let target = this.runs.get(localId);
+      // spec 12 OPEN-2: a reattach start never re-creates a closed conversation
+      if (!target && msg.reattach === true) return send({ type: 'error', error: 'session_closed', detail: 'This conversation is not open.' });
       if (!target) {
         const fixture = this.pickScenario(url, msg);
         if (kind === 'orchestrator' && !fixture) {

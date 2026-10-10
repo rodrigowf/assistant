@@ -33,6 +33,9 @@ data class NotificationModel(
  * takes precedence over every other wake text (the old Inc 9 behaviour).
  */
 object NotificationPolicy {
+    /** The idle text while the service runs only to deliver "agent session finished" notifications. */
+    fun waitingText(turns: Int): String = if (turns == 1) "Waiting for 1 agent session" else "Waiting for $turns agent sessions"
+
     fun model(state: VoiceUiState, spec: NotificationSpec, wakePhrase: String): NotificationModel {
         val s = state.session
         val voiceLive = s.isOwner && s.phase != SessionPhase.OFF && s.phase != SessionPhase.ERROR
@@ -66,7 +69,7 @@ object NotificationPolicy {
             WakeHealth.PAUSED_BY_USER -> spec.pausedText
             WakeHealth.ARMED, WakeHealth.PAUSED_FOR_VOICE ->
                 if (spec.armedText.contains("%s")) spec.armedText.format(wakePhrase) else spec.armedText
-            WakeHealth.DISABLED -> spec.idleText
+            WakeHealth.DISABLED -> if (state.agentTurnsWaiting > 0) waitingText(state.agentTurnsWaiting) else spec.idleText
         }
         val actions = if (!spec.fullActions) {
             emptyList()

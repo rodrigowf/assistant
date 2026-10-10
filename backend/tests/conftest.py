@@ -5,7 +5,14 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "shared" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import os
+import tempfile
+
 import pytest
+
+# The backend's machine-local state (the persisted open set) goes to a temp dir,
+# never the real ``state/`` a running backend on this machine restores from.
+os.environ["ARCHIE_STATE_DIR"] = tempfile.mkdtemp(prefix="archie-test-state-")
 
 # ``context/scripts/run.sh`` exports the real provider credentials from
 # context/.env.  Harness catalog loaders (and a few other code paths) call

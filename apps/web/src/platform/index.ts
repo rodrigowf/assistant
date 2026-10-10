@@ -11,6 +11,7 @@ export * from './debug';
 export * from './emitter';
 export * from './lowEnd';
 export * from './media';
+export * from './notifications';
 export * from './remoteLog';
 export * from './storage';
 export * from './time';

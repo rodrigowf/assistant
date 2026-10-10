@@ -118,6 +118,17 @@ export function openFromHistory(sdkId: string, isArchie: boolean): void {
   openSession({ kind: 'agent', sdkId, focus: true });
 }
 
+/**
+ * A tap on an "agent finished" notification (a user action, so FOCUS-1 allows the focus change):
+ * the workspace with that session focused. Its open tab, else the live pool session by `localId`
+ * (or, if it has left the pool, `start{local_id, resume_sdk_id}` reopens it from history).
+ */
+export function openFromNotification(localId: string, sdkId: string | null): void {
+  closeShellOverlays();
+  navigate({ name: 'workspace' });
+  openSession({ kind: 'agent', localId, sdkId, focus: true });
+}
+
 /** Focus an open tab from a list (drawer, switcher, list pane). */
 export function focusTab(id: string): void {
   closeShellOverlays();

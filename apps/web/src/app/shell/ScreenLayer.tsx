@@ -12,7 +12,7 @@ import { IconButton } from '@/ui/controls';
 import { TopAppBar } from '@/ui/navigation';
 import { ScrollArea } from '@/ui/primitives';
 import { navigate, useRoute, type Route } from '../navigation/route';
-import { HistoryPane, MemoryDocument, MemoryPane, SettingsScreen, VisualsPane, VisualViewer } from '../slots';
+import { HistoryPane, MemoryDocument, MemoryPane, SettingsScreen, VisualsPane, VisualViewer, VOICE_OVERLAY_SELECTOR } from '../slots';
 import type { WindowClass } from '../useWindowClass';
 import styles from './shell.module.css';
 
@@ -87,6 +87,8 @@ function Screen({ spec, compact, top }: { spec: ScreenSpec; compact: boolean; to
     // Compact screens cover everything: modal (background aria-hidden, focus trap, scroll lock).
     // Beside the rail the rail stays usable; the AppShell makes the covered panes `inert`.
     modal: compact && top,
+    // The floating voice controls stay usable over a compact screen (not over its dialogs).
+    ...(compact && top ? { keepExposed: VOICE_OVERLAY_SELECTOR } : null),
     initialFocus: back,
   });
   return (

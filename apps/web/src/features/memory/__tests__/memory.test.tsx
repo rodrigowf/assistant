@@ -6,7 +6,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MemoryNode } from '@/services';
-import { setCatalogItems } from '@/stores';
+import { bumpContent, contentChangesStore, resetContentChanges, setCatalogItems } from '@/stores';
 import { expectNoAxeViolations } from '@/test/axe';
 import { setupServices, teardownServices, textResponse, type Harness } from '../../../services/__tests__/fakes';
 import { countAll, filterMemory, MemoryDocument, MemoryPane, pinIndexFirst, toTreeNodes } from '..';
@@ -161,6 +161,43 @@ describe('<MemoryDocument>', () => {
     fireEvent.click(screen.getByRole('link', { name: 'lifecycle' }));
     expect(location.hash).toBe(before);
     await expectNoAxeViolations(container);
+  });
+
+  it('refetches on memory_changed for its file and on a resync, keeping the text; the cue only when the text changed', async () => {
+    resetContentChanges();
+    let body = '# Live\n\nOne.';
+    h.fetch.on('GET', '/memory/live.md', () => textResponse(body, 200, 'text/markdown'));
+    render(<MemoryDocument path="live.md" hidden={false} />);
+    await screen.findByText('One.');
+    const fetches = () => h.fetch.calls('GET', '/memory/live.md').length;
+    expect(fetches()).toBe(1);
+
+    act(() => {
+      bumpContent('memory', [{ path: 'other.md', deleted: false }]);
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(fetches()).toBe(1);
+
+    body = '# Live\n\nTwo.';
+    act(() => {
+      bumpContent('memory', [{ path: 'live.md', deleted: false }]);
+    });
+    await screen.findByText('Two.');
+    expect(fetches()).toBe(2);
+    expect(screen.getByRole('status').textContent).toBe('Updated');
+
+    // the socket came back: quiet refetch, same text → no cue
+    await waitFor(() => {
+      expect(screen.queryByRole('status')).toBeNull();
+    }, { timeout: 4000 });
+    act(() => {
+      contentChangesStore.setState((st) => ({ resyncEpoch: st.resyncEpoch + 1 }));
+    });
+    await waitFor(() => {
+      expect(fetches()).toBe(3);
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('shows the error with Retry, and Reload re-fetches', async () => {

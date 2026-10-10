@@ -224,14 +224,37 @@ def session_id_for(path: Path) -> str:
     """The session id a conversation file belongs to.
 
     The file name for every harness except Codex, whose rollouts are named
-    ``rollout-<timestamp>-<thread-id>.jsonl``.
+    ``rollout-<timestamp>-<thread-id>.jsonl``, and Gemini, whose
+    ``session-<iso-minute>-<id[:8]>.jsonl`` names only carry an id prefix: its
+    header line holds the real ``sessionId`` — the id SessionStore, the titles
+    and ``resume_conversation`` use.
     """
     path = Path(path)
     if path.name.startswith("rollout-"):
         from manager.codex.adapter import session_id_from_path
 
         return session_id_from_path(path) or path.stem
+    if path.name.startswith("session-"):
+        return _gemini_header_id(path) or path.stem
     return path.stem
+
+
+def _gemini_header_id(path: Path) -> str | None:
+    """``sessionId`` from a Gemini JSONL header (``{sessionId, projectHash, kind, …}``)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                obj = json.loads(raw)
+                if isinstance(obj, dict) and "projectHash" in obj:
+                    sid = obj.get("sessionId")
+                    return sid if isinstance(sid, str) and sid else None
+                return None
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def _extract_codex(path: Path) -> SessionDoc:
@@ -273,7 +296,7 @@ def extract_session(path: Path) -> SessionDoc:
     path = Path(path)
     if path.name.startswith("rollout-"):
         return _extract_codex(path)
-    doc = SessionDoc(session_id=path.stem, path=path, harness="claude")
+    doc = SessionDoc(session_id=session_id_for(path), path=path, harness="claude")
     harness: str | None = None
     skip_assistant_until_user = False
 
@@ -602,7 +625,7 @@ def session_sources(context_dir: Path | None = None, chats_dir: Path | None = No
     paths = list(context_dir.glob("*.jsonl"))
     if chats_dir.is_dir():
         paths.extend(chats_dir.glob("*.jsonl"))
-    paths.extend(_codex_sources())
+    paths.extend(_codex_sources(context_dir.parent))
 
     def mtime(p: Path) -> float:
         try:
@@ -613,13 +636,17 @@ def session_sources(context_dir: Path | None = None, chats_dir: Path | None = No
     return sorted(paths, key=mtime, reverse=True)
 
 
-def _codex_sources() -> list[Path]:
+def _codex_sources(project_dir: Path | None = None) -> list[Path]:
     """Archie's Codex rollouts (``context/codex/sessions/YYYY/MM/DD/`` and the
-    harness's other session roots), via the harness's own discoverer."""
-    try:
-        from manager.codex.adapter import _codex_discover_sessions, _project_dir
+    harness's other session roots), via the harness's own discoverer.
 
-        return [p for _sid, p in _codex_discover_sessions(_project_dir())]
+    *project_dir* is the repo whose ``context/`` is being indexed (default:
+    this install's); the CODEX_HOME roots are only searched for this install."""
+    try:
+        from manager.codex.adapter import _codex_discover_sessions
+
+        root = Path(project_dir) if project_dir else get_context_dir().parent
+        return [p for _sid, p in _codex_discover_sessions(str(root))]
     except Exception:  # noqa: BLE001 — a missing/broken harness must not stop indexing
         logger.debug("Codex session discovery failed", exc_info=True)
         return []

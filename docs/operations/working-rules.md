@@ -3,7 +3,7 @@ name: working-rules
 category: archie/operations
 tags: [rules, agents, workflow, git, subagents, devices, adb, cost, verification, safety, orchestrator]
 created: 2026-04-27
-modified: 2026-10-06
+modified: 2026-10-10
 summary: The rules agents follow when working on Archie, each with the reason and incident behind it.
 source: curated (consolidated from memory notes feedback-observe-before-acting.md, feedback_voice_debug_diagnose_before_patching.md, feedback_run_test_before_speculating.md, feedback_hands_on_checks_over_suites.md, feedback_use_adb_input_for_device_tests.md, feedback_subagents_no_git_writes.md, feedback_parallel_agent_cap.md, feedback_paid_api_evals_cost_check.md, feedback_dont_use_pkill_on_uvicorn.md, feedback_use_systemd_service_for_jetson_backend.md, feedback_dont_touch_wake_word_tuning.md, feedback_dont_shortcut_echo_ducking.md, assistant/utilities/experiments_dont_touch_app.md, assistant/utilities/review_artifacts_location.md, assistant/utilities/codebase_verification.md, assistant/utilities/project_skills_not_registered.md, context/AGENTS.md "Identity & Communication"; verified against code 2026-10-06)
 references:
@@ -91,6 +91,23 @@ first; fall back to `am startservice`/`am broadcast` with intent extras when tap
 human only for real voice input, physical placement, awkward gestures or UX feel. *Why:* scripted
 input is repeatable to the millisecond and can hit races (taps < 100 ms apart) no human can.
 
+**Rodrigo's phone is his phone.** Before every `input tap`/`text`, check that Archie is the focused
+window (`dumpsys window | grep mCurrentFocus`) and abort otherwise; if he is using the phone, stop and
+ask. Screenshots can capture private chats and notifications: crop to the element under test (locate
+it with `uiautomator dump`) and delete the images afterwards. *Why:* on 2026-10-10 a test script lost
+its target and the phone was showing a private WhatsApp chat.
+
+**A feature isn't done until it's reachable on the device.** Open it through the app's own
+navigation (not a test that renders the page directly) and see it work end to end. *Why:* the Android
+"agent session finished" page shipped with tests, docs and a build, yet was missing from the Settings
+home, so it could not be turned on (2026-10-10); the first real run then found a second bug (a turn
+finishing right after Home was treated as seen).
+
+**Never start a CLI login against a real config dir to "see what it prints".** `codex login` and
+`claude auth login` delete or empty the current credentials when they *start*. Probe in a throwaway
+`HOME`/`CODEX_HOME`/`CLAUDE_CONFIG_DIR` only. *Why:* 2026-10-09, a start-and-cancel probe wiped the
+laptop's Archie Codex login.
+
 **Use the laptop backend for on-device verification**, not the Jetson — don't redeploy or restart
 the Jetson in the middle of a test cycle.
 
@@ -163,6 +180,18 @@ a reboot wipes `/tmp`) and `nice -n 15` (Gradle `--max-workers=2`); a Gradle `ch
 build pushed load to ~11 and crashed VS Code. Check `df -h /` before emulator work — the disk hit
 98–100 % twice; free space by deleting AVD userdata overlays or `gradle clean` of finished modules,
 never Rodrigo's own caches without asking.
+
+**Parallel feature work: worktrees + `heavy.sh`** (2026-10-09). One `git worktree` per feature under
+`~/assistant-wt/<name>`, with `.venv`, `context`, `apps/web/node_modules` and
+`apps/design-tokens/node_modules` symlinked from the main tree (add them to `info/exclude`),
+`assistant_config.json` and `apps/android/{local,keystore}.properties` copied. Every heavy command goes
+through `shared/scripts/heavy.sh` (one lock, waits for free RAM, cgroup cap; `--gradle <dir> <tasks>`
+for the capped Gradle form + `--stop`); agents batch Android work into one Gradle run at the end. Give
+each branch a read-only review agent before merging (it found ~20 real bugs), merge on an
+integration branch, re-check budgets there, then fast-forward `local`. Hands-on tests:
+`shared/scripts/lean_backend.py` (no PyTorch; `LEAN_ENV_FILE` for a scratch `.env`). Remove worktree
+symlinks with guarded paths (`"${wt:?}/${l:?}"`) before `git worktree remove --force`. `pgrep -f
+<pattern>` matches its own shell too: filter with `ps -eo pid,args | grep "[p]attern"`.
 
 **Branch state is per machine.** Check `git branch --show-current` (Jetson:
 `git rev-parse --abbrev-ref HEAD`) before assuming; see

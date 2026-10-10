@@ -255,7 +255,7 @@ describe('New Archie and the three-action conflict dialog (spec 12 §6.11, inv02
     expect(restMatchingClose()).toEqual([]);
   });
 
-  it('Archie running on another device only: the dialog says so; replacing closes its pool entry first', async () => {
+  it('Archie started on another device: the dialog offers it; replacing closes its pool entry first', async () => {
     const user = userEvent.setup();
     host();
     const NodeWebSocket = (await import('ws')).default;

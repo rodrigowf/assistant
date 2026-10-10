@@ -100,3 +100,18 @@
 .warn {
   color: var(--md-ext-color-warning);
 }
+
+/* Floating controls scene: a stand-in memory document under the overlay. */
+.doc {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 24px 160px;
+  color: var(--md-sys-color-on-surface);
+}
+
+.pillRow {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0;
+}

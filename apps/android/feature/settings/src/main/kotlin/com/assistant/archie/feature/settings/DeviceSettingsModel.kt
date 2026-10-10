@@ -75,6 +75,9 @@ class DeviceSettingsModel(
     fun setAutoConnect(v: Boolean) = write { store.setAutoConnect(v) }
     fun setStayConnected(v: Boolean) = write { store.setStayConnectedInBackground(v) }
 
+    // Notifications
+    fun setNotifyAgentTurns(v: Boolean) = write { store.setNotifyAgentTurns(v) }
+
     // Appearance
     fun setTheme(v: ThemeMode) = write { store.setThemeMode(v) }
     fun setTextSize(v: TextSize) = write { appearanceStore.setTextSize(v) }

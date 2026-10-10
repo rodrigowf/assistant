@@ -7,6 +7,7 @@ import '@/styles';
 import { StrictMode, Suspense, lazy } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@/app/App';
+import { RootErrorBoundary } from '@/app/RootErrorBoundary';
 import { initPlatform } from '@/platform';
 
 initPlatform();
@@ -23,12 +24,14 @@ if (!container) throw new Error('#root element missing from index.html');
 
 createRoot(container).render(
   <StrictMode>
-    {isGallery && Gallery ? (
-      <Suspense fallback={null}>
-        <Gallery />
-      </Suspense>
-    ) : (
-      <App />
-    )}
+    <RootErrorBoundary>
+      {isGallery && Gallery ? (
+        <Suspense fallback={null}>
+          <Gallery />
+        </Suspense>
+      ) : (
+        <App />
+      )}
+    </RootErrorBoundary>
   </StrictMode>,
 );

@@ -10,10 +10,15 @@
 #   - its auth exists (file existence only — nothing is read or printed)
 #   - every symlink that routes its sessions/skills into context/
 #   - the repo seed settings Archie depends on (.qwen/, .gemini/)
+#   - memory/history wiring: context/memory/MEMORY.md, Gemini's project label
+#     (projects.json + .project_root markers) and memory index, Codex's
+#     [features] memories = false, ~/.gemini/GEMINI.md (warned about)
 # plus the root instruction symlinks (CLAUDE.md, QWEN.md, GEMINI.md, AGENTS.md)
 # and the context/{skills,scripts,agents} links to shared/.
 #
-# --fix repairs ONLY symlinks and seed files, with the installers' rules:
+# --fix repairs ONLY symlinks, seed files and seed keys (Qwen's memory keys,
+# Codex's memories key, Gemini's projects.json entry and context/.project_root
+# marker), with the installers' rules:
 #   correct link → left alone; missing → created; real directory → its
 #   sessions are copied into context/ (never overwriting) and the directory is
 #   moved aside to <name>.bak-<timestamp>, then linked; empty real directory →
@@ -29,7 +34,9 @@
 #
 # Portable: bash 3.2+ (macOS), no GNU-only flags.  Safe to copy elsewhere and
 # run with --repo (built-in pin defaults are used if the repo has no
-# install/harness-versions.env).
+# install/harness-versions.env; the helpers install/gemini-project.py and
+# install/codex-home-config.py are looked up next to this script, then in
+# the repo's install/).
 
 set -u
 
@@ -40,7 +47,7 @@ MODE="check"          # check | fix | plan
 USE_COLOR=auto
 
 usage() {
-    sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -127,6 +134,16 @@ pretty() {
 }
 
 TS="$(date +%Y%m%dT%H%M%S)"
+
+# helper NAME — path of an install/ helper script (next to this script first,
+# so a copy run with --repo can bring its own), or nothing.
+helper() {
+    local d
+    for d in "$SELF_DIR" "$REPO/install"; do
+        [ -f "$d/$1" ] && { printf '%s' "$d/$1"; return 0; }
+    done
+    return 1
+}
 
 # env_has KEY — true when KEY is non-empty in the environment or context/.env.
 # Values are never printed.
@@ -382,6 +399,22 @@ if [ -d "$CTX" ]; then
     fi
     # Archie's docs are part of the memory wiki (indexed, searchable, linked from MEMORY.md).
     check_link common "context/memory/archie" "$CTX/memory/archie" "$REPO/docs" "../../docs" none WARN
+    # The memory index every harness loads (Claude/Model Studio/Qwen/Codex via
+    # the backend's memory block, Gemini natively through its tmp/<label> link).
+    if [ -f "$CTX/memory/MEMORY.md" ]; then row OK common "context/memory/MEMORY.md" "present (every harness's memory index)"
+    elif [ ! -f "$REPO/install/MEMORY.md" ]; then
+        row FAIL common "context/memory/MEMORY.md" "missing — no session gets a memory index (no install/MEMORY.md template to seed from)"
+    elif need_fix FAIL common "context/memory/MEMORY.md" "missing — no session gets a memory index" \
+        "seed context/memory/MEMORY.md from install/MEMORY.md"; then
+        mkdir -p "$CTX/memory" && cp "$REPO/install/MEMORY.md" "$CTX/memory/MEMORY.md" \
+            && row FIXED common "context/memory/MEMORY.md" "seeded from install/" \
+            || row FAIL common "context/memory/MEMORY.md" "could not seed"
+    fi
+fi
+if [ -f "$REPO/backend/manager/memory_context.py" ]; then
+    row OK common "memory block (backend)" "repo sessions get MEMORY.md + the wiki write rules (Claude, Model Studio, Qwen, Codex)"
+else
+    row WARN common "memory block (backend)" "backend/manager/memory_context.py missing — this backend predates memory parity across harnesses"
 fi
 
 if [ -n "$NODE_VERSION" ]; then
@@ -463,6 +496,19 @@ if [ "$CLAUDE_ON" = true ] || [ "$MS_ON" = true ]; then
     check_link claude "projects/<cwd> -> context" "$REPO/.claude_config/projects/$MANGLED" "$CTX" "../../context" claude FAIL
     check_link claude ".claude_config/skills" "$REPO/.claude_config/skills" "$CTX/skills" "../context/skills" empty WARN
     check_link claude ".claude_config/agents" "$REPO/.claude_config/agents" "$CTX/agents" "../context/agents" empty WARN
+    # Auto-memory: the backend switches it off for sessions in the repo
+    # (CLAUDE_CODE_DISABLE_AUTO_MEMORY=1) and appends MEMORY.md itself;
+    # .claude_config/settings.json is a user setting SDK sessions never read.
+    AUTOMEM="not set"
+    if [ -f "$REPO/.claude_config/settings.json" ]; then
+        AUTOMEM="$(sed -n 's/.*"autoMemoryEnabled"[[:space:]]*:[[:space:]]*\([a-z]*\).*/\1/p' "$REPO/.claude_config/settings.json" | head -n 1)"
+        [ -n "$AUTOMEM" ] || AUTOMEM="not set"
+    fi
+    if grep -q 'CLAUDE_CODE_DISABLE_AUTO_MEMORY' "$REPO/backend/manager/claude/session.py" 2>/dev/null; then
+        row INFO claude "auto-memory" "off in repo sessions (backend: CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 + MEMORY.md block); .claude_config autoMemoryEnabled: $AUTOMEM (SDK sessions don't read it)"
+    else
+        row WARN claude "auto-memory" "this backend leaves Claude's auto-memory on — it writes its own flat notes into context/memory/ (.claude_config autoMemoryEnabled: $AUTOMEM is not read by SDK sessions)"
+    fi
     if [ -f "$REPO/.claude/settings.json" ]; then row INFO claude ".claude/settings.json" "present"
     else row INFO claude ".claude/settings.json" "not seeded (install/cli-runtime/claude/settings.json; optional allowlist, not auto-fixed)"; fi
 else
@@ -564,17 +610,78 @@ if enabled gemini; then
         row WARN gemini "~/.gemini/.env" "no GEMINI_API_KEY — needed only if this host is an SSH remote for Gemini (non-interactive SSH shells don't read context/.env)"
     fi
 
-    GLABEL=""
-    if [ -f "$HOME/.gemini/projects.json" ] && have python3; then
-        GLABEL="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("projects") or {}).get(sys.argv[2]) or "")' "$HOME/.gemini/projects.json" "$REPO" 2>/dev/null)"
+    # The label pins where Gemini keeps this repo's chats and its memory index
+    # (~/.gemini/tmp/<label>/{chats,memory/MEMORY.md}); the link makes that
+    # context/.  projects.json maps the repo to the label, and a .project_root
+    # marker naming another path makes Gemini claim a new label.
+    GPROJ="$(helper gemini-project.py || true)"
+    GLABEL=""; GSTAT=""
+    if [ -n "$GPROJ" ] && have python3; then
+        GLABEL="$(python3 "$GPROJ" "$REPO" label 2>/dev/null)"
+        [ -n "$GLABEL" ] && GSTAT="$(python3 "$GPROJ" "$REPO" check --label "$GLABEL" 2>/dev/null)"
     fi
-    if [ -n "$GLABEL" ]; then
-        row OK gemini "projects.json label" "$REPO → $GLABEL"
-    else
-        GLABEL="$(basename "$REPO")"
-        row INFO gemini "projects.json label" "repo not registered yet; the CLI will use \"$GLABEL\" on first run"
+    gval() { printf '%s\n' "$GSTAT" | sed -n "s/^$1=//p" | head -n 1; }
+    if [ -z "$GLABEL" ]; then
+        if [ -f "$HOME/.gemini/projects.json" ] && have python3; then
+            GLABEL="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("projects") or {}).get(sys.argv[2]) or "")' "$HOME/.gemini/projects.json" "$REPO" 2>/dev/null)"
+        fi
+        if [ -n "$GLABEL" ]; then row OK gemini "projects.json label" "$REPO → $GLABEL"
+        else
+            GLABEL="$(basename "$REPO")"
+            row WARN gemini "projects.json label" "not checked (needs python3 and install/gemini-project.py); assuming \"$GLABEL\""
+        fi
     fi
     check_link gemini "tmp/<label> -> context" "$HOME/.gemini/tmp/$GLABEL" "$CTX" "$CTX" gemini FAIL
+
+    gemini_apply() {   # gemini_apply SECTION CHECK — run the registration helper (--fix)
+        local out
+        if out="$(python3 "$GPROJ" "$REPO" apply --label "$GLABEL" 2>&1)"; then
+            row FIXED gemini "$2" "$(printf '%s\n' "$out" | sed -n 's/^note: //p' | head -n 1)"
+        else
+            row FAIL gemini "$2" "$(printf '%s\n' "$out" | sed -n 's/^problem: //p' | head -n 1)"
+        fi
+    }
+    if [ -n "$GSTAT" ]; then
+        case "$(gval registry)" in
+            unparseable) row FAIL gemini "projects.json" "~/.gemini/projects.json is not valid JSON — Gemini resets it (every project gets a new label); fix it by hand" ;;
+            *)
+                case "$(gval registered)" in
+                    yes) row OK gemini "projects.json label" "$REPO → $GLABEL" ;;
+                    *)
+                        if need_fix WARN gemini "projects.json label" "repo not registered — Gemini picks a label on its next run (\"$GLABEL\" if still free)" \
+                            "register $REPO → $GLABEL in ~/.gemini/projects.json"; then
+                            gemini_apply gemini "projects.json label"
+                        fi ;;
+                esac ;;
+        esac
+        MT="$(gval marker_tmp)"
+        case "$MT" in
+            foreign:*)
+                if need_fix FAIL gemini "ownership marker" "context/.project_root names ${MT#foreign:} — Gemini would claim a new label (chats + MEMORY.md leave context/)" \
+                    "rewrite context/.project_root to $REPO"; then
+                    gemini_apply gemini "ownership marker"
+                fi ;;
+        esac
+        MH="$(gval marker_history)"
+        case "$MH" in
+            foreign:*) row FAIL gemini "history marker" "~/.gemini/history/$GLABEL/.project_root names ${MH#foreign:} — Gemini would claim a new label; move that dir aside by hand" ;;
+        esac
+    fi
+    # Gemini loads ~/.gemini/tmp/<label>/memory/MEMORY.md into every session;
+    # through the link it must be the wiki's root index.
+    GMEM="$HOME/.gemini/tmp/$GLABEL/memory/MEMORY.md"
+    if [ -e "$GMEM" ] && [ -e "$CTX/memory/MEMORY.md" ] && [ "$(resolve "$GMEM")" = "$(resolve "$CTX/memory/MEMORY.md")" ]; then
+        row OK gemini "memory index" "$(pretty "$GMEM") → context/memory/MEMORY.md"
+    elif [ ! -f "$CTX/memory/MEMORY.md" ]; then
+        row FAIL gemini "memory index" "context/memory/MEMORY.md missing (see common)"
+    else
+        row FAIL gemini "memory index" "$(pretty "$GMEM") does not resolve to context/memory/MEMORY.md — fix the tmp/<label> link"
+    fi
+    if [ -f "$HOME/.gemini/GEMINI.md" ]; then
+        row WARN gemini "~/.gemini/GEMINI.md" "exists — Gemini's global memory tier (outside context/, not synced, not indexed); move its facts into context/memory/ and delete it"
+    else
+        row OK gemini "~/.gemini/GEMINI.md" "absent (no memory outside context/)"
+    fi
 
     GS="$REPO/.gemini/settings.json"
     GPY="python3"; [ -x "$REPO/.venv/bin/python" ] && GPY="$REPO/.venv/bin/python"
@@ -644,10 +751,40 @@ if enabled codex; then
             if [ -f "$REPO/install/cli-runtime/codex-home/config.toml" ]; then
                 cp "$REPO/install/cli-runtime/codex-home/config.toml" "$CODEX_ARCHIE/config.toml"
             else
-                printf '# Archie'\''s Codex home (CODEX_HOME=~/.codex-archie).\nproject_doc_max_bytes = 131072\n\n[features]\nplugins = false\napps = false\n' > "$CODEX_ARCHIE/config.toml"
+                printf '# Archie'\''s Codex home (CODEX_HOME=~/.codex-archie).\nproject_doc_max_bytes = 131072\n\n[features]\nplugins = false\napps = false\nmemories = false\n' > "$CODEX_ARCHIE/config.toml"
             fi
             row FIXED codex "~/.codex-archie/config.toml" "seeded"
         fi
+    fi
+    # Codex's own memory store (CODEX_HOME/memories) stays off: Archie passes
+    # MEMORY.md per session and memory is written into the wiki.
+    if [ -f "$CODEX_ARCHIE/config.toml" ]; then
+        CCFG="$(helper codex-home-config.py || true)"
+        CMEM=""
+        if [ -n "$CCFG" ] && have python3; then
+            CMEM="$(python3 "$CCFG" "$CODEX_ARCHIE/config.toml" check 2>/dev/null)"
+        fi
+        case "$CMEM" in
+            ok) row OK codex "memories feature" "[features] memories = false (memory lives in the wiki)" ;;
+            missing|on)
+                if [ "$CMEM" = on ]; then CSEV=FAIL; CDET="enabled — Codex keeps its own memory store outside context/"
+                else CSEV=WARN; CDET="not pinned in [features] (off by default in $CODEX_CLI_VERSION)"; fi
+                if need_fix "$CSEV" codex "memories feature" "$CDET" \
+                    "set [features] memories = false in ~/.codex-archie/config.toml"; then
+                    if python3 "$CCFG" "$CODEX_ARCHIE/config.toml" apply >/dev/null 2>&1; then
+                        row FIXED codex "memories feature" "[features] memories = false"
+                    else
+                        row FAIL codex "memories feature" "could not edit ~/.codex-archie/config.toml — add it by hand"
+                    fi
+                fi ;;
+            unsupported) row WARN codex "memories feature" "config.toml uses an inline features table — set memories = false there by hand" ;;
+            *)
+                if grep -Eq '^[[:space:]]*memories[[:space:]]*=[[:space:]]*false' "$CODEX_ARCHIE/config.toml"; then
+                    row OK codex "memories feature" "memories = false (grep only — install/codex-home-config.py or python3 unavailable)"
+                else
+                    row WARN codex "memories feature" "not verified (needs python3 and install/codex-home-config.py); want [features] memories = false"
+                fi ;;
+        esac
     fi
     check_link codex "sessions -> context" "$CODEX_ARCHIE/sessions" "$CTX/codex/sessions" "$CTX/codex/sessions" codex FAIL
 else

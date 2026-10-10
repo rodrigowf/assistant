@@ -13,7 +13,6 @@ import com.assistant.archie.feature.sessions.SessionsIntent
 import com.assistant.core.data.HistoryGroup
 import com.assistant.core.data.ItemKey
 import com.assistant.core.data.ItemKind
-import com.assistant.core.data.OpenSessionsRepository
 import com.assistant.core.data.WorkspaceItem
 import com.assistant.core.design.components.ListMeta
 import com.assistant.core.design.components.ListSectionHeader
@@ -21,7 +20,6 @@ import com.assistant.core.design.components.ProviderChip
 import com.assistant.core.design.components.StatusIndicator
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
-import com.assistant.core.model.PoolSession
 import com.assistant.core.model.SessionSummary
 
 /*
@@ -33,18 +31,16 @@ import com.assistant.core.model.SessionSummary
 /** Row density: the drawer is one-line (mockup (b)); the list pane and History screen are two-line. */
 enum class ListDensity { OneLine, TwoLine }
 
-/** "Open now": this device's open items, then live sessions with no view here ("Open on another device"). */
+/** "Open now": the server's open set, the same on every device (OPEN-1), plus local documents. */
 fun LazyListScope.openNowSection(
     items: List<WorkspaceItem>,
-    liveElsewhere: List<PoolSession>,
     active: ItemKey?,
     density: ListDensity,
     onSelect: (ItemKey) -> Unit,
-    onOpenLive: (PoolSession) -> Unit,
     onIntent: (SessionsIntent) -> Unit,
 ) {
     val twoLine = density == ListDensity.TwoLine
-    val count = items.size + liveElsewhere.size
+    val count = items.size
     if (count == 0) return
     item(key = "open-h", contentType = "header") {
         ListSectionHeader("Open now", trailing = if (twoLine) ({ ListMeta("$count") }) else null)
@@ -65,7 +61,6 @@ fun LazyListScope.openNowSection(
                 Text(if (item.kind == ItemKind.ARCHIE) "Archie · $detail" else detail, maxLines = 1)
             }) else null,
             trailing = {
-                if (item.unread && item.key != active) UnreadDot()
                 if (!twoLine) item.provider?.let { ProviderChip(it.label) }
                 item.status.toLive()?.let { StatusIndicator(it) }
             },
@@ -74,17 +69,6 @@ fun LazyListScope.openNowSection(
                 add(RowAction("Close", ArchieIcons.Close, { onIntent(SessionsIntent.RequestClose(item)) }))
                 if (conversation) add(RowAction("Delete", ArchieIcons.Delete, { onIntent(SessionsIntent.RequestDelete(target)) }, destructive = true))
             },
-        )
-    }
-    items(liveElsewhere, key = { "live-" + it.localId }, contentType = { "live" }) { p ->
-        SessionRow(
-            p.title?.takeIf { it.isNotBlank() } ?: OpenSessionsRepository.AGENT_PLACEHOLDER,
-            onClick = { onOpenLive(p) },
-            modifier = Modifier.testTag("live-row"),
-            twoLine = twoLine,
-            leading = { HistoryLeading(isArchie = false) },
-            supporting = if (twoLine) ({ Text("Open on another device", maxLines = 1) }) else null,
-            trailing = { OpenSessionsRepository.statusOf(p.status).toLive()?.let { StatusIndicator(it) } },
         )
     }
 }

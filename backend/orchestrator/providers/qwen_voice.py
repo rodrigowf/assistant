@@ -573,6 +573,36 @@ class QwenVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
         """Wrap a PCM chunk for upstream send to Qwen WS."""
         return {"type": "input_audio_buffer.append", "audio": pcm_b64}
 
+    # --- audio history budget ---------------------------------------------
+
+    # DashScope caps a realtime conversation at 320 "audios" — about 630s
+    # of committed input audio (history + the uncommitted buffer), silence
+    # included — then fails with ``Too many audios. The maximum allowed is
+    # 320.`` The documented "oldest history is discarded" rolling window
+    # never kicks in (probed 2026-10-10 on qwen3.8-omni-flash-realtime).
+    # ``conversation.item.delete`` on old user audio items does work, and
+    # keeps the same conversation (and its audio context) alive
+    # indefinitely. 420s leaves ~200s for the buffer and per-item rounding.
+    # Only user audio counts: the model's own replies are kept as text.
+    _DEFAULT_AUDIO_HISTORY_BUDGET_S = 420.0
+
+    @property
+    def gate_silence_upstream(self) -> bool:
+        return True
+
+    @property
+    def audio_history_budget_s(self) -> float | None:
+        raw = os.environ.get("QWEN_AUDIO_HISTORY_BUDGET_S")
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid QWEN_AUDIO_HISTORY_BUDGET_S=%r", raw)
+        return self._DEFAULT_AUDIO_HISTORY_BUDGET_S
+
+    def delete_item_frame(self, item_id: str) -> dict[str, Any] | None:
+        return {"type": "conversation.item.delete", "item_id": item_id}
+
     def build_keepalive_chunk(self) -> str:
         """Build a tiny silent PCM chunk to keep the ASR pipeline warm.
 
@@ -689,6 +719,21 @@ class QwenVoiceProvider(BaseVoiceProvider, ToolCallAccumulator):
                 message="This Qwen-Omni model isn't available on DashScope.",
                 recoverable=False,
                 recovery_hint="Switch to a different Qwen model in settings.",
+                provider_doc_url=None,
+                raw_close_code=close_code,
+                raw_close_reason=close_reason,
+                provider=self.provider_name,
+            )
+
+        # Conversation audio cap ("Too many audios. The maximum allowed is
+        # 320.") — not a rate limit. The relay's audio budget should keep
+        # us under it; if it slips through, reopening is the only way out.
+        if "too many audios" in lower:
+            return VoiceError(
+                category=VoiceErrorCategory.NETWORK,
+                message="Voice conversation audio limit reached; reopening.",
+                recoverable=True,
+                recovery_hint=None,
                 provider_doc_url=None,
                 raw_close_code=close_code,
                 raw_close_reason=close_reason,

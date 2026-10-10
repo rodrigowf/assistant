@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { createAccounts } from './accounts.mjs';
 import { DATA_DIR } from './scenarios.mjs';
 
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -109,6 +110,7 @@ export function createRest(engine, opts = {}) {
   const titles = new Map();
   const uploads = new Map();
   const debugLog = [];
+  const accounts = createAccounts();
   const memoryRoot = path.join(dataDir, 'memory');
   const publicRoot = path.join(dataDir, 'public');
 
@@ -225,6 +227,12 @@ export function createRest(engine, opts = {}) {
       const body = await readJsonBody(req);
       const ok = !!body && typeof body.credentials_json === 'string' && body.credentials_json.includes('accessToken');
       return json(res, 200, { authenticated: ok, auth_url: null, headless: true });
+    }
+
+    // Settings → Accounts + env keys (accounts.mjs)
+    if (p.startsWith('/api/accounts') || p.startsWith('/api/env')) {
+      const r = await accounts.handle(p, m, m === 'GET' || m === 'DELETE' ? null : await readJsonBody(req));
+      if (r) return json(res, r[0], r[1]);
     }
 
     // sessions

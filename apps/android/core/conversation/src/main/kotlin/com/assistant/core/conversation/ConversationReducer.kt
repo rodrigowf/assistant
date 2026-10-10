@@ -23,7 +23,7 @@ object ConversationReducer {
     fun reduceAll(state: ConversationState, inputs: Iterable<ConversationInput>): ConversationState =
         inputs.fold(state) { s, i -> reduce(s, i) }
 
-    internal val TURN_FAILURE_AGENT = setOf("send_failed", "upstream_wedged", "command_failed", "compact_failed")
+    internal val TURN_FAILURE_AGENT = setOf("send_failed", "upstream_wedged", "turn_timeout", "command_failed", "compact_failed")
     internal val TURN_FAILURE_ORCH = setOf(
         "api_error", "provider_error", "send_failed", "send_audio_failed",
         "invalid_audio", "inject_text_failed", "compact_failed",

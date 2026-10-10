@@ -1,15 +1,14 @@
 /**
  * The inline card above the composer (IA §6; mockups `.icard`, component sheet "Inline cards:
  * above the composer, never pinned to an edge"): icon, title, optional dismiss, body, actions.
- * Tones: permission (primary container), stall (warning container), error (error container),
- * ended (surface container highest).
+ * Tones: permission (primary container), stall (warning container), error (error container).
  */
 import type { ReactNode } from 'react';
 import { IconButton } from '@/ui/controls';
 import { Icon, cx, type IconName } from '@/ui/primitives';
 import styles from './Cards.module.css';
 
-export type InlineCardTone = 'permission' | 'stall' | 'error' | 'ended';
+export type InlineCardTone = 'permission' | 'stall' | 'error';
 
 export interface InlineCardProps {
   readonly tone: InlineCardTone;

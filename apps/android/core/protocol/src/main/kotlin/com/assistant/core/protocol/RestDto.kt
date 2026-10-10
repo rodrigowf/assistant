@@ -477,3 +477,136 @@ data class ErrorDetailDto(val detail: JsonElement? = null) {
         else -> null
     }
 }
+
+// ───────────── Settings → Accounts (`/api/accounts`, `/api/env`; spec 12 §8.1) ─────────────
+
+@Serializable
+data class AccountsDto(val services: List<AccountServiceDto> = emptyList(), @SerialName("env_path") val envPath: String = "")
+
+@Serializable
+data class AccountServiceDto(
+    val id: String,
+    val label: String = "",
+    /** `harness` | `api` | `other`. */
+    val group: String = "other",
+    val description: String = "",
+    /** `signed_in` | `signed_out` | `expired` | `unavailable` | `unknown`. */
+    val state: String = "unknown",
+    val method: String? = null,
+    val account: String? = null,
+    val plan: String? = null,
+    @SerialName("expires_at") val expiresAt: String? = null,
+    val detail: String? = null,
+    val warnings: List<String> = emptyList(),
+    val methods: List<AccountMethodDto> = emptyList(),
+    @SerialName("used_by") val usedBy: List<String> = emptyList(),
+    val flow: LoginFlowDto? = null,
+    val verified: AccountVerificationDto? = null,
+    @SerialName("can_verify") val canVerify: Boolean = false,
+)
+
+@Serializable
+data class AccountMethodDto(
+    val id: String,
+    /** `link` | `credentials` | `env` | `signout`. */
+    val kind: String,
+    val label: String = "",
+    val description: String = "",
+    val recommended: Boolean = false,
+    val active: Boolean = false,
+    val available: Boolean = true,
+    @SerialName("unavailable_reason") val unavailableReason: String = "",
+    @SerialName("needs_code") val needsCode: Boolean = false,
+    @SerialName("code_label") val codeLabel: String = "",
+    @SerialName("code_help") val codeHelp: String = "",
+    /** credentials: `json` (a file) or `secret` (one masked line). */
+    val input: String = "json",
+    val path: String = "",
+    @SerialName("source_hint") val sourceHint: String = "",
+    val placeholder: String = "",
+    val warning: String = "",
+    val fields: List<AccountEnvFieldDto> = emptyList(),
+)
+
+@Serializable
+data class AccountEnvFieldDto(
+    val name: String,
+    val label: String = "",
+    val secret: Boolean = true,
+    val help: String = "",
+    val placeholder: String = "",
+    val choices: List<AccountChoiceDto>? = null,
+    val set: Boolean = false,
+    /** Masked; never the value of a secret field. */
+    val preview: String = "",
+    /** Non-secret fields only. */
+    val value: String? = null,
+)
+
+@Serializable
+data class AccountChoiceDto(val value: String, val label: String)
+
+@Serializable
+data class LoginFlowDto(
+    val id: String = "",
+    val service: String = "",
+    val method: String = "",
+    /** `starting` | `waiting` | `verifying` | `succeeded` | `failed` | `cancelled` | `expired`. */
+    val status: String = "starting",
+    val url: String? = null,
+    @SerialName("user_code") val userCode: String? = null,
+    @SerialName("needs_code") val needsCode: Boolean = false,
+    @SerialName("code_label") val codeLabel: String = "Code",
+    @SerialName("code_help") val codeHelp: String = "",
+    val message: String = "",
+    @SerialName("expires_at") val expiresAt: String? = null,
+) {
+    val active: Boolean get() = status == "starting" || status == "waiting" || status == "verifying"
+}
+
+@Serializable
+data class AccountVerificationDto(val ok: Boolean = false, val message: String = "")
+
+@Serializable
+data class AccountActionDto(val message: String = "", val service: AccountServiceDto)
+
+@Serializable
+data class LoginRequest(val method: String)
+
+@Serializable
+data class LoginCodeRequest(val code: String)
+
+@Serializable
+data class AccountCredentialsRequest(val method: String, val content: String)
+
+@Serializable
+data class EnvListDto(val path: String = "", val exists: Boolean = true, val keys: List<EnvKeyDto> = emptyList())
+
+@Serializable
+data class EnvKeyDto(
+    val name: String,
+    val set: Boolean = false,
+    /** `••••abcd` (long values) or `••••`; never the value. */
+    val preview: String = "",
+    val length: Int = 0,
+    val line: Int = 0,
+    val exported: Boolean = false,
+    val duplicates: Int = 0,
+    @SerialName("in_process") val inProcess: Boolean = true,
+)
+
+@Serializable
+data class EnvRevealDto(val name: String, val value: String)
+
+@Serializable
+data class EnvValueRequest(val value: String)
+
+@Serializable
+data class EnvCreateRequest(val name: String, val value: String)
+
+@Serializable
+data class EnvChangeDto(
+    /** `now` | `backend_restart`. */
+    val applies: String = "now",
+    val note: String = "",
+)

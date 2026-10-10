@@ -85,11 +85,8 @@ enum class Surface { History, Switcher }
 fun FlowScreen(h: Harness, surface: Surface) {
     val items by h.open.items.collectAsState()
     val active by h.open.active.collectAsState()
-    val pool by h.history.pool.collectAsState()
     val sessions by h.history.sessions.collectAsState()
     val ui by h.controller.state.collectAsState()
-    val openLocal = items.mapNotNull { it.localId }.toSet()
-    val elsewhere = pool.filter { !it.isOrchestrator && it.localId !in openLocal }
     val onIntent: (SessionsIntent) -> Unit = h.controller::onIntent
     val activeItem = items.firstOrNull { it.key == active }
     ArchieTheme(reduceMotion = true) {
@@ -102,16 +99,16 @@ fun FlowScreen(h: Harness, surface: Surface) {
                 when (surface) {
                     Surface.History -> HistoryScreen(
                         state = HistoryListState(
-                            items = items, active = active, liveElsewhere = elsewhere,
-                            groups = HistoryList.groups(sessions.value.orEmpty(), items, elsewhere, "", Instant.now(), ZoneId.systemDefault()),
+                            items = items, active = active,
+                            groups = HistoryList.groups(sessions.value.orEmpty(), items, "", Instant.now(), ZoneId.systemDefault()),
                             loading = sessions.loading, error = sessions.error,
                         ),
-                        onQuery = {}, onSelect = h.open::select, onOpenLive = h.open::openLive, onIntent = onIntent,
+                        onQuery = {}, onSelect = h.open::select, onIntent = onIntent,
                         onRefresh = {}, onBack = {}, onOpened = {},
                     )
                     Surface.Switcher -> SessionSwitcherContent(
-                        items = items, active = active, liveElsewhere = elsewhere,
-                        onSelect = h.open::select, onOpenLive = h.open::openLive,
+                        items = items, active = active,
+                        onSelect = h.open::select,
                         onRequestClose = { onIntent(SessionsIntent.RequestClose(it)) },
                         onNewArchie = { onIntent(SessionsIntent.NewArchie) },
                         onNewAgent = { onIntent(SessionsIntent.NewAgent) },

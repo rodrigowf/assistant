@@ -485,7 +485,7 @@ class TestProviderPinning:
         sdk_id = str(uuid.uuid4())
         pool = SessionPool()
         _install(pool, _stub_sm("modelstudio", sdk_id))
-        runner = BackgroundAgentRunner(pool, MagicMock(), NotificationQueue(), default_timeout=5.0)
+        runner = BackgroundAgentRunner(pool, MagicMock(), NotificationQueue(), idle_timeout=5.0)
         await runner.spawn("tab-1", "do it")
         for _ in range(50):
             await asyncio.sleep(0.02)

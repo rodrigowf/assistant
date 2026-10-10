@@ -9,6 +9,8 @@ import { isRemoteLogEnabled, localStore, REMOTE_CONSOLE_KEY, remoteLogDefault, s
 export type ThemePref = 'system' | 'dark' | 'light';
 export type TextSizePref = 'small' | 'default' | 'large' | 'xlarge';
 export type RailDestination = 'chats' | 'memory' | 'visuals' | 'settings';
+/** Where the floating voice controls snap to (features/voice `VoiceOverlay`). */
+export type VoiceOverlayAnchor = 'top-left' | 'top-center' | 'top-right' | 'bottom-left' | 'bottom-center' | 'bottom-right';
 
 export interface Prefs {
   readonly theme: ThemePref;
@@ -19,6 +21,9 @@ export interface Prefs {
   readonly lastRailDestination: RailDestination;
   readonly remoteLogging: boolean;
   readonly toolStepGrouping: boolean;
+  /** System notification when an agent session finishes a turn (needs the browser's permission). */
+  readonly notifyAgentTurns: boolean;
+  readonly voiceOverlayAnchor: VoiceOverlayAnchor;
 }
 
 export const PREFS_STORAGE_KEY = 'prefs:v1';
@@ -32,11 +37,14 @@ export const DEFAULT_PREFS: Prefs = {
   lastRailDestination: 'chats',
   remoteLogging: false,
   toolStepGrouping: true,
+  notifyAgentTurns: false,
+  voiceOverlayAnchor: 'bottom-center', // where the dock sits on the Archie page
 };
 
 const THEMES: readonly ThemePref[] = ['system', 'dark', 'light'];
 const SIZES: readonly TextSizePref[] = ['small', 'default', 'large', 'xlarge'];
 const RAIL: readonly RailDestination[] = ['chats', 'memory', 'visuals', 'settings'];
+export const VOICE_OVERLAY_ANCHORS: readonly VoiceOverlayAnchor[] = ['top-left', 'top-center', 'top-right', 'bottom-left', 'bottom-center', 'bottom-right'];
 
 /** The remote-console flag (`archie.remoteConsole`, owned by `@/platform`), with the per-build default. */
 function remoteLoggingNow(): boolean {
@@ -61,6 +69,8 @@ export function sanitizePrefs(raw: unknown): Prefs {
     lastRailDestination: pick('lastRailDestination', RAIL),
     remoteLogging: remoteLoggingNow(),
     toolStepGrouping: bool('toolStepGrouping'),
+    notifyAgentTurns: bool('notifyAgentTurns'),
+    voiceOverlayAnchor: pick('voiceOverlayAnchor', VOICE_OVERLAY_ANCHORS),
   };
 }
 

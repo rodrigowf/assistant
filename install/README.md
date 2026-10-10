@@ -23,14 +23,16 @@ substitutions for you.
 | `manager.json` | `.manager.json` (repo root) | Session-manager defaults (model, permission mode, budget caps). |
 | `sync.env` | `infra/sync/config.env` | Optional. Configures the `context-sync` systemd service for two-machine deployments. |
 | `cli-runtime/<cli>/*` | `.<cli>/*` | Seeds the per-CLI runtime dirs (`.claude/`, `.qwen/`, `.gemini/`) at the project root with default `settings.json` and any other starter files. These dirs are gitignored on disk — the templates here are what gets dropped in on first install. Only the dirs for harnesses the user opts into are seeded. Existing files are never overwritten. `.qwen/settings.json` turns Qwen's managed auto-memory / auto-dream / auto-skill off (its project dir is `context/`, so auto-memory would write into the memory wiki). |
-| `cli-runtime/codex-home/config.toml` | `~/.codex-archie/config.toml` | Archie's Codex home config (`project_doc_max_bytes = 131072`, plugins/apps off). Seeded only when missing. |
+| `cli-runtime/codex-home/config.toml` | `~/.codex-archie/config.toml` | Archie's Codex home config (`project_doc_max_bytes = 131072`; `[features]` plugins, apps and memories off). Seeded only when missing; an existing file only gets `[features] memories = false` added (via `codex-home-config.py`). |
 
 ## Shared tooling (not copied anywhere)
 
 | File | Purpose |
 |------|---------|
 | `harness-versions.env` | The agent-CLI version pins (`QWEN_CLI_VERSION`, `GEMINI_CLI_VERSION`, `CODEX_CLI_VERSION`) and `NODE_MIN_MAJOR`. Sourced by the bash installers, parsed by the PowerShell ones, compared by `doctor.sh`. Bump a pin here (plus `QWEN_CLI_VERSION` in `backend/manager/qwen/adapter.py` for Qwen). The claude-agent-sdk pin stays in `backend/requirements-claude.txt`. |
-| `doctor.sh` | Checks an install per harness (claude, modelstudio, qwen, gemini, codex): CLI present + version vs pin, env keys (names only), auth files (existence only), every symlink below (including `context/memory/archie`), `context/memory/ORCHESTRATOR_MEMORY.md`, the Qwen/Gemini seed settings, the root instruction links and the `context/{skills,scripts,agents}` → `shared/` links. Prints an OK/WARN/FAIL table, exit 1 on any FAIL. `--fix` repairs only symlinks and seed files (installer rules: correct link kept, wrong link warned about, real directory migrated and moved aside to `<name>.bak-<ts>`); `--dry-run` lists what `--fix` would do; `--harness claude,codex` (or `all`) makes those required; `--repo DIR` checks another checkout (copy the script anywhere). Never installs packages or touches auth. bash 3.2+, macOS-safe. The bash installers run it as their last verification step. |
+| `gemini-project.py` | Pins Gemini CLI's project label for the repo: prints the label (`label`), reports (`check`), or registers `<repo> → <label>` in `~/.gemini/projects.json` and fixes the `context/.project_root` ownership marker (`apply`). Without both, Gemini can claim a new label on its next run and its chats and memory index leave `context/`. Stdlib only (Python 3.6+); used by all three installers and `doctor.sh`. |
+| `codex-home-config.py` | Adds or replaces `[features] memories = false` in a Codex `config.toml` without touching anything else (`check` / `apply`). Used by all three installers and `doctor.sh`. |
+| `doctor.sh` | Checks an install per harness (claude, modelstudio, qwen, gemini, codex): CLI present + version vs pin, env keys (names only), auth files (existence only), every symlink below (including `context/memory/archie`), `context/memory/ORCHESTRATOR_MEMORY.md` and `MEMORY.md`, the Qwen/Gemini seed settings, the memory/history wiring in the table below (Gemini label + ownership markers + memory index, `~/.gemini/GEMINI.md`, Codex `memories`; Claude's auto-memory is reported for information), the root instruction links and the `context/{skills,scripts,agents}` → `shared/` links. Prints an OK/WARN/FAIL table, exit 1 on any FAIL. `--fix` repairs only symlinks, seed files and seed keys (installer rules: correct link kept, wrong link warned about, real directory migrated and moved aside to `<name>.bak-<ts>`); `--dry-run` lists what `--fix` would do; `--harness claude,codex` (or `all`) makes those required; `--repo DIR` checks another checkout (copy the script anywhere). Never installs packages or touches auth. bash 3.2+, macOS-safe. The bash installers run it as their last verification step. |
 
 ## Links every install needs
 
@@ -40,11 +42,27 @@ substitutions for you.
 | `.claude_config/projects/<path with non-alphanumerics → ->` | `../../context` | claude, modelstudio |
 | `.claude_config/skills`, `.claude_config/agents` | `../context/skills`, `../context/agents` | claude, modelstudio |
 | `~/.qwen/projects/<same key>`, `~/.qwen/skills` | `<repo>/context`, `<repo>/context/skills` | qwen |
-| `~/.gemini/tmp/<label from ~/.gemini/projects.json, else folder name>` | `<repo>/context` | gemini |
+| `~/.gemini/tmp/<label>` (label registered in `~/.gemini/projects.json` by the installer) | `<repo>/context` | gemini |
 | `~/.codex-archie/sessions` | `<repo>/context/codex/sessions` | codex |
 | `.agents/skills` (repo) | `../context/skills` | codex (verified on 0.161), gemini, qwen |
 | `context/{skills,scripts,agents}/<name>` | `../../shared/<kind>/<name>` | all (`shared/scripts/setup-context.sh`) |
 | `context/memory/archie` | `../../docs` | all (new, imported and kept contexts; a junction on Windows without symlink rights) |
+
+## Memory and history per harness
+
+What each harness needs so that its conversations land in `context/` (and so in history search) and
+its memory reads/writes go to the `context/memory/` wiki. Runtime side:
+[`docs/architecture/memory-and-search.md`](../docs/architecture/memory-and-search.md#every-harness-reads-and-writes-the-same-memory).
+
+| Harness | Conversations (→ history index) | Memory index in | Memory writes / own memory off | Installer + doctor cover |
+|---|---|---|---|---|
+| Claude Code, Model Studio | `context/<id>.jsonl` via `.claude_config/projects/<key>` → `context` | backend appends `context/memory/MEMORY.md` | auto-memory off by the backend (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`); `autoMemoryEnabled` in `.claude_config/settings.json` is not read by SDK sessions | the projects/skills/agents links; doctor reports auto-memory as INFO |
+| Qwen Code | `context/chats/<id>.jsonl` via `~/.qwen/projects/<key>` → `context` | backend `--append-system-prompt` | managed auto-memory/dream/skill off per run and in `.qwen/settings.json` | the link, `~/.qwen/skills`, the `.qwen/settings.json` memory keys (merged into an existing file) |
+| Gemini CLI | `context/chats/session-*.jsonl` via `~/.gemini/tmp/<label>` → `context` | natively: `~/.gemini/tmp/<label>/memory/MEMORY.md` = `context/memory/MEMORY.md` | no `save_memory` in 0.63; `~/.gemini/GEMINI.md` (global tier outside `context/`) must not exist | the link, `projects.json` entry, `context/.project_root` marker (`gemini-project.py`), memory-index check, `GEMINI.md` warning |
+| Codex | `context/codex/sessions/YYYY/MM/DD/rollout-*.jsonl` via `~/.codex-archie/sessions` (needs the dedicated `~/.codex-archie` login) | backend `developerInstructions` | `[features] memories = false` | the link, the config seed + `memories` key (`codex-home-config.py`) |
+
+Every harness also reads `AGENTS.md` (the wiki rules) through the root links, and needs
+`context/memory/MEMORY.md` to exist.
 
 ## How install.sh uses these
 

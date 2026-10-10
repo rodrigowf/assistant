@@ -75,7 +75,7 @@ object SessionFixtures {
     fun historyState(query: String = "") = HistoryListState(
         items = items.take(3),
         active = ItemKey.Archie,
-        groups = HistoryList.groups(sessions, items, emptyList(), query, now, ZoneOffset.UTC, Locale.US),
+        groups = HistoryList.groups(sessions, items, query, now, ZoneOffset.UTC, Locale.US),
         query = query,
     )
 
@@ -112,7 +112,7 @@ class SessionsGoldens {
     @Composable
     private fun History(state: SessionsUiState = SessionsUiState()) {
         Box(Modifier.fillMaxSize()) {
-            HistoryScreen(SessionFixtures.historyState(), {}, {}, {}, {}, {}, {}, {})
+            HistoryScreen(SessionFixtures.historyState(), {}, {}, {}, {}, {}, {})
             SessionsHost(state, {})
         }
     }
@@ -132,7 +132,7 @@ class SessionsGoldens {
                     .background(c.surfaceContainerLow, RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
                     .padding(top = 34.dp),
             ) {
-                SessionSwitcherContent(SessionFixtures.items, ItemKey.Archie, emptyList(), {}, {}, {}, {}, {}, {}, {})
+                SessionSwitcherContent(SessionFixtures.items, ItemKey.Archie, {}, {}, {}, {}, {}, {})
             }
         }
     }

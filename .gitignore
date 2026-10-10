@@ -22,6 +22,9 @@ apps/web/node_modules/
 
 # Local logs
 logs/
+
+# Machine-local backend state (backend/api/open_sessions.py)
+state/
 remote_console.log
 
 # Context is an independent repo, ignored here
@@ -78,3 +81,6 @@ docs/projects/frontend-refactor/audit/screenshots/
 
 # Android apps (apps/android/, own .gitignore): signing paths/passwords, never committed (spec 14 §1.8)
 apps/android/keystore.properties
+
+# Backups Settings → Accounts keeps of context/.env (secrets; never synced or committed)
+.backups/

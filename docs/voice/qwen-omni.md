@@ -3,8 +3,8 @@ name: qwen-omni
 category: archie/voice
 tags: [voice, qwen, qwen-omni, dashscope, alibaba, websocket, voice-relay, silero, vad, schema-sanitiser, common-error]
 created: 2026-05-16
-modified: 2026-10-07
-summary: Qwen-Omni realtime voice over DashScope via the backend relay; the "Common error!" bisector, sanitisers, client-side Silero VAD, reconnect, voices.
+modified: 2026-10-10
+summary: Qwen-Omni realtime voice over DashScope via the backend relay; the "Common error!" bisector, sanitisers, client-side Silero VAD, the 320-audio cap (silence gating + audio budget), reconnect, voices.
 source: curated (consolidated from memory notes assistant/voice/qwen_omni_voice_adaptation.md, assistant/voice/voice-multimodel-plan.md, auto-memory feedback_qwen_voice_dashscope_2026_05, project_qwen_voice_gate_no_staleness_clear; verified against code 2026-10-06)
 references:
   - architecture.md
@@ -145,6 +145,53 @@ Server-VAD tuning history, in case you switch back: 0.5/800 (Alibaba
 defaults; the model cut in at any 0.8 s pause) → 0.4/1800 (`993c648`) →
 0.4/2500 (`4c38b23`).
 
+## The 320-audio cap: silence gating and the audio budget
+
+DashScope caps one realtime conversation at **320 "audios"**: about 630 s of
+committed input audio, counting what's in history plus the uncommitted
+buffer. Past that, every frame fails with
+`<400> InternalError.Algo.InvalidParameter: Too many audios. The maximum
+allowed is 320.` The docs promise a rolling window ("when exceeded, the
+oldest history is discarded"; 100 turns / 600 s for
+`qwen3.8-omni-flash-realtime` and `qwen3.5-omni-plus-realtime`). On
+2026-10-10 probes showed it never trims: audio tokens in each
+`response.done` grew by 7 per second of audio until the error. There is no
+parameter to raise the cap. Only user audio counts. The model's own replies
+stay in the conversation as text.
+
+Before the fix, the relay appended every mic chunk, silence included. With
+manual VAD a commit carries everything appended since the previous one, so
+the cap was reached after about 10.5 minutes of *wall-clock* time. The relay
+then reopened the conversation with a text-only history, which loses how the
+turns sounded. Two provider opt-ins now keep one conversation alive:
+
+- **Silence gating** (`gate_silence_upstream`, Qwen only). While the relay's
+  Silero VAD hears silence, mic chunks wait in a 1 s pre-roll
+  (`_PREROLL_S`) instead of going upstream. When speech starts, the
+  pre-roll goes out first, then audio streams until the turn is committed.
+  Committed turns hold speech plus the VAD's silence tail. The keepalive
+  still ticks during the held silence.
+- **Audio budget** (`audio_history_budget_s`, Qwen default 420 s, env
+  `QWEN_AUDIO_HISTORY_BUDGET_S`). The relay counts the seconds in each commit
+  and pairs them with the `input_audio_buffer.committed` ack, which names the
+  item. It doesn't use `conversation.item.created`: DashScope creates the user
+  item (`in_progress`) as soon as audio streams, before the commit. Right
+  after each commit, counting the turn just committed, it deletes the oldest
+  user audio items with `conversation.item.delete` until the rest fit. So the
+  deletes go out before that turn's `response.create`, and the model never
+  prefills over budget. It checks again on `response.done`, never deletes
+  the newest turn, and drops the duration of a commit DashScope rejects
+  ("buffer too small").
+  The probe kept one conversation alive for 1400 s of audio at a steady
+  400 s. Tracking resets on reconnect, because the old items don't exist in
+  the new conversation.
+
+Rebuilding a conversation after a reconnect doesn't work around this.
+DashScope ignores `previous_item_id` (items always go at the end) and
+silently drops client-created **assistant** items from the model's context;
+user text and user audio items do work. Reconnects still happen at the
+WebSocket's 120-minute limit and on DashScope's transient errors.
+
 ## The `response.create` gate
 
 Qwen rejects a concurrent `response.create` ("Conversation already has an
@@ -187,8 +234,17 @@ flight. A cancel with no active response makes DashScope close the socket
 
 `classify_close_reason`: balance insufficient (English and Chinese "余额不足")
 → `QUOTA_EXCEEDED`; `InvalidApiKey` → `AUTH`; "model not found" →
-`MODEL_UNAVAILABLE`; `Throttling` / "too many" → `RATE_LIMIT` (recoverable);
-the recoverable substrings above → `NETWORK` (recoverable).
+`MODEL_UNAVAILABLE`; "Too many audios" → `NETWORK` (recoverable: the audio
+cap, which the budget should prevent); `Throttling` / "too many" →
+`RATE_LIMIT` (recoverable); the recoverable substrings above → `NETWORK`
+(recoverable).
+
+Upstream `error` events go to the orchestrator pipeline but are **not**
+forwarded to clients. Clients treat a voice `error` as "the relay gave up"
+and tear down (spec 12 §7.7). On 2026-10-10 that ended a session while the
+relay was reconnecting successfully. A real give-up still reaches clients
+as `voice_relay_failed` plus a typed `voice_error`; a reconnect is announced
+with `voice_status: reconnecting`.
 
 ## Diagnosing Qwen voice
 
@@ -199,6 +255,7 @@ regression in our code.
 |---|---|---|
 | Session dies about 1 s after a frame | WS close **1011** "Parse RealtimeEvent error: Common error!" | one of the validators above; bisect |
 | Model cuts you off at 30–40 s | `speech_stopped → response.created` while audio chunks keep flowing | server VAD force-commit; make sure manual VAD is on |
+| Session ends after ~10.5 min (before the audio budget) | `ERR upstream error ... Too many audios. The maximum allowed is 320.` | the conversation's audio cap; check the `audio budget: deleting` lines and `audio_items=` in the close summary |
 | Tools run but results never reach the model | voice log: many `defer event type=response.create (provider gate active)`, no `drain deferred event` after them | gate wedge; check the watchdog |
 
 - `VOICE_DEBUG_QWEN_BODIES=1` (env on the backend) logs the session keys and a

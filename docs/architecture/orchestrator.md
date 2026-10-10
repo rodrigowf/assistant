@@ -163,21 +163,46 @@ Tools can declare a `schema_builder` to inject live state (e.g. the MCP list) in
 2. Events are buffered in a per-turn ring (200 entries) that `read_agent_session` shows as the live
    tail; pending permission ids are tracked for the prompt's active-sessions section.
 3. Exactly one terminal `Notification` per turn — `succeeded`, `failed`, `cancelled` or `timeout`
-   (default timeout 600 s, after which the session is interrupted) — is pushed onto the session's
-   `NotificationQueue`. `TurnAbandoned` (no SDK messages for 240 s) is retried once.
+   — is pushed onto the conversation's `NotificationQueue`. The timeout counts time **without
+   progress** (`idle_timeout`, default 1800 s with no text, tool call, tool result or permission
+   event; `SessionStalled` notices don't count, a pending permission is never idle), so a working
+   agent is never stopped however long the task; `max_turn_seconds` is an optional hard cap (off by
+   default). Until 2026-10-10 it was a fixed 600 s wall clock, which killed a session mid-edit.
+   `TurnAbandoned` (no SDK messages for 240 s) is retried once.
+   A cancelled `pool.send()` emits no `turn_complete`, so every turn the runner ends tells the
+   agent's open tabs itself (`broadcast_session`): `error{turn_timeout}` then
+   `status{interrupted}` on timeout, `status{interrupted}` on cancel, `status{retrying}` before the
+   abandoned-turn retry, `error{upstream_wedged}` / `error{send_failed}` on failure — the same
+   frames `pool._drive_turn` sends for chat-driven turns. Without them a tab kept showing the turn
+   as running ("Using tools…") forever.
 4. At the top of the next `OrchestratorSession.send()` (under `_busy_lock`) the queue is drained:
    each notification is persisted as a `background_notification` JSONL line (tied to
    `origin_tool_use_id`), and rendered as status lines prepended to the prompt:
    `[SESSION 1a2b3c4d ("title"), event: turn 5e6f7a8b succeeded, duration=42.0s, cost=$0.1234]`.
-   Lines carry status only; the model calls `read_agent_session` for content.
+   Lines carry status only; the model calls `read_agent_session` for content. When a turn did not
+   succeed the block adds an instruction to tell the user it stopped and why before anything else
+   (2026-10-10: on a timeout the model had answered with its own summary instead).
 5. **Wake callback**: `backend/api/routes/orchestrator.py` installs a callback on the queue. When a
    notification arrives and `session.is_busy` is false, it schedules a synthetic empty-prompt turn
    so the model can react without the user typing; a busy orchestrator just drains it next turn.
    An empty prompt with nothing pending returns immediately. **Voice sessions get no synthetic
    wake** — notifications wait for the next turn.
 
+**Agent turns belong to the conversation, not to the session object.** The runner and its queue
+live in `pool.agent_runtimes` (`AgentRuntimes`, keyed by the conversation's `jsonl_id`), and every
+`OrchestratorSession` of that conversation acquires the same pair. `OrchestratorSession.stop()` —
+closing the orchestrator tab, `switch_conversation`, a voice provider/model rebuild, a voice start
+dropping a dying session — therefore **never stops an agent turn** (it called `cancel_all()` until
+2026-10-10); it only releases its own wake callback (`release_wake_callback(owner)`, so an old
+session stopping late can't unhook its successor's). Finished turns' notifications wait in the
+queue; when the conversation gets a session again its route installs the wake callback and, if
+anything is pending, runs the synthetic turn at once. Only an explicit `interrupt_agent_session`
+(`runner.cancel`) or a backend shutdown stops a delegated turn. A runner keeps its last 100
+finished turns (never a session's latest) for `read_agent_session`.
+
 The runner imports only the pool, store and manager event types (not the session or agent), so it
-is unit-tested with mock pools (`backend/tests/test_runner.py`). Any new wake source must gate on
+is unit-tested with mock pools (`backend/tests/test_runner.py`,
+`backend/tests/test_orchestrator_stop_keeps_agents.py`). Any new wake source must gate on
 `is_busy` the same way.
 
 ## `run_script` and its allowlist

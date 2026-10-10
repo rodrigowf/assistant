@@ -1,0 +1,8 @@
+[?1049h Please visit the following URL to authorize the application:
+
+https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=https%3A%2F%2Fcodeassist.google.com%2Fauthcode&access_type=offline&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&code_challenge_method=S256&code_challenge=CHALLENGE&state=STATE&response_type=code&client_id=681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com
+
+  Enter the authorization code:  bogus
+Failed to authenticate with authorization code:invalid_grant
+
+Failed to authenticate with user code. Retrying...

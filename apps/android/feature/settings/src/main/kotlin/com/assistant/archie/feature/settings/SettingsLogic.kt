@@ -323,6 +323,22 @@ data class SliderSpec(val min: Float, val max: Float, val step: Float) {
     fun snap(v: Float): Float = (min + ((v - min) / step).roundToInt() * step).coerceIn(min, max)
 }
 
+/** Settings → Notifications (spec 12 §8.2): the switch as it actually works (Android can veto it). */
+object NotifyLogic {
+    /**
+     * [granted] = POST_NOTIFICATIONS granted (or not needed below API 33); [systemEnabled] = the
+     * app's notifications are on in system settings.
+     */
+    fun summary(enabled: Boolean, granted: Boolean, systemEnabled: Boolean): String = when {
+        !enabled -> "Off"
+        !granted || !systemEnabled -> "On · blocked by Android"
+        else -> "On · when an agent session finishes"
+    }
+
+    /** What the switch shows: on only when the notification can actually be posted. */
+    fun effective(enabled: Boolean, granted: Boolean, systemEnabled: Boolean): Boolean = enabled && granted && systemEnabled
+}
+
 object Format {
     fun threshold(v: Double): String = String.format(Locale.US, "%.2f", v)
     fun ms(v: Double): String = "${v.roundToInt()} ms"

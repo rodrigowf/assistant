@@ -15,7 +15,9 @@ import java.util.concurrent.CopyOnWriteArrayList
  * mutations): REST list / pool / messages / close / rename / duplicate / fork / delete, and both
  * WebSockets. `start` is answered with `session_started`; with [raceOrchestrator] set, an orchestrator
  * `start` for another id loses the race (`error{orchestrator_active}`) and that orchestrator appears in
- * the pool, as when another device started Archie after our pool check (§6.11).
+ * the pool, as when another device started Archie after our pool check (§6.11). Like the server
+ * (spec 12 OPEN-2) a user `start` opens its session in the pool, and a `reattach` start for a
+ * session the pool does not have gets `error{session_closed}`.
  *
  * Every request (with its body) and every client frame is recorded. Nothing here talks to a real
  * server: B-06 mutations are never run against the live Jetson.
@@ -89,6 +91,12 @@ class FakeBackend {
             .replace(Regex(",\\s*,"), ",").replace("[,", "[").replace(",]", "]")
     }
 
+    private fun addToPool(localId: String, sdkId: String?, orch: Boolean) {
+        val row = """{"local_id":"$localId","sdk_session_id":${(sdkId ?: localId.takeIf { orch })?.let { "\"$it\"" } ?: "null"},"status":"idle","cost":0.0,"turns":0,"title":null,"is_orchestrator":$orch}"""
+        val base = poolJson.trim().removeSuffix("]").trimEnd()
+        poolJson = if (base == "[") "[$row]" else "$base,$row]"
+    }
+
     private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
 
     private fun listener(endpoint: String, sockets: MutableList<WebSocket>) = object : WebSocketListener() {
@@ -105,6 +113,12 @@ class FakeBackend {
                 return
             }
             val resume = Regex("\"resume_sdk_id\":\"([^\"]+)\"").find(text)?.groupValues?.get(1)
+            val listed = poolJson.contains("\"local_id\":\"$localId\"")
+            if (text.contains("\"reattach\":true") && !listed) {
+                webSocket.send("""{"type":"error","error":"session_closed","detail":"not open"}""".encodeUtf8())
+                return
+            }
+            if (!listed) addToPool(localId, resume, orch = endpoint == "orch")
             val jsonl = if (endpoint == "orch") ""","jsonl_id":"${resume ?: localId}"""" else ""
             webSocket.send("""{"type":"session_started","session_id":"$localId"$jsonl}""".encodeUtf8())
         }

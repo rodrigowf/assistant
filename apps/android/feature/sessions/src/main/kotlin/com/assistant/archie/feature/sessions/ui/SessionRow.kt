@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.ProvideTextStyle
@@ -131,12 +130,6 @@ internal fun SessionRow(
             }
         }
     }
-}
-
-/** Unread dot for a background session opened by another device or by Archie (P-6). */
-@Composable
-internal fun UnreadDot() {
-    Box(Modifier.size(8.dp).background(ArchieTheme.colors.primary, CircleShape))
 }
 
 /** 24 dp leading slot: the Archie mark or the item's type icon. */

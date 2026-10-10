@@ -12,15 +12,57 @@
  *   hidden (`hidden` never unmounts it), so interactive visualizations keep their state.
  * - Toolbar (mockup h): "Updated 2 h ago · folder", **Show on TV** (only when the BX-2 probe says
  *   available — hidden, not disabled, spec 13 §3.7), ⋮ Reload / Open in browser / Copy link.
+ * - Live reload (spec 12 §9.3, VZ-6): when the content watcher reports this page or one of its
+ *   assets changed, the frame remounts once per burst (debounced) and a short "Updated" cue
+ *   shows. A hidden view waits until it is shown again (its state is not thrown away for a page
+ *   nobody is looking at, and the scroll position can be read back). A same-origin page gets its scroll position back after the reload
+ *   (re-applied briefly while scripts build the page); a deleted page is left as it is.
  */
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { parseServerTime } from '@/features/history';
 import { copyText, formatRelativeTime } from '@/platform';
-import { showSnackbar, useCapabilities, useCatalog } from '@/stores';
+import { showSnackbar, useCapabilities, useCatalog, useContentStamp } from '@/stores';
 import { Button, IconButton } from '@/ui/controls';
 import { Menu, MenuItem } from '@/ui/overlays';
 import { findVisual, showOnTv, vizFolder, vizHref } from './viz';
 import styles from './visuals.module.css';
+
+/** Changes closer together than this reload once (VZ-6). */
+export const LIVE_RELOAD_DEBOUNCE_MS = 300;
+/** How long the "Updated" cue stays. */
+export const UPDATED_CUE_MS = 2500;
+/** After a live reload, the saved scroll position is re-applied at these delays after `load`. */
+const SCROLL_RESTORE_DELAYS_MS = [0, 150, 600];
+
+interface ScrollPos {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** The frame's scroll position, or null for a cross-origin page (dev `VITE_VIZ_ORIGIN`). */
+function readScroll(frame: HTMLIFrameElement | null): ScrollPos | null {
+  try {
+    const w = frame?.contentWindow;
+    if (!w) return null;
+    return { x: w.scrollX || w.pageXOffset || 0, y: w.scrollY || w.pageYOffset || 0 };
+  } catch {
+    return null;
+  }
+}
+
+function restoreScroll(frame: HTMLIFrameElement | null, pos: ScrollPos, timers: ReturnType<typeof setTimeout>[]): void {
+  for (const ms of SCROLL_RESTORE_DELAYS_MS) {
+    timers.push(setTimeout(() => {
+      try {
+        const w = frame?.contentWindow;
+        // The user scrolled meanwhile, or it already holds: leave it.
+        if (w && w.scrollY < pos.y && w.scrollX <= pos.x + 1) w.scrollTo(pos.x, pos.y);
+      } catch {
+        // cross-origin: nothing to restore
+      }
+    }, ms));
+  }
+}
 
 /** The exact sandbox tokens (F-36, VZ-3). Exported for tests. */
 export const VIZ_SANDBOX = 'allow-scripts allow-same-origin allow-popups allow-forms allow-modals';
@@ -40,12 +82,51 @@ export function VisualViewer({ path, url, hidden }: VisualViewerProps) {
   const [reloadKey, setReloadKey] = useState(0);
   const [menuOpen, setMenuOpen] = useState(false);
   const [casting, setCasting] = useState(false);
+  const [cue, setCue] = useState(false);
   const menuRef = useRef<HTMLButtonElement>(null);
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  const pendingScroll = useRef<ScrollPos | null>(null);
+  const scrollTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const stamp = useContentStamp('visuals', path);
+  // Changes from before this viewer mounted are already in what it loads.
+  const handledVersion = useRef(stamp ? stamp.version : 0);
+  const version = stamp ? stamp.version : 0;
+  const deleted = !!stamp && stamp.deleted;
+
+  useEffect(() => {
+    const timers = scrollTimers.current;
+    return () => {
+      for (const t of timers.splice(0)) clearTimeout(t);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (version <= handledVersion.current || deleted || hidden) return undefined;
+    const t = setTimeout(() => {
+      handledVersion.current = version;
+      pendingScroll.current = readScroll(frameRef.current);
+      setReloadKey((k) => k + 1);
+      setCue(true);
+    }, LIVE_RELOAD_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(t);
+    };
+  }, [version, deleted, hidden]);
+
+  useEffect(() => {
+    if (!cue) return undefined;
+    const t = setTimeout(() => {
+      setCue(false);
+    }, UPDATED_CUE_MS);
+    return () => {
+      clearTimeout(t);
+    };
+  }, [cue, reloadKey]);
 
   const href = vizHref(path, url ?? item?.url);
   const title = item?.title ?? path;
   const modified = item ? parseServerTime(item.modified) : NaN;
-  const meta = [isFinite(modified) ? `Updated ${formatRelativeTime(modified)}` : null, vizFolder(path)].filter(Boolean).join(' · ');
+  const meta = [deleted ? 'Deleted' : isFinite(modified) ? `Updated ${formatRelativeTime(modified)}` : null, vizFolder(path)].filter(Boolean).join(' · ');
 
   const reload = (): void => {
     setReloadKey((k) => k + 1);
@@ -57,6 +138,11 @@ export function VisualViewer({ path, url, hidden }: VisualViewerProps) {
         <span className={styles.viewerMeta} title={href}>
           {meta}
         </span>
+        {cue ? (
+          <span className={styles.updatedCue} role="status">
+            Updated
+          </span>
+        ) : null}
         {castAvailable ? (
           <Button
             variant="tonal"
@@ -118,7 +204,20 @@ export function VisualViewer({ path, url, hidden }: VisualViewerProps) {
         </Menu>
       </div>
       <div className={styles.frameWrap}>
-        <iframe key={reloadKey} className={styles.frame} title={title} src={href} sandbox={VIZ_SANDBOX} data-reload={reloadKey} />
+        <iframe
+          key={reloadKey}
+          ref={frameRef}
+          className={styles.frame}
+          title={title}
+          src={href}
+          sandbox={VIZ_SANDBOX}
+          data-reload={reloadKey}
+          onLoad={() => {
+            const pos = pendingScroll.current;
+            pendingScroll.current = null;
+            if (pos && (pos.x || pos.y)) restoreScroll(frameRef.current, pos, scrollTimers.current);
+          }}
+        />
       </div>
     </section>
   );

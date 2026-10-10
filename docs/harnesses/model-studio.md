@@ -7,6 +7,7 @@ modified: 2026-10-08
 summary: The Model Studio harness — Claude Code's agent loop driving GLM, DeepSeek, Kimi and Qwen through Alibaba Model Studio's Anthropic-compatible endpoint; env contract, provider pinning, catalog/options, landmines.
 source: curated (implementation + live verification 2026-10-07, CLI 2.1.292, claude-agent-sdk 0.2.164)
 references:
+  - authentication.md
   - registry.md
   - claude-code.md
   - qwen-code.md
@@ -144,6 +145,11 @@ OAuth token the claude harness forwards.
   `claude`; pin it by hand (`PUT /api/sessions/{id}/config {"provider":"modelstudio"}`).
 - A fresh session's harness comes from the global default (`assistant_config.json` `provider`, which
   defaults to `claude`); `ASSISTANT_PROVIDER` alone does not switch it.
+- Memory works exactly as in the claude harness (inherited): auto-memory off in the repo and the
+  shared `MEMORY.md` block appended ([claude-code](claude-code.md)). Live 2026-10-08 before the
+  change, GLM-5.1 followed auto-memory's own format (flat note at the root of `context/memory/`,
+  pointer appended to `MEMORY.md`); after it, it quoted `MEMORY.md` and saved the fact into the
+  existing wiki note.
 
 ## History
 

@@ -7,7 +7,8 @@
  *
  * Two models (2026-10-04): no OpenAI chat model takes both typed text and audio, so Archie uses
  * the **text model** (`default_model`) for typed messages and the **audio model**
- * (`default_audio_model`, "" = server default) for voice messages. Live voice is the Voice page.
+ * (`default_audio_model`, "" = server default) for voice messages. Each has its own provider
+ * select (the audio one offers "Server default" like the summarizer). Live voice is the Voice page.
  */
 import { useState } from 'react';
 import { loadHarnessCatalogs, type HarnessInfo, type ServerConfig } from '@/services';
@@ -63,14 +64,18 @@ function ConversationModelForm({ cfg }: { cfg: ServerConfig }) {
   const currentIsAudioOnly = findModel(models, current)?.supports_audio === true;
   const providerOptions: SelectOption[] = providers.map((p) => ({ value: p, label: modelProviderLabel(p) }));
 
+  // The audio model has its own provider: audio-capable models don't exist for every text
+  // provider (none at Anthropic), so it can't follow the text provider. Same shape as the summarizer.
   const audio = audioModels(models);
+  const audioProviders = modelProviders(audio);
   const audioCurrent = cfg.default_audio_model ?? '';
+  const audioProvider = audioCurrent ? (findModel(models, audioCurrent)?.provider ?? audioProviders[0] ?? '') : SERVER_DEFAULT;
   const serverAudio = catalog?.default_audio_model;
   const serverDefault: SelectOption =
     serverAudio && !audioCurrent
       ? { value: SERVER_DEFAULT, label: 'Server default', description: `Now ${serverAudio}` }
       : { value: SERVER_DEFAULT, label: 'Server default' };
-  const audioOptions: SelectOption[] = [serverDefault, ...modelOptions(audio, 'openai', audioCurrent)];
+  const audioProviderOptions: SelectOption[] = [serverDefault, ...audioProviders.map((p) => ({ value: p, label: modelProviderLabel(p) }))];
   const audioSupported = cfg.default_audio_model !== undefined;
 
   const summ = cfg.summarizer_model;
@@ -136,15 +141,31 @@ function ConversationModelForm({ cfg }: { cfg: ServerConfig }) {
           }
         >
           <Select
-            label="Audio model"
-            options={audioOptions}
-            value={audioCurrent}
+            label="Audio model provider"
+            options={audioProviderOptions}
+            value={audioProvider}
             disabled={saving || !audioSupported || !models.length}
             supportingText={audioSupported ? undefined : 'This server has no separate audio model setting yet.'}
-            onChange={(id) => {
-              if (id !== audioCurrent) void saveSetting({ default_audio_model: id }, 'default_audio_model');
+            onChange={(p) => {
+              if (p === audioProvider) return;
+              if (p === SERVER_DEFAULT) void saveSetting({ default_audio_model: '' }, 'default_audio_model');
+              else {
+                const first = firstModelOf(audio, p);
+                if (first) void saveSetting({ default_audio_model: first }, 'default_audio_model');
+              }
             }}
           />
+          {audioProvider !== SERVER_DEFAULT ? (
+            <Select
+              label="Audio model"
+              options={modelOptions(audio, audioProvider, audioCurrent)}
+              value={audioCurrent}
+              disabled={saving || !audioSupported}
+              onChange={(id) => {
+                if (id !== audioCurrent) void saveSetting({ default_audio_model: id }, 'default_audio_model');
+              }}
+            />
+          ) : null}
         </Field>
       </FieldStack>
       <FieldStack label="History summaries">

@@ -22,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -33,7 +34,11 @@ import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -54,8 +59,44 @@ import com.assistant.core.design.components.TopAppBarSubtitle
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
 import com.assistant.core.model.VisualInfo
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.time.Instant
+
+/** How long the "Updated" cue stays after a live reload (spec 12 VZ-6). */
+const val UPDATED_CUE_MS = 2_500L
+
+/** The live-change counter of [path] for [VisualWebView] (`0` when unchanged or deleted), and whether it was deleted. */
+@Composable
+internal fun rememberLive(deps: VisualsDeps, path: String): Pair<Int, Boolean> {
+    val changes by deps.changes.collectAsStateWithLifecycle()
+    val stamp = changes[path]
+    return (if (stamp == null || stamp.deleted) 0 else stamp.version) to (stamp?.deleted == true)
+}
+
+/** A short-lived "Updated" pill (web `.updatedCue`); [shownAt] restarts it. */
+@Composable
+internal fun UpdatedCue(shownAt: Long, modifier: Modifier = Modifier) {
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(shownAt) {
+        if (shownAt == 0L) return@LaunchedEffect
+        visible = true
+        delay(UPDATED_CUE_MS)
+        visible = false
+    }
+    if (!visible) return
+    val c = ArchieTheme.colors
+    Text(
+        "Updated",
+        modifier
+            .testTag("visual-updated")
+            .semantics { liveRegion = LiveRegionMode.Polite }
+            .background(c.secondaryContainer, RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+        style = ArchieTheme.typography.labelMedium,
+        color = c.onSecondaryContainer,
+    )
+}
 
 /** The list entry for [path], if the list is loaded. */
 @Composable
@@ -76,6 +117,8 @@ fun VisualScreen(deps: VisualsDeps, path: String, onBack: () -> Unit, modifier: 
     val origin = deps.origin()
     val href = VisualUrls.href(origin, path, item?.url)
     var reload by rememberSaveable(path) { mutableIntStateOf(0) }
+    val (live, deleted) = rememberLive(deps, path)
+    var cueAt by remember(path) { mutableLongStateOf(0L) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(deps) {
         if (deps.list.value.value == null) deps.refresh()
@@ -88,12 +131,13 @@ fun VisualScreen(deps: VisualsDeps, path: String, onBack: () -> Unit, modifier: 
             ArchieTopAppBar(
                 title = title,
                 navigationIcon = { ArchieIconButton(ArchieIcons.Close, "Close", onBack) },
-                subtitle = { TopAppBarSubtitle(if (age != null) "Visuals · updated $age" else "Visuals") },
+                subtitle = { TopAppBarSubtitle(if (deleted) "Visuals · deleted" else if (age != null) "Visuals · updated $age" else "Visuals") },
             ) {
+                UpdatedCue(cueAt, Modifier.padding(end = 4.dp))
                 ShowOnTvButton(deps, path, title, snackbar, compact = true)
                 VisualMenu(href, onReload = { reload++ }, snackbar)
             }
-            VisualWebView(deps, path, href, reload, Modifier.weight(1f).fillMaxWidth())
+            VisualWebView(deps, path, href, reload, Modifier.weight(1f).fillMaxWidth(), live = live, onLiveReload = { cueAt = System.currentTimeMillis() })
         }
         ArchieSnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.navigationBars))
     }
@@ -109,13 +153,16 @@ fun VisualViewer(deps: VisualsDeps, path: String, modifier: Modifier = Modifier,
     val item = rememberVisual(deps, path)
     val href = VisualUrls.href(deps.origin(), path, item?.url)
     var reload by rememberSaveable(path) { mutableIntStateOf(0) }
+    val (live, deleted) = rememberLive(deps, path)
+    var cueAt by remember(path) { mutableLongStateOf(0L) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(deps) {
         if (deps.list.value.value == null) deps.refresh()
         deps.cast.ensure()
     }
     val title = item?.title?.takeIf { it.isNotBlank() } ?: path
-    val meta = listOfNotNull(relativeTime(item?.modified, now ?: Instant.now())?.let { "Updated $it" }, VisualUrls.folder(path)).joinToString(" · ")
+    val updated = if (deleted) "Deleted" else relativeTime(item?.modified, now ?: Instant.now())?.let { "Updated $it" }
+    val meta = listOfNotNull(updated, VisualUrls.folder(path)).joinToString(" · ")
     val c = ArchieTheme.colors
     Box(modifier.fillMaxSize().background(c.surface).testTag("visual-viewer:$path")) {
         Column(Modifier.fillMaxSize()) {
@@ -125,10 +172,11 @@ fun VisualViewer(deps: VisualsDeps, path: String, modifier: Modifier = Modifier,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(meta, Modifier.weight(1f), style = ArchieTheme.typography.bodySmall.copy(fontSize = 13.sp), color = c.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                UpdatedCue(cueAt)
                 ShowOnTvButton(deps, path, title, snackbar, compact = false)
                 VisualMenu(href, onReload = { reload++ }, snackbar)
             }
-            VisualWebView(deps, path, href, reload, Modifier.weight(1f).fillMaxWidth())
+            VisualWebView(deps, path, href, reload, Modifier.weight(1f).fillMaxWidth(), live = live, onLiveReload = { cueAt = System.currentTimeMillis() })
         }
         ArchieSnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter))
     }

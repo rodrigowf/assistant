@@ -18,6 +18,9 @@ import com.assistant.core.data.VisualsRepository
 import com.assistant.core.model.VisualInfo
 import com.assistant.core.network.ApiResult
 import com.assistant.core.network.UrlScheme
+import com.assistant.core.data.ContentChangesRepository
+import com.assistant.core.data.ContentStamp
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -41,7 +44,12 @@ interface VisualsDeps {
 
     /** Debug builds route a viz's `console.*` to logcat (`ArchieViz`). */
     val debug: Boolean get() = false
+
+    /** Per-visualization change counters (spec 12 §9.3): an open page reloads when its entry moves. */
+    val changes: StateFlow<Map<String, ContentStamp>> get() = NO_CHANGES
 }
+
+private val NO_CHANGES: StateFlow<Map<String, ContentStamp>> = MutableStateFlow(emptyMap())
 
 /** [VisualsDeps] over B-03's [VisualsRepository]. */
 class RepositoryVisualsDeps(
@@ -50,7 +58,9 @@ class RepositoryVisualsDeps(
     override val pool: WebViewPool,
     override val trust: WebTrust,
     override val debug: Boolean = false,
+    private val content: ContentChangesRepository? = null,
 ) : VisualsDeps {
+    override val changes: StateFlow<Map<String, ContentStamp>> get() = content?.visuals ?: super.changes
     override val list: StateFlow<LoadState<List<VisualInfo>>> get() = repository.list
     override fun refresh() = repository.refresh()
     override suspend fun rename(path: String, title: String): ApiResult<Unit> = repository.rename(path, title)
@@ -58,9 +68,16 @@ class RepositoryVisualsDeps(
 
 /** Opening things outside the app (spec 14 §4.2: Custom Tab; ACTION_VIEW for other schemes). */
 object ExternalLinks {
+    /**
+     * Schemes a markdown link may open. `file:` throws FileUriExposedException, and `content:`,
+     * `javascript:` and `intent:` must never be launched from text an agent wrote.
+     */
+    private val ALLOWED = setOf("http", "https", "mailto", "tel", "sms", "geo")
+
     fun open(context: Context, url: String) {
         val uri = Uri.parse(url)
         val scheme = uri.scheme?.lowercase()
+        if (scheme !in ALLOWED) return
         val newTask = context.findActivity() == null
         try {
             if (scheme == "http" || scheme == "https") {
@@ -72,6 +89,8 @@ object ExternalLinks {
             }
         } catch (_: ActivityNotFoundException) {
             // No browser / handler: nothing to open it with. The link stays inert rather than crashing.
+        } catch (_: RuntimeException) {
+            // A malformed or refused URI (SecurityException, …): inert too.
         }
     }
 

@@ -24,8 +24,8 @@ interface ChatVoice {
     val remoteDevice: StateFlow<String?>
 
     /**
-     * Whether passive viewers get the transcript mirrored (WS providers). OpenAI (WebRTC) has no
-     * server mirror, so the dock says the live transcript is only on the owner (VT-2, G-32).
+     * Whether passive viewers get the transcript mirrored. True for every provider: WS providers are
+     * mirrored from the relay, OpenAI (WebRTC) from the owner's `voice_event` mirror (VT-2).
      */
     val remoteTranscriptMirrored: StateFlow<Boolean>
 

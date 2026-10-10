@@ -166,6 +166,11 @@ def _render_notifications(notes: list[Notification]) -> str:
         if n.error:
             bits.append(f'error="{n.error}"')
         lines.append(", ".join(bits) + "]")
+    if any(n.status != "succeeded" for n in notes):
+        lines.append(
+            "(A turn above did NOT finish: tell the user it stopped and why before anything "
+            "else, then read the session to say how far it got. Don't present its work as done.)"
+        )
     lines.append(
         "(Use read_agent_session(session_id) for the actual content — it returns "
         "persisted messages plus a 'live' block with status and in-flight events.)"
@@ -296,19 +301,26 @@ class OrchestratorSession:
         # by the send_to_agent_session tool.  Notifications drain at the top
         # of every send() call; the route layer installs a wake_callback that
         # synthesises an empty-prompt turn when one arrives while idle.
+        # Runner and queue belong to the CONVERSATION (``agent_runtimes``, held
+        # by the pool), not to this object: stopping this session never stops
+        # the agent turns it started, and the next session of the same
+        # conversation inherits them and their pending notifications.
         self._notifications = NotificationQueue()
         store = context.get("store")
         pool = context.get("pool")
-        if store is not None and pool is not None:
-            self._runner: BackgroundAgentRunner | None = BackgroundAgentRunner(
-                pool, store, self._notifications,
-            )
+        runtimes = context.get("agent_runtimes")
+        self._runner: BackgroundAgentRunner | None
+        if store is not None and pool is not None and runtimes is not None:
+            self._runner, self._notifications = runtimes.acquire(self.jsonl_id, pool, store)
+        elif store is not None and pool is not None:
+            self._runner = BackgroundAgentRunner(pool, store, self._notifications)
+        else:
+            self._runner = None
+        if self._runner is not None:
             # Make the runner reachable from tools that get only the
             # context dict (e.g. send_to_agent_session, read_agent_session).
             context["runner"] = self._runner
             context["notifications"] = self._notifications
-        else:
-            self._runner = None
         # Held while a send() / send_audio() / _run_agent is in flight.  The
         # wake callback uses is_busy to decide whether to schedule a
         # synthetic turn now or let the next user prompt drain notifications.
@@ -2059,9 +2071,11 @@ class OrchestratorSession:
     async def stop(self, reason: str = "shutdown") -> None:
         """Clean up the session.
 
-        Cancels every in-flight background-agent turn (with SDK interrupts so
-        the bundled ``claude`` subprocesses actually stop) and unsubscribes
-        the wake callback so notifications fired during shutdown go nowhere.
+        Never stops the agent turns this conversation delegated: they keep
+        running (their runner belongs to the conversation, see
+        :class:`~orchestrator.runner.AgentRuntimes`) and their notifications
+        wait for the conversation's next session.  Only this session's wake
+        callback is released, so a finishing turn doesn't wake a dead session.
 
         Voice teardown is delegated to :meth:`end_voice` so the canonical
         lifecycle path runs (graceful shutdown frames, broadcasts, state
@@ -2076,12 +2090,7 @@ class OrchestratorSession:
         :param reason: Forwarded to :meth:`end_voice` if voice is active.
             Defaults to ``shutdown``; the pool override path uses ``user_stop``.
         """
-        self._notifications.set_wake_callback(None)
-        if self._runner is not None:
-            try:
-                await self._runner.cancel_all()
-            except Exception:  # noqa: BLE001
-                logger.exception("BackgroundAgentRunner.cancel_all failed during stop")
+        self._notifications.release_wake_callback(self)
         # Funnel voice teardown through the canonical path so the state
         # machine and broadcasts stay coherent. ``end_voice`` is idempotent
         # and handles the no-voice case (state == IDLE) implicitly.

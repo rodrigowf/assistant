@@ -6,9 +6,11 @@
  *
  * Screen mode for screenshots: `#/dev/gallery/voice?screen=<state>&theme=dark` renders a phone /
  * desktop conversation (W-09's view, seeded with voice transcripts) with the dock in the
- * composer slot.
+ * composer slot. `?screen=overlay` (optionally `&state=<state>`) renders the floating controls
+ * over a stand-in memory document: they fade to the pill after 4 s, any activity wakes them,
+ * drag snaps them (anchors are not persisted here).
  */
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ConversationPanel } from '@/features/conversation';
 import { initialConversation, type AssistantEntry, type Block, type Conversation, type Entry, type ToolBlock, type UserEntry } from '@/protocol';
@@ -18,7 +20,9 @@ import { TopAppBar } from '@/ui/navigation';
 import { Icon } from '@/ui/primitives';
 import { OFF_SNAPSHOT, type VoiceSnapshot } from '@/voice';
 import { statusWord } from './copy';
+import type { OverlayAnchor } from './overlay';
 import { ActiveElsewhereView, VoiceDockView, type VoiceDockActions } from './VoiceDock';
+import { FloatingVoiceDock, VoicePill } from './VoiceOverlay';
 import styles from './Voice.gallery.module.css';
 
 const NOW = 1_000_000;
@@ -133,7 +137,7 @@ function Dock({ state }: { state: State }) {
   if (!state.snap) {
     return (
       <>
-        <ActiveElsewhereView provider="qwen" onTakeOver={noop} />
+        <ActiveElsewhereView onTakeOver={noop} />
         <ComposerStub />
       </>
     );
@@ -178,6 +182,48 @@ function Screen({ name }: { name: string }) {
   );
 }
 
+// ───────────────────────── floating controls (VoiceOverlay) ─────────────────────────
+
+const PILLS: readonly { key: string; title: string; snap: VoiceSnapshot }[] = [
+  { key: 'pill-listening', title: 'Floating · idle pill (listening)', snap: s({}) },
+  { key: 'pill-muted', title: 'Floating · idle pill (mic muted)', snap: s({ micMuted: true }) },
+  { key: 'pill-speaking', title: 'Floating · idle pill (speaking)', snap: s({ status: 'speaking' }) },
+];
+
+function OverlayScreen({ name }: { name: string }) {
+  const state = STATES[name] ?? (STATES.listening as State);
+  const region = useRef<HTMLDivElement>(null);
+  const [anchor, setAnchor] = useState<OverlayAnchor>('bottom-center');
+  const [snap, setSnap] = useState<VoiceSnapshot>(state.snap ?? s({}));
+  const level = useMemo(() => () => 0.04 + 0.04 * Math.abs(Math.sin(Date.now() / 300)), []);
+  const actions: VoiceDockActions = {
+    ...ACTIONS,
+    onToggleMic: () => setSnap((v) => ({ ...v, micMuted: !v.micMuted })),
+    onToggleSpeaker: () => setSnap((v) => ({ ...v, speakerMuted: !v.speakerMuted })),
+  };
+  return (
+    <div className={styles.screenInner}>
+      <TopAppBar className={styles.appbar} leading={<IconButton icon="arrow_back" aria-label="Back" />} title="voice-architecture.md" />
+      <div ref={region} className={styles.doc}>
+        {Array.from({ length: 12 }, (_, i) => (
+          <p key={i}>
+            Paragraph {i + 1} of a memory document. Move the mouse, scroll or tap to wake the controls; leave the screen still for 4 s and
+            they shrink to the faded pill. Drag them to a corner.
+          </p>
+        ))}
+      </div>
+      <FloatingVoiceDock
+        dock={{ snapshot: snap, now: NOW, level, ...actions }}
+        regionRef={region}
+        compact={window.innerWidth < 600}
+        anchor={anchor}
+        onAnchorChange={setAnchor}
+        onOpenConversation={noop}
+      />
+    </div>
+  );
+}
+
 function hashParams(): Record<string, string> {
   const h = window.location.hash;
   const q = h.indexOf('?');
@@ -199,7 +245,11 @@ export function VoiceGallery() {
   if (params.screen) {
     return createPortal(
       <div className={styles.screen}>
-        <Screen key={params.screen} name={params.screen} />
+        {params.screen === 'overlay' ? (
+          <OverlayScreen name={params.state ?? 'listening'} />
+        ) : (
+          <Screen key={params.screen} name={params.screen} />
+        )}
       </div>,
       document.body,
     );
@@ -207,7 +257,8 @@ export function VoiceGallery() {
   return (
     <div className={styles.page}>
       <p className={styles.lead}>
-        Full-viewport scenes: <code>?screen=&lt;state&gt;</code> ({Object.keys(STATES).join(', ')}).
+        Full-viewport scenes: <code>?screen=&lt;state&gt;</code> ({Object.keys(STATES).join(', ')}); floating controls:{' '}
+        <code>?screen=overlay&amp;state=&lt;state&gt;</code>.
       </p>
       <Board>
         {Object.keys(STATES).map((k) => {
@@ -222,6 +273,24 @@ export function VoiceGallery() {
             </section>
           );
         })}
+        <section className={styles.cell}>
+          <h3 className={styles.cellTitle}>
+            Floating · expanded (the state text opens Archie)
+            <small>overlay</small>
+          </h3>
+          <VoiceDockView snapshot={s({})} now={NOW} {...ACTIONS} onOpenConversation={noop} />
+        </section>
+        {PILLS.map((pl) => (
+          <section key={pl.key} className={styles.cell}>
+            <h3 className={styles.cellTitle}>
+              {pl.title}
+              <small>{pl.key}</small>
+            </h3>
+            <div className={styles.pillRow}>
+              <VoicePill snapshot={pl.snap} onExpand={noop} />
+            </div>
+          </section>
+        ))}
       </Board>
     </div>
   );

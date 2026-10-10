@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 from pathlib import Path
+
 
 
 def _get_auth_env() -> dict[str, str]:
@@ -51,7 +51,11 @@ class AuthManager:
     AUTH_URL = "https://console.anthropic.com/settings/workspaces/default/oauth_tokens"
 
     def __init__(self, cli_path: str | None = None, headless: bool = False) -> None:
-        self._cli = cli_path or shutil.which("claude") or "claude"
+        # PATH first, then the CLI bundled with claude-agent-sdk (a systemd backend may not have
+        # ~/.local/bin or nvm on its PATH).
+        from manager.accounts.claude import claude_cli  # lazy: keeps `import manager.auth` light
+
+        self._cli = cli_path or claude_cli() or "claude"
         self._headless = headless
         self._credentials_path = _get_credentials_path()
 
@@ -72,6 +76,11 @@ class AuthManager:
 
         # Fall back to credentials file check
         if self._check_credentials_file():
+            return True
+
+        # A token or key in the environment (CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`,
+        # saved to context/.env by Settings → Accounts) signs Claude Code in without a file.
+        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip():
             return True
 
         return False
@@ -176,12 +185,11 @@ class AuthManager:
             if not oauth.get("accessToken"):
                 return False
 
-            # Ensure directory exists
-            self._credentials_path.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic, mode 0600, previous file kept as .credentials.json.bak-<timestamp>
+            # (the same writer Settings → Accounts uses).
+            from manager.accounts.files import atomic_write
 
-            # Write credentials with secure permissions
-            self._credentials_path.write_text(credentials_json)
-            self._credentials_path.chmod(0o600)
+            atomic_write(self._credentials_path, credentials_json)
 
             return True
         except (json.JSONDecodeError, OSError):

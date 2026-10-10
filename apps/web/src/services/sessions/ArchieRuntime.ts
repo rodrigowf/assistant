@@ -52,13 +52,14 @@ const VOICE_FRAMES: readonly string[] = [
   'voice_ended',
   'voice_stopped',
   'error',
-  'agent_session_closed',
 ];
 
 export interface ArchieRuntimeOptions {
   localId: string;
   /** The JSONL id when resuming (G-14); `null` for a brand-new orchestrator. */
   sdkId?: string | null;
+  /** Opened from the server's pool, not by a user action: every `start` reattaches (OPEN-2). */
+  reattach?: boolean;
   voiceActive?: boolean;
   hidden?: boolean;
   readOnly?: boolean;
@@ -79,6 +80,7 @@ export class ArchieRuntime extends ConversationRuntime implements ChannelClient,
       localId: opts.localId,
       kind: 'orchestrator',
       sdkId: opts.sdkId ?? null,
+      reattach: opts.reattach,
       voiceActive: opts.voiceActive === true,
     });
     super(conv, createSessionStore({ localId: opts.localId, conv, readOnly: opts.readOnly, hidden: opts.hidden }), hooks);
@@ -114,7 +116,7 @@ export class ArchieRuntime extends ConversationRuntime implements ChannelClient,
     }
     this.step({ type: 'frame', frame: f });
     this.trackModel(f);
-    if (this.coldOpenPending && (f.type === 'session_started' || f.type === 'error')) {
+    if (this.coldOpenPending && !this.disposed && (f.type === 'session_started' || f.type === 'error')) {
       this.coldOpenPending = false;
       void this.runReload();
     }

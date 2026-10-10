@@ -47,14 +47,13 @@ private fun LazyListScope.sessionLists(
         if (i is SessionsIntent.OpenHistory) after()
     }
     openNowSection(
-        state.items, state.liveElsewhere, state.active, density,
+        state.items, state.active, density,
         onSelect = { onAction(ShellAction.Select(it)); after() },
-        onOpenLive = { onAction(ShellAction.OpenLive(it)); after() },
         onIntent = intent,
     )
     historySection(state.history, density, intent)
     historyStatus(
-        hasRows = state.history.isNotEmpty() || state.items.isNotEmpty() || state.liveElsewhere.isNotEmpty(),
+        hasRows = state.history.isNotEmpty() || state.items.isNotEmpty(),
         loading = state.historyLoading,
         error = state.historyError,
         query = state.search,

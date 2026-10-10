@@ -112,7 +112,7 @@ android-next/
 | `:core:data` | Android lib · **26** | `:core:conversation`, `:core:network`, `:core:session`, `:core:settings`, `:core:voice-host` (interfaces only) | Repositories implementing spec 12 against the network: `ConversationRepository` (per open session: `state(sessionKey): StateFlow<ConversationState>`, `send`, `queue`, `interrupt`, `compact`, `command`, `respondToPermission`, `loadOlder`, `rewind`, `fork`), `OpenSessionsRepository` (the workspace "tabs": pool sessions + open memory docs + open visuals), `HistoryRepository`, `ServerConfigRepository`, `MemoryRepository`, `VisualsRepository`, `UploadRepository`, `AgentSocketPool` (one `SocketClient` per open agent session; idle sessions beyond 6 disconnect LRU), `VoiceTranscriptBridge : TranscriptSink` (voice transcripts become blocks of the tail assistant message, inv03 §4.3 fix). |
 | `:core:design` | Android lib · 26 · Compose | Compose BOM, material3, `design/tokens/dist/Tokens.kt` | `ArchieTheme(mode: ThemeMode, content)`, `LocalExtendedColors`, `ArchieIcons`, components: `ArchieTopAppBar`, `TabStrip`, `StatusIndicator`, `ComposerShell`, `InlineCard` (permission/stall/error/termination shells), `SettingsGroup`/`SettingsRow`/`LevelSlider`/`SwitchRow`, `EmptyState`, `ToolCardShell`, `CodeSurface`, `SnackbarHost` helpers. No business logic. |
 | `:core:markdown` | Android lib · 26 · Compose | `:core:design`, commonmark 0.30.0 (+ gfm-tables, gfm-strikethrough, task-list-items, autolink, yaml-front-matter), dev.snipme:highlights 1.1.0 | `MarkdownDocument` (incremental, §3.2), `MarkdownBlockItem(block, style, onLink)`, `CodeBlock`, `MarkdownTable`, `Frontmatter.split(text)`, `LinkTarget` classification. Used by chat and memory. |
-| `:feature:chat` | Android lib · 26 · Compose | `:core:data`, `:core:design`, `:core:markdown`, `:feature:toolcards` | `ConversationScreen(sessionKey)`, `ConversationViewModel`, `ChatListFlattener`, `Composer`, `VoiceDock`, inline cards. Package `com.assistant.archie.feature.chat`. |
+| `:feature:chat` | Android lib · 26 · Compose | `:core:data`, `:core:design`, `:core:markdown`, `:feature:toolcards` | `ConversationScreen(sessionKey)`, `ConversationViewModel`, `ChatListFlattener`, `Composer`, `VoiceDock` / `VoiceControls`, `VoiceDockModel`, the floating `VoiceOverlay` (+ `VoiceOverlayModel`; hosted by app-main's `ShellVoiceOverlay`), inline cards. Package `com.assistant.archie.feature.chat`. |
 | `:feature:toolcards` | Android lib · 26 · Compose | `:core:design`, `:core:markdown`, `:core:conversation`, java-diff-utils 4.17 | `ToolCard(block: Block.ToolUse, sessionKind, expanded, onToggle)`, `ToolCatalog` (category, icon, summary — port of `frontend/src/components/ToolUseBlock.tsx:101-450`), per-tool renderers, `EditDiffView`. |
 | `:feature:sessions` | Android lib · 26 · Compose | `:core:data`, `:core:design` | `SessionSwitcherSheet`, `ChatsListPane` (Open now + history), `HistoryScreen`, `NewSessionMenu`, `OrchestratorConflictDialog`, rename/duplicate/delete/fork/rewind flows. |
 | `:feature:memory` | Android lib · 26 · Compose | `:core:data`, `:core:design`, `:core:markdown` | `MemoryTreePane`, `MemoryDocumentScreen(path)`, `MemoryLinkResolver`. |
@@ -509,7 +509,15 @@ interface TranscriptSink { fun userTranscript(t: String, final: Boolean); fun as
 | `AgentSocketPool` | process | agent sockets | `ConversationRepository` |
 
 **When the service runs (main app):** whenever wake word is enabled, **or** a voice session is active, **or** the
-optional "Stay connected in background" setting is on (needed for permission-request notifications, §2.7). Otherwise
+optional "Stay connected in background" setting is on (needed for permission-request notifications, §2.7), **or**
+"Agent session finished" notifications are on and an agent turn is in flight (`VoiceHostRuntime.setAgentWorkHold`,
+driven by `AgentWork` in `app-main/system/TurnNotifier.kt` from the `agent_turn_started/finished` watcher frames,
+spec 12 TURN-1; re-synced with `pool/live` on every orchestrator reconnect and every 3 min while turns run, so a missed
+finish cannot hold the service forever). When it is the only reason the service runs, the service takes the special-use
+FGS type only (never the microphone type: `VoiceHostRuntime.micTypeWanted`; wake word or voice promote it later from a
+foreground start) and its notification reads "Waiting for N agent sessions". That last hold lets a turn started while the app was open notify with the phone in a pocket; like
+every reason it only *starts* the service from a foreground context, so turns started elsewhere while the app sits in
+the background need "Stay connected". Otherwise
 the service stops itself, and the runtime keeps the socket only while the UI is started
 (`ProcessLifecycleOwner` ON_START/ON_STOP). The runtime disconnects 60 s after ON_STOP when the service is not
 running.
@@ -543,6 +551,7 @@ renders the new state. This is inv04 §8 design rule 3. Re-validating the timing
 | `voice` | DEFAULT, silent, ongoing, chronometer | a voice session is active (owner) | "Archie · Listening/Speaking/Thinking/Using tools" | **Mute/Unmute**, **End** (direct `PendingIntent.getService` to the running service; allowed because the service is already in the foreground) |
 | `attention` | HIGH | only while the app is not visible: an agent `permission_request` (e.g. `ExitPlanMode`), `session_stalled` for >2 min, `session_terminated` | Session title + one line | **Approve**, **Reject** (with `RemoteInput` "Reply with feedback" → deny with reason, the web's semantics, inv02 F-14), **Open** |
 | `background` | LOW | `BackgroundRestricted` | "Archie can't listen in the background" | **Fix** → `BackgroundReliabilityPage` |
+| `agent_turns` ("Agent sessions") | HIGH (heads-up; opt-in) | an agent turn finished (`agent_turn_finished`, spec 12 TURN-2), Settings → Notifications on, the user not looking at that session | Session title + the reply's first line, or "Failed: …"; id 1004, tag `turn:<localId>` (one per session, replaced) | tap → focus that session (`EXTRA_OPEN_AGENT` + `EXTRA_OPEN_AGENT_SDK`); cleared when the session is opened |
 
 The FGS notification id is 1001 (inv04 §4.5). The `host` and `voice` notifications are the same notification id
 updated in place, so only one ongoing notification is shown.
@@ -566,7 +575,7 @@ updated in place, so only one ongoing notification is shown.
 | Permission | Asked when | Denied state shown |
 |---|---|---|
 | `RECORD_AUDIO` | first tap on Voice, PTT or wake-word enable, with a one-screen rationale | The voice dock shows "Microphone permission needed · Grant". Wake-word rows are disabled with the reason. Permanently denied → "Open app settings" (`ACTION_APPLICATION_DETAILS_SETTINGS`). |
-| `POST_NOTIFICATIONS` (33+) | when wake word or "Stay connected" is enabled | A card on Settings → This device. Without it the FGS still runs, but its notification is hidden. |
+| `POST_NOTIFICATIONS` (33+) | when wake word, "Stay connected" or "Agent session finished" is enabled | A card on Settings → This device. Without it the FGS still runs, but its notification is hidden. |
 | `BLUETOOTH_CONNECT` (31+) | when the user picks the BT output | The BT output option is disabled with "Allow Nearby devices". A `SecurityException` is caught (inv04 RS-28). |
 | Battery / autostart | from `BackgroundReliabilityPage` | §2.6 |
 | Full-screen intent (34+) | when "Show over lock screen on wake" is enabled | §2.6 |
@@ -759,8 +768,11 @@ is part of R7's acceptance test.
 ### 3.6 Scrolling and performance budget
 
 - `LazyColumn(reverseLayout = true)` over the reversed item list. Bottom anchoring is native, so streaming growth stays
-  pinned without the per-delta `scrollToItem` calls that today's code needs (`ChatScreen.kt:104-149`). When the user
-  has scrolled up, keys preserve their position. The "Jump to latest" FAB uses `animateScrollToItem(0)` (user
+  pinned without the per-delta `scrollToItem` calls that today's code needs (`ChatScreen.kt:104-149`). A **new** item at
+  the bottom (the next markdown block, a tool card) is not covered by that: LazyList keeps its position on the first
+  visible item's key, so the list would stay on the old item with the new one below the fold. `ChatList`'s
+  `FollowNewest` calls `requestScrollToItem(0)` when the newest key changes while the list is at the bottom (within
+  24 dp, no scroll in progress); test `FollowNewestTest`. When the user has scrolled up, keys preserve their position. The "Jump to latest" FAB uses `animateScrollToItem(0)` (user
   initiated only; nothing animates during streaming, per `06fe06f`).
 - Load older: when the last visible index is within 3 of the end, call `loadOlder()`. A guard keyed on the oldest
   message id prevents the infinite load loop (port of `5c029d6`).
@@ -1111,7 +1123,7 @@ A small instrumented smoke subset runs on `POCO_X7`.
 | `ToolOrderingFixtureUiTest` | for each fixture tagged `r4`, rendered item order equals the fixture's expected order (text/tool interleaving in orchestrator voice and text turns) |
 | `ToolResultVisibleUiTest` | for fixtures tagged `r7`, every completed tool card shows its output, live and after refetch |
 | `ComposerStatesUiTest` | Voice → Send → Stop morph; queued send while working; disabled states with reasons |
-| `InlineCardsUiTest` | permission Approve, Reject, and type-to-reject; stall Interrupt; termination "Continue in new session" uses the **correct endpoint** (fixes inv03 §8 bug 5) |
+| `InlineCardsUiTest` | permission Approve, Reject, and type-to-reject; stall Interrupt (the termination card was removed 2026-10-10: a terminated session's view closes, spec 12 OPEN-3; it had fixed inv03 §8 bug 5) |
 | `SessionSwitcherUiTest`, `DrawerUiTest` | Open-now list, close, new Archie/agent session |
 | `MemoryLinkNavigationUiTest` | tapping `../folder/x.md` opens that doc; Back returns |
 | `SettingsSaveUiTest` | snackbar "Saved" / server error verbatim + Retry; MCP toggle semantics |

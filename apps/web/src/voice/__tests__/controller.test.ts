@@ -466,15 +466,6 @@ describe('ending (§7.6) and errors (§7.7)', () => {
     r.c.start();
     expect(r.c.snapshot.status).toBe('connecting');
   });
-
-  it('agent_session_closed for this orchestrator ends voice locally', () => {
-    const r = rig();
-    const t = r.live();
-    r.frame({ type: 'agent_session_closed', session_id: 'O1', is_orchestrator: true });
-    expect(r.c.snapshot.status).toBe('off');
-    expect(t.closed).toBe(true);
-    expect(r.port.localEnds).toBe(1);
-  });
 });
 
 describe('passive viewers (§7.5; fixes W-1)', () => {

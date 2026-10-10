@@ -842,21 +842,13 @@ if [ "$WITH_GEMINI" = true ]; then
     step "Setting up Gemini CLI configuration..."
 
     GEMINI_HOME="$HOME/.gemini"
-    # Compute Gemini's label for this cwd.  Read ~/.gemini/projects.json if
-    # present (any prior `gemini` run in this dir registered one); fall back
-    # to the cwd basename, which is exactly what the CLI does on first run.
+    # Gemini's label for this repo: the one ~/.gemini/projects.json already
+    # maps it to (any prior `gemini` run here registered one), else the one the
+    # CLI would claim on its first run (the base name, or <base>-1 … when that
+    # is taken) — install/gemini-project.py reproduces the CLI's rules.
     GEMINI_LABEL=""
-    if [ -f "$GEMINI_HOME/projects.json" ] && command -v python3 &> /dev/null; then
-        GEMINI_LABEL="$(python3 -c "
-import json, sys
-try:
-    with open('$GEMINI_HOME/projects.json') as f:
-        data = json.load(f)
-    label = data.get('projects', {}).get('$SCRIPT_DIR')
-    print(label or '')
-except Exception:
-    print('')
-" 2>/dev/null || true)"
+    if command -v python3 &> /dev/null; then
+        GEMINI_LABEL="$(python3 "$INSTALL_TEMPLATES/gemini-project.py" "$SCRIPT_DIR" label 2>/dev/null || true)"
     fi
     if [ -z "$GEMINI_LABEL" ]; then
         GEMINI_LABEL="$(basename "$SCRIPT_DIR")"
@@ -902,6 +894,35 @@ except Exception:
     # from day one (Qwen's setup creates this too — idempotent).
     mkdir -p context/chats
 
+    # Pin the label: register the repo in ~/.gemini/projects.json and make the
+    # ownership marker (context/.project_root through the link) name this repo.
+    # Without both, Gemini can claim a new label on its next run — its chats
+    # (history) and its memory index ~/.gemini/tmp/<label>/memory/MEMORY.md,
+    # which through the link IS context/memory/MEMORY.md, would leave context/.
+    if command -v python3 &> /dev/null; then
+        GEMINI_REG_OUT="$(python3 "$INSTALL_TEMPLATES/gemini-project.py" "$SCRIPT_DIR" apply --label "$GEMINI_LABEL" 2>&1)" \
+            && GEMINI_REG_OK=true || GEMINI_REG_OK=false
+        printf '%s\n' "$GEMINI_REG_OUT" | sed -n 's/^note: /  /p'
+        printf '%s\n' "$GEMINI_REG_OUT" | sed -n 's/^problem: //p' | while IFS= read -r line; do warn "$line"; done
+        if [ "$GEMINI_REG_OK" = true ]; then
+            info "Gemini project \"$GEMINI_LABEL\" registered for $SCRIPT_DIR"
+        fi
+        case "$GEMINI_REG_OUT" in
+            *"memory_index=ok"*)
+                info "Gemini's memory index resolves to context/memory/MEMORY.md" ;;
+            *)
+                warn "Gemini's memory index (~/.gemini/tmp/$GEMINI_LABEL/memory/MEMORY.md) does not resolve to context/memory/MEMORY.md — run install/doctor.sh" ;;
+        esac
+    else
+        warn "python3 not found — register $SCRIPT_DIR → $GEMINI_LABEL in ~/.gemini/projects.json by hand"
+    fi
+
+    # Gemini's built-in prompt offers a "global personal memory" at
+    # ~/.gemini/GEMINI.md — outside context/, not synced, not indexed.
+    if [ -f "$GEMINI_HOME/GEMINI.md" ]; then
+        warn "$GEMINI_HOME/GEMINI.md exists (Gemini's global memory, outside context/) — move its facts into context/memory/ and delete it"
+    fi
+
     # When another machine runs Gemini sessions here over SSH, the
     # non-interactive SSH shell never sources context/.env — the CLI then
     # needs the key in ~/.gemini/.env (mode 600).  Offer to copy it.
@@ -946,11 +967,23 @@ if [ "$WITH_CODEX" = true ]; then
 
     if [ ! -e "$CODEX_ARCHIE_HOME/config.toml" ]; then
         # Template: project_doc_max_bytes = 131072 (context/AGENTS.md is ~51 KB,
-        # the default 32 KiB would truncate it); plugins/apps features off.
+        # the default 32 KiB would truncate it); plugins/apps/memories features off.
         cp "$INSTALL_TEMPLATES/cli-runtime/codex-home/config.toml" "$CODEX_ARCHIE_HOME/config.toml"
         info "Seeded $CODEX_ARCHIE_HOME/config.toml"
     else
-        info "$CODEX_ARCHIE_HOME/config.toml already exists — leaving it alone"
+        info "$CODEX_ARCHIE_HOME/config.toml already exists — leaving its settings alone"
+    fi
+    # Archie's memory is the wiki (the backend passes context/memory/MEMORY.md
+    # per session); keep Codex's own memory store off.  Adds or replaces only
+    # `memories` under [features] in an existing file — nothing else changes.
+    if command -v python3 &> /dev/null; then
+        case "$(python3 "$INSTALL_TEMPLATES/codex-home-config.py" "$CODEX_ARCHIE_HOME/config.toml" apply 2>&1)" in
+            ok)       info "Codex memories feature already off ([features] memories = false)" ;;
+            added|appended|replaced) info "Set [features] memories = false in $CODEX_ARCHIE_HOME/config.toml" ;;
+            *)        warn "Could not set [features] memories = false in $CODEX_ARCHIE_HOME/config.toml — add it by hand" ;;
+        esac
+    else
+        warn "python3 not found — make sure $CODEX_ARCHIE_HOME/config.toml has [features] memories = false"
     fi
 
     CODEX_SESSIONS_LINK="$CODEX_ARCHIE_HOME/sessions"
@@ -1093,6 +1126,31 @@ seed_cli_runtime() {
 [ "$WITH_CLAUDE" = true ] && seed_cli_runtime claude
 [ "$WITH_QWEN"   = true ] && seed_cli_runtime qwen
 [ "$WITH_GEMINI" = true ] && seed_cli_runtime gemini
+# An existing .qwen/settings.json is never overwritten either, so make sure its
+# memory keys are off: Qwen's project dir is context/, so its managed
+# auto-memory / auto-dream / auto-skill would write into the memory wiki in
+# their own format.  (The backend also turns them off per run; this file is
+# the fallback when the per-run settings file cannot be written.)
+if [ "$WITH_QWEN" = true ] && [ -f .qwen/settings.json ] && command -v python3 &>/dev/null; then
+    QWEN_MEM_OUT="$(python3 -c '
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+m = d.setdefault("memory", {})
+keys = ("enableManagedAutoMemory", "enableManagedAutoDream", "enableAutoSkill")
+bad = [k for k in keys if m.get(k) is not False]
+if bad:
+    for k in keys:
+        m[k] = False
+    open(p, "w").write(json.dumps(d, indent=2) + "\n")
+print(" ".join(bad))
+' .qwen/settings.json 2>/dev/null)" || QWEN_MEM_OUT="!error"
+    case "$QWEN_MEM_OUT" in
+        "")      info "Qwen managed auto-memory/auto-dream/auto-skill already off in .qwen/settings.json" ;;
+        "!error") warn "Could not check .qwen/settings.json (not valid JSON?) — set memory.enableManagedAutoMemory/AutoDream/AutoSkill to false by hand" ;;
+        *)       info "Turned off in .qwen/settings.json: $QWEN_MEM_OUT" ;;
+    esac
+fi
 # An existing .gemini/settings.json is never overwritten above, so merge
 # Archie's keys into it: session retention OFF (the CLI's sweep would delete
 # old sessions in context/chats/), context.fileFiltering (older seeds used a

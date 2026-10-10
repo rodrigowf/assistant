@@ -74,6 +74,7 @@ from typing import NamedTuple
 
 from ..base_session import BaseSessionManager, SessionDeadError, TurnAbandoned
 from ..config import ManagerConfig
+from ..memory_context import is_archie_project, memory_instructions
 from ..protocol import tool_result_text
 from ..types import (
     CompactComplete,
@@ -125,6 +126,9 @@ _PERMISSION_GATING_PROMPT = (
 # thinking *mode* is untouched.  (SDK PR #1367; the flag exists back to CLI
 # 2.1.139, so older SSH-remote CLIs accept it too.)
 _THINKING_DISPLAY = "summarized"
+
+# Switches Claude Code's auto-memory off (CLI env; wins over settings).
+_DISABLE_AUTO_MEMORY_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
 
 # CLI ≥ 2.1.233 hides TodoWrite / TaskCreate… on Opus 4.8, Sonnet 5, Fable 5
 # and newer models; our web + Android UIs render TodoWrite as checklist
@@ -1008,6 +1012,13 @@ class ClaudeSessionManager(BaseSessionManager):
                 "append": _PERMISSION_GATING_PROMPT,
             },
         }
+        # Archie's memory index replaces the CLI's auto-memory in the Archie
+        # repo (see _harness_env): same MEMORY.md, read at session start,
+        # but with the wiki's write rules instead of auto-memory's own
+        # format.  The same block goes to every harness (manager/memory_context.py).
+        memory = memory_instructions(self._config.project_dir)
+        if memory:
+            kwargs["system_prompt"]["append"] = f"{_PERMISSION_GATING_PROMPT}\n\n{memory}"
         if self._config.permission_mode:
             kwargs["permission_mode"] = self._config.permission_mode
         if self._config.model:
@@ -1143,6 +1154,15 @@ class ClaudeSessionManager(BaseSessionManager):
         if opts.get(TODO_TOOLS, True) is not False:
             env[_TODO_TOOLS_ENV] = "1"
         env[_MCP_STARTUP_WAIT_ENV] = os.environ.get(_MCP_STARTUP_WAIT_ENV) or _MCP_STARTUP_WAIT_MS
+        if is_archie_project(self._config.project_dir):
+            # In the Archie repo the auto-memory directory is context/memory/
+            # (.claude_config/projects/<repo> -> context), and auto-memory's
+            # own instructions make the agent write flat notes in its format
+            # and append pointers to the wiki's MEMORY.md.  The
+            # ``autoMemoryEnabled: false`` in .claude_config/settings.json does
+            # not reach SDK sessions (setting_sources excludes "user"), so
+            # switch it off here; _build_options loads MEMORY.md instead.
+            env[_DISABLE_AUTO_MEMORY_ENV] = "1"
         return env
 
     def _write_ssh_wrapper(self) -> str:

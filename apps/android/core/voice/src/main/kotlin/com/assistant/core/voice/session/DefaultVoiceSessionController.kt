@@ -115,6 +115,14 @@ class DefaultVoiceSessionController(
     private val lock = Any()
     private var owner = false
     private var finalized = false
+    /**
+     * `voice_start`s sent whose `voice_owner_active{active:true}` broadcast has not come back yet.
+     * The server broadcasts that frame to every subscriber, the sender included, after each
+     * successful `voice_start`: while this is > 0 an incoming one is our own echo; at 0 it means
+     * another device took over (V-13). A start answered by an error never echoes and leaves this
+     * high, which only costs one missed takeover (the old behaviour), never our own call.
+     */
+    private var ownerEchoesPending = 0
     private var activeConfig: VoiceStartConfig? = null
     private var transport: VoiceTransport? = null
     private var collectors: List<Job> = emptyList()
@@ -248,10 +256,7 @@ class DefaultVoiceSessionController(
                 if (!isOwner()) return log.d(TAG, "Ignoring voice_command — not the voice owner")
                 relay.onBackendCommand(frame.command)
             }
-            is VoiceInbound.OwnerActive -> {
-                // Another device's voice: read-only "active elsewhere". The owner's own lifecycle drives its state.
-                if (!isOwner()) _state.update { it.copy(remoteVoiceActive = frame.active) }
-            }
+            is VoiceInbound.OwnerActive -> onOwnerActive(frame.active)
             is VoiceInbound.ProviderEvent -> onProviderEvent(frame.event)
             is VoiceInbound.AudioOut -> synchronized(lock) { transport }?.pushSpeakerChunk(frame.audioB64)
             is VoiceInbound.Ending -> {
@@ -263,7 +268,15 @@ class DefaultVoiceSessionController(
                 }
             }
             is VoiceInbound.Ended, VoiceInbound.Stopped -> {
-                if (!isOwner()) return log.d(TAG, "Ignoring voice_ended/stopped — not the voice owner")
+                if (!isOwner()) {
+                    // The server's voice is over, so a transport still held here is a zombie call that
+                    // nothing else would ever close (2026-10-08: the call outlived end_voice_session).
+                    if (holdsLocalCall()) {
+                        log.w(TAG, "voice_ended while not the owner but holding a transport — tearing it down")
+                        finalize()
+                    }
+                    return log.d(TAG, "Ignoring voice_ended/stopped — not the voice owner")
+                }
                 // TurnComplete never arrives in voice mode: finalize the streaming text, then tear down (RS-17).
                 deps.transcripts.voiceEnded()
                 // §6.11a SW-3: a switch is a quiet end — the call goes on in the resumed conversation,
@@ -278,14 +291,28 @@ class DefaultVoiceSessionController(
 
     private fun onSessionStarted(frame: VoiceInbound.SessionStarted) {
         var restored: VoiceLinkEvent? = null
+        var lost = false
+        var held = false
         val (busy, hasTransport) = synchronized(lock) {
             if (frame.voice) {
-                // We own voice iff the backend says we initiated it; otherwise we are a passive peer (RS-11).
-                owner = frame.voiceInitiator
+                if (!frame.voiceInitiator && owner && holdsLocalCallLocked()) {
+                    // Answer to a plain `start` while this device runs the call. With a `voice_start`
+                    // in flight or still to be sent (a start in progress, or a reconnect re-arm racing
+                    // the conversation's `start`) its answer decides; otherwise another socket owns
+                    // voice now: end the local call (V-13). Merely flipping `owner` kept a zombie
+                    // WebRTC call that dropped every voice_command and ignored voice_ended
+                    // (2026-10-08, POCO X7 Pro).
+                    if (ownerEchoesPending > 0 || transport == null) held = true else lost = true
+                } else {
+                    // We own voice iff the backend says we initiated it; otherwise we are a passive peer (RS-11).
+                    owner = frame.voiceInitiator
+                }
                 if (frame.voiceInitiator && linkMachine.isReconnecting) restored = linkMachine.onVoiceConfirmed(deps.clock.nowMs())
             }
             (startJob?.isActive == true) to (transport != null)
         }
+        if (held) return log.i(TAG, "session_started voice_initiator=false during a voice_start re-arm — keeping the call")
+        if (lost) return ownershipLost("session_started voice_initiator=false while holding the call")
         if (restored != null) {
             log.i(TAG, "voice re-confirmed after the link loss — ${restored}")
             cancelLinkTicks()
@@ -306,6 +333,41 @@ class DefaultVoiceSessionController(
             }
         }
     }
+
+    /** `voice_owner_active` (spec 12 §7.5 and V-13). */
+    private fun onOwnerActive(active: Boolean) {
+        val takenOver = synchronized(lock) {
+            when {
+                !owner -> false
+                !active -> false // the end of voice: the owner's own voice_ended drives its state
+                ownerEchoesPending > 0 -> { ownerEchoesPending--; false } // the echo of our voice_start
+                else -> holdsLocalCallLocked()
+            }
+        }
+        if (takenOver) return ownershipLost("voice_owner_active from another device")
+        // Another device's voice: read-only "active elsewhere". The owner's own lifecycle drives its state.
+        if (!isOwner()) _state.update { it.copy(remoteVoiceActive = active) }
+    }
+
+    /**
+     * V-13: another device owns voice now. Tear the local call down **without** `voice_stop` (that
+     * would end the other device's call) and show the read-only "active elsewhere" state.
+     */
+    private fun ownershipLost(why: String) {
+        log.w(TAG, "voice ownership lost ($why) — ending the local call, no voice_stop")
+        finalize()
+        _state.update { it.copy(isOwner = false, remoteVoiceActive = true) }
+    }
+
+    /** Wire `voice_start` for this session; counts the `voice_owner_active` echo it will produce. */
+    private fun sendVoiceStart(req: VoiceStartRequest) {
+        synchronized(lock) { ownerEchoesPending++ }
+        deps.wire.sendVoiceStart(req)
+    }
+
+    private fun holdsLocalCall() = synchronized(lock) { holdsLocalCallLocked() }
+
+    private fun holdsLocalCallLocked() = !finalized && (transport != null || startJob?.isActive == true)
 
     private fun onProviderEvent(event: kotlinx.serialization.json.JsonObject) {
         val t = synchronized(lock) { transport }
@@ -333,7 +395,7 @@ class DefaultVoiceSessionController(
                 }
                 if (cfg != null) {
                     log.i(TAG, "WS reconnect during live voice — re-arming via voice_start")
-                    deps.wire.sendVoiceStart(request(signal.localId, signal.sdkSessionId, cfg))
+                    sendVoiceStart(request(signal.localId, signal.sdkSessionId, cfg).copy(reattach = true))
                     publishLink(null)
                 } else {
                     // Resume protocol: the start carries the persisted checkpoint.
@@ -418,7 +480,7 @@ class DefaultVoiceSessionController(
         log.i(TAG, "start: voice config provider=${cfg.provider} model=${cfg.model} voice=${cfg.voice} lang=${cfg.transcriptionLanguage}")
         synchronized(lock) { activeConfig = cfg }
         val ctx = deps.orchestrator
-        deps.wire.sendVoiceStart(request(ctx.localId, ctx.jsonlSessionId ?: ctx.currentSessionId, cfg))
+        sendVoiceStart(request(ctx.localId, ctx.jsonlSessionId ?: ctx.currentSessionId, cfg))
 
         val info = deps.api.startVoiceSession(cfg)
         if (info == null) {

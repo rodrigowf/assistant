@@ -6,16 +6,21 @@
  *
  * - No raw HTML (no rehype-raw). react-markdown's default `urlTransform` drops `javascript:` URLs.
  * - Links: external in a new tab with the `md-link` class; a `linkResolver` may take some
- *   links in-app (memory documents, `links.ts`).
+ *   links in-app (memory documents, `links.ts`). Under an `InternalLinksProvider`, links to a
+ *   visualization or memory file open in the app and printed paths are auto-linked (spec 12 §9.4,
+ *   `@/features/links`); the explicit `linkResolver` is asked first.
  * - Every fence becomes a <CodeBlock> (with or without a language). Tables scroll sideways.
  * - Memoized by props: a host must keep `linkResolver` stable (useMemo/useCallback).
  */
 import type { Element, ElementContent } from 'hast';
 import { memo, useMemo, type MouseEvent } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
+import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CodeBlock } from './CodeBlock';
+import { useInternalLinks } from '@/features/links';
+import { chainResolvers, createInternalLinkResolver } from './internalLinksContext';
 import { EXTERNAL_LINK_PROPS, MD_LINK_CLASS, type LinkResolver } from './links';
+import { remarkInternalPaths } from './remarkInternalPaths';
 import styles from './Markdown.module.css';
 
 export interface MarkdownProps {
@@ -28,7 +33,9 @@ export interface MarkdownProps {
   className?: string;
 }
 
-const REMARK_PLUGINS = [remarkGfm];
+type PluggableList = NonNullable<Options['remarkPlugins']>;
+
+const REMARK_PLUGINS: PluggableList = [remarkGfm];
 
 function textOf(node: ElementContent): string {
   if (node.type === 'text') return node.value;
@@ -126,9 +133,12 @@ interface MarkdownBodyProps {
 
 /** The parsed content with no wrapper; StreamingMarkdown renders several inside one root. */
 function MarkdownBodyImpl({ source, linkResolver, highlight }: MarkdownBodyProps) {
-  const components = useMemo(() => buildComponents(linkResolver, highlight), [linkResolver, highlight]);
+  const internal = useInternalLinks();
+  const resolver = useMemo(() => chainResolvers(linkResolver, internal ? createInternalLinkResolver(internal) : undefined), [linkResolver, internal]);
+  const plugins = useMemo<PluggableList>(() => (internal ? [remarkGfm, [remarkInternalPaths, internal.context]] : REMARK_PLUGINS), [internal]);
+  const components = useMemo(() => buildComponents(resolver, highlight), [resolver, highlight]);
   return (
-    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={components}>
+    <ReactMarkdown remarkPlugins={plugins} components={components}>
       {source}
     </ReactMarkdown>
   );

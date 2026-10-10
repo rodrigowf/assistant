@@ -80,7 +80,6 @@ function ForkDialog() {
 
 function ArchieConflictDialog() {
   const c = useSessionActionsState((s) => s.archieConflict);
-  const runningHere = c ? !!findTab(c.running.localId) : false;
   const resume = c?.mode === 'resume';
   const stopLabel = resume ? 'Stop it and resume this one' : 'Stop it and start new';
   return (
@@ -105,7 +104,7 @@ function ArchieConflictDialog() {
         </>
       }
     >
-      {`Only one Archie conversation runs at a time${runningHere ? '' : ', and one is running on another device'}. ${
+      {`Only one Archie conversation runs at a time. ${
         resume ? 'Resuming this conversation' : 'Starting a new one'
       } stops the running one on every device. You can resume it later from the history.`}
     </Dialog>

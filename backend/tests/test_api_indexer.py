@@ -134,6 +134,21 @@ class TestHistoryIndexer:
             (chats_dir / "qwen.jsonl").write_text("one two")
             assert indexer._compute_sessions_hash() != before
 
+    def test_compute_hash_covers_codex_rollouts(self, tmp_path):
+        """A Codex-only change (context/codex/sessions/YYYY/MM/DD/rollout-*.jsonl) triggers a run."""
+        (tmp_path / "context").mkdir()
+        day = tmp_path / "context" / "codex" / "sessions" / "2026" / "10" / "08"
+        day.mkdir(parents=True)
+        rollout = day / "rollout-2026-10-08T10-00-00-01a11d14-5790-7c60-a0e4-f3bf113ee2df.jsonl"
+        rollout.write_text("{}")
+
+        with patch("utils.paths.PROJECT_ROOT", tmp_path), \
+                patch("utils.history_index._codex_sources", return_value=[rollout]):
+            indexer = HistoryIndexer(tmp_path)
+            before = indexer._compute_sessions_hash()
+            rollout.write_text("{}\n{}")
+            assert indexer._compute_sessions_hash() != before
+
     def test_stop(self):
         indexer = HistoryIndexer(Path("/tmp/test"))
         indexer.stop()

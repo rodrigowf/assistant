@@ -266,6 +266,45 @@ sealed interface ServerFrame {
     ) : ServerFrame { override val type get() = "agent_session_closed" }
 
     /**
+     * Turn watcher event (spec 12 §3.7): an agent session (any harness, never the orchestrator)
+     * started a turn, from any device or delegated by the orchestrator. Pool watchers only (every
+     * orchestrator WS); handled at the app level (device notifications), never by a reducer.
+     */
+    data class AgentTurnStarted(
+        /** `localId`. */
+        val sessionId: String?,
+        val sdkSessionId: String? = null,
+        val provider: String? = null,
+        override val seq: Long? = null,
+        override val streamId: String? = null,
+    ) : ServerFrame { override val type get() = "agent_turn_started" }
+
+    /** The matching end of [AgentTurnStarted]: [status] `ok` | `error` | `interrupted` (a Stop: never notified). */
+    data class AgentTurnFinished(
+        /** `localId`. */
+        val sessionId: String?,
+        val sdkSessionId: String? = null,
+        val provider: String? = null,
+        /** The session's title when the server knows it. */
+        val title: String? = null,
+        val status: String = STATUS_OK,
+        /** One line of the turn's final assistant text (≤ 200 chars). */
+        val preview: String? = null,
+        /** Failure detail when [status] is `error`. */
+        val error: String? = null,
+        override val seq: Long? = null,
+        override val streamId: String? = null,
+    ) : ServerFrame {
+        override val type get() = "agent_turn_finished"
+
+        companion object {
+            const val STATUS_OK = "ok"
+            const val STATUS_ERROR = "error"
+            const val STATUS_INTERRUPTED = "interrupted"
+        }
+    }
+
+    /**
      * Spec 12 §6.11a: the orchestrator's `switch_conversation` stopped the live orchestrator
      * ([fromSessionId], its old `localId`) and asks THIS socket to resume [sdkSessionId] (a past
      * orchestrator jsonl id) and, when [voice], to start voice on it. Sent to one socket only;
@@ -279,6 +318,25 @@ sealed interface ServerFrame {
         override val seq: Long? = null,
         override val streamId: String? = null,
     ) : ServerFrame { override val type get() = "orchestrator_switch" }
+
+    /**
+     * Spec 12 §9.3: files under `context/public/` changed (the backend's content watcher, pushed to
+     * every orchestrator WS like the pool watcher events). [visualizations] are list paths
+     * (`GET /api/visualizations`) whose page or assets changed; [files] the raw changed paths.
+     */
+    data class VisualizationChanged(
+        val visualizations: List<ContentChange> = emptyList(),
+        val files: List<ContentChange> = emptyList(),
+        override val seq: Long? = null,
+        override val streamId: String? = null,
+    ) : ServerFrame { override val type get() = "visualization_changed" }
+
+    /** Spec 12 §9.3: markdown under the memory tree changed (paths as in `GET /api/memory/tree`). */
+    data class MemoryChanged(
+        val changes: List<ContentChange> = emptyList(),
+        override val seq: Long? = null,
+        override val streamId: String? = null,
+    ) : ServerFrame { override val type get() = "memory_changed" }
 
     /** Legacy side effect of `POST /api/orchestrator/audio`; nothing consumes it. */
     data class AudioUpload(
@@ -360,4 +418,16 @@ sealed interface ServerFrame {
         override val seq: Long? = null,
         override val streamId: String? = null,
     ) : ServerFrame
+}
+
+/** One entry of a §9.3 change frame. [kind] is advisory (an atomic save or an rsync reads as a create). */
+data class ContentChange(val path: String, val kind: Kind) {
+    enum class Kind(val wire: String) {
+        CREATED("created"), MODIFIED("modified"), DELETED("deleted");
+
+        companion object {
+            /** Anything unknown counts as a modification. */
+            fun of(wire: String?): Kind = entries.firstOrNull { it.wire == wire } ?: MODIFIED
+        }
+    }
 }

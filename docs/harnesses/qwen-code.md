@@ -7,6 +7,7 @@ modified: 2026-10-08
 summary: The Qwen Code harness (qwen-code 0.25.0) — spawn-per-turn qwen CLI, per-run system settings file, ~/.qwen symlinks into context/, JSONL normalization, model catalog + options, the auto-memory landmine.
 source: curated (consolidated from memory notes assistant/providers/qwen_code_adaptation.md, assistant/providers/provider_generalization.md; verified against code 2026-10-06)
 references:
+  - authentication.md
   - registry.md
   - claude-code.md
   - gemini-cli.md
@@ -14,6 +15,7 @@ references:
   - ../infrastructure/installation.md
   - ../infrastructure/ssh-remote-execution.md
   - ../voice/qwen-omni.md
+  - ../architecture/memory-and-search.md
 ---
 
 # Qwen Code harness
@@ -66,6 +68,17 @@ the `memory/` folder of its managed auto-memory, which is `context/memory/`, Arc
 That is why every Archie run switches auto-memory off (see [Per-run settings](#per-run-settings)
 and the first landmine).
 
+**Memory like Claude's.** With auto-memory off nothing loads `MEMORY.md`, so in the Archie repo
+`_build_argv()` adds `--append-system-prompt <memory block>`: the live `context/memory/MEMORY.md`
+plus the rule that memory is written with file tools following `AGENTS.md`
+(`backend/manager/memory_context.py`, shared by all harnesses —
+[memory and search](../architecture/memory-and-search.md#every-harness-reads-and-writes-the-same-memory)).
+Qwen rebuilds its system prompt on every spawn, so the block is current every turn and never lands
+in the chat JSONL; over SSH it travels as one shell-quoted argument. 0.25 registers no
+`save_memory` tool (`manage_memory` / `search_memory` are declared only in structured-recall mode),
+so the model saves memory with `write_file` / `edit`. Verified live 2026-10-08 (deepseek-v4-flash):
+it quoted `MEMORY.md` without tools and saved a fact by extending an existing wiki note.
+
 Other Qwen state stays in `~/.qwen/` per machine: `settings.json` (model providers, env, auth
 type, default model), `output-language.md`, `tmp/`, `todos/`, `debug/`, and since 0.25
 `usage_record.jsonl`, `extensions/`, `extension-store/`. Project instructions come from `QWEN.md` at the
@@ -94,8 +107,9 @@ qwen --input-format stream-json --output-format stream-json --include-partial-me
 - The env is the backend's env minus `CLAUDECODE`, plus `QWEN_CODE_SUPPRESS_YOLO_WARNING=1` (0.25
   prints a yolo-without-sandbox warning to stderr on every turn otherwise) and
   `QWEN_CODE_SYSTEM_SETTINGS_PATH=<per-run file>` ([Per-run settings](#per-run-settings)). API keys
-  (`DASHSCOPE_API_KEY`) come from `context/.env` via `run.sh`, or from Qwen's own OAuth / settings
-  `env` block.
+  (`DASHSCOPE_API_KEY`) come from `context/.env` via `run.sh`, or from the settings `env` block. Qwen
+  OAuth was discontinued on 2026-04-15 (0.25 marks `qwen auth` "removed"); Settings → Accounts
+  manages the keys ([authentication.md](authentication.md)).
 - Fork: the first turn of a forked session runs `--resume <parent> --fork-session` (0.16+); the
   new session id from `system/init` / `result` becomes the session's own id and later turns
   resume it without the flag. If the prewarm saw a CLI older than 0.16 the flag is left out and
@@ -310,3 +324,5 @@ steps — and the subprocess plus stdin/stdout path gives that uniformly.
   (auto-memory off, English output, no auto-update), catalog with live DashScope models and the
   `thinking` / `thinking_budget` / `effort` / `temperature` options, `--fork-session`, turn errors
   from `error.message`, yolo warning suppressed.
+- 2026-10-08 — `MEMORY.md` block via `--append-system-prompt` in the repo (memory parity with
+  Claude Code).

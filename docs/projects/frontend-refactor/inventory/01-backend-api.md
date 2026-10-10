@@ -44,6 +44,8 @@ nginx facts (read from the Jetson's `~/nginx-server.conf`): `listen 443 ssl; ser
 
 `CORSMiddleware(allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])` (`api/app.py:154-159`). No credentials mode is configured (`allow_credentials` defaults to False), which is fine because **the API uses no cookies**.
 
+> **Superseded 2026-10-09:** CORS now echoes only trusted origins and a browser-origin guard refuses cross-site writes and WebSocket handshakes — see [backend.md](../../../architecture/backend.md#auth-and-the-browser-origin-guard).
+
 ### 1.3 Authentication — there is none for clients
 
 - **There is no user/client authentication on any REST or WebSocket endpoint** except the browser-extension channel (§3.13). No tokens, cookies or headers are required. The trust model is "anyone on the LAN / tailnet". `GET /api/config/openai-key` even hands out the raw OpenAI key (`api/routes/config.py:304-322`).
@@ -812,7 +814,7 @@ Reconnect policies (`voice_relay.py:1295-1398,1480-1711`; `voice_reconnect.py:10
 - **G-29 — broadcast audio.** `voice_audio_out` and every mirrored `voice_event` go to all subscribers; only `voice_command` is owner-scoped. `owner_local_id` is the shared orchestrator id, useless for telling devices apart.
 - **G-30 — voice config drift on reconnect** destroys the orchestrator and clears every subscriber without notifying them.
 - **G-31 — any owner socket drop ends voice immediately** (no grace period).
-- **G-32 — OpenAI-specific duties fall on the client:** forward `voice_session_update` on data-channel open (initiator only), mirror every data-channel event, execute every `voice_command`. Non-owners get no live transcripts for OpenAI sessions. Ephemeral tokens are minted even for non-initiators.
+- **G-32 — OpenAI-specific duties fall on the client:** forward `voice_session_update` on data-channel open (initiator only), mirror every data-channel event, execute every `voice_command`. Non-owners get no live transcripts for OpenAI sessions (fixed 2026-10-10: the backend re-broadcasts the owner's mirrored transcript events, spec 12 VT-2). Ephemeral tokens are minted even for non-initiators.
 - **G-33 — provider/model defaults differ by entry point:** WS `voice_start` uses `assistant_config.json` defaults; REST `POST /voice/session` uses registry defaults; unknown provider ids silently become `openai`; `GET /api/orchestrator/voice/models` omits `google` on its live path.
 - **G-34 — `interrupt` does not stop a realtime voice response;** barge-in is client-driven (`response.cancel` for qwen, only while a response is active).
 - **G-35 — no `voice_status: ready` after a Qwen reconnect** (only Gemini re-emits it).

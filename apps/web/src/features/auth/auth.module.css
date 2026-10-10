@@ -95,6 +95,19 @@
   margin-right: var(--app-space-2);
 }
 
+.link {
+  margin: 0;
+  padding: var(--app-space-2) var(--app-space-3);
+  max-height: 4.5em;
+  overflow: auto;
+  border-radius: var(--md-sys-shape-corner-medium);
+  background: var(--md-sys-color-surface-container-highest);
+  font-family: var(--md-ref-typeface-code);
+  font-size: var(--md-sys-typescale-body-small-size);
+  color: var(--md-sys-color-on-surface);
+  word-break: break-all;
+}
+
 .error {
   margin: 0;
   padding: var(--app-space-2) var(--app-space-3);

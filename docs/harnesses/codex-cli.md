@@ -7,6 +7,7 @@ modified: 2026-10-08
 summary: The OpenAI Codex harness — one persistent `codex app-server` per session (JSON-RPC over stdio), CODEX_HOME choice, rollout storage and adapter, catalog/options, landmines.
 source: curated (implemented and verified against Codex CLI 0.161.0 on 2026-10-07)
 references:
+  - authentication.md
   - registry.md
   - claude-code.md
   - gemini-cli.md
@@ -14,6 +15,7 @@ references:
   - ../architecture/agent-sessions.md
   - ../infrastructure/installation.md
   - ../infrastructure/ssh-remote-execution.md
+  - ../architecture/memory-and-search.md
 ---
 
 # Codex CLI harness
@@ -36,7 +38,7 @@ ChatGPT login (`codex login`); no API credits are used.
 | `backend/manager/codex/catalog.py` | `load_codex_catalog()` — models (live `model/list` → `models_cache.json` → built-in) and options |
 | `backend/manager/codex/home.py` | `codex_home()` (dedicated vs shared), `sessions_roots()`, `home_for_thread()`, `codex_env()`, `codex_executable()` |
 | `AGENTS.md` (repo root) | Symlink → `context/AGENTS.md` — the file Codex reads natively; committed like `CLAUDE.md` / `QWEN.md` / `GEMINI.md` |
-| `install/{linux,apple}/install.sh`, `install/windows/install.ps1` | `--with-codex` (`-WithCodex`): seeds `~/.codex-archie/config.toml` (from `install/cli-runtime/codex-home/`), links its `sessions/`, links `.agents/skills` → `context/skills`, installs the CLI pinned to `CODEX_CLI_VERSION` (0.161.0, `install/harness-versions.env`; warns on a different version), login hint; root `AGENTS.md` link. Without Node/npm (`--no-node`, e.g. the Jetson) it installs the static `codex-<arch>-unknown-linux-musl` binary from GitHub release `rust-v<version>` into `/usr/local/bin` (or `~/.local/bin` + `CODEX_CLI_PATH`). `install-with-agent.*` can install Codex as the driver CLI; `install/doctor.sh` checks binary, auth, config and links |
+| `install/{linux,apple}/install.sh`, `install/windows/install.ps1` | `--with-codex` (`-WithCodex`): seeds `~/.codex-archie/config.toml` (from `install/cli-runtime/codex-home/`; an existing file only gets `[features] memories = false` added or replaced, via `install/codex-home-config.py`), links its `sessions/`, links `.agents/skills` → `context/skills`, installs the CLI pinned to `CODEX_CLI_VERSION` (0.161.0, `install/harness-versions.env`; warns on a different version), login hint; root `AGENTS.md` link. Without Node/npm (`--no-node`, e.g. the Jetson) it installs the static `codex-<arch>-unknown-linux-musl` binary from GitHub release `rust-v<version>` into `/usr/local/bin` (or `~/.local/bin` + `CODEX_CLI_PATH`). `install-with-agent.*` can install Codex as the driver CLI; `install/doctor.sh` checks binary, auth, config (incl. `memories = false`) and links |
 | `backend/tests/test_codex_session.py`, `test_codex_adapter.py`, `fixtures/codex/` | Tests: a scripted fake app-server (`fake_app_server.py`) and a trimmed real rollout |
 
 ## Binary and process
@@ -121,7 +123,8 @@ keeps the same `(stream_id, seq)` replay ring as Claude for WebSocket resume.
 | `ARCHIE_CODEX_HOME` | env override | wherever that home keeps them |
 
 Create the dedicated login with `CODEX_HOME=~/.codex-archie codex login --device-auth` (each
-machine needs its own).
+machine needs its own) — or from Settings → Accounts, which runs the same device-code login (and
+the browser login, API key, `auth.json` paste, sign out) for that home ([authentication.md](authentication.md)).
 
 **Skills.** Codex 0.161 lists skills from `<cwd>/.agents/skills` up to the repo root,
 `<repo>/.codex/skills`, `$CODEX_HOME/skills` (its own `.system/` skills live there — so do not link
@@ -145,6 +148,22 @@ scans.
 - `thread/resume` only finds rollouts under the running `CODEX_HOME`, so `home_for_thread()` runs a
   resumed session with the home that holds its rollout (a session started on the shared fallback
   keeps resuming there after a dedicated login is created).
+- The home is chosen per session start (`codex_home()` checks for `auth.json` every time), so a new
+  login takes effect without a backend restart. Since 2026-10-08 both machines have the dedicated
+  login: a new session's rollout lands in `context/codex/sessions/YYYY/MM/DD/` and syncs.
+- History search: `history_index.session_sources()` adds the same rollouts through
+  `_codex_discover_sessions()`, and the `HistoryIndexer` change hash includes them.
+
+**Memory.** Codex has no counterpart to Claude's auto-memory that could point at the wiki: its
+`memories` feature (off by default; `CODEX_HOME/memories` + `memories_1.sqlite`) keeps its own
+store. Archie keeps it off — the installers pin `[features] memories = false` in
+`~/.codex-archie/config.toml` (the backend passes no flag for it) — and, for sessions in the repo, passes the shared memory block
+(`backend/manager/memory_context.py`: the live `context/memory/MEMORY.md` plus the rule to write
+memory with file tools per `AGENTS.md`) as `developerInstructions` on `thread/start` only. Codex
+records it once as a developer message at the head of the rollout (hidden by the adapter and the
+history index); `thread/resume` and `thread/fork` reuse it from the history. Verified live
+2026-10-08: quoted `MEMORY.md` without tools on a new thread and again after a resume, and saved a
+test fact by extending an existing wiki note ([memory and search](../architecture/memory-and-search.md#every-harness-reads-and-writes-the-same-memory)).
 
 ## Rollout format (adapter)
 
@@ -228,8 +247,8 @@ PID, not `codex`.
    thread from what is left.
 9. **Interrupted turns** leave no agent message in the rollout (`turn_aborted` only), so a reopened
    conversation shows the prompt without the partial answer.
-10. Rollouts are not indexed by history search yet (`backend/utils/history_index.py` scans only
-    `context/*.jsonl` and `context/chats/*.jsonl`).
+10. A new `thread/start` reads `MEMORY.md` once; a long-lived thread keeps the index it started
+    with (like a Claude session). Start a new session to see index edits.
 
 ## History
 
@@ -238,3 +257,5 @@ PID, not `codex`.
   (three generations), catalog/options, installer `--with-codex`, root `AGENTS.md` symlink.
   Verified live on CLI 0.161.0 with a ChatGPT free-plan login: text, reasoning summary, `ls`,
   file write, resume in a new process, `turn/interrupt`, history through `/api/sessions/<id>`.
+- 2026-10-08 — dedicated `~/.codex-archie` logins on both machines; memory block as
+  `developerInstructions`; Codex rollouts in the history indexer's change hash.

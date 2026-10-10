@@ -149,6 +149,12 @@ data class VoiceUiState(
     val speakerMuted: Boolean = false,
     val pushToTalk: Boolean = false,
     val lastExchange: LastExchange = LastExchange(),
+    /**
+     * Main app: agent turns the service is held for when that hold is its only reason to run
+     * (`VoiceHostRuntime.setAgentWorkHold`); the idle notification then says "Waiting for N agent
+     * sessions" instead of "Connected". 0 otherwise.
+     */
+    val agentTurnsWaiting: Int = 0,
 )
 
 sealed interface VoiceUiEvent {

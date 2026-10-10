@@ -142,6 +142,21 @@ class TestExtraction:
         assert [t.text for t in doc.turns] == ["Hello Gemini", "Hello Rodrigo"]
         assert doc.started_at == "2026-05-16T14:48:12Z"
 
+    def test_gemini_session_id_is_the_header_id(self, ctx):
+        """The file name only carries id[:8]; SessionStore, titles and resume use the header id."""
+        sid = "9901da9c-d9da-4f55-979f-cbd70b255708"
+        path = _write(ctx / "chats" / "session-2026-10-08T19-49-9901da9c.jsonl", [
+            {"sessionId": sid, "projectHash": "h", "startTime": "t", "kind": "main"},
+            {"id": "1", "timestamp": "2026-10-08T19:49:16Z", "type": "user", "content": [{"text": "Hi"}]},
+        ])
+        assert hi.session_id_for(path) == sid
+        assert hi.extract_session(path).session_id == sid
+        # A header-less file keeps its file name as the id.
+        bare = _write(ctx / "chats" / "session-2026-10-08T19-50-deadbeef.jsonl", [
+            {"id": "1", "type": "user", "content": [{"text": "Hi"}]},
+        ])
+        assert hi.session_id_for(bare) == bare.stem
+
     def test_blobs_are_stripped(self, ctx):
         blob = "A" * 500
         doc = hi.extract_session(_write(ctx / "b.jsonl", [_claude("user", f"see image {blob} please")]))
@@ -400,7 +415,21 @@ def test_session_sources_includes_codex_rollouts(tmp_path, monkeypatch):
     rollout = tmp_path / "codex" / "2026" / "10" / "07" / "rollout-2026-10-07T20-54-43-abc.jsonl"
     rollout.parent.mkdir(parents=True)
     rollout.write_text("{}\n")
-    monkeypatch.setattr(hi, "_codex_sources", lambda: [rollout])
+    monkeypatch.setattr(hi, "_codex_sources", lambda project_dir=None: [rollout])
     (tmp_path / "ctx").mkdir()
     sources = hi.session_sources(tmp_path / "ctx", tmp_path / "ctx" / "chats")
     assert rollout in sources
+
+
+def test_codex_sources_are_scoped_to_the_indexed_context(tmp_path):
+    """A context/ other than this install's sees only its own context/codex/sessions —
+    never this machine's CODEX_HOME rollouts."""
+    from utils import history_index as hi
+
+    ctx = tmp_path / "context"
+    rollout = ctx / "codex" / "sessions" / "2026" / "10" / "08" / (
+        "rollout-2026-10-08T16-53-54-01a11d14-5790-7c60-a0e4-f3bf113ee2df.jsonl")
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("{}\n")
+    assert hi._codex_sources(tmp_path) == [rollout]
+    assert hi.session_sources(ctx, ctx / "chats") == [rollout]

@@ -271,6 +271,13 @@ export interface Conversation {
   readonly reloadBuffer: readonly ServerFrame[];
   /** `error{orchestrator_stopping}` was already retried once since the last `start` (T-12). */
   readonly stoppingRetried: boolean;
+  /**
+   * The conversation is in the server's open set as far as this view knows (opened from the pool,
+   * or subscribed here): every `start` carries `reattach` (OPEN-2) and a close by the server
+   * closes the view (OPEN-3). False while a user action's `start` creates it, and after
+   * `local_stop` (this client is closing or replacing it itself).
+   */
+  readonly reattach: boolean;
 }
 
 export const BUSY_STATUSES: readonly SessionStatus[] = [

@@ -66,6 +66,8 @@ def _make_pool(mock_sm, session_id="test-123"):
     turn_tasks: dict[str, asyncio.Task] = {}
 
     pool.has = MagicMock(return_value=False)
+    pool.is_open = MagicMock(return_value=False)
+    pool.restored_sdk_id = MagicMock(return_value=None)
     pool.create = AsyncMock(return_value=session_id)
     pool.get = MagicMock(return_value=mock_sm)
     pool.interrupt = AsyncMock()

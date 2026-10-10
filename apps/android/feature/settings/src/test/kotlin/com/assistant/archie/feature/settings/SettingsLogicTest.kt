@@ -207,4 +207,14 @@ class SettingsLogicTest {
         assertEquals("Notifications not allowed", st.summary)
         assertEquals("1 of 3 set", st.copy(isXiaomiFamily = true).checklistSummary)
     }
+
+    @Test fun notify_summaryAndSwitchFollowWhatAndroidAllows() {
+        assertEquals("Off", NotifyLogic.summary(enabled = false, granted = true, systemEnabled = true))
+        assertEquals("On · when an agent session finishes", NotifyLogic.summary(true, true, true))
+        assertEquals("On · blocked by Android", NotifyLogic.summary(true, granted = false, systemEnabled = true))
+        assertEquals("On · blocked by Android", NotifyLogic.summary(true, granted = true, systemEnabled = false))
+        assertTrue(NotifyLogic.effective(true, true, true))
+        assertFalse(NotifyLogic.effective(true, false, true))
+        assertFalse(NotifyLogic.effective(false, true, true))
+    }
 }

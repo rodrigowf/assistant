@@ -30,6 +30,12 @@
         the project path that is not a letter or digit with '-'; Qwen
         lower-cases the path first on Windows.
 
+      - Memory/history wiring (Gemini's projects.json label + ownership
+        marker, Codex's [features] memories = false, Qwen's memory keys) runs
+        after the venv exists, with the venv's Python and the same install\
+        helpers as Linux/macOS.  Gemini's projects.json key is the lower-cased
+        path on Windows (the CLI's own rule).
+
       - Not mirrored from Linux: the no-Node backend-only mode (--no-node,
         static Codex binary) and the ~/.gemini/.env offer for SSH remotes.
         install/doctor.sh is bash-only; on Windows the installer's own
@@ -857,7 +863,9 @@ if ($CodexAxis) {
     if (-not (Test-Path $CodexConfig)) {
         # Template (install\cli-runtime\codex-home\config.toml): project_doc_max_bytes
         # = 131072 (context\AGENTS.md is ~51 KB, the default 32 KiB would truncate
-        # it); plugins/apps features off.  Copied byte for byte (UTF-8, no BOM).
+        # it); plugins/apps/memories features off.  Copied byte for byte (UTF-8, no BOM).
+        # An existing file gets only [features] memories = false added, after
+        # the venv exists (Step 4, below).
         Copy-Item -LiteralPath (Join-Path $InstallTemplates 'cli-runtime\codex-home\config.toml') -Destination $CodexConfig
         Write-Info "Seeded $CodexConfig"
     } else {
@@ -1057,6 +1065,61 @@ if ($GeminiAxis) {
     & $VenvPy 'backend\manager\gemini\workspace_settings.py' $ScriptDir
     if ($LASTEXITCODE -ne 0) {
         Write-Warn "Could not merge Archie's keys into .gemini\settings.json - fix the file; the backend refuses Gemini turns until then"
+    }
+}
+
+# Step 3c (continued): pin Gemini's label.  Register the repo in
+# ~\.gemini\projects.json and make the ownership marker (context\.project_root
+# through the link) name this repo — otherwise Gemini can claim a new label on
+# its next run, and its chats (history) and its memory index
+# ~\.gemini\tmp\<label>\memory\MEMORY.md (through the link: the wiki's
+# context\memory\MEMORY.md) would leave context\.  Same helper as Linux/macOS.
+if ($GeminiAxis) {
+    $gemOut = @(& $VenvPy 'install\gemini-project.py' $ScriptDir 'apply' '--label' $GeminiLabel 2>$null | ForEach-Object { "$_" })
+    $gemOk  = ($LASTEXITCODE -eq 0)
+    foreach ($l in $gemOut) {
+        if ($l.StartsWith('note: '))        { Write-Host ("    " + $l.Substring(6)) }
+        elseif ($l.StartsWith('problem: ')) { Write-Warn $l.Substring(9) }
+    }
+    if ($gemOk) { Write-Info "Gemini project '$GeminiLabel' registered for $ScriptDir" }
+    if ($gemOut -contains 'memory_index=ok') {
+        Write-Info "Gemini's memory index resolves to context\memory\MEMORY.md"
+    } else {
+        Write-Warn "Gemini's memory index (~\.gemini\tmp\$GeminiLabel\memory\MEMORY.md) does not resolve to context\memory\MEMORY.md - check the Gemini project link"
+    }
+    # Gemini's built-in prompt offers a "global personal memory" at
+    # ~\.gemini\GEMINI.md - outside context\, not synced, not indexed.
+    if (Test-Path (Join-Path $env:USERPROFILE '.gemini\GEMINI.md')) {
+        Write-Warn "$env:USERPROFILE\.gemini\GEMINI.md exists (Gemini's global memory, outside context\) - move its facts into context\memory\ and delete it"
+    }
+}
+
+# Step 3c2 (continued): Archie's memory is the wiki (the backend passes
+# context\memory\MEMORY.md per session); keep Codex's own memory store off.
+# Adds or replaces only `memories` under [features] in an existing file.
+if ($CodexAxis) {
+    $CodexConfig = Join-Path $env:USERPROFILE '.codex-archie\config.toml'
+    $codexRes = "$(& $VenvPy 'install\codex-home-config.py' $CodexConfig 'apply' 2>$null | Select-Object -Last 1)"
+    switch -Regex ($codexRes) {
+        '^ok$'                         { Write-Info "Codex memories feature already off ([features] memories = false)" }
+        '^(added|appended|replaced)$'  { Write-Info "Set [features] memories = false in $CodexConfig" }
+        default                        { Write-Warn "Could not set [features] memories = false in $CodexConfig ($codexRes) - add it by hand" }
+    }
+}
+
+# Step 3e (continued): an existing .qwen\settings.json is never overwritten
+# either, so make sure its memory keys are off (Qwen's project dir is context\,
+# so its managed auto-memory / auto-dream / auto-skill would write into the
+# memory wiki in their own format; the backend also turns them off per run).
+if ($QwenAxis -and (Test-Path '.qwen\settings.json')) {
+    $qwenPy = "import json,sys;p=sys.argv[1];d=json.load(open(p,encoding='utf-8'));m=d.setdefault('memory',{});k=('enableManagedAutoMemory','enableManagedAutoDream','enableAutoSkill');b=[x for x in k if m.get(x) is not False];[m.__setitem__(x,False) for x in k];b and open(p,'w',encoding='utf-8').write(json.dumps(d,indent=2)+chr(10));print(' '.join(b))"
+    $qwenRes = "$(& $VenvPy -c $qwenPy '.qwen\settings.json' 2>$null)"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Could not check .qwen\settings.json (not valid JSON?) - set memory.enableManagedAutoMemory/AutoDream/AutoSkill to false by hand"
+    } elseif ([string]::IsNullOrWhiteSpace($qwenRes)) {
+        Write-Info "Qwen managed auto-memory/auto-dream/auto-skill already off in .qwen\settings.json"
+    } else {
+        Write-Info "Turned off in .qwen\settings.json: $qwenRes"
     }
 }
 
@@ -1427,8 +1490,25 @@ if ($QwenAxis) {
     Test-LinkTarget (Join-Path $env:USERPROFILE ".qwen\projects\$QwenMangled") $ctxDir 'Qwen projects link'
     Test-LinkTarget (Join-Path $env:USERPROFILE '.qwen\skills') (Join-Path $ctxDir 'skills') 'Qwen skills link'
 }
-if ($GeminiAxis) { Test-LinkTarget $GeminiProjectDir $ctxDir 'Gemini project link' }
-if ($CodexAxis)  { Test-LinkTarget (Join-Path $env:USERPROFILE '.codex-archie\sessions') (Join-Path $ctxDir 'codex\sessions') 'Codex sessions link' }
+if ($GeminiAxis) {
+    Test-LinkTarget $GeminiProjectDir $ctxDir 'Gemini project link'
+    $gemChk = @(& $VenvPy 'install\gemini-project.py' $ScriptDir 'check' '--label' $GeminiLabel 2>$null | ForEach-Object { "$_" })
+    if ($gemChk -contains 'registered=yes') { Write-Info "Gemini projects.json maps this repo to '$GeminiLabel'" }
+    else { Write-Warn "Gemini projects.json does not map this repo to '$GeminiLabel' - Gemini may pick another label (re-run the installer)" }
+    if ($gemChk -contains 'memory_index=ok') { Write-Info "Gemini memory index -> context\memory\MEMORY.md" }
+    else { Write-Warn "Gemini memory index does not resolve to context\memory\MEMORY.md" }
+    foreach ($l in $gemChk) {
+        if ($l -like 'marker_*=foreign:*') { Write-Warn "Gemini ownership marker names another path ($l) - Gemini would claim a new label" }
+    }
+}
+if ($CodexAxis)  {
+    Test-LinkTarget (Join-Path $env:USERPROFILE '.codex-archie\sessions') (Join-Path $ctxDir 'codex\sessions') 'Codex sessions link'
+    $codexChk = "$(& $VenvPy 'install\codex-home-config.py' (Join-Path $env:USERPROFILE '.codex-archie\config.toml') 'check' 2>$null)"
+    if ($codexChk -eq 'ok') { Write-Info "Codex [features] memories = false" }
+    else { Write-Warn "Codex config.toml: memories feature is '$codexChk' (want [features] memories = false)" }
+}
+if (Test-Path 'context\memory\MEMORY.md') { Write-Info "context\memory\MEMORY.md present (every harness's memory index)" }
+else { Write-Warn "context\memory\MEMORY.md missing - no session gets a memory index" }
 if ($CodexAxis -or $GeminiAxis -or $QwenAxis) { Test-LinkTarget '.agents\skills' (Join-Path $ctxDir 'skills') 'Repo skills link (.agents\skills)' }
 
 # ─────────────────────────────────────────────────────────────────────────────

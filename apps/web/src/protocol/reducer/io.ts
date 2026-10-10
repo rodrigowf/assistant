@@ -25,7 +25,7 @@ export type ConversationInput =
   | { readonly type: 'local_inject'; readonly text: string }
   | { readonly type: 'local_interrupt' }
   | { readonly type: 'local_compact' }
-  /** Before sending `stop` or `POST …/close`: the next `session_stopped` is our own ack. */
+  /** Before sending `stop` or `POST …/close`: the next `session_stopped` is our own ack, the next `start` is ours (OPEN-2). */
   | { readonly type: 'local_stop' }
   /** The voice controller tore voice down locally (timeout, fatal error, §7.6). */
   | { readonly type: 'voice_local_end' }

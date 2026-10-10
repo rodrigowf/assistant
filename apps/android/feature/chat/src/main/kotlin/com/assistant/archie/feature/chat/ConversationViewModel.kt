@@ -22,13 +22,11 @@ import com.assistant.core.model.UploadResult
 import com.assistant.core.network.ApiResult
 import com.assistant.core.network.SendResult
 import com.assistant.core.network.UploadSource
-import com.assistant.core.voice.ports.SessionPhase
 import kotlinx.collections.immutable.toImmutableList
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -63,7 +61,6 @@ sealed interface ChatAction {
     data class AgentApproval(val localId: String, val requestId: String, val allow: Boolean) : ChatAction
     data class DismissCard(val id: String) : ChatAction
     data class Retry(val kind: RetryKind, val cardId: String) : ChatAction
-    data object ContinueInNewView : ChatAction
     data class Rewind(val entryId: String) : ChatAction
     data class Fork(val entryId: String) : ChatAction
     data class Upload(val source: UploadSource, val subject: String? = null) : ChatAction
@@ -102,6 +99,8 @@ class ConversationViewModel(
     private val clock: () -> Long = System::currentTimeMillis,
     externalScope: CoroutineScope? = null,
     private val title: () -> String? = { null },
+    /** The process-wide voice dock model (shared with the floating controls); null: a local one. */
+    voiceDock: VoiceDockModel? = null,
 ) : ViewModel() {
     private val scope: CoroutineScope = externalScope ?: viewModelScope
 
@@ -121,11 +120,11 @@ class ConversationViewModel(
     private val dismissed = MutableStateFlow<Set<String>>(emptySet())
     private val transientErrors = MutableStateFlow<List<InlineCardUi.Error>>(emptyList())
     private val busy = MutableStateFlow<String?>(null)
-    private val reconnectSince = MutableStateFlow<Long?>(null)
-    private val voiceOutcome = MutableStateFlow<VoiceUi?>(null)
     private var resendOnConnect: String? = null
     private var olderGuard: String? = null
-    private var outcomeJob: Job? = null
+
+    /** The voice dock's state and actions, with the reconnect timeline (shared with the floating controls). */
+    private val dock = voiceDock ?: VoiceDockModel(voice, scope, clock)
 
     private val effects = Channel<ChatEffect>(Channel.BUFFERED)
     val effectFlow: Flow<ChatEffect> = effects.receiveAsFlow()
@@ -146,20 +145,7 @@ class ConversationViewModel(
             .conflate()
             .transform { emit(it); if (it.second.streaming) delay(SAMPLE_MS) }
 
-    private val voiceUi: Flow<VoiceUi> = combine(
-        combine(voice.state, voice.speakerMuted, voice.remoteDevice, voice.remoteTranscriptMirrored, ::VoiceInputs),
-        reconnectSince,
-        voiceOutcome,
-    ) { v, since, outcome ->
-        ConversationUiMapper.voice(v.state, v.speakerMuted, v.device, v.mirrored, since, outcome)
-    }
-
-    private data class VoiceInputs(
-        val state: com.assistant.core.voice.ports.VoiceSessionState,
-        val speakerMuted: Boolean,
-        val device: String?,
-        val mirrored: Boolean,
-    )
+    private val voiceUi: Flow<VoiceUi> = dock.ui
 
     private data class Local(
         val answered: Set<String>,
@@ -195,7 +181,7 @@ class ConversationViewModel(
     init {
         scope.launch { backend.events.collect(::onEvent) }
         scope.launch { backend.state.filterNotNull().collect(::onConversation) }
-        scope.launch { voice.state.collect { v -> onVoiceState(v.reconnectBanner != null, v.phase) } }
+        dock.start()
         backend.touch()
     }
 
@@ -233,17 +219,12 @@ class ConversationViewModel(
                 if (a.id.startsWith("banner:")) backend.dismissBanner()
             }
             is ChatAction.Retry -> retry(a.kind, a.cardId)
-            ChatAction.ContinueInNewView -> backend.state.value?.let { s -> ContinueTarget.of(s)?.let(backend::continueTerminated) }
             is ChatAction.Rewind -> cut(a.entryId, rewind = true)
             is ChatAction.Fork -> cut(a.entryId, rewind = false)
             is ChatAction.Upload -> upload(a.source, a.subject)
             ChatAction.Reload -> { dismissed.update { it + "gap" }; backend.reload() }
-            ChatAction.StartVoice -> voice.start()
-            ChatAction.EndVoice -> { voiceOutcome.value = null; voice.stop() }
-            ChatAction.ToggleMic -> voice.toggleMute()
-            ChatAction.ToggleSpeaker -> voice.toggleSpeaker()
-            ChatAction.TakeOverVoice -> voice.takeOver()
-            ChatAction.ToggleRecording -> voice.toggleRecording()
+            ChatAction.StartVoice, ChatAction.EndVoice, ChatAction.ToggleMic, ChatAction.ToggleSpeaker,
+            ChatAction.TakeOverVoice, ChatAction.ToggleRecording -> dock.onAction(a)
         }
     }
 
@@ -352,9 +333,6 @@ class ConversationViewModel(
         }
         // A new stall instance (different elapsed) re-shows a card the user dismissed with Keep waiting.
         if (s.stall == null) dismissed.update { it - "stall" }
-        if (s.termination == null && dismissed.value.contains("stopped") && s.status != com.assistant.core.model.SessionStatus.STOPPED) {
-            dismissed.update { it - "stopped" }
-        }
     }
 
     private fun onEvent(e: ConversationEvent) {
@@ -401,35 +379,6 @@ class ConversationViewModel(
         }
     }
 
-    // ───────────────────────── voice reconnect timeline (mockup k) ─────────────────────────
-
-    private var wasReconnecting = false
-
-    private fun onVoiceState(reconnecting: Boolean, phase: SessionPhase) {
-        if (reconnecting && !wasReconnecting) {
-            outcomeJob?.cancel()
-            voiceOutcome.value = null
-            reconnectSince.value = clock()
-        }
-        if (!reconnecting && wasReconnecting) {
-            val since = reconnectSince.value
-            reconnectSince.value = null
-            val ok = phase == SessionPhase.ACTIVE || phase == SessionPhase.SPEAKING ||
-                phase == SessionPhase.THINKING || phase == SessionPhase.TOOL_USE
-            if (ok) {
-                val secs = if (since != null) ((clock() - since) / 1000).toInt() else 0
-                voiceOutcome.value = VoiceUi.Reconnected(secs)
-                outcomeJob = scope.launch { delay(OUTCOME_MS); voiceOutcome.value = null }
-            } else if (phase == SessionPhase.ERROR || phase == SessionPhase.OFF) {
-                voiceOutcome.value = VoiceUi.ReconnectFailed(voice.state.value.errorMessage)
-            }
-        }
-        if (!reconnecting && voiceOutcome.value is VoiceUi.ReconnectFailed && phase != SessionPhase.ERROR && phase != SessionPhase.OFF) {
-            voiceOutcome.value = null
-        }
-        wasReconnecting = reconnecting
-    }
-
     // ───────────────────────── saved toggles ─────────────────────────
 
     private fun readToggles(key: String): Map<String, Boolean> =
@@ -442,7 +391,7 @@ class ConversationViewModel(
     companion object {
         /** List publication interval while streaming (spec 14 §2.3). */
         const val SAMPLE_MS = 33L
-        const val OUTCOME_MS = 3_000L
+        const val OUTCOME_MS = VoiceDockModel.OUTCOME_MS
         private const val KEY_DRAFT = "draft"
         private const val KEY_GROUPS = "groups"
         private const val KEY_CARDS = "cards"
@@ -478,6 +427,7 @@ fun conversationViewModelFactory(
     voice: ChatVoice,
     toolCards: com.assistant.archie.feature.chat.ui.ToolCardRenderer = com.assistant.archie.feature.chat.ui.DefaultToolCardRenderer,
     title: () -> String? = { null },
+    voiceDock: VoiceDockModel? = null,
 ): androidx.lifecycle.ViewModelProvider.Factory = androidx.lifecycle.viewmodel.viewModelFactory {
     initializer {
         ConversationViewModel(
@@ -486,6 +436,7 @@ fun conversationViewModelFactory(
             describe = toolCards::describe,
             saved = createSavedStateHandle(),
             title = title,
+            voiceDock = voiceDock,
         )
     }
 }

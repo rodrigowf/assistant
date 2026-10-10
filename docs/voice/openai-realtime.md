@@ -175,7 +175,7 @@ is no backend WS, most errors reach the backend as mirrored `error` events.
 
 | Path | Model | Where |
 |---|---|---|
-| **One-shot voice message** (`send_audio`: the talk word, push-to-talk, the web voice-message button) | **`gpt-audio`** family via Chat Completions with `input_audio` | `OrchestratorSession._send_audio_inner` → `resolve_audio_model()` = `default_audio_model` from `assistant_config.json` (Settings → Audio model), else `AUDIO_FALLBACK_MODEL_ID = "gpt-audio"` |
+| **One-shot voice message** (`send_audio`: the talk word, push-to-talk, the web voice-message button) | **`gpt-audio`** family via Chat Completions with `input_audio` | `OrchestratorSession._send_audio_inner` → `resolve_audio_model()` = `default_audio_model` from `assistant_config.json` (Settings → Conversation model → Audio model provider + Audio model; "Server default" clears it), else `AUDIO_FALLBACK_MODEL_ID = "gpt-audio"` |
 | **Wake-word confirmation** | `whisper-1` transcription, called directly from Android | [wake-word.md](wake-word.md) |
 | **History summarizer** | `summarizer_model`, default `gpt-5.1` | [prompt-budget.md](prompt-budget.md) |
 

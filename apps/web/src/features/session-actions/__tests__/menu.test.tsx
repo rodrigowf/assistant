@@ -139,9 +139,9 @@ describe('start race: error{orchestrator_active} (spec 12 §6.11)', () => {
       ws.emit({ type: 'error', error: 'orchestrator_active', detail: 'Another orchestrator is active (WINNER).' });
     });
     const dlg = await screen.findByRole('alertdialog', { name: 'Archie is already active' });
-    expect(dlg.textContent).toContain('one is running on another device');
+    expect(dlg.textContent).toContain('Only one Archie conversation runs at a time.');
     await waitFor(() => {
-      expect(tabsStore.getState().tabs.map((t) => t.id)).not.toContain(mine);
+      expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['WINNER']); // OPEN-1: the pool's Archie is open here too
     });
     expect(h.fetch.calls('POST', `/api/sessions/${mine}/close`)).toEqual([]);
   });

@@ -7,7 +7,10 @@ import com.assistant.core.network.ArchieApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -31,7 +34,17 @@ class HistoryRepository(
     val sessions: StateFlow<LoadState<List<SessionSummary>>> = _sessions.asStateFlow()
 
     private val _pool = MutableStateFlow<List<PoolSession>>(emptyList())
+
+    /** The server's open set (spec 12 OPEN-1): the last `pool/live` read, kept current by watcher events. */
     val pool: StateFlow<List<PoolSession>> = _pool.asStateFlow()
+
+    /** One `pool/live` answer as read (OPEN-4); [requestedAt] is `System.nanoTime()` at the request. */
+    data class PoolRead(val rows: List<PoolSession>, val requestedAt: Long)
+
+    private val _poolReads = MutableSharedFlow<PoolRead>(extraBufferCapacity = 16)
+
+    /** Every successful [syncPool], for the OPEN-4 reconcile of open views. */
+    val poolReads: SharedFlow<PoolRead> = _poolReads.asSharedFlow()
 
     private val listMutex = Mutex()
     private val poolMutex = Mutex()
@@ -53,10 +66,15 @@ class HistoryRepository(
 
     /** `syncPool()` of §3.7: on app start, on visible, after any session mutation. */
     suspend fun syncPool(): List<PoolSession>? = poolMutex.withLock {
+        val requestedAt = System.nanoTime()
         val rows = api.livePool().getOrNull() ?: return null
         _pool.value = rows
+        _poolReads.tryEmit(PoolRead(rows, requestedAt))
         rows
     }
+
+    /** `agent_session_closed` (OPEN-4): the row leaves the open set at once, before the next read. */
+    fun dropFromPool(localId: String) = _pool.update { rows -> rows.filterNot { it.localId == localId } }
 
     /** Both stores (start, foreground, watcher events). */
     fun refreshAll() {

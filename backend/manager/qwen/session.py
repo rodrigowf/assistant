@@ -41,6 +41,7 @@ from .._ssh import (
 from .._proc import process_tree, reap_descendants, signal_group
 from ..base_session import BaseSessionManager, TurnAbandoned
 from ..config import ManagerConfig
+from ..memory_context import memory_instructions
 from . import run_settings as _run_settings
 from ..types import (
     CompactComplete,
@@ -818,6 +819,13 @@ class QwenSessionManager(BaseSessionManager):
 
         if self._config.max_turns is not None:
             argv += ["--max-session-turns", str(self._config.max_turns)]
+
+        # Archie's memory index (context/memory/MEMORY.md), read live, the
+        # way Claude Code's auto-memory loads it.  Qwen rebuilds its system
+        # prompt on every spawn, so this is never stored in the history.
+        memory = memory_instructions(self._config.project_dir)
+        if memory:
+            argv += ["--append-system-prompt", memory]
 
         return argv
 

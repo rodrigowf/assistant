@@ -1,7 +1,8 @@
 /**
  * Session directory: P-1 (no close/stop from unload, visibility, teardown; explicit close does
- * close), P-6 / FOCUS-1 (background opens never steal focus), pool sync, watcher events with
- * `is_orchestrator` (FOCUS-2, WATCH-1), the single orchestrator socket (T-6/T-7), Archie
+ * close), P-6 / FOCUS-1 (background opens never steal focus), the server's pool as the open set
+ * (OPEN-1..4: reattach-only starts, closed elsewhere = gone, reconcile on every read), watcher
+ * events with `is_orchestrator` (FOCUS-2), the single orchestrator socket (T-6/T-7), Archie
  * attach, delete (§6.8), rewind order (§6.5), agent approvals (§6.9).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -10,12 +11,12 @@ import {
   ArchieRuntime,
   closeSession,
   closeTab,
-  continueTerminated,
   deleteSession,
   forkSession,
   getArchieRuntime,
   getOrchestratorRef,
   getSessionRuntime,
+  onAgentTurn,
   openArchie,
   openSession,
   replaceRunningArchie,
@@ -124,15 +125,23 @@ describe('P-6 / FOCUS-1: background opens never steal focus', () => {
     await syncPool();
     const s = tabsStore.getState();
     expect(s.activeId).toBe('MINE');
-    expect(s.tabs.map((t) => [t.id, t.kind, t.unseen, t.openedBySync])).toEqual([
-      ['O1', 'archie', true, true],
-      ['MINE', 'agent', false, false],
-      ['A1', 'agent', true, true],
+    expect(s.tabs.map((t) => [t.id, t.kind, t.unseen])).toEqual([
+      ['O1', 'archie', true],
+      ['MINE', 'agent', false],
+      ['A1', 'agent', true],
     ]);
     expect(getOrchestratorRef()).toEqual({ localId: 'O1', sdkId: 'O1' });
     const a1 = getSessionRuntime('A1') as SessionRuntime;
     expect(a1.conv.status).toBe('streaming'); // ST-2 from pool/live
     expect(a1.handle.store.getState().hidden).toBe(true);
+    // OPEN-2: a pool row only ever reattaches; the user's own new session creates
+    const [mine, a1ws] = FakeWebSocket.all(CHAT) as [FakeWebSocket, FakeWebSocket];
+    mine.open();
+    a1ws.open();
+    expect(mine.messages()).toEqual([{ type: 'start', local_id: 'MINE' }]);
+    expect(a1ws.messages()).toEqual([{ type: 'start', local_id: 'A1', resume_sdk_id: 'sdk-a', reattach: true }]);
+    activateTab('A1'); // OPEN-1: a row with no view of its own here is simply open: a click shows it
+    expect(tabsStore.getState().activeId).toBe('A1');
   });
 
   it('agent_session_opened on the watcher socket adds a badged background tab + snackbar; Open activates it', () => {
@@ -143,29 +152,95 @@ describe('P-6 / FOCUS-1: background opens never steal focus', () => {
     expect(watcher.sent).toEqual([]); // T-7: the watcher never sends start
     watcher.emit({ type: 'agent_session_opened', session_id: 'BG1', sdk_session_id: null, is_orchestrator: false });
     expect(tabsStore.getState().activeId).toBe('MINE');
-    expect(tabsStore.getState().tabs.find((t) => t.id === 'BG1')).toMatchObject({ unseen: true, openedBySync: true });
+    expect(tabsStore.getState().tabs.find((t) => t.id === 'BG1')).toMatchObject({ unseen: true });
     const snack = snackbarStore.getState().queue[0];
     expect(snack?.message).toBe('Archie opened Agent BG1');
     snack?.action?.run();
     expect(tabsStore.getState().activeId).toBe('BG1');
   });
 
-  it('agent_session_closed: an unseen synced view goes away; a looked-at view stays (FOCUS-3); is_orchestrator is checked (FOCUS-2)', () => {
+  it('OPEN-3: agent_session_closed closes the view at once, active or not, with no close request; focus moves (FOCUS-2)', () => {
     startServices({ skipInitialSync: true });
-    openSession({ kind: 'agent', localId: 'MINE', focus: true });
     const watcher = FakeWebSocket.last(ORCH);
     watcher.open();
+    openSession({ kind: 'agent', localId: 'MINE', focus: true });
+    subscribe(FakeWebSocket.last(CHAT), 'MINE');
     watcher.emit({ type: 'agent_session_opened', session_id: 'BG1', is_orchestrator: false });
     watcher.emit({ type: 'agent_session_opened', session_id: 'BG2', is_orchestrator: false });
-    activateTab('BG2');
-    activateTab('MINE');
     watcher.emit({ type: 'agent_session_closed', session_id: 'MINE', is_orchestrator: true }); // wrong kind: ignored
-    expect((getSessionRuntime('MINE') as SessionRuntime).conv.status).not.toBe('stopped');
-    watcher.emit({ type: 'agent_session_closed', session_id: 'BG1', is_orchestrator: false });
-    watcher.emit({ type: 'agent_session_closed', session_id: 'BG2', is_orchestrator: false });
-    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['MINE', 'BG2']);
-    expect((getSessionRuntime('BG2') as SessionRuntime).conv.status).toBe('stopped');
+    expect(getSessionRuntime('MINE')).toBeDefined();
+    watcher.emit({ type: 'agent_session_closed', session_id: 'BG2', is_orchestrator: false }); // in the background
+    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['MINE', 'BG1']);
+    expect(tabsStore.getState().activeId).toBe('MINE');
+    watcher.emit({ type: 'agent_session_closed', session_id: 'MINE', is_orchestrator: false }); // the one on screen
+    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['BG1']);
+    expect(tabsStore.getState().activeId).toBe('BG1'); // as after an explicit close
+    expect(getSessionRuntime('MINE')).toBeUndefined();
+    expect(snackbarStore.getState().queue.map((q) => q.message).pop()).toBe('New agent session was closed elsewhere');
     expect(closeCalls()).toEqual([]);
+  });
+
+  it('OPEN-4: closed while this device was away: the pool read when visible again closes the view; the resync reattaches', async () => {
+    startServices({ skipInitialSync: true });
+    h.fetch.on('GET', '/api/sessions/pool/live', pool([{ local_id: 'A1' }]));
+    openSession({ kind: 'agent', localId: 'A1', focus: true });
+    const ws = FakeWebSocket.last(CHAT);
+    subscribe(ws, 'A1');
+    await flushPromises();
+    h.visibility.set(true);
+    h.fetch.on('GET', '/api/sessions/pool/live', pool([])); // another device closed it meanwhile
+    h.visibility.set(false);
+    expect(ws.messages()[1]).toEqual({ type: 'start', local_id: 'A1', reattach: true }); // can never re-create it
+    await flushPromises();
+    expect(getSessionRuntime('A1')).toBeUndefined();
+    expect(tabsStore.getState().tabs).toEqual([]);
+    expect(closeCalls()).toEqual([]);
+  });
+
+  it('OPEN-3: error{session_closed}, the answer to a reattach start, closes the view', () => {
+    startServices({ skipInitialSync: true });
+    openSession({ kind: 'agent', localId: 'A1', focus: true });
+    const ws = FakeWebSocket.last(CHAT);
+    subscribe(ws, 'A1');
+    ws.drop();
+    vi.advanceTimersByTime(1000);
+    const again = FakeWebSocket.last(CHAT);
+    again.open();
+    expect(again.messages()).toEqual([{ type: 'start', local_id: 'A1', reattach: true }]);
+    again.emit({ type: 'error', error: 'session_closed', detail: 'This conversation is not open.' });
+    expect(getSessionRuntime('A1')).toBeUndefined();
+    expect(tabsStore.getState().tabs).toEqual([]);
+    expect(closeCalls()).toEqual([]);
+  });
+
+  it('OPEN-2: a user action creates (History open: no reattach); a pool read sent before its session_started never closes it', async () => {
+    startServices({ skipInitialSync: true });
+    h.fetch.on('GET', /\/messages/, { messages: [], total_count: 0, has_more: false, start_index: 0 });
+    const rt = openSession({ kind: 'agent', sdkId: 'past', focus: true }) as SessionRuntime;
+    const ws = FakeWebSocket.last(CHAT);
+    ws.open();
+    expect(ws.messages()).toEqual([{ type: 'start', local_id: rt.localId, resume_sdk_id: 'past' }]);
+    let answer: (r: Response) => void = () => undefined;
+    h.fetch.on('GET', '/api/sessions/pool/live', () => new Promise<Response>((r) => (answer = r)));
+    const read = syncPool();
+    ws.emit({ type: 'session_started', session_id: rt.localId }); // created while the read was out
+    answer(jsonResponse([]));
+    await read;
+    expect(getSessionRuntime(rt.localId)).toBe(rt);
+  });
+
+  it('Save and Restart: the close it makes itself does not close the view; its start creates (no reattach)', async () => {
+    startServices({ skipInitialSync: true });
+    const watcher = FakeWebSocket.last(ORCH);
+    watcher.open();
+    const rt = openSession({ kind: 'agent', localId: 'A1', focus: true }) as SessionRuntime;
+    const ws = FakeWebSocket.last(CHAT);
+    subscribe(ws, 'A1');
+    const done = rt.restart();
+    watcher.emit({ type: 'agent_session_closed', session_id: 'A1', is_orchestrator: false }); // our own close, echoed
+    await done;
+    expect(getSessionRuntime('A1')).toBe(rt);
+    expect(ws.messages().pop()).toEqual({ type: 'start', local_id: 'A1' });
   });
 
   it('a turn ending in a hidden tab marks it unseen, never activates it', () => {
@@ -207,17 +282,47 @@ describe('Archie on the single orchestrator socket (T-6, T-7)', () => {
     vi.advanceTimersByTime(1000);
     const again = FakeWebSocket.last(ORCH);
     again.open();
-    expect(again.messages()).toEqual([{ type: 'voice_start', local_id: 'O1' }]);
+    expect(again.messages()).toEqual([{ type: 'voice_start', local_id: 'O1', reattach: true }]); // OPEN-2
   });
 
-  it('WATCH-1: agent_session_closed for the own orchestrator stops the view but keeps it open', () => {
+  it('OPEN-3: Archie closed elsewhere: its view closes (voice with it), the ref is cleared, nothing is sent', () => {
     startServices({ skipInitialSync: true });
+    openSession({ kind: 'agent', localId: 'A1', focus: false });
     const rt = openSession({ kind: 'archie', localId: 'O1', focus: true }) as ArchieRuntime;
     const ws = FakeWebSocket.last(ORCH);
     subscribe(ws, 'O1');
+    const voice = { startMessage: () => null, onFrame: vi.fn() };
+    rt.setVoiceHooks(voice);
+    ws.emit({ type: 'agent_session_opened', session_id: 'O1', sdk_session_id: 'O1', is_orchestrator: true });
+    expect(getOrchestratorRef()).toEqual({ localId: 'O1', sdkId: 'O1' });
     ws.emit({ type: 'agent_session_closed', session_id: 'O1', is_orchestrator: true });
-    expect(rt.conv.status).toBe('stopped');
-    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['O1']);
+    expect(rt.isDisposed).toBe(true); // the voice registry disposes its controller with it
+    expect(getArchieRuntime()).toBeUndefined();
+    expect(getOrchestratorRef()).toBeNull();
+    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['A1']);
+    expect(tabsStore.getState().activeId).toBe('A1');
+    expect(ws.types()).toEqual(['start']);
+    expect(closeCalls()).toEqual([]);
+  });
+
+  it('OPEN-4 on the orchestrator socket: every open re-reads the pool; the reopen reattaches, Archie gone meanwhile closes', async () => {
+    startServices({ skipInitialSync: true });
+    h.fetch.on('GET', '/api/sessions/pool/live', pool([{ local_id: 'O1', sdk_session_id: 'O1', is_orchestrator: true }]));
+    const rt = openSession({ kind: 'archie', localId: 'O1', focus: true }) as ArchieRuntime;
+    subscribe(FakeWebSocket.last(ORCH), 'O1', { jsonl_id: 'O1' });
+    await flushPromises();
+    expect(getArchieRuntime()).toBe(rt); // still in the pool
+    h.fetch.on('GET', '/api/sessions/pool/live', pool([])); // closed on another device while this socket is down
+    FakeWebSocket.last(ORCH).drop();
+    vi.advanceTimersByTime(1000);
+    const again = FakeWebSocket.last(ORCH);
+    const reads = h.fetch.calls('GET', '/api/sessions/pool/live').length;
+    again.open();
+    expect(again.messages()).toEqual([{ type: 'start', local_id: 'O1', resume_sdk_id: 'O1', reattach: true }]);
+    await flushPromises();
+    expect(h.fetch.calls('GET', '/api/sessions/pool/live').length).toBe(reads + 1);
+    expect(getArchieRuntime()).toBeUndefined();
+    expect(tabsStore.getState().tabs).toEqual([]); // the empty workspace: "New Archie conversation"
   });
 
   it('openArchie attaches to the running orchestrator from pool/live (G-15); a different resume is a conflict', async () => {
@@ -232,7 +337,7 @@ describe('Archie on the single orchestrator socket (T-6, T-7)', () => {
     expect(c).toMatchObject({ conflict: true, running: { localId: 'RUN', sdkId: 'RUN' } });
     const ws = FakeWebSocket.last(ORCH);
     ws.open();
-    expect(ws.messages()[0]).toEqual({ type: 'start', local_id: 'RUN', resume_sdk_id: 'RUN' });
+    expect(ws.messages()[0]).toEqual({ type: 'start', local_id: 'RUN', resume_sdk_id: 'RUN', reattach: true }); // opened from the pool
     const fresh = await replaceRunningArchie('PAST');
     expect(closeCalls()).toEqual(['/api/sessions/RUN/close']);
     expect(fresh.conv.ref.sdkId).toBe('PAST');
@@ -393,17 +498,18 @@ describe('explicit actions', () => {
     expect(rt.isDisposed).toBe(false);
   });
 
-  it('termination recovery replaces the view in place with the terminated sdk id (§6.13)', async () => {
-    h.fetch.on('GET', /\/messages/, { messages: [], total_count: 0, has_more: false, start_index: 0 });
-    const rt = openSession({ kind: 'agent', localId: 'T1', focus: true }) as SessionRuntime;
+  it('a terminated session closes with its reason in the notice (§6.13, OPEN-3)', () => {
+    startServices({ skipInitialSync: true });
+    const watcher = FakeWebSocket.last(ORCH);
+    watcher.open();
+    openSession({ kind: 'agent', localId: 'T1', focus: true });
     const ws = FakeWebSocket.last(CHAT);
     subscribe(ws, 'T1');
-    ws.emit({ type: 'session_terminated', reason: 'subprocess_crashed', detail: 'boom', sdk_session_id: 'sdk-t' });
+    ws.emit({ type: 'session_terminated', reason: 'subprocess_crashed', detail: 'exit code 1', sdk_session_id: 'sdk-t' });
     ws.emit({ type: 'session_stopped' });
-    expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual(['T1']); // W-9: the tab stays
-    expect(rt.conv.termination?.reason).toBe('subprocess_crashed');
-    const next = continueTerminated('T1');
-    expect(next?.conv.ref.sdkId).toBe('sdk-t');
+    watcher.emit({ type: 'agent_session_closed', session_id: 'T1', is_orchestrator: false });
+    expect(getSessionRuntime('T1')).toBeUndefined();
+    expect(snackbarStore.getState().queue.map((q) => q.message).pop()).toBe('New agent session crashed: exit code 1');
     expect(closeCalls()).toEqual([]);
   });
 });
@@ -478,7 +584,7 @@ describe('§6.11a orchestrator_switch (agent-initiated switch)', () => {
       ws.emit({ type: 'voice_ending', reason: 'switch', session_id: 'O1' });
       ws.emit({ type: 'voice_ended', reason: 'switch', session_id: 'O1' });
     }
-    ws.emit({ type: 'agent_session_closed', session_id: 'O1', is_orchestrator: true }); // WATCH-1
+    ws.emit({ type: 'agent_session_closed', session_id: 'O1', is_orchestrator: true }); // OPEN-3
     ws.emit({ ...SWITCH, voice });
   }
 
@@ -538,5 +644,39 @@ describe('§6.11a orchestrator_switch (agent-initiated switch)', () => {
     const fresh = getArchieRuntime() as ArchieRuntime;
     expect(getSessionRuntime('R1')).toBeUndefined();
     expect(tabsStore.getState().tabs.map((t) => t.id)).toEqual([fresh.localId]);
+  });
+});
+
+describe('§3.7 agent turn watcher events (device notifications)', () => {
+  const FINISHED = { type: 'agent_turn_finished', session_id: 'A1', sdk_session_id: 'S1', provider: 'claude', title: 'Energy', status: 'ok', preview: 'Done', error: null };
+
+  it('reach onAgentTurn from the passive watcher socket and never open or focus a view (FOCUS-1)', () => {
+    startServices({ skipInitialSync: true });
+    const seen: string[] = [];
+    const off = onAgentTurn((f) => seen.push(`${f.type}:${f.session_id}`));
+    const ws = FakeWebSocket.last(ORCH);
+    ws.open();
+    ws.emit({ type: 'agent_turn_started', session_id: 'A1', sdk_session_id: 'S1', provider: 'claude' });
+    ws.emit(FINISHED);
+    off();
+    ws.emit(FINISHED);
+    expect(seen).toEqual(['agent_turn_started:A1', 'agent_turn_finished:A1']);
+    expect(getSessionRuntime('A1')).toBeUndefined();
+    expect(tabsStore.getState().activeId).toBeNull();
+  });
+
+  it('reach onAgentTurn with Archie attached, without touching its conversation', () => {
+    startServices({ skipInitialSync: true });
+    h.fetch.on('GET', /\/messages/, { messages: [], total_count: 0, has_more: false, start_index: 0 });
+    const rt = openSession({ kind: 'archie', localId: 'O1', focus: true }) as ArchieRuntime;
+    const ws = FakeWebSocket.last(ORCH);
+    subscribe(ws, 'O1');
+    const before = rt.conv.entries.length;
+    const seen: string[] = [];
+    const off = onAgentTurn((f) => seen.push(f.type));
+    ws.emit(FINISHED);
+    off();
+    expect(seen).toEqual(['agent_turn_finished']);
+    expect(rt.conv.entries.length).toBe(before);
   });
 });

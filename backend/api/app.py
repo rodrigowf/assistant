@@ -5,24 +5,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
-from utils.paths import PROJECT_ROOT, is_within_memory
+from utils.paths import PROJECT_ROOT, get_state_dir, is_within_memory
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
+from manager.accounts import AccountsManager
 from manager.auth import AuthManager
 from manager.config import ManagerConfig
 from manager.loop_watchdog import start_loop_watchdog
 from manager.store import SessionStore
 
 from .connections import ConnectionManager
+from .guard import RequestGuardMiddleware, TrustedCORSMiddleware
+from .content_watcher import ContentWatcher
 from .indexer import HistoryIndexer, MemoryWatcher
+from .open_sessions import OpenSessionsStore
 from .pool import SessionPool
-from .routes import agents, auth, browser, chat, config, debug, mcp, memory, orchestrator, sessions, skills, uploads, visualizations, voice
+from .routes import accounts, agents, auth, browser, chat, config, debug, mcp, memory, orchestrator, sessions, skills, uploads, visualizations, voice
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +51,14 @@ async def lifespan(app: FastAPI):
         not os.environ.get("DISPLAY") and os.name != "nt"
     )
     app.state.auth = AuthManager(headless=headless)
+    app.state.accounts = AccountsManager()
 
     app.state.connections = ConnectionManager()
     app.state.pool = SessionPool()
+    # What was open before the restart is open again (spec 12 OPEN-1), before any client connects.
+    app.state.pool.restore_open_set(OpenSessionsStore(get_state_dir() / "open_sessions.json"))
+    # agent_turn_finished carries the session's title (device notifications).
+    app.state.pool.title_resolver = app.state.store.session_title
     # Background orphan reaper — last-line defense against leaked
     # bundled-claude subprocesses (per-session SIGKILL inside
     # SessionManager is the primary defense).  Cheap when nothing is
@@ -66,6 +75,13 @@ async def lifespan(app: FastAPI):
     memory_watcher = MemoryWatcher(project_path)
     memory_task = asyncio.create_task(memory_watcher.run())
     app.state.memory_watcher = memory_watcher
+
+    # One watcher over context/public/ and the memory tree: pushes
+    # visualization_changed / memory_changed to every orchestrator socket
+    # (spec 12 §9.3) and wakes the memory indexer on markdown changes.
+    content_watcher = ContentWatcher(app.state.pool.notify_watchers, on_memory_markdown=memory_watcher.notify)
+    content_task = asyncio.create_task(content_watcher.run())
+    app.state.content_watcher = content_watcher
 
     history_indexer = HistoryIndexer(project_path, interval_seconds=300)
     history_task = asyncio.create_task(history_indexer.run())
@@ -116,6 +132,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Error stopping dead-session reaper on shutdown")
 
+        # Kill any sign-in CLI still waiting for a pasted code (Settings → Accounts).
+        try:
+            await app.state.accounts.flows.shutdown()
+        except Exception:
+            logger.exception("Error stopping sign-in flows on shutdown")
+
         # Drain the session pool first so remote SSH + claude children get
         # clean SIGTERMs instead of being orphaned by the backend exiting.
         try:
@@ -130,17 +152,41 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Error shutting down search server")
 
+        content_watcher.stop()
         memory_watcher.stop()
         history_indexer.stop()
+        content_task.cancel()
         memory_task.cancel()
         history_task.cancel()
         prewarm_task.cancel()
         search_prewarm_task.cancel()
-        for task in [memory_task, history_task, prewarm_task, search_prewarm_task]:
+        for task in [content_task, memory_task, history_task, prewarm_task, search_prewarm_task]:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+
+
+def revalidated_file(request: Request, path: Path) -> Response:
+    """A file that changes in place (visualizations, memory files: spec 12 §9.3).
+
+    ``no-cache`` makes the browser revalidate on every load, so a reloaded
+    visualization never comes from a heuristic cache; an unchanged file costs
+    a 304 (Starlette's ``FileResponse`` sets the ETag but never answers
+    ``If-None-Match`` itself).
+    """
+    headers = {"Cache-Control": "no-cache"}
+    try:
+        stat = path.stat()
+    except OSError:
+        raise HTTPException(status_code=404)
+    # The ETag of this stat answers If-None-Match; a full response stats again
+    # when it is sent, so a file rewritten in between never gets a stale
+    # Content-Length (the watcher's reload races the writer by design).
+    etag = FileResponse(path, stat_result=stat).headers.get("etag")
+    if etag and etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers={**headers, "ETag": etag})
+    return FileResponse(path, headers=headers)
 
 
 def _spa_dirs() -> list[tuple[str, Path]]:
@@ -218,16 +264,18 @@ def create_app() -> FastAPI:
     # to tests that mount the router without running the full lifespan.
     app.state.browser_hub = browser.BrowserHub()
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Allow all origins for Android app and local dev
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # Other web sites must not drive or read the API (api/guard.py): the guard refuses
+    # cross-site writes to /api/*, cross-site WebSocket handshakes and untrusted Hosts (DNS
+    # rebinding); CORS echoes only trusted origins. Native clients (no Origin) are unaffected.
+    # The last middleware added runs first: CORS wraps the guard, so a trusted page (e.g. a dev
+    # server) can read the guard's 403 detail.
+    app.add_middleware(RequestGuardMiddleware)
+    app.add_middleware(TrustedCORSMiddleware)
 
     app.include_router(sessions.router)
     app.include_router(chat.router)
     app.include_router(auth.router)
+    app.include_router(accounts.router)
     app.include_router(orchestrator.router)
     app.include_router(voice.router)
     app.include_router(mcp.router)
@@ -318,20 +366,20 @@ def create_app() -> FastAPI:
     if context_memory_resolved is not None:
         @app.get("/memory")
         @app.get("/memory/")
-        async def serve_memory_index():
+        async def serve_memory_index(request: Request):
             candidate = context_memory / "MEMORY.md"
             if candidate.is_file():
-                return FileResponse(candidate)
+                return revalidated_file(request, candidate.resolve())
             raise HTTPException(status_code=404)
 
         @app.get("/memory/{full_path:path}")
-        async def serve_memory(full_path: str):
+        async def serve_memory(full_path: str, request: Request):
             if not full_path:
                 raise HTTPException(status_code=404)
             candidate = context_memory / full_path
             # Symlinks may point into docs/ (context/memory/archie), never elsewhere.
             if is_within_memory(candidate, context_memory) and candidate.is_file():
-                return FileResponse(candidate.resolve())
+                return revalidated_file(request, candidate.resolve())
             # Directory listing not supported — return 404. Use the index
             # at /memory/ or fetch specific files.
             raise HTTPException(status_code=404)
@@ -339,7 +387,9 @@ def create_app() -> FastAPI:
     # Serve the production frontend build if it exists
     frontend_dist = project_root / "apps" / "web" / "dist"
     if frontend_dist.exists():
+        frontend_dist_resolved = frontend_dist.resolve()
         app.mount("/assets", StaticFiles(directory=frontend_dist / "assets"), name="assets")
+        frontend_dist_resolved = frontend_dist.resolve()
 
         # Same no-cache policy as the compat index — see comment above.
         @app.get("/")
@@ -347,24 +397,42 @@ def create_app() -> FastAPI:
             return FileResponse(frontend_dist / "index.html", headers=_no_cache)
 
         @app.get("/{full_path:path}")
-        async def serve_spa(full_path: str):
+        async def serve_spa(full_path: str, request: Request):
             # 1) Check context/public/ first — runtime-served public files
             #    (visualizations, photo-server, downloads, etc.) without rebuild.
+            #    They change in place (live visualizations), so they revalidate.
             if context_public_resolved is not None and full_path:
                 candidate = (context_public / full_path).resolve()
                 # Path traversal guard: candidate must stay under context/public/.
-                if (
-                    candidate.is_relative_to(context_public_resolved)
-                    and candidate.is_file()
-                ):
-                    return FileResponse(candidate)
+                if candidate.is_relative_to(context_public_resolved):
+                    if candidate.is_file():
+                        return revalidated_file(request, candidate)
+                    # A folder visualization: /<dir>/ serves its index.html;
+                    # /<dir> redirects first so its relative asset URLs resolve.
+                    # The index is resolved again: it may be a symlink out of public/.
+                    index = (candidate / "index.html").resolve() if candidate.is_dir() else None
+                    if index is not None and index.is_relative_to(context_public_resolved) and index.is_file():
+                        if full_path.endswith("/"):
+                            return revalidated_file(request, index)
+                        target = "/" + quote(full_path) + "/"
+                        if request.url.query:
+                            target += "?" + request.url.query
+                        return RedirectResponse(target, status_code=307)
 
-            # 2) Then check the built frontend dist for static assets.
-            file_path = frontend_dist / full_path
-            if file_path.exists() and file_path.is_file():
-                return FileResponse(file_path)
+            # 2) Then check the built frontend dist for static assets (same guard:
+            #    resolve, then stay under the dist).
+            if full_path:
+                file_path = (frontend_dist / full_path).resolve()
+                if file_path.is_relative_to(frontend_dist_resolved) and file_path.is_file():
+                    return FileResponse(file_path)
 
-            # 3) SPA fallback — serve index.html for client-side routing.
+            # 3) An unknown page is a 404, not the app shell: a stale visualization
+            #    link must not load the whole app inside the Visuals viewer (spec 12
+            #    VZ-2). The app routes on the URL hash, so no app route ends in .html.
+            if full_path.lower().endswith((".html", ".htm")):
+                raise HTTPException(status_code=404)
+
+            # 4) SPA fallback — serve index.html for client-side routing.
             return FileResponse(frontend_dist / "index.html", headers=_no_cache)
 
     return app

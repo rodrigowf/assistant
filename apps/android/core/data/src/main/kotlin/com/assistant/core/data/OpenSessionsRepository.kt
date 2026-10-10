@@ -1,6 +1,7 @@
 package com.assistant.core.data
 
 import com.assistant.core.conversation.ConversationState
+import com.assistant.core.conversation.Termination
 import com.assistant.core.model.HarnessProvider
 import com.assistant.core.model.LiveStatus
 import com.assistant.core.model.PoolSession
@@ -13,7 +14,10 @@ import com.assistant.core.session.OrchestratorChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
@@ -52,23 +56,22 @@ data class WorkspaceItem(
     val status: TabStatus = TabStatus.NONE,
     /** One-line state for the switcher / subtitle ("Ready · 14 turns", "Using Bash…"). */
     val detail: String = "",
-    /** Opened by a server event and not looked at yet (P-6 background tab badge). */
-    val unread: Boolean = false,
     /** Pool key / history key of a conversation item (`null` for memory and visuals, or not known yet). */
     val localId: String? = null,
     val sdkId: String? = null,
 )
 
 /**
- * The workspace "tabs" (spec 14 §2.4): the Archie conversation, open agent sessions and (on
- * Expanded) open memory documents and visuals; [active] is the selected one. Selecting changes state,
- * never the back stack.
+ * The workspace "tabs" (spec 14 §2.4) and "Open now". The server owns the open set (spec 12 OPEN-1):
+ * [items] are the Archie conversation, then **every** agent session in `pool/live`, in pool order,
+ * whether or not this device has its view, then views opened here that the pool does not list yet
+ * (a new or resumed session before its first `start`), then memory documents and visuals. [active]
+ * is the selected one; selecting a pool session with no view here opens its view.
  *
- * Focus rules (spec 12 FOCUS-1/3, decision P-6): server events (pool sync, `agent_session_opened`)
- * may add a **background** item with an unread badge but never change [active]; only user calls
- * ([select], [openSession], [newAgentSession], [openMemory], [openVisual]) do, plus Archie's
- * `orchestrator_switch` (§6.11a), which is the user's own request relayed by Archie. A server-side close
- * removes only a sync-opened item the user never focused; anything else stays and shows "stopped".
+ * Focus (FOCUS-1): server events never change [active]; only user calls ([select], [openSession],
+ * [newAgentSession], [openMemory], [openVisual], …) and Archie's `orchestrator_switch` (§6.11a, the
+ * user's own request) do. A session closed on the server (OPEN-3, [ConversationEvent.Closed]) leaves
+ * like an explicit close: its view goes and focus moves to the neighbour, Archie first.
  *
  * Decision P-1: [close] is the only path that ends a session on the server, and only for an
  * explicit user close. There is deliberately no lifecycle hook here that closes anything.
@@ -80,83 +83,89 @@ class OpenSessionsRepository(
     private val orchestrator: OrchestratorChannel,
     private val scope: CoroutineScope,
 ) {
-    private data class Slot(
-        val key: ItemKey,
-        val openedBySync: Boolean = false,
-        val everFocused: Boolean = false,
-        val unread: Boolean = false,
-    )
-
-    private val slots = MutableStateFlow<List<Slot>>(emptyList())
+    /** What is open **here**, in open order: the Archie view, agent views, memory and visuals. */
+    private val local = MutableStateFlow<List<ItemKey>>(emptyList())
     private val _active = MutableStateFlow<ItemKey?>(null)
     val active: StateFlow<ItemKey?> = _active.asStateFlow()
 
     private val _items = MutableStateFlow<List<WorkspaceItem>>(emptyList())
     val items: StateFlow<List<WorkspaceItem>> = _items.asStateFlow()
 
+    private val _notices = MutableSharedFlow<String>(extraBufferCapacity = 8)
+
+    /** One-line notices for the snackbar: the active agent view closed on the server (OPEN-3). */
+    val notices: SharedFlow<String> = _notices.asSharedFlow()
+
     init {
         // The Archie item exists while an Archie conversation is open (adopted, armed or resumed).
         conversations.openKeys.onEach { keys ->
             if (ConversationKey.ARCHIE in keys) {
-                slots.update { s -> if (s.any { it.key == ItemKey.Archie }) s else listOf(Slot(ItemKey.Archie)) + s }
+                local.update { l -> if (ItemKey.Archie in l) l else listOf(ItemKey.Archie) + l }
                 _active.compareAndSet(null, ItemKey.Archie)
             }
         }.launchIn(scope)
-        // §6.11a SW-2: Archie moved this device to a past conversation because the user asked it to
-        // (by voice or text), so it is a user action: focus the resumed view.
-        conversations.events.onEach { if (it is ConversationEvent.ArchieSwitched) focus(ItemKey.Archie) }.launchIn(scope)
-        // Watcher events (T-7): a session opened elsewhere becomes a background item (P-6).
+        conversations.events.onEach {
+            when (it) {
+                // §6.11a SW-2: Archie moved this device to a past conversation at the user's request.
+                is ConversationEvent.ArchieSwitched -> focus(ItemKey.Archie)
+                is ConversationEvent.Closed -> onClosedByServer(it)
+                else -> Unit
+            }
+        }.launchIn(scope)
+        // Watcher events (T-7): a session opened anywhere is listed at once (OPEN-4); closes are
+        // handled by the conversation repository (the view) and the pool (the row).
         val frames = orchestrator.subscribeFrames()
         scope.launch {
             frames.consumeEach { f ->
                 when (f) {
-                    is ServerFrame.AgentSessionOpened -> {
-                        val pool = history.syncPool()
-                        if (!f.isOrchestrator) f.sessionId?.let { onAgentOpened(it, f.sdkSessionId, pool) }
-                        history.refreshListSoon()
-                    }
-                    is ServerFrame.AgentSessionClosed -> {
-                        if (!f.isOrchestrator) f.sessionId?.let { onAgentClosed(it) }
-                        history.refreshListSoon()
-                    }
+                    is ServerFrame.AgentSessionOpened -> { history.syncPool(); history.refreshListSoon() }
+                    is ServerFrame.AgentSessionClosed -> history.refreshListSoon()
                     else -> Unit
                 }
             }
         }
-        // Derived items: slots × titles × per-conversation state.
-        slots.flatMapLatest { list ->
-            val states = list.map { s ->
-                when (val k = s.key) {
+        // Derived items: local keys × their conversation state × the pool × titles.
+        local.flatMapLatest { keys ->
+            val states = keys.map { k ->
+                when (k) {
                     ItemKey.Archie -> conversations.state(ConversationKey.ARCHIE)
                     is ItemKey.Agent -> conversations.state(k.conversation)
                     else -> flowOf(null)
                 }
             }
             if (states.isEmpty()) flowOf(emptyList())
-            else combine(states) { arr -> list.mapIndexed { i, s -> s to arr[i] } }
-        }.let { pairs ->
-            combine(pairs, history.sessions, history.pool) { p, _, _ -> p.map { (slot, st) -> derive(slot, st) } }
+            else combine(states) { arr -> keys.mapIndexed { i, k -> k to arr[i] } }
+        }.let { views ->
+            combine(views, history.pool, history.sessions) { v, pool, _ -> layout(v, pool) }
         }.onEach { _items.value = it }.launchIn(scope)
     }
 
     // ───────────── user actions ─────────────
 
+    /** Selects [key]; a pool session with no view here gets its view first. */
     fun select(key: ItemKey) {
-        if (slots.value.none { it.key == key }) return
+        if (key !in local.value) {
+            val row = (key as? ItemKey.Agent)?.let { k -> history.pool.value.firstOrNull { ConversationKey.agent(it.localId) == k.conversation } }
+                ?: return
+            openLive(row)
+            return
+        }
         _active.value = key
-        slots.update { l -> l.map { if (it.key == key) it.copy(everFocused = true, unread = false) else it } }
         (key as? ItemKey.Agent)?.let { conversations.touch(it.conversation) }
     }
 
     /** The next / previous item (Compact title swipe, Ctrl+Tab). Wraps around. */
     fun selectRelative(delta: Int) {
-        val list = slots.value
+        val list = _items.value
         if (list.isEmpty()) return
         val i = list.indexOfFirst { it.key == _active.value }.coerceAtLeast(0)
         select(list[(i + delta).mod(list.size)].key)
     }
 
-    /** Opens a history row: an Archie conversation resumes on the one orchestrator socket, an agent opens its view. */
+    /**
+     * Opens a history row: an Archie conversation resumes on the one orchestrator socket, an agent
+     * opens its view. A user action (OPEN-2): its `start` may resume the session.
+     */
     fun openSession(summary: SessionSummary) {
         if (summary.isOrchestrator) {
             val cur = conversations.current(ConversationKey.ARCHIE)?.ref
@@ -173,10 +182,10 @@ class OpenSessionsRepository(
             live = live != null,
             liveStatus = live?.status,
         )
-        focus(ItemKey.Agent(conversations.openAgent(ref)))
+        focus(ItemKey.Agent(conversations.openAgent(ref, userStart = true)))
     }
 
-    /** A live pool session (e.g. from the drawer's Open now) as a focused view. */
+    /** A pool session as a focused view (its `start` reattaches). */
     fun openLive(pool: PoolSession) {
         if (pool.isOrchestrator) { focus(ItemKey.Archie); return }
         focus(ItemKey.Agent(conversations.openAgent(pool.toRef())))
@@ -187,9 +196,7 @@ class OpenSessionsRepository(
      * opening it from the live pool when it is not open here. False = no such live agent session.
      */
     suspend fun openAgentByLocalId(localId: String): Boolean {
-        slots.value.firstOrNull { s ->
-            (s.key as? ItemKey.Agent)?.let { conversations.current(it.conversation)?.ref?.localId == localId } == true
-        }?.let { select(it.key); return true }
+        viewKeyOf(localId)?.let { select(it); return true }
         val live = history.pool.value.firstOrNull { it.localId == localId && !it.isOrchestrator }
             ?: history.syncPool()?.firstOrNull { it.localId == localId && !it.isOrchestrator }
             ?: return false
@@ -218,103 +225,123 @@ class OpenSessionsRepository(
     fun openVisual(path: String) = focus(ItemKey.Visual(path))
 
     /**
-     * Explicit close (§6.7, P-1): agent and Archie views close the session for everyone; memory and
-     * visual tabs just go away. Focus moves to the neighbour, Archie first.
+     * Explicit close (§6.7, P-1): agent and Archie conversations close for everyone, with or without
+     * a view here; memory and visual tabs just go away. Focus moves to the neighbour, Archie first.
      */
     suspend fun close(key: ItemKey): Boolean {
+        val localId = _items.value.firstOrNull { it.key == key }?.localId
+        localId?.let(history::dropFromPool)                                   // gone from "Open now" at once
         val ok = when (key) {
             ItemKey.Archie -> conversations.close(ConversationKey.ARCHIE)
-            is ItemKey.Agent -> conversations.close(key.conversation)
+            is ItemKey.Agent ->
+                if (key in local.value) conversations.close(key.conversation)
+                else localId?.let { conversations.closePoolSession(it) } ?: false
             else -> true
         }
-        dropSlot(key)
+        dropLocal(key)
         history.syncPool()
         return ok
     }
 
     /** After a delete (§6.8): views of that session go away (their pool entry was closed). */
     fun forgetSession(sdkId: String) {
-        slots.value.filter { s -> (s.key as? ItemKey.Agent)?.let { conversations.current(it.conversation)?.ref?.sdkId == sdkId } == true }
-            .forEach { s -> (s.key as ItemKey.Agent).let { conversations.forget(it.conversation); dropSlot(it) } }
+        local.value.filterIsInstance<ItemKey.Agent>().filter { conversations.current(it.conversation)?.ref?.sdkId == sdkId }
+            .forEach { conversations.forget(it.conversation); dropLocal(it) }
     }
 
     /** T-15: a new server. Everything local goes; nothing is closed on either server. */
     fun resetForServer() {
-        slots.value = emptyList()
+        local.value = emptyList()
         _active.value = null
     }
 
-    // ───────────── server-driven (never changes focus) ─────────────
+    // ───────────── internals ─────────────
 
     /**
-     * `agent_session_opened` (§3.7): a session started on another device or by Archie opens as a
-     * **background** item with an unread badge; [active] does not change (FOCUS-1, P-6). Live
-     * sessions found by a plain `syncPool` are only listed (drawer / switcher "Open now"), not opened.
+     * OPEN-3: the view leaves like an explicit close. Only the agent view the user is looking at
+     * gets a notice; Archie's close is followed by its own switch announcement (§6.11a).
      */
-    private fun onAgentOpened(localId: String, sdkId: String?, pool: List<PoolSession>?) {
-        val open = slots.value.any { s ->
-            (s.key as? ItemKey.Agent)?.let { conversations.current(it.conversation)?.ref?.localId == localId } == true
+    private fun onClosedByServer(e: ConversationEvent.Closed) {
+        val key = if (e.key == ConversationKey.ARCHIE) ItemKey.Archie else ItemKey.Agent(e.key)
+        if (key is ItemKey.Agent && _active.value == key) {
+            _notices.tryEmit(closedNotice(history.titleFor(e.ref.sdkId, e.ref.localId, AGENT_PLACEHOLDER), e.termination))
         }
-        if (open) return
-        val row = pool?.firstOrNull { it.localId == localId }
-        val ref = row?.toRef() ?: SessionRef(localId, sdkId, SessionKind.AGENT, provider = null, live = true)
-        val key = ItemKey.Agent(conversations.openAgent(ref))
-        slots.update { l -> if (l.any { it.key == key }) l else l + Slot(key, openedBySync = true, unread = true) }
+        dropLocal(key)
     }
 
-    private fun onAgentClosed(localId: String) {
-        val slot = slots.value.firstOrNull { s ->
-            (s.key as? ItemKey.Agent)?.let { conversations.current(it.conversation)?.ref?.localId == localId } == true
-        } ?: return
-        if (slot.openedBySync && !slot.everFocused && _active.value != slot.key) {
-            conversations.forget((slot.key as ItemKey.Agent).conversation)
-            dropSlot(slot.key)
-        }
-        // Otherwise the view stays and shows "stopped" (FOCUS-3); the reducer saw the frame.
-    }
+    private fun viewKeyOf(localId: String): ItemKey.Agent? =
+        local.value.filterIsInstance<ItemKey.Agent>().firstOrNull { conversations.current(it.conversation)?.ref?.localId == localId }
 
     private fun focus(key: ItemKey) {
-        slots.update { l ->
+        local.update { l ->
             when {
-                l.any { it.key == key } -> l
-                key == ItemKey.Archie -> listOf(Slot(key)) + l
-                else -> l + Slot(key)
+                key in l -> l
+                key == ItemKey.Archie -> listOf(key) + l
+                else -> l + key
             }
         }
         select(key)
     }
 
-    private fun dropSlot(key: ItemKey) {
-        val before = slots.value
-        val idx = before.indexOfFirst { it.key == key }
-        if (idx < 0) return
-        val after = before.filterNot { it.key == key }
-        slots.value = after
-        if (_active.value == key) _active.value = after.getOrNull((idx - 1).coerceAtLeast(0))?.key ?: after.firstOrNull()?.key
+    /** [key] leaves; if it was active, focus moves to the previous item open here (Archie first, §6.7). */
+    private fun dropLocal(key: ItemKey) {
+        if (key !in local.value) return
+        val here = _items.value.map { it.key }.filter { it in local.value }
+        val idx = here.indexOf(key)
+        local.update { it - key }
+        if (_active.value == key) _active.value = here.filterNot { it == key }.getOrNull((idx - 1).coerceAtLeast(0)) ?: local.value.firstOrNull()
     }
 
-    private fun derive(slot: Slot, st: ConversationState?): WorkspaceItem = when (val k = slot.key) {
+    /** OPEN-1: Archie, the pool's agent sessions in pool order, views not listed yet, then documents. */
+    private fun layout(views: List<Pair<ItemKey, ConversationState?>>, pool: List<PoolSession>): List<WorkspaceItem> {
+        val agents = views.filter { it.first is ItemKey.Agent }
+        val byLocalId = agents.mapNotNull { v -> v.second?.let { it.ref.localId to v } }.toMap()
+        val listed = HashSet<ItemKey>()
+        val out = ArrayList<WorkspaceItem>(views.size + pool.size)
+        views.firstOrNull { it.first == ItemKey.Archie }?.let { out += derive(it.first, it.second) }
+        for (row in pool) {
+            if (row.isOrchestrator) continue
+            val v = byLocalId[row.localId]
+            if (v != null) { out += derive(v.first, v.second); listed += v.first } else out += rowItem(row)
+        }
+        agents.filter { it.first !in listed }.forEach { out += derive(it.first, it.second) }
+        views.filter { it.first is ItemKey.Memory || it.first is ItemKey.Visual }.forEach { out += derive(it.first, it.second) }
+        return out
+    }
+
+    private fun derive(k: ItemKey, st: ConversationState?): WorkspaceItem = when (k) {
         ItemKey.Archie -> WorkspaceItem(
             key = k, kind = ItemKind.ARCHIE,
             title = archieTitle(history.titleFor(st?.ref?.sdkId, st?.ref?.localId, ARCHIE_PLACEHOLDER)),
-            status = statusOf(st), detail = detailOf(st, "Archie"), unread = slot.unread,
+            status = statusOf(st), detail = detailOf(st, "Archie"),
             localId = st?.ref?.localId, sdkId = st?.ref?.sdkId,
         )
         is ItemKey.Agent -> WorkspaceItem(
             key = k, kind = ItemKind.AGENT,
             title = history.titleFor(st?.ref?.sdkId, st?.ref?.localId, AGENT_PLACEHOLDER),
             provider = st?.ref?.provider,
-            status = statusOf(st), detail = detailOf(st, null), unread = slot.unread,
+            status = statusOf(st), detail = detailOf(st, null),
             localId = st?.ref?.localId, sdkId = st?.ref?.sdkId,
         )
         is ItemKey.Memory -> WorkspaceItem(k, ItemKind.MEMORY, k.path.substringAfterLast('/'), detail = memoryDetail(k.path))
         is ItemKey.Visual -> WorkspaceItem(k, ItemKind.VISUAL, k.path.substringAfterLast('/').substringBeforeLast('.'), detail = "Visual")
     }
 
+    /** A pool session with no view here (OPEN-1): listed like any other, from its row. */
+    private fun rowItem(row: PoolSession) = WorkspaceItem(
+        key = ItemKey.Agent(ConversationKey.agent(row.localId)), kind = ItemKind.AGENT,
+        title = history.titleFor(row.sdkId, row.localId, AGENT_PLACEHOLDER),
+        provider = providerOf(row.sdkId),
+        status = statusOf(row.status),
+        detail = if (statusOf(row.status) == TabStatus.WORKING) "Working…" else "Ready",
+        localId = row.localId, sdkId = row.sdkId,
+    )
+
+    private fun providerOf(sdkId: String?) = sdkId?.let { id -> history.sessions.value.value?.firstOrNull { it.sdkId == id }?.provider }
+
     private fun PoolSession.toRef() = SessionRef(
         localId = localId, sdkId = sdkId, kind = if (isOrchestrator) SessionKind.ORCHESTRATOR else SessionKind.AGENT,
-        provider = history.sessions.value.value?.firstOrNull { it.sdkId == sdkId }?.provider,
-        live = true, liveStatus = status,
+        provider = providerOf(sdkId), live = true, liveStatus = status,
     )
 
     companion object {
@@ -327,6 +354,22 @@ class OpenSessionsRepository(
          * conversation "Orchestrator", and the placeholder is "Archie": both show as
          * "New conversation" (same rule as `SessionTitles.conversationTitle` and the web).
          */
+        /** Same wording as the web (spec 12 OPEN-3, §6.13). */
+        fun closedNotice(title: String, termination: Termination?): String {
+            if (termination == null) return "$title was closed elsewhere"
+            val how = ENDED[termination.reason] ?: "ended"
+            return if (termination.detail.isNullOrBlank()) "$title $how" else "$title $how: ${termination.detail}"
+        }
+
+        /** How a terminated session ended, by `session_terminated.reason`. */
+        private val ENDED = mapOf(
+            "subprocess_crashed" to "crashed",
+            "subprocess_lost" to "ended unexpectedly",
+            "unreachable" to "can't reach its host",
+            "replaced" to "was replaced",
+            "closed_by_user" to "was closed",
+        )
+
         fun archieTitle(raw: String): String = raw.trim().let { if (GENERIC_ARCHIE.matches(it)) NEW_CONVERSATION else it }
         const val AGENT_PLACEHOLDER = "New agent session"
 

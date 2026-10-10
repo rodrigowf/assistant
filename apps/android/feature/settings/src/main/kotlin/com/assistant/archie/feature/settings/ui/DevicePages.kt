@@ -41,6 +41,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.assistant.archie.feature.settings.AppPermission
 import com.assistant.archie.feature.settings.ConnectionModel
 import com.assistant.archie.feature.settings.Format
+import com.assistant.archie.feature.settings.NotifyLogic
 import com.assistant.archie.feature.settings.Ranges
 import com.assistant.archie.feature.settings.ServerRow
 import com.assistant.archie.feature.settings.SettingsFeature
@@ -141,8 +142,8 @@ internal fun ConnectionPage(feature: SettingsFeature, onBack: (() -> Unit)?) {
                         if (on) ask.ask(AppPermission.NOTIFICATIONS) { feature.device.setStayConnected(true) }
                         else feature.device.setStayConnected(false)
                     },
-                    help = "Keeps the link for approval notifications.",
-                    info = "Archie keeps its server connection while it is in the background, so agent approval requests reach this phone as notifications. Uses a little more battery. Off by default.",
+                    help = "Keeps the link for approval and agent notifications.",
+                    info = "Archie keeps its server connection while it is in the background, so agent approval requests and “agent session finished” notifications reach this phone. Uses a little more battery. Off by default.",
                     testTag = "stay-connected",
                 )
             }
@@ -500,6 +501,71 @@ private fun PhraseField(label: String, saved: String, placeholder: String, help:
             enabled = enabled,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
             keyboardActions = KeyboardActions(onDone = { commit() }),
+        )
+    }
+}
+
+// ───────────────────────────── Notifications ─────────────────────────────
+
+/**
+ * "Agent session finished" (spec 12 §3.7 `agent_turn_finished`, §8.2). Turning it on asks for
+ * POST_NOTIFICATIONS (API 33+) through the usual rationale; the switch reads on only when Android
+ * would actually show the notification.
+ */
+@Composable
+internal fun NotificationsPage(feature: SettingsFeature, onBack: (() -> Unit)?, open: (SettingsPageKey) -> Unit) {
+    val s by feature.device.settings.collectAsStateWithLifecycle()
+    val perms by feature.permissions.state.collectAsStateWithLifecycle()
+    val ask = rememberPermissionAsk(feature)
+    val context = LocalContext.current
+    SettingsPageFrame("Notifications", feature.messages, onBack, scope = ScopeLabel.device(feature.platform.deviceName)) {
+        val d = s ?: return@SettingsPageFrame LoadingBody("Loading…")
+        val granted = perms.granted(AppPermission.NOTIFICATIONS)
+        if (d.notifyAgentTurns && !granted) {
+            Notice(
+                NoticeTone.WARNING, "Notifications are not allowed", body = "Archie can't show the agent notifications until Android allows it.",
+                icon = SettingsIcons.Notifications,
+                actions = { com.assistant.core.design.components.InlineCardAction("Allow", { ask.ask(AppPermission.NOTIFICATIONS) }, primary = true) },
+            )
+        } else if (d.notifyAgentTurns && !perms.notificationsEnabled) {
+            Notice(
+                NoticeTone.WARNING, "Notifications are off for Archie", body = "Turn them on in Android’s notification settings.",
+                icon = SettingsIcons.Notifications,
+                actions = {
+                    com.assistant.core.design.components.InlineCardAction("Open settings", { context.launch(feature.platform.notificationSettingsIntent()) }, primary = true)
+                },
+            )
+        }
+        Section(null) {
+            ToggleField(
+                "Agent session finished",
+                NotifyLogic.effective(d.notifyAgentTurns, granted, perms.notificationsEnabled),
+                { on ->
+                    if (on) ask.ask(AppPermission.NOTIFICATIONS) { feature.device.setNotifyAgentTurns(true) }
+                    else feature.device.setNotifyAgentTurns(false)
+                },
+                help = "A notification when an agent session finishes, unless you’re looking at it.",
+                info = "For any agent session (Claude Code, Codex, Gemini, Qwen…), whether you started it here, on another device or " +
+                    "Archie did. A stopped turn doesn’t notify; a failed one says so. Tapping it opens the session.",
+                testTag = "notify-agent-turns",
+            )
+        }
+        Section("In the background") {
+            SettingsRow(
+                "Stay connected in background",
+                icon = ArchieIcons.Lan,
+                value = if (d.stayConnectedInBackground) "On: every finished turn reaches this phone" else "Off",
+                onClick = { open(SettingsPageKey.CONNECTION) },
+                modifier = Modifier.testTag("open-connection"),
+            )
+        }
+        HelpLine(
+            "While a turn is running, Archie keeps its connection (the “Waiting for N agent sessions” notification) until it ends, " +
+                "so the phone can be in your pocket.",
+            info = "Android only lets Archie hold the connection if the turn was already running while Archie was open. " +
+                "Turns started elsewhere while Archie is closed or long in the background reach this phone only with " +
+                "“Stay connected in background” on, or while the wake word or a voice conversation keeps Archie running.",
+            modifier = Modifier.padding(start = 4.dp, bottom = 16.dp),
         )
     }
 }

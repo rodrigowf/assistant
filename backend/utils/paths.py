@@ -13,6 +13,7 @@ Structure:
     └── public/          # Public static files served at URL root
                          # (visualizations/, photo-server/, downloads, etc.)
 """
+import os
 from pathlib import Path
 
 # The repository root (backend/utils/paths.py → three levels up). Every backend module that needs
@@ -33,6 +34,12 @@ def get_context_dir() -> Path:
 def get_memory_dir() -> Path:
     """Get the memory directory."""
     return get_context_dir() / "memory"
+
+
+def get_state_dir() -> Path:
+    """Machine-local backend state (the open set, ...): gitignored, never synced like context/.
+    ``ARCHIE_STATE_DIR`` overrides it (the test suite points it at a temp dir)."""
+    return Path(os.environ.get("ARCHIE_STATE_DIR") or PROJECT_ROOT / "state")
 
 
 def get_docs_dir() -> Path:

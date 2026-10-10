@@ -58,6 +58,14 @@ def truncate_voice_tool_output(output: str) -> str:
     try:
         import json as _json
         parsed = _json.loads(output)
+        if isinstance(parsed, dict) and "total_lines" not in parsed:
+            # Other JSON (search_history, search_memory, ...): a raw char
+            # cut left invalid JSON and dropped whole trailing sections —
+            # an 18 KB search_history lost its ``memory`` block and most
+            # sessions (2026-10-08). Shrink it structurally instead.
+            fitted = _fit_json(parsed, VOICE_TOOL_OUTPUT_MAX_CHARS)
+            if fitted is not None:
+                return fitted
         if isinstance(parsed, dict) and "total_lines" in parsed:
             total = parsed["total_lines"]
             start = parsed.get("start_line", 1)
@@ -76,6 +84,88 @@ def truncate_voice_tool_output(output: str) -> str:
         pass
 
     return clipped + f"\n\n{suffix}"
+
+
+_FIT_NOTE_KEY = "_voice_truncated"
+_FIT_STRING_CAPS = (600, 400, 250, 150)
+
+
+def _clip_strings(value: Any, cap: int) -> tuple[Any, int]:
+    """Copy of ``value`` with every string longer than ``cap`` shortened.
+    Returns ``(copy, number_of_strings_shortened)``."""
+    if isinstance(value, str):
+        if len(value) > cap:
+            return value[:cap].rstrip() + "…", 1
+        return value, 0
+    if isinstance(value, list):
+        out, n = [], 0
+        for item in value:
+            v, k = _clip_strings(item, cap)
+            out.append(v)
+            n += k
+        return out, n
+    if isinstance(value, dict):
+        out_d, n = {}, 0
+        for key, item in value.items():
+            v, k = _clip_strings(item, cap)
+            out_d[key] = v
+            n += k
+        return out_d, n
+    return value, 0
+
+
+def _largest_list(value: Any) -> list | None:
+    """The list with the largest serialized size (> 1 item) inside ``value``."""
+    import json as _json
+
+    best: list | None = None
+    best_size = 0
+    stack = [value]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            if len(cur) > 1:
+                size = len(_json.dumps(cur, ensure_ascii=False))
+                if size > best_size:
+                    best, best_size = cur, size
+            stack.extend(cur)
+    return best
+
+
+def _fit_json(parsed: dict, limit: int) -> str | None:
+    """Serialize ``parsed`` within ``limit`` chars as valid JSON: shorten long
+    strings progressively, then drop trailing items from the biggest lists.
+    A ``_voice_truncated`` note says what was cut. ``None`` if it can't fit."""
+    import json as _json
+
+    def _dump(obj: dict, clipped: int, dropped: int) -> str:
+        note = "Shortened to fit realtime voice:"
+        if clipped:
+            note += f" {clipped} long text fields cut (…)"
+        if dropped:
+            note += f"{',' if clipped else ''} {dropped} trailing list items dropped"
+        note += ". Ask again more narrowly, or open the item, for the full text."
+        return _json.dumps({_FIT_NOTE_KEY: note, **obj}, ensure_ascii=False)
+
+    candidate: dict = parsed
+    clipped = 0
+    for cap in _FIT_STRING_CAPS:
+        candidate, clipped = _clip_strings(parsed, cap)
+        text = _dump(candidate, clipped, 0)
+        if len(text) <= limit:
+            return text
+    dropped = 0
+    while True:
+        biggest = _largest_list(candidate)
+        if biggest is None:
+            return None
+        biggest.pop()
+        dropped += 1
+        text = _dump(candidate, clipped, dropped)
+        if len(text) <= limit:
+            return text
 
 
 class BaseVoiceProvider(ABC):
@@ -436,6 +526,43 @@ class BaseVoiceProvider(ABC):
         ``manual_vad_stop_frames`` is enough.
         """
         return bool(self.manual_vad_stop_frames())
+
+    @property
+    def gate_silence_upstream(self) -> bool:
+        """Hold mic audio back while the relay's manual VAD hears silence.
+
+        When True (and manual VAD is active), the relay keeps silent mic
+        chunks in a short pre-roll buffer instead of appending them
+        upstream, flushes the pre-roll when speech starts, and streams
+        normally until the turn is committed. Providers that bill or cap
+        committed audio (DashScope counts every committed second, silence
+        included) want this; the rest keep the default and stream
+        everything.
+
+        Default: ``False``.
+        """
+        return False
+
+    @property
+    def audio_history_budget_s(self) -> float | None:
+        """Seconds of committed user audio to keep in the upstream conversation.
+
+        When set, the relay tracks the duration of every user audio item
+        the provider creates and deletes the oldest ones (via
+        :meth:`delete_item_frame`) once the total passes the budget, so a
+        long conversation never hits a provider-side audio cap and never
+        has to be reopened.
+
+        Default: ``None`` (no budget).
+        """
+        return None
+
+    def delete_item_frame(self, item_id: str) -> dict[str, Any] | None:
+        """Upstream frame that removes one conversation item, or None.
+
+        Used with :attr:`audio_history_budget_s`. Default: ``None``.
+        """
+        return None
 
     def build_keepalive_chunk(self) -> str | None:
         """Return a base64-PCM silent chunk to keep the upstream warm, or None.

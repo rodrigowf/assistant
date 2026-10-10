@@ -9,6 +9,8 @@ export interface StartMessage {
   local_id: string;
   resume_sdk_id?: string;
   resume_from?: Checkpoint;
+  /** OPEN-2: subscribe only; the server answers `error{session_closed}` instead of re-creating it. */
+  reattach?: true;
 }
 
 /** Voice fields of `voice_start` (V-1: omit all of them to use the server defaults). */
@@ -24,6 +26,8 @@ export interface VoiceStartMessage extends VoiceConfigFields {
   type: 'voice_start';
   local_id: string;
   resume_sdk_id?: string;
+  /** OPEN-2, as on `start`. */
+  reattach?: true;
 }
 
 export type ClientMessage =

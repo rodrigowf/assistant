@@ -188,7 +188,8 @@
         "resume_from": {
           "stream_id": "L1:1759500000000",
           "seq": 14
-        }
+        },
+        "reattach": true
       }
     }
   }

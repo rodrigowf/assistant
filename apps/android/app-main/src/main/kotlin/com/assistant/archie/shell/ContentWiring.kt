@@ -15,6 +15,7 @@ import com.assistant.archie.feature.visuals.web.WebTrust
 import com.assistant.archie.feature.visuals.web.WebViewPool
 import com.assistant.archie.graph.MainAppGraph
 import com.assistant.core.data.ConnectionStatus
+import com.assistant.core.markdown.InternalLinks
 import com.assistant.core.model.DeviceSettings
 import com.assistant.core.network.UrlScheme
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -22,6 +23,9 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.WeakHashMap
 
 /*
@@ -51,6 +55,7 @@ fun visualsDepsOf(graph: MainAppGraph, context: Context): VisualsDeps = synchron
             pool = WebViewPool(app),
             trust = WebTrust(serverUrl = { graph.serverUrl() }, pinFor = graph.settings::pinFor),
             debug = (app.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0,
+            content = graph.content,
         )
     }
 }
@@ -70,6 +75,50 @@ fun rememberMemoryDeps(graph: MainAppGraph): MemoryDeps {
             repository = graph.memory,
             originOf = { UrlScheme.httpBase(graph.serverUrl()) },
             external = { url -> ExternalLinks.open(context, url) },
+            visual = { path -> graph.openVisualChecked(path) { ExternalLinks.open(context, it) } },
+            content = graph.content,
         )
+    }
+}
+
+/**
+ * Opens a visualization in the app only when it is a real page (spec 12 §9.4): in the list, or in
+ * the list after a refresh (a page written a moment ago). Otherwise the
+ * URL goes to [external] rather than framing a 404 in the viewer.
+ */
+fun MainAppGraph.openVisualChecked(path: String, external: (String) -> Unit) {
+    fun listed() = visuals.list.value.value?.any { it.path == path } == true
+    if (listed()) {
+        openSessions.openVisual(path)
+        return
+    }
+    scope.launch {
+        visuals.refreshNow()
+        withContext(Dispatchers.Main) {
+            if (listed()) openSessions.openVisual(path)
+            else external(UrlScheme.httpBase(serverUrl()) + InternalLinks.url(InternalLinks.Target.Visual(path)))
+        }
+    }
+}
+
+/**
+ * Chat links (spec 12 §9.4): a visualization or memory file opens as a workspace item, like a
+ * memory document's links do; anything else leaves the app (a root-relative path against the
+ * current server; only web / mail / phone schemes, `ExternalLinks`).
+ */
+@Composable
+fun rememberChatLinkHandler(graph: MainAppGraph): (String) -> Unit {
+    val context = LocalContext.current
+    return remember<(String) -> Unit>(graph, context) {
+        { href ->
+            val origin = UrlScheme.httpBase(graph.serverUrl())
+            val listed = graph.visuals.list.value.value
+            val ctx = InternalLinks.Context(origin) { p -> listed?.any { it.path == p } == true }
+            when (val t = InternalLinks.resolve(href, ctx)) {
+                is InternalLinks.Target.Visual -> graph.openVisualChecked(t.path) { ExternalLinks.open(context, it) }
+                is InternalLinks.Target.Memory -> graph.openSessions.openMemory(t.path)
+                null -> ExternalLinks.open(context, if (href.startsWith("/") && !href.startsWith("//")) origin + href else href)
+            }
+        }
     }
 }

@@ -6,8 +6,6 @@ import com.assistant.core.data.ItemKind
 import com.assistant.core.data.WorkspaceItem
 import com.assistant.core.data.ConversationKey
 import com.assistant.core.model.HarnessProvider
-import com.assistant.core.model.LiveStatus
-import com.assistant.core.model.PoolSession
 import com.assistant.core.model.SessionSummary
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -36,7 +34,7 @@ class HistoryListTimeZoneTest {
     )
 
     private fun table(zone: String): Map<String, Pair<HistoryBucket, String>> =
-        HistoryList.groups(sessions, emptyList(), emptyList(), "", now, ZoneId.of(zone), Locale.US)
+        HistoryList.groups(sessions, emptyList(), "", now, ZoneId.of(zone), Locale.US)
             .flatMap { g -> g.rows.map { it.summary.sdkId to (g.bucket to it.meta) } }.toMap()
 
     @Test fun utc() {
@@ -71,7 +69,7 @@ class HistoryListTimeZoneTest {
     }
 
     @Test fun newestFirst_withinEachBucket() {
-        val rows = HistoryList.groups(sessions, emptyList(), emptyList(), "", now, ZoneId.of("Asia/Tokyo"), Locale.US)
+        val rows = HistoryList.groups(sessions, emptyList(), "", now, ZoneId.of("Asia/Tokyo"), Locale.US)
             .first { it.bucket == HistoryBucket.TODAY }.rows.map { it.summary.sdkId }
         assertEquals(listOf("rio-offset", "utc-late"), rows)
     }
@@ -83,9 +81,12 @@ class HistoryListTimeZoneTest {
             s("C", "2026-10-02T08:00:00+00:00", "Energy dashboard"),
             s("D", "2026-10-02T07:00:00+00:00", "Orchestrator", orch = true),
         )
-        val open = listOf(WorkspaceItem(ItemKey.Agent(ConversationKey.agent("L")), ItemKind.AGENT, "Fix", localId = "L", sdkId = "B"))
-        val live = listOf(PoolSession("P", "C", LiveStatus.TOOL_USE, 0.0, 1, "Energy dashboard", false))
-        val ids = { q: String -> HistoryList.groups(list, open, live, q, now, ZoneId.of("UTC"), Locale.US).flatMap { g -> g.rows.map { it.summary.sdkId } } }
+        // "Open now" (OPEN-1) holds an open view and a pool session with no view here: both leave the history.
+        val open = listOf(
+            WorkspaceItem(ItemKey.Agent(ConversationKey.agent("L")), ItemKind.AGENT, "Fix", localId = "L", sdkId = "B"),
+            WorkspaceItem(ItemKey.Agent(ConversationKey.agent("P")), ItemKind.AGENT, "Energy dashboard", localId = "P", sdkId = "C"),
+        )
+        val ids = { q: String -> HistoryList.groups(list, open, q, now, ZoneId.of("UTC"), Locale.US).flatMap { g -> g.rows.map { it.summary.sdkId } } }
         assertEquals(listOf("A", "D"), ids(""))
         assertEquals(listOf("A"), ids("energy weekly"))
         assertEquals(emptyList<String>(), ids("weekly dashboard"))

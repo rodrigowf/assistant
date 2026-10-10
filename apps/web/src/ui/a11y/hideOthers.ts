@@ -6,14 +6,17 @@
  * the original attributes.
  *
  * Elements marked `data-a11y-keep` (the shared live region, the snackbar host) stay exposed, so
- * announcements still reach screen readers while a modal is open.
+ * announcements still reach screen readers while a modal is open. `keep` (a selector) leaves more
+ * exposed for one layer only: a compact screen keeps the floating voice controls usable, a dialog
+ * over it does not.
  */
 
 const counts = new Map<Element, number>();
 const SKIP = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'LINK', 'META']);
 
-function hide(el: Element, touched: Element[]): void {
+function hide(el: Element, touched: Element[], keep: string | undefined): void {
   if (SKIP.has(el.tagName) || el.hasAttribute('data-a11y-keep')) return;
+  if (keep && typeof el.matches === 'function' && el.matches(keep)) return;
   const n = counts.get(el);
   if (n === undefined) {
     if (el.getAttribute('aria-hidden') === 'true') return; // hidden by its owner: not ours
@@ -25,13 +28,13 @@ function hide(el: Element, touched: Element[]): void {
   touched.push(el);
 }
 
-export function hideOthers(target: Element): () => void {
+export function hideOthers(target: Element, keep?: string): () => void {
   const touched: Element[] = [];
   let node: Element | null = target;
   while (node && node !== document.body && node.parentElement) {
     const parent: Element = node.parentElement;
     for (const sib of Array.from(parent.children)) {
-      if (sib !== node && !sib.contains(target)) hide(sib, touched);
+      if (sib !== node && !sib.contains(target)) hide(sib, touched, keep);
     }
     node = parent;
   }

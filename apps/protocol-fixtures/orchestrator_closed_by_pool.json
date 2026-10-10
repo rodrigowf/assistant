@@ -1,6 +1,6 @@
 {
   "name": "orchestrator_closed_by_pool",
-  "description": "WATCH-1: the orchestrator is stopped elsewhere (POST close / stop from another device). Its subscribers are dropped silently; the only signal is the watcher event agent_session_closed for its own localId. The view marks itself stopped and ends the turn (running tool -> no_result). A close for another session, or with the wrong is_orchestrator flag (FOCUS-2), changes nothing.",
+  "description": "OPEN-3: the orchestrator is closed elsewhere (POST close / stop from another device). Its subscribers are dropped silently; the only signal is the watcher event agent_session_closed for its own localId. The reducer marks the conversation stopped and ends the turn (running tool -> no_result); the session directory then closes the view (not a reducer concern). A close for another session, or with the wrong is_orchestrator flag (FOCUS-2), changes nothing.",
   "source": "synthetic",
   "session": {
     "kind": "orchestrator",

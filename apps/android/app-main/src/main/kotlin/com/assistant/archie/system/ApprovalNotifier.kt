@@ -331,6 +331,9 @@ class ApprovalActionReceiver : BroadcastReceiver() {
     }
 }
 
+/** A notification tap: focus agent [localId] (pool key); [sdkId] when known. */
+data class OpenRequest(val localId: String, val sdkId: String? = null)
+
 /** The app's foreground / workspace-on-top signals plus the notifier, owned by the graph. */
 class ApprovalCenter(
     val notifier: ApprovalNotifier,
@@ -339,13 +342,16 @@ class ApprovalCenter(
     val foreground = MutableStateFlow(false)
     val workspaceOnTop = MutableStateFlow(true)
 
-    /** A notification tap: the agent `localId` to focus. A StateFlow so a cold-launch tap is not lost. */
-    private val _openRequest = MutableStateFlow<String?>(null)
-    val openRequest: kotlinx.coroutines.flow.StateFlow<String?> = _openRequest
+    /**
+     * A notification tap (approval or "agent finished"): the agent to focus. A StateFlow so a
+     * cold-launch tap is not lost. [OpenRequest.sdkId] reopens it from history once it left the pool.
+     */
+    private val _openRequest = MutableStateFlow<OpenRequest?>(null)
+    val openRequest: kotlinx.coroutines.flow.StateFlow<OpenRequest?> = _openRequest
 
-    fun requestOpen(localId: String) { _openRequest.value = localId }
+    fun requestOpen(localId: String, sdkId: String? = null) { _openRequest.value = OpenRequest(localId, sdkId) }
 
-    fun takeOpenRequest(): String? = _openRequest.value.also { _openRequest.value = null }
+    fun takeOpenRequest(): OpenRequest? = _openRequest.value.also { _openRequest.value = null }
 
     /** A cold process (receiver after process death) must read the stored server URL before calling. */
     suspend fun answerFromNotification(notice: ApprovalNotice, allow: Boolean): ApprovalAnswer {

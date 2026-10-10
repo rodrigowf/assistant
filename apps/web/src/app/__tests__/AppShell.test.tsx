@@ -68,13 +68,15 @@ afterEach(() => {
 /* ------------------------------------------------------------------ §4.4 */
 
 describe('all tabs stay mounted (spec 13 §4.4, inv02 §7 #1)', () => {
-  it('keeps panel and iframe DOM identity across tab switches, reorders and window-class changes', () => {
+  it('keeps panel and iframe DOM identity across tab switches, reorders and window-class changes', async () => {
     openThree();
     const { getByRole } = renderUi(<App services={false} />);
     const main = getByRole('main', { name: 'Workspace' });
     const p1 = panel('A1');
     const p2 = panel('A2');
     const pv = panel('viz:energy/index.html');
+    // the viewer is a lazy chunk: its iframe mounts once the chunk is in, then never moves
+    await waitFor(() => expect(pv.querySelector('iframe')).toBeTruthy());
     const iframe = pv.querySelector('iframe');
     expect(iframe).toBeTruthy();
     expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts allow-same-origin allow-popups allow-forms allow-modals');

@@ -45,6 +45,8 @@ import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
@@ -72,37 +74,104 @@ import com.assistant.core.design.components.TopAppBarSubtitle
 import com.assistant.core.design.icons.ArchieIcon
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
+import com.assistant.core.data.ContentStamp
 import com.assistant.core.markdown.Frontmatter
+import com.assistant.core.markdown.InternalLinks
 import com.assistant.core.markdown.MdNode
 import com.assistant.core.markdown.Slugger
 import com.assistant.core.markdown.ui.MarkdownBlock
 import com.assistant.core.markdown.ui.MarkdownStyle
 import com.assistant.core.markdown.ui.rememberMarkdown
 import com.assistant.core.network.ApiResult
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.time.Instant
 
-/** What the document view shows for one path (web parity: MemoryDocument.tsx `DocState`). */
+/**
+ * What the document view shows for one path (web parity: MemoryDocument.tsx `DocState`).
+ * [changedAt]: when a live refetch last brought different text (the "Updated" cue), 0 = never.
+ */
 @Immutable
-data class MemoryDocState(val text: String? = null, val error: String? = null, val loading: Boolean = true)
+data class MemoryDocState(val text: String? = null, val error: String? = null, val loading: Boolean = true, val changedAt: Long = 0L)
+
+/** Changes closer together than this refetch once (spec 12 §9.3). */
+const val LIVE_REFETCH_DEBOUNCE_MS = 300L
 
 /**
  * Loads `GET /memory/<path>` on open and on every [reload] (spec 14 §4.1). The previous text of the
  * same file stays visible while a reload runs and after a failed one (inv02 F-37); a late answer
  * for an old path is dropped (the effect is keyed by path).
+ *
+ * Live (spec 12 §9.3, VZ-6): a new [changes] entry for [path], or a new [resync] epoch, refetches
+ * the same way (debounced), so the list keeps its scroll position; [MemoryDocState.changedAt] is set
+ * only when the text actually changed.
  */
 @Composable
-fun rememberMemoryDocument(path: String, load: suspend (String) -> ApiResult<String>): Pair<MemoryDocState, () -> Unit> {
+fun rememberMemoryDocument(
+    path: String,
+    load: suspend (String) -> ApiResult<String>,
+    changes: StateFlow<Map<String, ContentStamp>> = NO_CHANGES,
+    resync: StateFlow<Int> = NO_RESYNC,
+): Pair<MemoryDocState, () -> Unit> {
     var tick by rememberSaveable(path) { mutableIntStateOf(0) }
     var state by remember(path) { mutableStateOf(MemoryDocState()) }
+    val stamp = changes.collectAsStateWithLifecycle().value[path]
+    val epoch by resync.collectAsStateWithLifecycle()
+    val liveKey = "${stamp?.version ?: 0}:$epoch"
+    // What this view already reflects (a change before it opened is in the first fetch).
+    var handled by remember(path) { mutableStateOf(liveKey) }
+    var liveTick by remember(path) { mutableIntStateOf(-1) }
+    LaunchedEffect(path, liveKey) {
+        if (liveKey == handled || stamp?.deleted == true) return@LaunchedEffect
+        delay(LIVE_REFETCH_DEBOUNCE_MS)
+        handled = liveKey
+        liveTick = tick + 1
+        tick++
+    }
     LaunchedEffect(path, tick) {
+        val before = state.text
         state = state.copy(loading = true, error = null)
         state = when (val r = load(path)) {
-            is ApiResult.Ok -> MemoryDocState(r.value, null, loading = false)
+            is ApiResult.Ok -> {
+                val changed = tick == liveTick && before != null && before != r.value
+                MemoryDocState(r.value, null, loading = false, changedAt = if (changed) System.currentTimeMillis() else state.changedAt)
+            }
             else -> state.copy(error = r.errorMessage(), loading = false)
         }
     }
     return state to { tick++ }
+}
+
+private val NO_CHANGES: StateFlow<Map<String, ContentStamp>> = MutableStateFlow(emptyMap())
+private val NO_RESYNC: StateFlow<Int> = MutableStateFlow(0)
+
+/** How long the "Updated" cue stays. */
+const val UPDATED_CUE_MS = 2_500L
+
+/** A short-lived "Updated" pill after a live refetch changed the text (web `.updatedCue`). */
+@Composable
+private fun UpdatedCue(changedAt: Long, modifier: Modifier = Modifier) {
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(changedAt) {
+        if (changedAt == 0L) return@LaunchedEffect
+        visible = true
+        delay(UPDATED_CUE_MS)
+        visible = false
+    }
+    if (!visible) return
+    val c = ArchieTheme.colors
+    Text(
+        "Updated",
+        modifier
+            .testTag("memory-updated")
+            .semantics { liveRegion = LiveRegionMode.Polite }
+            .background(c.secondaryContainer, RoundedCornerShape(50))
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+        style = ArchieTheme.typography.labelMedium,
+        color = c.onSecondaryContainer,
+    )
 }
 
 /**
@@ -118,8 +187,10 @@ fun MemoryDocumentScreen(
     onOpenDoc: (String) -> Unit,
     modifier: Modifier = Modifier,
     now: Instant? = null,
+    /** A visualization link (spec 12 §9.4); null = [MemoryDeps.openVisual]. */
+    onOpenVisual: ((String) -> Unit)? = null,
 ) {
-    val (doc, reload) = rememberMemoryDocument(path, deps::document)
+    val (doc, reload) = rememberMemoryDocument(path, deps::document, deps.changes, deps.resyncEpoch)
     val snackbar = remember { SnackbarHostState() }
     Box(modifier.fillMaxSize().background(ArchieTheme.colors.surface).testTag("memory-doc:$path")) {
         Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
@@ -129,11 +200,12 @@ fun MemoryDocumentScreen(
                 navigationIcon = { ArchieIconButton(ArchieIcons.ArrowBack, "Back", onBack) },
                 subtitle = { TopAppBarSubtitle(crumb.ifEmpty { "memory" }) },
             ) {
+                UpdatedCue(doc.changedAt, Modifier.padding(end = 4.dp))
                 if (doc.loading && doc.text != null) Box(Modifier.padding(12.dp)) { Spinner(size = 20.dp) }
                 ArchieIconButton(ArchieIcons.Refresh, "Reload", reload)
                 DocMenu(deps, path, snackbar)
             }
-            MemoryDocumentBody(deps, path, doc, reload, onOpenDoc, snackbar, Modifier.weight(1f), now)
+            MemoryDocumentBody(deps, path, doc, reload, onOpenDoc, snackbar, Modifier.weight(1f), now, onOpenVisual)
         }
         ArchieSnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.navigationBars))
     }
@@ -145,7 +217,7 @@ fun MemoryDocumentScreen(
  */
 @Composable
 fun MemoryDocumentContent(deps: MemoryDeps, path: String, onOpenDoc: (String) -> Unit, modifier: Modifier = Modifier, now: Instant? = null) {
-    val (doc, reload) = rememberMemoryDocument(path, deps::document)
+    val (doc, reload) = rememberMemoryDocument(path, deps::document, deps.changes, deps.resyncEpoch)
     val snackbar = remember { SnackbarHostState() }
     val c = ArchieTheme.colors
     Box(modifier.fillMaxSize().background(c.surface).testTag("memory-doc:$path")) {
@@ -163,6 +235,7 @@ fun MemoryDocumentContent(deps: MemoryDeps, path: String, onOpenDoc: (String) ->
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                UpdatedCue(doc.changedAt)
                 if (doc.loading && doc.text != null) Spinner(size = 18.dp)
                 ArchieIconButton(ArchieIcons.Refresh, "Reload", reload, size = 40.dp, iconSize = 20.dp)
                 DocMenu(deps, path, snackbar)
@@ -212,6 +285,7 @@ internal fun MemoryDocumentBody(
     snackbar: SnackbarHostState,
     modifier: Modifier = Modifier,
     now: Instant? = null,
+    onOpenVisual: ((String) -> Unit)? = null,
 ) {
     val c = ArchieTheme.colors
     val tree by deps.tree.collectAsStateWithLifecycle()
@@ -222,7 +296,8 @@ internal fun MemoryDocumentBody(
     val modified = remember(split?.frontmatter, now) { modifiedLine(split?.frontmatter, now ?: Instant.now()) }
     val list = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    val style = MarkdownStyle.fromTheme()
+    val style = MarkdownStyle.fromTheme().copy(autoLinkPaths = true, linkOrigin = deps.origin())
+    val linkCtx = remember(deps) { InternalLinks.Context(deps.origin()) }
     // Items before the markdown blocks: [frontmatter], [error], [loading] (see below).
     val hasFm = split?.frontmatter != null
     val titleFirst = nodes?.firstOrNull().let { it is MdNode.Heading && it.level == 1 }
@@ -237,7 +312,7 @@ internal fun MemoryDocumentBody(
         }
     }
     val onLink: (String) -> Unit = { href ->
-        when (val l = MemoryLinkResolver.resolve(path, href)) {
+        when (val l = MemoryLinkResolver.resolve(path, href, linkCtx)) {
             is MemoryLink.Anchor -> scrollTo(l.id)
             is MemoryLink.Document -> when {
                 l.path == path -> l.fragment?.let(scrollTo)
@@ -247,6 +322,7 @@ internal fun MemoryDocumentBody(
                 }
                 else -> onOpenDoc(l.path)
             }
+            is MemoryLink.Visual -> onOpenVisual?.invoke(l.path) ?: deps.openVisual(l.path)
             is MemoryLink.External -> deps.openExternal(l.url)
             is MemoryLink.Server -> deps.openExternal(deps.origin() + l.path)
         }

@@ -12,6 +12,9 @@
  * - The file is fetched with every path segment URL-encoded (MEM-3, fixes `fetch("/memory/" +
  *   path)` in frontend/src/api/rest.ts:58). Reload keeps the old text visible until the new one
  *   arrives (inv02 F-37); "Open raw" opens `/memory/<path>` in a new tab.
+ * - Live (spec 12 §9.3): a `memory_changed` for this file, or the socket coming back after a drop
+ *   (VZ-6), refetches it the same way, so the scroll position stays; the "Updated" cue shows only
+ *   when the text actually changed.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { api, errorMessage, httpUrl } from '@/services';
@@ -20,7 +23,7 @@ import { Button, Disclosure, IconButton } from '@/ui/controls';
 import { ScrollArea, Spinner, type ScrollAreaHandle } from '@/ui/primitives';
 import { parseServerTime } from '@/features/history';
 import { formatRelativeTime } from '@/platform';
-import { usePrefs } from '@/stores';
+import { useContentResyncEpoch, useContentStamp, usePrefs } from '@/stores';
 import { fileName, folderCrumb } from './tree';
 import styles from './memory.module.css';
 
@@ -93,9 +96,55 @@ export function slugify(text: string): string {
     .replace(/\s+/g, '-');
 }
 
+/** Changes closer together than this refetch once. */
+export const LIVE_REFETCH_DEBOUNCE_MS = 300;
+const UPDATED_CUE_MS = 2500;
+
 export function MemoryDocument({ path, hidden, onOpenLink }: MemoryDocumentProps) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
+  const [cue, setCue] = useState(false);
+  const stamp = useContentStamp('memory', path);
+  const epoch = useContentResyncEpoch();
+  const liveKey = `${stamp ? stamp.version : 0}:${epoch}`;
+  const deleted = !!stamp && stamp.deleted;
+  // What this view already reflects (a change before it opened is in the first fetch).
+  const handled = useRef(liveKey);
+  /** The reload tick a live change started, and the text it replaces (for the cue). */
+  const liveTick = useRef<{ tick: number; text: string | null } | null>(null);
+  const lastText = useRef<string | null>(null);
+  const tickNow = useRef(reloadTick);
+
+  useEffect(() => {
+    tickNow.current = reloadTick;
+  }, [reloadTick]);
+
+  useEffect(() => {
+    handled.current = liveKey; // another file: start from what it has now
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on a path change
+  }, [path]);
+
+  useEffect(() => {
+    if (liveKey === handled.current || deleted) return undefined;
+    const t = setTimeout(() => {
+      handled.current = liveKey;
+      liveTick.current = { tick: tickNow.current + 1, text: lastText.current };
+      setReloadTick(tickNow.current + 1);
+    }, LIVE_REFETCH_DEBOUNCE_MS);
+    return () => {
+      clearTimeout(t);
+    };
+  }, [liveKey, deleted]);
+
+  useEffect(() => {
+    if (!cue) return undefined;
+    const t = setTimeout(() => {
+      setCue(false);
+    }, UPDATED_CUE_MS);
+    return () => {
+      clearTimeout(t);
+    };
+  }, [cue]);
   const [fmOpen, setFmOpen] = useState(false);
   const scroller = useRef<ScrollAreaHandle>(null);
   const body = useRef<HTMLDivElement>(null);
@@ -108,7 +157,15 @@ export function MemoryDocument({ path, hidden, onOpenLink }: MemoryDocumentProps
     let live = true;
     api.memory.file(path).then(
       (text) => {
-        if (live) setLoaded({ path, tick: reloadTick, text: typeof text === 'string' ? text : '', error: null });
+        if (!live) return;
+        const body = typeof text === 'string' ? text : '';
+        const started = liveTick.current;
+        if (started && started.tick === reloadTick) {
+          liveTick.current = null;
+          if (started.text !== null && started.text !== body) setCue(true);
+        }
+        lastText.current = body;
+        setLoaded({ path, tick: reloadTick, text: body, error: null });
       },
       (err: unknown) => {
         if (live) setLoaded((prev) => ({ path, tick: reloadTick, text: prev && prev.path === path ? prev.text : null, error: errorMessage(err) }));
@@ -169,6 +226,11 @@ export function MemoryDocument({ path, hidden, onOpenLink }: MemoryDocumentProps
         <span className={styles.crumb} title={path}>
           {crumb || 'memory'}
         </span>
+        {cue ? (
+          <span className={styles.updatedCue} role="status">
+            Updated
+          </span>
+        ) : null}
         {state.loading && state.text !== null ? <Spinner size={18} label="Reloading" /> : null}
         <IconButton icon="refresh" size="small" iconSize={20} aria-label="Reload" title="Reload" onClick={load} />
         <IconButton

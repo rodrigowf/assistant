@@ -442,7 +442,7 @@ class VoiceSessionControllerParityTest {
         r.startActive()
         r.connection(ConnectionSignal.Disconnected(willReconnect = true))
         r.connection(ConnectionSignal.Reconnected("local-2", "sdk-2"))
-        assertEquals(VoiceStartRequest("local-2", "sdk-2", "google", "gemini-live", "Puck", "en", null), r.wire.voiceStarts.last().request)
+        assertEquals(VoiceStartRequest("local-2", "sdk-2", "google", "gemini-live", "Puck", "en", null, reattach = true), r.wire.voiceStarts.last().request)   // OPEN-2
         assertTrue(r.wire.resumeStarts.isEmpty())
     }
 

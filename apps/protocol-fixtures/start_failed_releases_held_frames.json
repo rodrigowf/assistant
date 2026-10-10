@@ -61,7 +61,8 @@
       "last_start": {
         "type": "start",
         "local_id": "L1",
-        "resume_sdk_id": "sdk-1"
+        "resume_sdk_id": "sdk-1",
+        "reattach": true
       }
     }
   }

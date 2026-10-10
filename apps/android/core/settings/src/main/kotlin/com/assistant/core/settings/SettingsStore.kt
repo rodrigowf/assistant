@@ -78,6 +78,8 @@ class SettingsStore(
     suspend fun setEnableButtonTrigger(v: Boolean) = edit { it[SettingsKeys.ENABLE_BUTTON_TRIGGER] = v }
     suspend fun setListPaneCollapsed(v: Boolean) = edit { it[SettingsKeys.LIST_PANE_COLLAPSED] = v }
     suspend fun setStayConnectedInBackground(v: Boolean) = edit { it[SettingsKeys.STAY_CONNECTED] = v }
+    suspend fun setNotifyAgentTurns(v: Boolean) = edit { it[SettingsKeys.NOTIFY_AGENT_TURNS] = v }
+    suspend fun setVoiceOverlayAnchor(v: String) = edit { it[SettingsKeys.VOICE_OVERLAY_ANCHOR] = v }
 
     /** Adds or replaces (same URL) a saved server. Blank label/URL is ignored (old behaviour). */
     suspend fun addSavedServer(label: String, url: String) {
@@ -169,6 +171,8 @@ class SettingsStore(
                 enableButtonTrigger = p[SettingsKeys.ENABLE_BUTTON_TRIGGER] ?: d.enableButtonTrigger,
                 listPaneCollapsed = p[SettingsKeys.LIST_PANE_COLLAPSED] ?: d.listPaneCollapsed,
                 stayConnectedInBackground = p[SettingsKeys.STAY_CONNECTED] ?: d.stayConnectedInBackground,
+                notifyAgentTurns = p[SettingsKeys.NOTIFY_AGENT_TURNS] ?: d.notifyAgentTurns,
+                voiceOverlayAnchor = p[SettingsKeys.VOICE_OVERLAY_ANCHOR] ?: d.voiceOverlayAnchor,
             )
         }
 

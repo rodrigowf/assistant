@@ -2,7 +2,6 @@ package com.assistant.archie.feature.chat.support
 
 import com.assistant.archie.feature.chat.ChatBackend
 import com.assistant.archie.feature.chat.ChatVoice
-import com.assistant.archie.feature.chat.ContinueTarget
 import com.assistant.core.conversation.ConversationInput
 import com.assistant.core.conversation.ConversationReducer
 import com.assistant.core.conversation.ConversationState
@@ -31,7 +30,6 @@ class FakeChatBackend(initial: ConversationState) : ChatBackend {
     val commands = mutableListOf<String>()
     val permissions = mutableListOf<Pair<String, Boolean>>()
     val agentApprovals = mutableListOf<Triple<String, String, Boolean>>()
-    val continued = mutableListOf<ContinueTarget>()
     val injected = mutableListOf<String>()
     var interrupts = 0
     var compacts = 0
@@ -66,7 +64,6 @@ class FakeChatBackend(initial: ConversationState) : ChatBackend {
     override fun retry() { retries++ }
     override suspend fun rewind(entryId: String) = cutResult
     override suspend fun fork(entryId: String) = cutResult
-    override fun continueTerminated(target: ContinueTarget) { continued += target }
     override suspend fun upload(source: UploadSource, onProgress: (Long, Long) -> Unit): ApiResult<UploadResult> =
         ApiResult.Ok(UploadResult(source.fileName, "/srv/uploads/${source.fileName}", "/uploads/${source.fileName}", 2048, "text/plain"))
     override fun inject(text: String) { injected += text }

@@ -3,8 +3,8 @@ name: visualizations-and-sharing
 category: archie/integrations
 tags: [visualizations, create-viz, context-public, markdown-reader, memory-urls, uploads, sharing, ipad, fire-tv, hardlink, review-artifacts, media-generation, remotion]
 created: 2026-04-15
-modified: 2026-10-07
-summary: Making things viewable on any device — /create-viz, what each URL prefix serves, the markdown reader, review-artifact placement, media generation skills.
+modified: 2026-10-09
+summary: Making things viewable on any device — /create-viz (interactive canvases, live reload, in-app links), what each URL prefix serves, the markdown reader, review-artifact placement, media generation skills.
 source: curated (consolidated from memory notes assistant/infrastructure/features_and_integrations_summary.md §8, §10, §14, assistant/utilities/markdown_workflow.md, assistant/utilities/memory_url_and_hardlink_edit_gotcha.md, assistant/utilities/review_artifacts_location.md, assistant/utilities/experiments_dont_touch_app.md, projects/content-creation/content_creation_project.md (tooling parts); verified against code 2026-10-06)
 references:
   - skills.md
@@ -47,29 +47,47 @@ machine without nginx use `http://<lan-ip>:8765/<path>`.
 `/uploads/x` is *not* `context/public/uploads/x`. When something hands you a `/`-prefixed path,
 check which mount owns it before looking for the file. Full route table: [backend](../architecture/backend.md).
 
-## `/create-viz`
+## `/create-viz`: interactive canvases
 
-The personal skill `context/skills/create-viz/SKILL.md` wraps
-`context/scripts/create_visualization.py`:
+The personal skill `context/skills/create-viz/` (`SKILL.md` + `references/patterns.md`,
+`references/devices.md`, rewritten 2026-10-09) treats visualizations as the agents' canvas: project
+interfaces that grow with the work (one folder per project at the public root, e.g.
+`context/public/<project>/index.html` with its assets beside it), interactive explainers, review and
+editor pages that post choices back to the session (`POST /api/sessions/inject`), and live
+dashboards that read the backend. Agents write the HTML directly with Write/Edit and edit it in
+place; the apps reload open pages on every change (below). `<title>` names the page in the
+Visuals list.
 
-```
-context/scripts/run.sh context/scripts/create_visualization.py --filename NAME --title "TITLE" \
-    [--type basic|chart|dashboard|tv-remote] [--content HTML] [--template PATH] \
-    [--show-url] [--display-tv] [--port N]
-```
-
-- Writes `context/public/visualizations/<name>.html` (`.html` added if missing; an existing file is
-  overwritten). Templates: `basic` (centered, gradient), `chart` (Chart.js from a CDN), `dashboard`
-  (card grid), `tv-remote` (arrow-key menu for the TV). `{title}` is substituted.
-- Prints the URL for the machine it runs on: if something listens on local port 443 (nginx — the
-  Jetson) `https://<ip>/visualizations/<name>.html`, else `http://<ip>:8765/visualizations/…`.
-  `get_visualization_url.py <name> --network` reprints it later. The Vite dev servers (5450/5451,
-  and the old 5432) do **not** serve `/visualizations`. The skill's pages and the TV test script
-  were updated on 2026-10-07 to print backend URLs; any older note that prints `:5432` is wrong.
-- Gallery page: `/visualizations/index.html`.
+`context/scripts/create_visualization.py` (templates `basic`, `chart`, `dashboard`, `tv-remote`
+into `context/public/visualizations/<name>.html`; `--show-url`, `--display-tv`) and
+`get_visualization_url.py` still work but are legacy: they only cover `visualizations/`. The Vite
+dev servers (5450/5451, and the old 5432) do **not** serve public files.
 
 Because `context/` is synced, a visualization written on the laptop is live on the Jetson's URL a
 few seconds later ([context-sync](../infrastructure/context-sync.md)).
+
+### Live reload
+
+`backend/api/content_watcher.py` watches `context/public/` and the memory tree (one `watchfiles`
+loop, which also wakes the memory indexer) and pushes `visualization_changed` / `memory_changed`
+to every orchestrator socket (spec 12 §9.3). The web and Android apps reload an open
+visualization when its page **or any of its assets** changes (an asset maps to the pages in its
+folder tree that name it, else the folder's `index.html`), keep the scroll position, and show a
+short "Updated" cue (a hidden tab waits until it is shown); open memory documents refetch in place. Bursts (an rsync from context-sync)
+are coalesced; temp files are ignored. If the machine is out of inotify watches the watcher
+falls back to polling every 2 s; other errors retry with backoff, and a root that appears after
+boot is picked up. Public and memory files are served with `Cache-Control: no-cache` + `ETag`,
+`/<dir>/` serves `<dir>/index.html`, and an unknown `*.html` path is a 404 (not the app shell).
+
+### Links open in the app
+
+Chat (agent sessions and Archie) and memory documents open links to a visualization or a memory
+file in the app's own viewer (spec 12 §9.4): root-relative URLs (`/avatar-pipeline/index.html`,
+`/<dir>/`, `/memory/<path>.md`, the old `/markdown_reader.html?file=memory/…`), the same on the
+server's host, filesystem paths as agents print them (`context/public/…html`,
+`context/memory/…md`, `docs/…md` → `/memory/archie/…`, bare or in backticks). The **convention**
+for agents is a root-relative markdown link: `[Avatar pipeline](/avatar-pipeline/index.html)`,
+`[Voice notes](/memory/projects/voice.md)`.
 
 ### Listing and "Show on TV"
 
@@ -104,8 +122,10 @@ recording.
   which the memory route serves straight from `context/memory/`. No copy is needed.
 - A doc in this tree: `?file=memory/archie/<path-under-docs>` (through the `archie` symlink).
 
-**Link convention** (chat, orchestrator replies, anything the iPad opens): always the Jetson IP,
-as a clickable markdown link with a readable label:
+**Link convention**: in chat, link a memory note as `[Revised script](/memory/projects/<project>/<file>.md)`;
+the apps render it in their memory viewer (§ Links open in the app). For a URL that must work
+outside the app (pasted into another app, opened on a device without Archie), use the reader on
+the Jetson IP as a readable markdown link:
 
 ```
 [Revised script](https://192.168.0.200/markdown_reader.html?file=memory/projects/<project>/<file>.md)

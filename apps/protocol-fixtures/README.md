@@ -80,7 +80,7 @@ So `events` that follow `initial_history` may legitimately overlap it (see `hist
 | `datachannel_event` | `event` | OpenAI data-channel inbound event, owner only (§4.7) |
 | `voice_local_end` | — | voice torn down locally (§7.6) |
 | `ws_closed` | — | the socket closed: entries are untouched; `gapPossible` per §3.3/SEQ-7 |
-| `ws_open` | — | the socket reopened: `sendStart` (§3.3) records the `start` message (with `resume_from` when allowed) and starts holding frames until `session_started` |
+| `ws_open` | — | the socket reopened: `sendStart` (§3.3) records the `start` message (with `resume_from` when allowed, and `reattach: true`: an automatic re-start of a conversation that was subscribed, OPEN-2) and starts holding frames until `session_started` |
 | `rest_page` | `mode` (`replace` \| `prepend` \| `reconcile`), `response` | `reduce(history_page{mode, response})` (§5.1, §5.5). A `replace` while a reload is pending (after `replay_overflow`) completes the canonical reload and flushes the held frames (§5.6). |
 
 ## Normalisation

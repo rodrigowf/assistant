@@ -350,7 +350,7 @@ async def _run_switch(pool: Any, session: Any, ws: Any, frame: dict) -> None:
 async def close_agent_session(context: dict[str, Any], session_id: str) -> str:
     pool = context["pool"]
 
-    if not pool.has(session_id):
+    if not pool.is_open(session_id):
         return json.dumps({"error": f"No active session with ID {session_id}"})
 
     try:
@@ -401,7 +401,7 @@ async def read_agent_session(
 
     # session_id is the local_id; look up the SDK session ID for JSONL store
     sm = pool.get(session_id)
-    sdk_id = sm.sdk_session_id if sm else session_id
+    sdk_id = sm.sdk_session_id if sm else (pool.restored_sdk_id(session_id) or session_id)
 
     previews = store.get_preview(sdk_id, max_messages=max_messages)
     messages = [
@@ -483,7 +483,7 @@ async def send_to_agent_session(
             "error": "BackgroundAgentRunner not available in context — orchestrator init bug",
         })
 
-    if not pool.has(session_id):
+    if not pool.is_open(session_id):
         return json.dumps({"error": f"No active session with ID {session_id}"})
 
     try:

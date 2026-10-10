@@ -79,6 +79,13 @@ class ProtocolCodecTest {
         ServerFrame.AgentSessionOpened("A1", "sdk-9", false),
         ServerFrame.AgentSessionClosed("O1", true),
         ServerFrame.OrchestratorSwitch("past-1", "Lamps", true, "O1"),
+        ServerFrame.AgentTurnStarted("A1", "S1", "claude"),
+        ServerFrame.AgentTurnFinished("A1", "S1", "codex", "Energy", "error", "Half done", "Credit balance is too low"),
+        ServerFrame.VisualizationChanged(
+            listOf(ContentChange("dash/index.html", ContentChange.Kind.MODIFIED), ContentChange("old.html", ContentChange.Kind.DELETED)),
+            listOf(ContentChange("dash/data.json", ContentChange.Kind.MODIFIED)),
+        ),
+        ServerFrame.MemoryChanged(listOf(ContentChange("archie/specs/12-client-protocol.md", ContentChange.Kind.CREATED))),
         ServerFrame.AudioUpload("AAAA", "webm", "hi", 3),
         ServerFrame.Ping(),
         ServerFrame.VoiceEvent(tree),
@@ -207,6 +214,9 @@ class ProtocolCodecTest {
             """{"type":"agent_session_closed","session_id":"A1","is_orchestrator":false}""",
             // backend/orchestrator/tools/agent_sessions.py switch_conversation (spec 12 §6.11a)
             """{"type":"orchestrator_switch","sdk_session_id":"past-1","title":"Lamps","voice":true,"from_session_id":"O1"}""",
+            // backend/api/pool.py send(): turn watcher events (spec 12 §3.7)
+            """{"type":"agent_turn_started","session_id":"A1","sdk_session_id":"S1","provider":"claude"}""",
+            """{"type":"agent_turn_finished","session_id":"A1","sdk_session_id":"S1","provider":"claude","title":"Energy","status":"ok","preview":"All 12 tests pass.","error":null}""",
             """{"type":"voice_command","command":{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"c","output":"{}"}}}""",
             """{"type":"voice_audio_out","audio":"AAEC"}""",
             """{"type":"voice_connection_error","detail":"x"}""",
@@ -289,6 +299,12 @@ class ProtocolCodecTest {
         )
         // no resume fields at all for a brand-new session
         assertEquals(obj("""{"type":"start","local_id":"L1"}"""), ProtocolCodec.encodeClientJson(ClientFrame.Start("L1")))
+        // OPEN-2: automatic starts and the voice re-arm reattach
+        assertEquals(obj("""{"type":"start","local_id":"L1","reattach":true}"""), ProtocolCodec.encodeClientJson(ClientFrame.Start("L1", reattach = true)))
+        assertEquals(
+            obj("""{"type":"voice_start","local_id":"O1","reattach":true}"""),
+            ProtocolCodec.encodeClientJson(ClientFrame.VoiceStart("O1", reattach = true)),
+        )
     }
 
     @Test

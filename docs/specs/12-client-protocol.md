@@ -226,7 +226,7 @@ Mapping to the requested concept list:
 ```
 
 - **ST-1.** Unknown `status` values from the server MUST map to the current status unchanged, never to "Ready" (W-6.2, A-1.4). `retrying` MUST be shown as a distinct state.
-- **ST-2.** On (re)subscribe the client MUST take `pool/live[].status` as authoritative for agent sessions whose turn state it does not know: `streaming|tool_use|thinking` ⇒ `inTurn = true` and that status; `idle` while `inTurn` ⇒ `endTurn("unknown")`. The orchestrator row always says `idle` (G-15) and MUST NOT be used this way.
+- **ST-2.** On every (re)subscribe (each `session_started` of an agent socket) the client MUST fetch `pool/live` and take its row's `status` as authoritative: `streaming|tool_use|thinking` ⇒ `inTurn = true` and that status; any other status (`idle`, `interrupted` — Codex, Gemini and Qwen keep it after a stopped turn — or `disconnected`) while `inTurn` ⇒ `endTurn("unknown")`. A turn that ended while the socket was away, or ended without a terminal frame, otherwise stays "running" forever. The orchestrator row always says `idle` (G-15) and MUST NOT be used this way.
 - **ST-3.** Tab/page indicators MUST distinguish: connecting, subscribed-idle, busy, stopped, terminated, connection failed (W-6.1).
 
 ---
@@ -239,6 +239,7 @@ Mapping to the requested concept list:
 - **T-2.** Client→server frames MUST be **text** frames. A client MUST NEVER send a binary frame: the server drops the socket with no close frame.
 - **T-3.** A frame that does not parse as a JSON object, or has no string `type`, MUST be logged and ignored. It MUST NOT reach the reducer.
 - **T-4.** Clients MUST NOT send `ping` on the chat WS (it answers `error: unknown_type`, G-24). Keep-alive relies on protocol pings: OkHttp `pingInterval(30s)` on Android; the browser's own on web. Android MUST NOT add an app-level heartbeat (03 §3.3). Server `{"type":"ping"}` frames on the orchestrator WS MUST be ignored.
+- **T-4a.** The server refuses requests from other web sites (`backend/api/guard.py`, [backend.md](../architecture/backend.md#auth-and-the-browser-origin-guard)): every `/api/*` `POST`/`PUT`/`PATCH`/`DELETE` and every WebSocket handshake with `Sec-Fetch-Site: cross-site` or an untrusted `Origin` (`null` included) gets 403 (sockets: closed with 1008 before `accept`), and every `/api/*`, `/memory`, `/uploads` and `/projects` request with an untrusted `Host` (DNS rebinding) gets 403. Trusted origins: the server's own host name (any scheme/port), the web dev/mock servers (5450/5451/8799) on a trusted host, `chrome-extension://`, `ARCHIE_TRUSTED_ORIGINS`. CORS echoes only trusted origins (no `*`). Clients MUST call the API from the origin that served them (web: `location.origin`) or send no `Origin` at all (native clients); a page served elsewhere needs its origin in `ARCHIE_TRUSTED_ORIGINS`. The web apps and `context/public/` pages are never refused.
 
 ### 3.2 Sockets per conversation
 
@@ -265,9 +266,10 @@ connect(conv):
      if conv.kind == "orchestrator" and conv.inTurn: conv.gapPossible = true
      scheduleReconnect(conv)
 
-sendStart(conv):
+sendStart(conv, userAction = false):
   msg = { type: "start", local_id: conv.ref.localId }
   if conv.ref.sdkId: msg.resume_sdk_id = conv.ref.sdkId
+  if not userAction: msg.reattach = true      // OPEN-2: subscribe only, never create
   if seqCapable(conv.ref) and conv.checkpoint != null and conv.history.loaded:
        msg.resume_from = { stream_id: conv.checkpoint.stream_id, seq: conv.checkpoint.seq }
   conv.startRequest = msg
@@ -276,15 +278,16 @@ sendStart(conv):
   send(msg)
 ```
 
-- **T-9.** `start` MUST be (re-)sent on every socket open and on every visibility/foreground resume while the socket is open (§3.5). Re-sending `start` on a subscribed socket is safe: subscription is a set (`api/pool.py:488-491`).
+- **T-9.** `start` MUST be (re-)sent on every socket open and on every visibility/foreground resume while the socket is open (§3.5). Re-sending `start` on a subscribed socket is safe: subscription is a set (`api/pool.py:488-491`). Every such automatic `start` of an existing view carries `reattach: true` (OPEN-2), so it can never re-create a conversation that was closed.
 - **T-10.** `resume_from` MUST only be sent when the conversation's entries were built in this process from the same stream (in-memory checkpoint). A client that rebuilt the conversation from REST (cold open, process death, page reload) MUST NOT send a persisted checkpoint (fixes W-7). Checkpoints MUST NOT be written to persistent storage per event (A-2.2/A-8.14). Android MAY persist `{localId, checkpoint}` **together with a full snapshot of the entries** on `onStop`; restoring both is equivalent to "in memory".
-- **T-11.** For the orchestrator, `voice_start` replaces `start` while this client owns voice (§7.3).
+- **T-11.** For the orchestrator, `voice_start` replaces `start` while this client owns voice (§7.3). A plain `start` from the owner's own socket is still safe: the server answers it with `voice_initiator: true` and voice metadata only (no `voice_session_update`, no `voice_connection_info`). Android's conversation layer sends one on every foreground.
 - **T-12.** Responses to `start`:
   - `status{connecting}` → `status = connecting`.
   - `session_started` → `connState = subscribed`; clear `connectionBanner`; adopt `localId` (ID-1); set `counters.contextWindow` from `context_window` (chat) or `model_info.model_info.context_window` (orchestrator), fallback 200 000; then §3.6.
   - `error{start_timeout|start_failed}` → `connState = failed`, `connectionBanner = {code, detail}`, offer Retry. No automatic retry loop. Every start error also ends the wait for `session_started` (SEQ-8).
   - `error{orchestrator_active}` → §6.12 (conflict). `error{orchestrator_stopping}` → retry `start` once after 1 s, then fail.
-  - `error{not_started}` received at any time → re-send `start` once.
+  - `error{not_started}` received at any time → re-send `start` once (with `reattach`).
+  - `error{session_closed}` (answer to a `reattach` start: the conversation is not open) → OPEN-3: the view closes.
 
 ### 3.4 Reconnect and backoff
 
@@ -298,9 +301,9 @@ sendStart(conv):
 ```
 onVisible():                                    // web visibilitychange→visible; Android onStart/onResume
   for conv in openConversations:
-     if socket(conv).isOpen: sendStart(conv)    // resync: replay what we missed
+     if socket(conv).isOpen: sendStart(conv)    // resync with reattach (OPEN-2): replay what we missed
      else: reconnectNow(conv)
-  sessionDirectory.syncPool()                   // §3.7
+  sessionDirectory.syncPool()                   // §3.7: OPEN-4 reconcile
   sessionDirectory.refreshList()
 ```
 
@@ -375,30 +378,40 @@ SessionDirectory:
   list: SessionInfo[]            // GET /api/sessions
   pool: PoolSession[]            // GET /api/sessions/pool/live
 
-syncPool():                      // on app start, on visible, after any session mutation
+syncPool():                      // OPEN-4: every orchestrator socket open, every visible/foreground, after any mutation
   pool = GET /api/sessions/pool/live
-  for row in pool:
-     if row.is_orchestrator: orchestratorRef = {localId: row.local_id, sdkId: row.sdk_session_id}
-     else if no open view has row.local_id: markLive(row)      // badge in the switcher
+  orchestratorRef = pool.find(is_orchestrator) ?? null           // null: the Archie view closes (OPEN-3)
+  for view in openConversationViews: if no row has view.localId: closeView(view)   // OPEN-3
+  openNow = pool                                                  // OPEN-1: the list IS the pool
 
 onWatcherEvent(e):               // only arrives on the orchestrator WS, even unsubscribed (T-7)
   agent_session_opened{session_id, sdk_session_id, is_orchestrator}:
        if is_orchestrator: orchestratorRef = {session_id, sdk_session_id}
        else: markLive(...) ; maybe open a background view (FOCUS-1)
        refreshList() ; refreshVisualizations()
-  agent_session_closed{session_id, is_orchestrator}:
-       v = openViewByLocalId(session_id)
-       if v: v.status = (v.status == terminated) ? terminated : stopped ; endTurn(v,"stopped")
-             if v.openedBySync and not v.everFocused and not v.isActive: closeView(v)
+  agent_turn_started{session_id, ...} / agent_turn_finished{session_id, status, preview, ...}:
+       device notifications only, at the channel level (TURN-1, TURN-2); no view changes
+  agent_session_closed{session_id, is_orchestrator}:            // OPEN-3
+       closeView(openViewByLocalId(session_id))                 // active or not; no close request
        if is_orchestrator: orchestratorRef = null ; voice teardown if any (§7)
-       refreshList()
+       openNow.remove(session_id) ; refreshList()
+  visualization_changed / memory_changed:   // same fan-out, handled at the channel level (§9.3)
+       onContentFrame(e)
 ```
 
 - **FOCUS-1.** No server-originated event (pool sync, `agent_session_opened`, `user_message`, a background turn, a voice transcript) may change which view is active or navigate the UI. Only a direct user action may change focus. Clients MAY open a **background** view for a session started elsewhere (web parity), shown with an unread/live badge, but it MUST NOT become active (fixes W-6.1 focus stealing, A-1.1 auto-navigation).
 - **FOCUS-2.** `agent_session_closed` MUST check `is_orchestrator` before acting on a view (G-39).
-- **WATCH-1.** A conversation that itself receives `agent_session_closed` with its own `localId` and the matching `is_orchestrator` flag (FOCUS-2) MUST treat it as a server `session_stopped`: `status = stopped` (a `terminated` status is kept), `endTurn`, `endVoice`. The view stays open (FOCUS-3). In practice this is the orchestrator conversation, whose socket receives the watcher events. *Rationale:* `pool.stop_orchestrator()` clears the orchestrator's subscribers without sending them any frame and only notifies watchers (`api/pool.py:591-602`). Every orchestrator socket is a watcher (`api/routes/orchestrator.py:127-128`), so this frame is the orchestrator view's only signal that its session ended elsewhere. Fixture `orchestrator_closed_by_pool`.
-- **FOCUS-3.** A view the user has interacted with MUST NOT be closed by a server event. It shows `stopped` with a "Session ended" state and a Resume action (`start` with a new `localId` and `resume_sdk_id`).
+- **OPEN-1. The server owns the open set.** A conversation (Archie or agent) is open exactly when `GET /api/sessions/pool/live` has its row. "Open now" on every device **is** that list — the same conversations on every device, each with its live status, whether or not this device has a view of it (the order may be the user's, e.g. dragged tabs; membership is the pool's). A client MUST NOT list, keep or re-create a conversation that is not in the pool. The pool survives backend restarts: the server persists it and restores it at startup, a restored conversation listed as `idle` until something uses it (`backend/api/open_sessions.py`). So there is no "backend restarted" case for clients to guess at (it replaced RT-4 and the 2026-10-10 server-id heuristic).
+- **OPEN-2. Reattach, never re-create.** Every automatic `start` (socket open, reconnect, visible/foreground resync, `not_started` recovery; Android's voice-owner `voice_start` on reconnect) carries `reattach: true`. The server then subscribes the socket if the conversation is in its pool (spawning a restored one) and otherwise answers `error{session_closed}` without creating anything. Only a direct user action that **creates** or resumes a conversation sends `start` without `reattach`: a new conversation, opening one from History, fork / duplicate / continue / rewind, Save and Restart, the §6.11 take-over. (A voice start pressed on a view that is already subscribed may keep `reattach`: while the conversation is open the result is the same.) The server is the one place that decides, so a device that missed a close cannot revive the conversation, whatever its timing.
+- **OPEN-3. Closed = gone, everywhere, at once.** When a conversation leaves the pool — `agent_session_closed{session_id, is_orchestrator}` (check the flag, FOCUS-2), `error{session_closed}`, or a `pool/live` read without its row (OPEN-4) — every client closes its view immediately, whether it is active or not, without a `close` request (the server already closed it). If it was active, focus moves to its neighbouring view, as after an explicit close. Orchestrator: `orchestratorRef = null`, voice ends (§7), the Archie slot shows the empty "New conversation" state. A client MAY show a one-line notice ("Closed on another device"; for `session_terminated{reason}` the reason). *Rationale:* until 2026-10-10 a view the user had looked at stayed as a "Stopped" tab (FOCUS-3, now removed), listed under "Open now" with no session behind it, and its next automatic `start` re-opened the session on the server for every device.
+- **OPEN-4. Reconcile on every read.** Clients read `pool/live` on every orchestrator socket open and every visible/foreground (§3.5), and after each `session_started` of an agent view (ST-2, one read for both): views whose row is missing close (OPEN-3), the others take the row's status (ST-2), rows with no view here are listed (OPEN-1). Watcher events keep it current in between: `agent_session_opened` adds the row on every device, `agent_session_closed` removes it.
 - **MC-1.** Mutations are not broadcast (G-27). After rename, delete, duplicate, rewind, fork, close and config writes, the acting client refreshes its own stores. Other clients see changes on their next `refreshList()` (visible, watcher event, or any `turn_complete`).
+- **TURN-1.** Turn watcher events (added 2026-10-09 for device notifications). `pool.send()` (`backend/api/pool.py`), the path of every agent turn (chat tabs and the orchestrator's runner; never the orchestrator's own turns), tells every pool watcher:
+  - `agent_turn_started{session_id, sdk_session_id, provider}` when a turn begins;
+  - `agent_turn_finished{session_id, sdk_session_id, provider, title, status, preview, error}` when it ends. `session_id` is the agent's `localId`. `status` is `ok` | `error` | `interrupted`: a turn stopped through `pool.interrupt` (chat Stop, `cancel_turn`, a superseding prompt, the runner's cancel) is `interrupted` even though the SDK still sends a `TurnComplete`; an `is_error` `TurnComplete`, an exception, an abandoned turn after its retry and the runner's timeout are `error` (the timeout arrives as `interrupted` then `error`). `title` is the session's custom title or first prompt (null when unknown: use MC-2). `preview` is one line of the turn's final assistant text (markdown markers dropped, ≤ 200 chars); `error` the failure detail when `status == "error"`. An unknown `status` reads as `ok`.
+
+  Each `send()` announces exactly one finish; an abandoned attempt that is retried announces a second `agent_turn_started` and only the final outcome (a cancellation or failure in the pause between the attempts is announced there: `interrupted` / `error`). Both emissions run as their own tasks, so a stalled watcher socket never delays a turn; a finish waits for its start, so watchers see them in order. Clients handle both frames at the **channel level** (like `orchestrator_switch`), attached or not; they never reach a conversation reducer and never change focus (FOCUS-1).
+- **TURN-2.** Device notification (Settings → This device → Notifications → "Agent session finished", §8.2, off by default). On `agent_turn_finished` a client posts one system notification when the switch is on, the OS/browser allows it, `status != interrupted`, and the user is not looking at that session (app visible and focused, the workspace on top, that view active; on the web also in another page of the same browser, published through a localStorage "viewing" entry refreshed every 20 s and trusted for 45 s). Title: `title`, else the derived title, else "Agent session". Body: `preview` (or "Finished"); errors read "Failed: <error>". One notification per session (tag `archie-turn:<localId>` on web, `turn:<localId>` on Android): a newer one replaces it. A tap is a user action: it brings the app forward and focuses that session (its open view, else the live pool session, else `start{local_id, resume_sdk_id}`). Web: `registration.showNotification` through the main build's service worker (the only path on Android Chrome), else `new Notification`; no Notification API (iOS 12 Safari) or an http origin → the setting explains instead. Android: the "Agent sessions" channel (high importance: heads-up; the feature is opt-in); while the switch is on and an agent turn is in flight (tracked from these frames, reconciled with `pool/live` on every reconnect and every 3 min while busy, a finish newer than a pool read wins, 2 h age-out) the voice host's foreground service is held, special-use type only, its notification reading "Waiting for N agent sessions", so the socket survives the background (spec 14 §2.5). Both log one line per decision (`[notify] …` / logcat tag `ArchieNotify`).
 - **MC-2.** Titles are derived, not stored on the view (02 §1.6 load-bearing): `title = list.find(s => s.session_id == sdkId)?.title ?? list.find(s => s.local_id == localId)?.title ?? placeholder`. The backend's `"(active session)"` (a live session with no history file yet) counts as no title: the placeholder shows (2026-10-04). Placeholders: Archie → "New conversation" (CR-9), agent → "New agent session" on both platforms. `refreshList()` runs after every `endTurn` of any view (debounced to 1 per 2 s).
 
 ---
@@ -760,7 +773,7 @@ function reduce(f) {
     if (expectStopAck) { expectStopAck = false; return }         // reply to our own stop / close
     if (status != "terminated") status = "stopped"
     endTurn("stopped"); endVoice()
-    return                                                     // the view is NOT closed (fixes W-9)
+    effects.push({type: "closed", reason: termination})        // OPEN-3: the session directory closes the view
 
   case "voice_event":       return onVoiceEvent(f.event)
   case "voice_owner_active": if (f.active) voiceActive = true; else endVoice(); return
@@ -779,7 +792,7 @@ function reduce(f) {
       agentApprovals = agentApprovals.filter(a => !(a.localId == f.session_id && a.request_id == rid))
     return
   }
-  case "agent_session_closed":                                 // WATCH-1: this conversation itself left the pool
+  case "agent_session_closed":                                 // OPEN-3: this conversation itself left the pool (the view closes)
     if (f.session_id == ref.localId && (f.is_orchestrator === true) == (ref.kind == "orchestrator")) {
       if (status != "terminated") status = "stopped"
       endTurn("stopped"); endVoice()
@@ -833,7 +846,7 @@ function onStatus(s) {
   }
 }
 
-const TURN_FAILURE_AGENT = ["send_failed", "upstream_wedged", "command_failed", "compact_failed"]
+const TURN_FAILURE_AGENT = ["send_failed", "upstream_wedged", "turn_timeout", "command_failed", "compact_failed"]
 const TURN_FAILURE_ORCH  = ["api_error", "provider_error", "send_failed", "send_audio_failed",
                             "invalid_audio", "inject_text_failed", "compact_failed"]
 const ORCH_NO_IDLE_AFTER = ["send_failed", "send_audio_failed", "compact_failed"]  // exception paths
@@ -924,7 +937,7 @@ Before backend O-3 the orchestrator did not echo typed prompts to other devices 
 
 | Class | Codes | Effect |
 |---|---|---|
-| Turn failure | agent: `send_failed`, `upstream_wedged`, `command_failed`, `compact_failed`; orchestrator: `api_error`, `provider_error`, `send_failed`, `send_audio_failed`, `invalid_audio`, `inject_text_failed`, `compact_failed` | `notice{error}` entry + turn end |
+| Turn failure | agent: `send_failed`, `upstream_wedged`, `turn_timeout`, `command_failed`, `compact_failed`; orchestrator: `api_error`, `provider_error`, `send_failed`, `send_audio_failed`, `invalid_audio`, `inject_text_failed`, `compact_failed` | `notice{error}` entry + turn end |
 | Interrupt | orchestrator `interrupted` | `notice{interrupted}` (deduped with `status{interrupted}`) |
 | Start / connection | `start_timeout`, `start_failed`, `orchestrator_active`, `orchestrator_stopping`, client-side socket errors | `connectionBanner` (§3.3); never an entry |
 | Voice | `voice_event_failed`, `voice_audio_failed`, `voice_restart_failed`, `voice_config_busy`, `not_voice_session`, `cannot_switch_voice` | voice controller banner (§7) |
@@ -980,7 +993,7 @@ Rules:
 
 ### 4.7 Voice transcripts in the timeline
 
-Mapping from provider events to reducer actions. The same mapping applies to `voice_event{event}` frames (WS providers, received by every subscribed device) and `datachannel_event{event}` inputs (OpenAI owner only, inbound events only).
+Mapping from provider events to reducer actions. The same mapping applies to `voice_event{event}` frames (received by every subscribed device except the OpenAI owner) and `datachannel_event{event}` inputs (OpenAI owner only, inbound events only).
 
 | Provider event | Action |
 |---|---|
@@ -1032,7 +1045,7 @@ function voiceTurnEnd() {
 ```
 
 - **VT-1.** Voice assistant text streams into the current run as a `TextBlock{scope:"voice"}`; a voice user transcript is a user entry and therefore ends the run (I-2), unless it is placed by the anchor (I-9). This is the fix for the Android ordering bug (A-4.3): later tool calls go into the new tail run, never into an older message.
-- **VT-2.** Passive viewers render transcripts exactly like the owner for WS providers. For OpenAI (WebRTC) there is no server mirror, so passive viewers see only tool cards until the conversation is reloaded; the UI SHOULD say "Live transcript is only on the device that started voice" (G-32).
+- **VT-2.** Passive viewers render transcripts exactly like the owner, for every provider. WS providers: the backend relay broadcasts every provider event. OpenAI (WebRTC): the owner mirrors its data-channel events as `voice_event`, and the backend re-broadcasts the transcript ones (the event types of the table above) to every other subscriber, never back to the owner, which renders from its data channel (`api/routes/orchestrator.py` `_mirror_to_passive_viewers`). Before 2026-10-10 the backend did not, and passive viewers saw only tool cards (G-32).
 - **VT-3.** `voice_ended`/`voice_stopped`, `voice_owner_active{active:false}` and `voice_local_end` run `endVoice()` on **every** device, owner or passive, so voice tool cards always finish (A-4.3 compounding paths). This is conversation state; it is separate from the passive device's own voice-button state (§7.5).
 
 ---
@@ -1390,7 +1403,7 @@ The orchestrator's `switch_conversation` tool (`backend/orchestrator/tools/agent
 
 ```
 server: [voice] end_voice("switch") ⇒ voice_ending/voice_ended{reason:"switch"} to all subscribers
-        pool.stop_orchestrator()     ⇒ agent_session_closed{session_id: old localId, is_orchestrator:true} to all watchers (WATCH-1)
+        pool.stop_orchestrator()     ⇒ agent_session_closed{session_id: old localId, is_orchestrator:true} to all watchers (OPEN-3)
         ⇒ orchestrator_switch{sdk_session_id, title, voice, from_session_id} to ONE socket only:
            the voice owner (voice:true), else the socket that sent the latest send/send_audio/inject_text
 acting client: drop the old (stopped) Archie view locally (no REST close needed, it is already gone);
@@ -1399,7 +1412,7 @@ acting client: drop the old (stopped) Archie view locally (no REST close needed,
                      voice_start{local_id: <the new id>, resume_sdk_id: sdk_session_id, …}   (§7.3)
 other clients: nothing new; they follow the watcher frames as for any replace from another device.
 ```
-- **SW-1.** `orchestrator_switch` is handled at the **socket/channel level**, not by the Archie view's reducer: it arrives after WATCH-1 already ended that view. Each client MUST act on it at most once (dedupe on `sdk_session_id` + `from_session_id`).
+- **SW-1.** `orchestrator_switch` is handled at the **socket/channel level**, not by the Archie view's reducer: it arrives after OPEN-3 already closed that view. Each client MUST act on it at most once (dedupe on `sdk_session_id` + `from_session_id`).
 - **SW-2.** The switch is the user's request made by voice or text, so it counts as user intent: focus the resumed view (main apps) and auto-start voice without a gesture when `voice` is true. A client that cannot start voice without a gesture (web autoplay rules) opens the view and shows its normal voice button.
 - **SW-3.** `voice_ended{reason:"switch"}` is a quiet end: no closing cue or "call ended" notice, because the call continues in the resumed conversation.
 - **SW-4.** Clients without conversation history views (app-lite) apply the same sequence through their voice host: resume `sdk_session_id`, start voice when `voice` is true.
@@ -1413,7 +1426,7 @@ Shown while `stall != null` and the view is busy: "<tool> has been running for <
 - **Turn errors** are `notice{error}` entries (§4.4.4). No action needed.
 - **Connection banner**: Retry = reconnect now (resets backoff). Start failures show the backend `detail`.
 - **Retry after a failed start** (`start_failed` / SEQ-8): the user's Retry closes and reopens the socket (a fresh `socket_open` → `start`), never re-sends `start` on the failed socket; the reducer stays in `failed` until the new `session_started`. Both clients implement it this way.
-- **Termination** (`session_terminated` then `session_stopped`): the view stays open (W-9) with a banner whose headline depends on `reason` (`subprocess_crashed` "This session crashed", `subprocess_lost` "The session ended unexpectedly", `unreachable` "The host is unreachable", `replaced` "This session was replaced", `closed_by_user` "This session was closed") plus `detail`. "Continue in a new view" (enabled when `sdk_session_id` is present) replaces the view in place with a new view: new `localId`, `sdkId = sdk_session_id`, **the same kind** (A-8.5), canonical cold open. `session_terminated` is only sent on the chat WS; an orchestrator that died shows as `agent_session_closed{is_orchestrator:true}` or a socket close and recovers through §6.11.
+- **Termination** (`session_terminated` then `session_stopped`): the pool closed the session, so its view closes on every device like any other close (OPEN-3, 2026-10-10; it used to stay with a "Continue in a new view" banner, W-9). If it was the active view, a one-line notice names the session and how it ended — `<title> crashed` / `ended unexpectedly` / `can't reach its host` / `was replaced` / `was closed` (by `reason`: `subprocess_crashed`, `subprocess_lost`, `unreachable`, `replaced`, `closed_by_user`; else `ended`), then `: <detail>` when there is one. Recovery is reopening it from History (a user `start` with its `resume_sdk_id`). `session_terminated` is only sent on the chat WS; an orchestrator that died shows as `agent_session_closed{is_orchestrator:true}` or a socket close.
 
 ### 6.14 Session config: Save and Restart
 
@@ -1543,7 +1556,7 @@ voice_owner_active{active:true}  and not voice.pendingStart and voice.state == o
 voice_owner_active{active:false} | voice_ended | voice_stopped → remoteActive = false
 ```
 - **V-12.** A passive device MUST NOT change its own `voice.state` from mirrored provider events, MUST NOT hide its text input, MUST NOT play `voice_audio_out` and MUST NOT send any `voice_*` frame. Its voice button shows "Active elsewhere" (disabled). The conversation reducer still processes `voice_event`, `tool_use`/`tool_result`, `voice_ended` (VT-2, VT-3).
-- **V-13. Ownership loss.** If the owner receives `voice_owner_active{active:true}` while `voice.pendingStart == false`, another device took over: tear the transport down locally **without** sending `voice_stop`, set `voice.state = off`, `remoteActive = true`.
+- **V-13. Ownership loss.** If the owner receives `voice_owner_active{active:true}` while `voice.pendingStart == false`, another device took over: tear the transport down locally **without** sending `voice_stop`, set `voice.state = off`, `remoteActive = true`. The same applies to `session_started{voice:true, voice_initiator:false}` received while the client holds a live transport and has no `voice_start` in flight. A client MUST NOT become a non-owner while keeping its transport up: such a call drops every `voice_command` and ignores `voice_ended` (2026-10-08).
 
 ### 7.6 Ending
 
@@ -1591,7 +1604,14 @@ When `session_started.voice_recording_enabled` and the transport is WebRTC, the 
 | Harness catalogs | `GET /api/config/harnesses[?refresh=true]`, `GET /api/config/harness/{p}/catalog[?refresh=true]` | `{harnesses: [{id, label, description, catalog \| null}]}`; catalog = `{provider, models: [{id, label, source, description?, context_window?, supports_thinking?, supports_vision?, efforts?, default_effort?}], options: [{key, label, kind: select\|toggle\|number, choices?: [{value, label, description?, models?}], default?, help?, models?, min?, max?, step?}], default_model, allow_custom_model, warnings}`. Shared keys: `effort`, `thinking`. Cached ~5 min server-side; `refresh=true` rebuilds. Older servers: 404 → use `/api/config/providers` + `/api/config/harness/qwen/models` |
 | Titles | `PATCH /api/sessions/{sdkId}/rename`, `PATCH /api/visualizations/rename` | — |
 | Catalogs (read-only) | `/api/config/harnesses` (supersedes `/api/config/providers` + `/api/config/harness/qwen/models`, kept for older clients), `/api/orchestrator/models`, `/api/orchestrator/voice/models`, `/api/config/voice/google/models`, `/api/mcp/servers`, `/api/skills`, `/api/agents` | — |
-| Claude CLI auth | `/api/auth/status`, `/api/auth/login`, `/api/auth/credentials` | Both clients SHOULD check status after connecting and offer the credential-paste flow on headless backends (Android lacks it, 03 §5). |
+| Claude CLI auth | `/api/auth/status`, `/api/auth/login` (legacy; 409 while a link sign-in runs), `/api/auth/credentials` | Both clients SHOULD check status after connecting. The AuthGate's "Sign in with Claude" uses the link sign-in (`POST /api/accounts/claude/login {method: "token"}`, below) and falls back to `/api/auth/login` only on servers without `/api/accounts`; credentials paste stays the alternative. |
+| Accounts | `GET /api/accounts`, `GET /api/accounts/{id}`; `POST /api/accounts/{id}/login {method}` → flow, `GET …/login` (poll; 404 = none), `POST …/login/code {code}` (waits ≤15 s for the verdict), `DELETE …/login` (cancel); `POST …/credentials {method, content}` → `{message, service}`; `POST …/logout` → `{message, service}`; `POST …/verify` → service with `verified` | Service: `{id, label, group: harness\|api\|other, description, state: signed_in\|signed_out\|expired\|unavailable\|unknown, method, account, plan, expires_at, detail, warnings[], used_by[], docs, can_verify, verified: {ok, message, checked_at} \| null, flow \| null, methods: [{id, kind: link\|credentials\|env\|signout, label, description, recommended, active, available, unavailable_reason, needs_code, code_label, code_help, input: json\|secret, path, source_hint, placeholder, warning, fields: [{name, label, secret, help, placeholder, choices \| null, set, preview, value}]}]}`. Flow: `{id, service, method, status: starting\|waiting\|verifying\|succeeded\|failed\|cancelled\|expired, url, user_code, needs_code, code_label, code_help, message, started_at, expires_at, finished_at}`. One flow per service (another method → 409). See [authentication.md](../harnesses/authentication.md). |
+| Env keys (`context/.env`) | `GET /api/env` → `{path, exists, keys: [{name, set, preview, length, line, exported, duplicates, in_process}]}`; `POST /api/env/{name}/reveal` → `{name, value}`; `POST /api/env {name, value}` (409 if it exists); `PUT /api/env/{name} {value}` (create or update); `DELETE /api/env/{name}` | Changes answer `{applies: now\|backend_restart, note, key?\|name?, removed?}`. Names `^[A-Z_][A-Z0-9_]*$` (400 otherwise). |
+
+- **ACC-1.** Lists and statuses carry masked previews only; a client MUST fetch a full value only on an explicit user action (reveal, edit) via `POST /api/env/{name}/reveal`, keep it in view state only (never in persisted storage) and drop it when the page closes.
+- **ACC-2.** While a service's `flow.status` is `starting|waiting|verifying` the Accounts page polls `GET …/login` (2 s) and, when it ends `succeeded`, refetches that service; a Claude change also re-checks `/api/auth/status` (the AuthGate).
+- **ACC-4.** `/api/accounts/*` and `/api/env/*` answer 403 to cross-site browser requests on every method, reads included (`Sec-Fetch-Site: cross-site`, or an `Origin` other than the server / the web dev servers / Archie's browser extension / `ARCHIE_TRUSTED_ORIGINS`), on top of the API-wide guard (T-4a). Clients on the server's own origin and native clients (no `Origin`) are unaffected.
+- **ACC-3.** The page refetches `GET /api/accounts` on open (CFG-3) and after every env change (keys are shared between services: `GEMINI_API_KEY`, `DASHSCOPE_API_KEY`).
 
 - **CFG-1.** Each control saves immediately with a partial `PUT`; the response replaces the local copy. Sliders MUST commit on release, not on every tick (W-6.2). Controls of the section in flight are disabled.
 - **CFG-2.** On 400 the client MUST show the backend `detail` string (W-6.2).
@@ -1613,6 +1633,7 @@ When `session_started.voice_recording_enabled` and the transport is WebRTC, the 
 | Mic gain, speaker volume, echo ducking, audio output route | — | DataStore (chapter 04) |
 | Wake/talk words, sensitivities, button trigger | — | DataStore (chapter 04) |
 | Remote console logging (default on for compat and lite) | localStorage flag | n/a |
+| "Agent session finished" notifications (TURN-2; off by default; enabling asks the OS/browser permission from that tap) | localStorage `prefs:v1` `notifyAgentTurns` | DataStore `notify_agent_turns` |
 | Conversation snapshots + checkpoint (T-10) | memory only | optional snapshot on `onStop` |
 
 Storage writes MUST NOT happen per streamed event (A-8.14). Every storage access on the web is wrapped in try/catch (private mode, Safari 12).
@@ -1621,19 +1642,20 @@ Storage writes MUST NOT happen per streamed event (A-8.14). Every storage access
 
 ## 9. Visualizations and Memory
 
-These flows exist on the web today and are new on Android (charter goal 5). Neither has push events; both are pull-only.
+These flows exist on the web today and are new on Android (charter goal 5). Lists and files are fetched over REST; since 2026-10-09 the backend also pushes change events (§9.3) so open views reload live, and links to either open in the app (§9.4).
 
 ### 9.1 Visualizations
 
 ```
 list:    GET /api/visualizations → [{path, url, title, created, modified, size}]  (sorted by modified desc)
 refresh: when the section opens; manual Refresh / pull-to-refresh; after any view's endTurn (debounced 2 s,
-         compat included, 02 §5.2 regression); on agent_session_opened/closed
+         compat included, 02 §5.2 regression); on agent_session_opened/closed; on visualization_changed
+         (debounced 400 ms, §9.3)
 open:    view key "viz:<path>"; load <origin> + encodePath(url) in an iframe (web) / WebView (Android)
 rename:  optimistic title → PATCH /api/visualizations/rename {path, title} (204; 404 tolerated) → refresh
 ```
 - **VZ-1.** `url` is not percent-encoded (G-38): encode each path segment with `encodeURIComponent`.
-- **VZ-2.** Unknown paths return `200` + the SPA `index.html` (G-38). Before showing a stale entry, a client that needs to know whether a file still exists MUST `GET` it and check `Content-Type` and that the body is not the app shell. `HEAD` is not supported (405).
+- **VZ-2.** Unknown paths return `200` + the SPA `index.html` (G-38), except unknown `*.html` / `*.htm` paths, which return `404` since 2026-10-09 (the app routes on the URL hash, so no app route ends in `.html`; a stale link must not load the whole app inside the viewer). For other paths, a client that needs to know whether a file still exists MUST `GET` it and check `Content-Type` and that the body is not the app shell. `HEAD` is not supported (405).
 - **VZ-3.** Web iframe sandbox: `allow-scripts allow-same-origin allow-popups allow-forms allow-modals` (no top navigation, no downloads). Android WebView: JavaScript and DOM storage enabled, same origin as the backend, navigation outside the visualization opens the external browser, file access disabled, the self-signed certificate accepted only for the configured backend host.
 - **VZ-4.** A visualization view keeps its frame/WebView alive while hidden (state survives view switches). Reload = remount (web) / `reload()` (Android). "Open in browser" opens `<origin><url>`.
 - **VZ-5.** Item meta: relative `modified` time (parsed with its UTC offset, A-8.4), parent folder name or "public". Rename only; no delete.
@@ -1644,13 +1666,91 @@ rename:  optimistic title → PATCH /api/visualizations/rename {path, title} (20
 tree:   GET /api/memory/tree → MemoryNode[] {name, path, is_dir, children|null}   (dirs first, alphabetical)
 file:   GET /memory/<encodePath(path)> → raw markdown (text/markdown), 404 for dirs/missing
 root:   GET /memory/ → MEMORY.md
-refresh: when the section opens; manual Refresh. (No refresh on turn end.)
+refresh: when the section opens; manual Refresh; on memory_changed with a created/deleted file while the
+         tree is loaded (§9.3). (No refresh on turn end.) An open document refetches on memory_changed for it.
 ```
 - **MEM-1.** Split leading frontmatter with `/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/` and show it verbatim in a collapsed "Frontmatter" section; render the rest as markdown (02 §7.13).
 - **MEM-2.** Relative links (`[x](../projects/frontend-refactor/folder/y.md)`, `#anchor`) MUST resolve against the directory of the current file, normalising `.` and `..`. A result inside the memory root that ends in `.md` opens a memory view (`memory:<path>`) in the app; a result escaping the root, or an absolute `http(s)` link, opens externally (fixes 02 F-37).
 - **MEM-3.** Paths are percent-encoded per segment when fetched (02 §6.2).
 - **MEM-4.** Folder expand state is per view and local; top-level folders start expanded.
 - **MEM-5.** Read-only: no write, rename or search endpoints exist.
+
+### 9.3 Live changes
+
+The backend's content watcher (`backend/api/content_watcher.py`, one `watchfiles` loop over `context/public/`,
+`context/memory/` and `docs/`) pushes two frames to **every orchestrator socket**, the same fan-out as the pool
+watcher events (§3.7: they arrive with no Archie view, subscribed or not):
+
+```
+visualization_changed {visualizations: [{path, kind}], files: [{path, kind}]}
+    visualizations: list paths (GET /api/visualizations `path`) whose page or one of its assets changed
+    files:          the raw changed paths under context/public/
+memory_changed {changes: [{path, kind}]}
+    changes:        markdown paths as in GET /api/memory/tree (docs/x.md is reported as archie/x.md)
+kind: "created" | "modified" | "deleted"   (advisory: an atomic save or an rsync reads as a create)
+
+onContentFrame(f):                      // channel level, never the conversation reducer
+  visualization_changed: for c in f.visualizations: stamp.visuals[c.path] = {version+1, deleted: c.kind == deleted}
+                         refreshVisuals() debounced 400 ms
+  memory_changed:        for c in f.changes: stamp.memory[c.path] = {version+1, deleted: …}
+                         if memory tree loaded and some kind != modified: refreshTree() debounced 400 ms
+```
+
+- **VZ-6.** An open visualization view reloads when its stamp moves past the version it loaded (a change from
+  before it opened is already in what it loaded), once per burst (300 ms debounce) (web: the
+  iframe stays mounted but waits while hidden; Android: the pooled WebView remembers the version it loaded), so
+  a change that arrived while the view was hidden reloads it when it shows again. A deleted page is not reloaded; the meta line says
+  "Deleted". The reload keeps the scroll position (web: same-origin frames are scrolled back after `load`;
+  Android: `WebView.reload()`), and a small "Updated" cue shows for 2.5 s. An open memory document refetches
+  in place the same way (the text stays visible, so does the scroll position); its cue shows only when the
+  text changed. **Fallback:** when the orchestrator socket opens again after a drop (not on the first open),
+  the client refetches the visualization list and bumps every entry whose `modified` moved (vanished ones as
+  deleted), and bumps a resync epoch on which open memory documents refetch quietly. An asset-only change of a
+  folder visualization during the outage is not caught by this fallback (the list's `modified` is the page's).
+- **VZ-7.** Batches are coalesced on the server (`awatch` step 300 ms, max 1.5 s); temp and editor files
+  (rsync's `.name.XXXXXX`, `*.swp`, `*.tmp.*`, dot-folders, `node_modules`) never appear. An asset maps to the
+  pages in its folder or an ancestor folder (below the public root) whose source names it, else to the nearest
+  `index.html` above it, else to nothing (the list still refreshes). Public and memory files are served with
+  `Cache-Control: no-cache` + `ETag` (304 when unchanged), so a reload never shows a cached copy, and
+  `/<dir>/` serves `<dir>/index.html` (`/<dir>` redirects there).
+
+### 9.4 Internal links
+
+In chat (agent sessions and Archie, including plans and tool output on the web) and in memory documents, a
+link to a visualization or a memory file opens the in-app view (`viz:<path>` / `memory:<path>`, the same
+navigation as the Visuals / Memory lists) instead of a browser tab. One resolver per platform
+(`apps/web/src/features/links/internalLinks.ts`, `:core:markdown` `InternalLinks.kt`), both checked against
+the shared corpus `apps/protocol-fixtures/links/internal-links.json`. First match wins:
+
+- **LNK-1** Filesystem paths as agents print them: `context/public/<x>.html` → visual, `context/memory/<x>.md`
+  → memory (relative, `./`, absolute `/home/u/assistant/context/…`, or `~/…`); `docs/<x>.md` and
+  `…/assistant/docs/<x>.md` → memory `archie/<x>.md`. A trailing `:line` / `:line-line` is dropped.
+- **LNK-2** Root-relative URLs: `/memory/<x>.md` (`/memory/` → `MEMORY.md`), the old
+  `/markdown_reader.html?file=memory/<x>.md`, and `/<x>.html` or `/<dir>/` (→ `<dir>/index.html`) outside
+  the app's own prefixes (`api assets compat legacy legacy_compat next next-compat memory uploads projects`),
+  with no query string. Absolute filesystem roots (`/home/`, `/tmp/`, …) are not URLs.
+- **LNK-3** `http(s)` URLs on the backend's host (any port) → as LNK-2.
+- **LNK-4** Other private-network hosts (LAN, Tailscale CGNAT `100.64/10`, `*.ts.net`, localhost: the other
+  Archie machine, whose content is synced) → LNK-2 only for `/memory/…`, the reader, `/visualizations/…`, or a
+  path that is in the visualization list.
+- **LNK-5** Auto-linking: inline code that is exactly an internal path or URL (no whitespace or glob
+  characters) becomes a link; bare `context/public/….html` / `context/memory/….md` paths in plain text too.
+  `docs/` paths only from inline code; never inside fenced code or an existing link. The link's href is the
+  target's canonical URL (`/memory/archie/x.md`, `/x/index.html`), never the printed path, which a memory
+  document's MEM-2 resolver would resolve relative to itself.
+- **LNK-6** Web: a plain click opens in the app; middle / ctrl / cmd-click keep the browser default on the
+  real URL (the anchor's `href`). Memory documents ask their relative-link resolver (MEM-2) first.
+- **LNK-7** A visual target opens in the viewer only when it is a real page: in the visualization list,
+  or in the list after one refresh (also under `visualizations/`). Otherwise the URL opens externally (web: a
+  snackbar with "Open in browser", a user gesture; Android: the Custom Tab). A segment that decodes to a
+  separator (`..%2F..`) makes a path not internal. Android opens only `http(s)`, `mailto`, `tel`, `sms` and
+  `geo` links externally; anything else (`file:`, `content:`, `javascript:`, `intent:`) is inert.
+
+**Link convention for agents.** Print root-relative markdown links, which work in the app and, against the
+server, in any browser: `[Avatar pipeline](/avatar-pipeline/index.html)`, `[Energy](/visualizations/energy.html)`,
+`[Voice notes](/memory/projects/voice.md)`, `[Client protocol](/memory/archie/specs/12-client-protocol.md)`.
+A full URL on the server (`https://<server>/avatar-pipeline/`) also opens in the app, for a link meant to be
+pasted elsewhere.
 
 ---
 
@@ -1670,7 +1770,7 @@ IDs: **W-n** = item n of 02 §6.3; **W-6.1 / W-6.2** = the lists in 02 §6.1 / �
 | W-6 `dropLastN` mismatches the backend | §6.5: prompt-anchored cut resolved against a fresh REST listing, with verification and abort. |
 | W-7 Reload mid-turn duplicates content | T-10 (no persisted checkpoint after a rebuild) + §5.4 overlap dedupe. Fixture `history_live_overlap_dedupe`. |
 | W-8 Deleting an open session leaves its tab | §6.8: close every view with that `sdkId`/`localId` and the pool session, then `DELETE`. |
-| W-9 Terminated tab closes immediately | `session_stopped` never closes a view (§4.3); the termination banner stays. Fixture `termination_banner`. |
+| W-9 Terminated tab closes immediately | Superseded 2026-10-10 by OPEN-3: a closed session's view closes on every device, with a notice carrying the termination reason (§6.13). |
 | W-10 Voice start sends `stop` on the text WS | T-6: one orchestrator socket; `voice_start` on it; never `stop` to start voice. |
 | W-11 Past orchestrator conversations cannot be viewed | H-3 read-only views; §6.11 resume through the conflict dialog. |
 | W-12 Compat GFM shim strips inline formatting | UI/markdown spec (13-…): the compat table shim must keep inline markdown in non-table paragraphs. Not a protocol rule. |
@@ -1723,7 +1823,7 @@ IDs: **W-n** = item n of 02 §6.3; **W-6.1 / W-6.2** = the lists in 02 §6.1 / �
 | A-1.1 Auto-navigation on connect / orchestrator events | FOCUS-1. |
 | A-1.3 IME Send ignored while streaming; no queueing | §6.1: sending while busy is allowed and goes to the tray. |
 | A-3.6 `permission_*`, `session_stalled`, `voice_connection_error`, orchestrator `compact_complete` ignored | §4.3 handles every frame type; §6.9, §6.12, §7.7. |
-| A-5 Non-owner devices show no transcripts | VT-2 (WS providers mirror; OpenAI cannot). |
+| A-5 Non-owner devices show no transcripts | VT-2 (WS providers mirror from the relay; OpenAI from the owner's mirror, re-broadcast by the backend). |
 
 ---
 
@@ -1758,7 +1858,7 @@ IDs: **W-n** = item n of 02 §6.3; **W-6.1 / W-6.2** = the lists in 02 §6.1 / �
 | `orchestrator_voice_message_sender_and_history` | VM-1 (sender: one local bubble, no echo), §5.1 `[audio:<fmt>]` lines |
 | `history_prepend_queued_prompt_dispatch` | H-6 (prepend keeps `promptSinceTurnEnd`), I-12 |
 | `history_prepend_voice_anchor_shift` | H-6 (anchor shift, open transcript survives a prepend), I-9 |
-| `orchestrator_closed_by_pool` | WATCH-1, FOCUS-2 |
+| `orchestrator_closed_by_pool` | OPEN-3, FOCUS-2 |
 | `start_failed_releases_held_frames` | SEQ-5 exception, SEQ-8, I-15 |
 | `orchestrator_agent_approvals_and_jsonl_id` | ID-4, PM-5 |
 | `voice_transcript_coalescing_gemini` | §4.7 fragments |
@@ -1766,7 +1866,7 @@ IDs: **W-n** = item n of 02 §6.3; **W-6.1 / W-6.2** = the lists in 02 §6.1 / �
 | `queued_prompt_echoed_twice` | G-5, I-12 (observer) |
 | `queued_prompt_sender` | I-12 (sender) |
 | `queued_prompt_observer_no_reecho` | I-12 (observer, backend O-6: no re-echo) |
-| `termination_banner` | W-9, R-6 |
+| `termination_banner` | §6.13 (reducer state; the view then closes, OPEN-3), R-6 |
 | `tool_result_after_interleaved_user_message` | R-1 across an inject entry |
 | `tool_result_after_voice_transcript` | R-1 across a transcript |
 | `tool_result_after_turn_ended` | R-6 `no_result` → `done` |
@@ -1797,6 +1897,7 @@ Only fixes that a client cannot reasonably work around. Everything else in 01 §
 - **Fix.** When `pool.cancel_turn()` returns `True`, broadcast the same frame to all subscribers of the session (keep the direct reply when it returns `False`).
 - **Why the client cannot fix it.** The only alternative is polling `GET /api/sessions/pool/live` while busy.
 - **Size / risk.** ≈ 5 lines. Low risk: clients already handle the frame; the sender receives it once.
+- **Also the orchestrator's runner (2026-10-10).** Turns the runner ends (timeout, `interrupt_agent_session`, failure) never pass through `chat.py`, so the runner broadcasts the frames itself: `error{turn_timeout}` then `status{interrupted}` on timeout, `status{interrupted}` on cancel, `error{upstream_wedged|send_failed}` on failure (`backend/orchestrator/runner.py` `_tell_tabs`). These are unsequenced (not in the replay ring), so a socket that was away still relies on ST-2.
 
 ### BF-3 — nginx request-body limit (required, infrastructure)
 

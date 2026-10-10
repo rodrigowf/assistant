@@ -1,39 +1,52 @@
 /**
- * The sign-in flows (inv02 §1.11), shared by the AuthGate screen and Settings → Account:
+ * The Claude sign-in flows (inv02 §1.11) of the AuthGate screen:
  *
- * - **With a browser on the server** (not headless): "Sign in with Claude" runs
- *   `claude setup-token` on the server (`POST /api/auth/login`, which blocks until it exits);
- *   "Paste credentials instead" opens the manual flow.
- * - **Headless server**, or the manual view: paste `~/.claude/.credentials.json` from a signed-in
- *   machine (`POST /api/auth/credentials`), with an optional link to the Claude Console.
+ * - **Sign in with a link** (any server, also headless): `POST /api/accounts/claude/login` runs
+ *   `claude setup-token` on the server; the panel shows its URL (Open / Copy), the user signs in on
+ *   any device and pastes back the code; the 1-year token is saved on the server. Older backends
+ *   without `/api/accounts` fall back to the blocking `POST /api/auth/login` (server with a screen).
+ * - **Paste credentials**: `~/.claude/.credentials.json` from a signed-in machine
+ *   (`POST /api/auth/credentials`).
+ *
+ * Settings → Accounts has every method of every service.
  */
 import { useEffect, useRef, useState } from 'react';
+import { copyText } from '@/platform';
 import { showSnackbar } from '@/stores';
 import { Button, TextField } from '@/ui/controls';
 import { Icon } from '@/ui/primitives';
-import { clearAuthError, signIn, submitCredentials, useAuth } from './authStore';
+import { cancelLinkSignIn, clearAuthError, linkFlowActive, pollLinkSignIn, startLinkSignIn, submitCredentials, submitLinkCode } from './authActions';
+import { useAuth } from './authStore';
 import styles from './auth.module.css';
 
 export interface AuthPanelProps {
-  /** Server host for the copy ("A browser window opens on 192.168.0.200"). */
+  /** Server host for the copy ("…saved on 192.168.0.200"). */
   host: string;
-  /** Start in the paste view even when the server could open a browser (Settings → "Replace credentials"). */
+  /** Start in the paste view. */
   startWithPaste?: boolean;
   /** Called after a successful sign-in or credentials save. */
   onSignedIn?: () => void;
 }
 
+export const LINK_POLL_MS = 2000;
+
 export function AuthPanel({ host, startWithPaste = false, onSignedIn }: AuthPanelProps) {
   const status = useAuth((s) => s.status);
   const phase = useAuth((s) => s.phase);
   const error = useAuth((s) => s.actionError);
-  const headless = status?.headless === true;
-  const [pasteChosen, setPaste] = useState(startWithPaste);
-  const paste = pasteChosen || headless;
+  const flow = useAuth((s) => s.flow);
+  const [paste, setPaste] = useState(startWithPaste);
   const [text, setText] = useState('');
+  const [code, setCode] = useState('');
   const field = useRef<HTMLTextAreaElement | HTMLInputElement>(null);
+  const active = linkFlowActive(flow);
 
   useEffect(() => () => clearAuthError(), []);
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setInterval(() => void pollLinkSignIn(), LINK_POLL_MS);
+    return () => clearInterval(t);
+  }, [active]);
 
   const done = (): void => {
     showSnackbar('Signed in to Claude', { durationMs: 2500 });
@@ -42,12 +55,79 @@ export function AuthPanel({ host, startWithPaste = false, onSignedIn }: AuthPane
   };
 
   if (!paste) {
+    const url = active ? flow?.url : null;
     return (
       <div className={styles.panel}>
-        <p className={styles.lead}>Sign in with your Claude account. A sign-in window opens on <b>{host}</b>; finish there and this page updates.</p>
-        {phase === 'signing-in' ? (
+        {!flow || !active ? (
+          <p className={styles.lead}>
+            Sign in with your Claude subscription: open a link on any device, sign in, and paste back the code it shows. The token is saved on <b>{host}</b>.
+          </p>
+        ) : null}
+        {active && !url ? (
           <p className={styles.waiting} role="status">
-            <Icon name="hourglass_top" size={18} /> Waiting for sign-in to finish on {host}…
+            <Icon name="hourglass_top" size={18} /> Starting the sign-in on {host}…
+          </p>
+        ) : null}
+        {url ? (
+          <>
+            <ol className={styles.steps}>
+              <li>Open the link and sign in with your Claude account.</li>
+              <li>Copy the code the page shows and paste it below.</li>
+            </ol>
+            <p className={styles.link} data-flow-url="">
+              {url}
+            </p>
+            <div className={styles.actions}>
+              <Button variant="filled" trailingIcon="open_in_new" onClick={() => window.open(url, '_blank', 'noopener,noreferrer')}>
+                Open link
+              </Button>
+              <Button
+                variant="outlined"
+                icon="content_copy"
+                onClick={() => {
+                  void copyText(url).then((ok) => showSnackbar(ok ? 'Link copied' : "Couldn't copy; select it and copy by hand", { durationMs: 2500 }));
+                }}
+              >
+                Copy link
+              </Button>
+            </div>
+            <form
+              noValidate
+              className={styles.panel}
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (code.trim()) void submitLinkCode(code).then(() => setCode(''));
+              }}
+            >
+              <TextField
+                label="Code"
+                value={code}
+                autoComplete="off"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                onValueChange={setCode}
+                disabled={flow?.status === 'verifying'}
+              />
+              <div className={styles.actions}>
+                <Button type="submit" variant="filled" icon="check" loading={phase === 'signing-in' || flow?.status === 'verifying'} disabled={!code.trim()}>
+                  Finish sign-in
+                </Button>
+                <Button variant="text" onClick={() => void cancelLinkSignIn()}>
+                  Cancel
+                </Button>
+              </div>
+            </form>
+          </>
+        ) : null}
+        {phase === 'signing-in' && !flow ? (
+          <p className={styles.waiting} role="status">
+            <Icon name="hourglass_top" size={18} /> Waiting for {host}…
+          </p>
+        ) : null}
+        {flow?.status === 'succeeded' ? (
+          <p className={styles.waiting} role="status">
+            <Icon name="check_circle" size={18} /> {flow.message}
           </p>
         ) : null}
         {error ? (
@@ -55,31 +135,24 @@ export function AuthPanel({ host, startWithPaste = false, onSignedIn }: AuthPane
             {error}
           </p>
         ) : null}
-        <div className={styles.actions}>
-          <Button
-            variant="filled"
-            icon="account_circle"
-            loading={phase === 'signing-in'}
-            onClick={() => {
-              void signIn().then((ok) => {
-                if (ok) done();
-              });
-            }}
-          >
-            Sign in with Claude
-          </Button>
-          <Button
-            variant="text"
-            icon="content_paste"
-            disabled={phase === 'signing-in'}
-            onClick={() => {
-              clearAuthError();
-              setPaste(true);
-            }}
-          >
-            Paste credentials instead
-          </Button>
-        </div>
+        {!active ? (
+          <div className={styles.actions}>
+            <Button variant="filled" icon="login" loading={phase === 'signing-in'} onClick={() => void startLinkSignIn()}>
+              Sign in with Claude
+            </Button>
+            <Button
+              variant="text"
+              icon="content_paste"
+              disabled={phase === 'signing-in'}
+              onClick={() => {
+                clearAuthError();
+                setPaste(true);
+              }}
+            >
+              Paste credentials instead
+            </Button>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -106,11 +179,9 @@ export function AuthPanel({ host, startWithPaste = false, onSignedIn }: AuthPane
         </li>
         <li>Copy the whole file and paste it below.</li>
       </ol>
-      {headless ? (
-        <p className={styles.note}>
-          <Icon name="info" size={16} /> {host} runs without a screen, so it can't open a sign-in window.
-        </p>
-      ) : null}
+      <p className={styles.note}>
+        <Icon name="info" size={16} /> Don&apos;t paste a login another machine keeps using: refresh tokens rotate and one of the two stops working.
+      </p>
       <TextField
         ref={field}
         label="Credentials JSON"
@@ -137,7 +208,7 @@ export function AuthPanel({ host, startWithPaste = false, onSignedIn }: AuthPane
             Claude Console
           </Button>
         ) : null}
-        {!headless && !startWithPaste ? (
+        {!startWithPaste ? (
           <Button
             variant="text"
             icon="arrow_back"

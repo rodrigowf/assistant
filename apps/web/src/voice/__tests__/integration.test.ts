@@ -96,7 +96,7 @@ describe('voice on the Archie runtime', () => {
     const s = setup();
     s.c.start();
     expect(s.ws.types()).toEqual(['start', 'voice_start']);
-    expect(s.ws.messages()[1]).toEqual({ type: 'voice_start', local_id: 'O1', resume_sdk_id: 'O1' });
+    expect(s.ws.messages()[1]).toEqual({ type: 'voice_start', local_id: 'O1', resume_sdk_id: 'O1', reattach: true }); // subscribed: it exists (OPEN-2)
     expect(FakeWebSocket.all(ORCH)).toHaveLength(1);
   });
 
@@ -160,6 +160,6 @@ describe('voice on the Archie runtime', () => {
     vi.advanceTimersByTime(1_000);
     const again = FakeWebSocket.last(ORCH);
     again.open();
-    expect(again.messages()).toEqual([{ type: 'voice_start', local_id: 'O1', resume_sdk_id: 'O1' }]);
+    expect(again.messages()).toEqual([{ type: 'voice_start', local_id: 'O1', resume_sdk_id: 'O1', reattach: true }]); // OPEN-2
   });
 });

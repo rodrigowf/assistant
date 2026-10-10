@@ -94,10 +94,16 @@ internal fun ConversationModelPage(feature: SettingsFeature, onBack: (() -> Unit
     val provider = ModelLogic.find(models, current)?.provider ?: providers.firstOrNull().orEmpty()
     val availability = ModelLogic.availability(current, catalog)
     val providerOptions = providers.map { Option(it, ModelLogic.providerLabel(it)) }
+    // The audio model has its own provider: audio-capable models don't exist for every text
+    // provider (none at Anthropic), so it can't follow the text provider. Same shape as the summarizer.
+    val audio = ModelLogic.audioModels(models)
+    val audioProviders = ModelLogic.providers(audio)
     val audioCurrent = cfg.defaultAudioModel.orEmpty()
+    val audioProvider = if (audioCurrent.isNotEmpty()) ModelLogic.find(models, audioCurrent)?.provider ?: audioProviders.firstOrNull().orEmpty() else ""
     val serverAudio = catalog?.defaultAudioModel?.takeIf { audioCurrent.isEmpty() }
-    val audioOptions = listOf(Option("", "Server default", serverAudio?.let { "Now $it" })) +
-        modelOptions(ModelLogic.audioModels(models), "openai", audioCurrent)
+    val audioProviderOptions = listOf(Option("", "Server default", serverAudio?.let { "Now $it" })) +
+        audioProviders.map { Option(it, ModelLogic.providerLabel(it)) }
+    val audioSupported = cfg.defaultAudioModel != null
     if (availability != ModelAvailability.OK) {
         Notice(
             NoticeTone.WARNING,
@@ -125,10 +131,16 @@ internal fun ConversationModelPage(feature: SettingsFeature, onBack: (() -> Unit
                 "You can still switch models inside a conversation. If this model can't be used, the server falls back to its ORCHESTRATOR_MODEL setting, then gpt-audio.",
             )
         }
-        SelectRow("Audio model", audioOptions, audioCurrent, { id ->
-            m.launchSave(ConfigPatch(defaultAudioModel = id), "default_audio_model")
-        }, enabled = !saving && models.isNotEmpty() && cfg.defaultAudioModel != null,
-            supporting = if (cfg.defaultAudioModel == null) "This server has no separate audio model setting yet." else null)
+        SelectRow("Audio model provider", audioProviderOptions, audioProvider, { p ->
+            if (p == "") m.launchSave(ConfigPatch(defaultAudioModel = ""), "default_audio_model")
+            else ModelLogic.firstOf(audio, p)?.let { m.launchSave(ConfigPatch(defaultAudioModel = it), "default_audio_model") }
+        }, enabled = !saving && models.isNotEmpty() && audioSupported,
+            supporting = if (!audioSupported) "This server has no separate audio model setting yet." else null)
+        if (audioProvider.isNotEmpty()) {
+            SelectRow("Audio model", modelOptions(audio, audioProvider, audioCurrent), audioCurrent, { id ->
+                m.launchSave(ConfigPatch(defaultAudioModel = id), "default_audio_model")
+            }, enabled = !saving && audioSupported)
+        }
         FieldBlock {
             HelpLine(
                 "Answers voice messages (recorded clips).",

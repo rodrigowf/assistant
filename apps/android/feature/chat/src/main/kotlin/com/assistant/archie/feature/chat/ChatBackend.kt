@@ -7,7 +7,6 @@ import com.assistant.core.data.ConversationKey
 import com.assistant.core.data.ConversationRepository
 import com.assistant.core.data.CutResult
 import com.assistant.core.data.UploadRepository
-import com.assistant.core.model.SessionKind
 import com.assistant.core.model.SessionRef
 import com.assistant.core.model.UploadResult
 import com.assistant.core.network.ApiResult
@@ -50,8 +49,6 @@ interface ChatBackend {
     suspend fun rewind(entryId: String): CutResult
     suspend fun fork(entryId: String): CutResult
 
-    /** §6.13 "Continue in a new view" for a terminated session, kept in the same kind. */
-    fun continueTerminated(target: ContinueTarget)
 
     /** §6.15: upload then inject the share line into the Archie conversation. */
     suspend fun upload(source: UploadSource, onProgress: (Long, Long) -> Unit): ApiResult<UploadResult>
@@ -62,24 +59,6 @@ interface ChatBackend {
 }
 
 /** Where "Continue in a new view" goes; decided from the view's kind, never from the screen (bug 5). */
-sealed interface ContinueTarget {
-    val sdkId: String
-
-    /** Resume through the orchestrator socket (`start{resume_sdk_id}`). */
-    data class Archie(override val sdkId: String) : ContinueTarget
-
-    /** Replace the agent view in place on the agent endpoint. */
-    data class Agent(override val sdkId: String) : ContinueTarget
-
-    companion object {
-        /** `null` while the termination carries no `sdk_session_id` (the action is then disabled). */
-        fun of(state: ConversationState): ContinueTarget? {
-            val sdk = state.termination?.sdkSessionId ?: return null
-            return if (state.kind == SessionKind.ORCHESTRATOR) Archie(sdk) else Agent(sdk)
-        }
-    }
-}
-
 /** The production backend over the process-scoped repositories (B-03). */
 class RepositoryChatBackend(
     override val key: ConversationKey,
@@ -104,13 +83,6 @@ class RepositoryChatBackend(
     override fun retry() = repo.retry(key)
     override suspend fun rewind(entryId: String) = repo.rewind(key, entryId)
     override suspend fun fork(entryId: String) = repo.fork(key, entryId)
-
-    override fun continueTerminated(target: ContinueTarget) {
-        when (target) {
-            is ContinueTarget.Archie -> repo.resumeArchie(target.sdkId)
-            is ContinueTarget.Agent -> repo.continueInNewView(key, target.sdkId)
-        }
-    }
 
     override suspend fun upload(source: UploadSource, onProgress: (Long, Long) -> Unit) = uploads.upload(source, onProgress)
     override fun inject(text: String) = repo.inject(text)

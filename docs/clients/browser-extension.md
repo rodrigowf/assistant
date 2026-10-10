@@ -3,7 +3,7 @@ name: browser-extension
 category: archie/clients
 tags: [chrome, extension, manifest-v3, browser-control, userscripts, snapshot, daemon, automation]
 created: 2026-08-27
-modified: 2026-10-07
+modified: 2026-10-09
 summary: apps/browser-extension — Chrome MV3 extension + local daemon that let agent sessions drive the user's real, logged-in Chrome.
 source: curated (consolidated from memory notes assistant/devices/browser_control_extension.md, feedback/browser_control_x_snapshot_timeout.md; verified against code 2026-10-06)
 references:
@@ -76,6 +76,10 @@ reach the socket can act as the user on every site he is signed into. So:
 - **Loopback only.** The daemon binds 127.0.0.1; `/api/browser/command` also refuses any request
   that arrived through the reverse proxy (`X-Forwarded-For` from a non-loopback address → 403).
   A session on another machine goes through SSH, never an open port.
+- **Other web sites are refused.** The main backend and the daemon both run the browser-origin
+  guard (`backend/api/guard.py`, [backend.md](../architecture/backend.md#auth-and-the-browser-origin-guard)):
+  a page open in Chrome cannot open the socket or POST `/api/uploads`; the extension's
+  `chrome-extension://` origin and `browser_cmd.py` (no `Origin`) pass.
 - Writes on real accounts (submitting forms, sending messages, purchases, destructive clicks)
   need the user's explicit intent for that action. Reading is free.
 

@@ -3,7 +3,7 @@ name: lifecycle
 category: archie/voice
 tags: [voice, lifecycle, voice-lifecycle, end_voice, restart_voice, wake-after-stop, ownership, voice_initiator, voice_owner_active, multi-device, session-update, self-heal, deferred-response-create, resumption-handle]
 created: 2026-06-04
-modified: 2026-10-06
+modified: 2026-10-08
 summary: The voice lifecycle state machine, end and restart paths, owner-scoped voice across devices, the session.update self-heal, and the rules they enforce.
 source: curated (consolidated from memory notes assistant/voice/voice_lifecycle_and_wake_after_stop.md, assistant/architecture/voice_subsystem.md, assistant/voice/feedback_voice_debug_diagnose_before_patching.md, auto-memory project_voice_initiator_flag_2026_06_06, project_voice_ghost_state_fix_2026_06_30, project_multidevice_voice_ownership_2026_07_21, project_voice_session_update_restart_race_2026_07_21, project_qwen_voice_gate_no_staleness_clear, project_voice_lifecycle_refactor_branch, feedback_clear_provider_state_on_rebuild, feedback_voice_debug_diagnose_before_patching; verified against code 2026-10-06)
 references:
@@ -109,7 +109,8 @@ new `session_started` with `voice_initiator: true`.
 |---|---|---|
 | `voice_start` | voice ENDING | stop the orchestrator, wait, start a **new** session |
 | `voice_start` | not voice | `restart_voice` + `session_started{voice_initiator:true}` (the wake-after-stop path) |
-| `start` (text) | voice live | subscribe as a passive viewer: `session_started{voice:true, voice_initiator:false}` |
+| `start` (text) | voice live, from the **owner's** socket | keep ownership: `session_started{voice:true, voice_initiator:true}` with voice metadata only (no `voice_session_update`, no new token). Clients re-send `start` on every foreground (spec 12 T-9) |
+| `start` (text) | voice live, any other socket | subscribe as a passive viewer: `session_started{voice:true, voice_initiator:false}` |
 | `voice_start` | voice live, same config | reconnect to the live relay; send the cached payload with `voice_initiator: true` (Android WS reconnect mid-call) |
 | `voice_start` | voice live, **config drift** (`voice_config_drifts_from`) | while a turn runs → `error{voice_config_busy}`; otherwise stop and rebuild the orchestrator. Every subscriber is dropped, so clients must re-sync (spec 12 V-2) |
 
@@ -163,7 +164,13 @@ Client implementations:
   `remoteActive`, `swallowOwnerActive`, 5 s ending timeout).
 - Android: `apps/android/core/voice/.../session/DefaultVoiceSessionController.kt`
   (`isOwner`, `remoteVoiceActive`; it ignores `voice_command` and
-  `voice_ending/ended` unless it is the owner).
+  `voice_ending/ended` unless it is the owner). `ownerEchoesPending` counts
+  its own `voice_start`s so their `voice_owner_active` echo is not taken for
+  a takeover. A device that holds the call never becomes "not owner and
+  still talking": `session_started{voice_initiator:false}` with no
+  `voice_start` in flight, or a takeover `voice_owner_active`, ends the
+  local call (V-13, no `voice_stop`). A `voice_ended` always tears down a
+  transport that is still held.
 
 The bug behind this design (2026-07-21, `b6d184f` + `afe77a4`): with the A300M
 and the phone on one conversation, starting voice on one made the other show
@@ -311,3 +318,12 @@ ignores a `ping` frame; that is harmless. Spec inventory 04 §4.6 still says
   `9ef6dc1`, then Qwen and the relay).
 - 2026-10: the new web and Android clients implement all of this from
   spec 12 §7.
+- 2026-10-08: the owner's plain `start` no longer demotes it. Unlocking
+  the phone mid-call re-sent `start` (T-9); the backend answered
+  `voice_initiator:false` and Android flipped to non-owner while its WebRTC
+  call ran on. It dropped the `voice_command`s carrying a `search_history`
+  result (the model kept saying the search was "still running"), showed
+  "Voice active on another device", and ignored `voice_ended`, so the call
+  outlived `end_voice_session`. Fixed on both sides (see the table and the
+  Android notes above). The Android takeover (V-13) is new in the same
+  change.

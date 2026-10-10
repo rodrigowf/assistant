@@ -41,6 +41,10 @@ import com.assistant.core.design.icons.ArchieIcon
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
 import androidx.compose.material3.LinearProgressIndicator
+import kotlinx.coroutines.delay
+
+/** Changes closer together than this reload once (spec 12 VZ-6). */
+const val LIVE_RELOAD_DEBOUNCE_MS = 300L
 
 /**
  * The pooled, sandboxed WebView of one visual (spec 14 §4.2). [key] is the visual's path: the same
@@ -48,9 +52,22 @@ import androidx.compose.material3.LinearProgressIndicator
  * (VZ-4). [reload] is a counter: each increment reloads the visual's URL once (the web remounts its
  * iframe). External links leave for a Custom Tab; downloads ask first; a refused certificate or a
  * failed load shows an error with Retry instead of a blank page.
+ *
+ * [live] is the visual's change counter (spec 12 §9.3, `0` = none or deleted): when it is ahead of
+ * what the pooled page loaded, the page reloads once per burst (debounced) with `reload()`, which
+ * keeps the scroll position, and [onLiveReload] fires (the "Updated" cue). The counter lives on the
+ * pool entry, so a change that arrived while the tab was hidden reloads it when it shows again.
  */
 @Composable
-fun VisualWebView(deps: VisualsDeps, key: String, url: String, reload: Int, modifier: Modifier = Modifier) {
+fun VisualWebView(
+    deps: VisualsDeps,
+    key: String,
+    url: String,
+    reload: Int,
+    modifier: Modifier = Modifier,
+    live: Int = 0,
+    onLiveReload: () -> Unit = {},
+) {
     if (LocalInspectionMode.current) {
         Box(modifier.fillMaxSize().background(ArchieTheme.colors.surfaceContainerLowest))
         return
@@ -67,6 +84,7 @@ fun VisualWebView(deps: VisualsDeps, key: String, url: String, reload: Int, modi
             e.webView.setDownloadListener { dlUrl, userAgent, contentDisposition, mimeType, _ ->
                 e.page.pendingDownload = PendingDownload(dlUrl, URLUtil.guessFileName(dlUrl, contentDisposition, mimeType), mimeType, userAgent)
             }
+            e.liveVersion = live
             e.webView.loadUrl(url)
         }
     }
@@ -90,6 +108,15 @@ fun VisualWebView(deps: VisualsDeps, key: String, url: String, reload: Int, modi
             entry.handledReload = reload
             page.error = null
             entry.webView.loadUrl(url)
+        }
+    }
+    LaunchedEffect(entry, live) {
+        if (live > entry.liveVersion) {
+            delay(LIVE_RELOAD_DEBOUNCE_MS) // a newer change restarts the effect: one reload per burst
+            entry.liveVersion = live
+            page.error = null
+            entry.webView.reload()
+            onLiveReload()
         }
     }
     Box(modifier.fillMaxSize().testTag("visual-webview:$key")) {

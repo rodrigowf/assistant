@@ -13,7 +13,6 @@ import com.assistant.core.data.ConnectionStatus
 import com.assistant.core.data.HistoryGroup
 import com.assistant.core.data.ItemKey
 import com.assistant.core.data.WorkspaceItem
-import com.assistant.core.model.PoolSession
 import com.assistant.core.model.SessionSummary
 import com.assistant.core.model.ThemeMode
 import com.assistant.core.voice.ports.SessionPhase
@@ -34,8 +33,6 @@ data class ShellUiState(
     val connection: ConnectionStatus = ConnectionStatus(),
     val items: List<WorkspaceItem> = emptyList(),
     val active: ItemKey? = null,
-    /** Live pool sessions with no open view here ("Open now" rows that open on tap). */
-    val liveElsewhere: List<PoolSession> = emptyList(),
     val history: List<HistoryGroup> = emptyList(),
     val historyLoading: Boolean = false,
     val historyError: String? = null,
@@ -55,7 +52,6 @@ sealed interface ShellAction {
     data class Select(val key: ItemKey) : ShellAction
     data class SelectRelative(val delta: Int) : ShellAction
     data class OpenHistory(val session: SessionSummary) : ShellAction
-    data class OpenLive(val session: PoolSession) : ShellAction
     data object NewArchie : ShellAction
     data object NewAgent : ShellAction
     /** Explicit close by the user (P-1: the only path that closes on the server). */
@@ -104,22 +100,14 @@ class ShellViewModel(
         graph.openSessions.items,
         graph.openSessions.active,
         graph.connection.status,
-        graph.history.pool,
         graph.voice.state,
-    ) { items, active, conn, pool, voice ->
-        val openLocal = items.mapNotNull { it.localId }.toSet()
-        ShellUiState(
-            connection = conn,
-            items = items,
-            active = active,
-            liveElsewhere = pool.filter { !it.isOrchestrator && it.localId !in openLocal },
-            voice = voice,
-        )
+    ) { items, active, conn, voice ->
+        ShellUiState(connection = conn, items = items, active = active, voice = voice)
     }
 
     private val withHistory = combine(base, graph.history.sessions, search, minute) { b, list, q, now ->
         b.copy(
-            history = HistoryList.groups(list.value.orEmpty(), b.items, b.liveElsewhere, q, now, clock.zone),
+            history = HistoryList.groups(list.value.orEmpty(), b.items, q, now, clock.zone),
             historyLoading = list.loading,
             historyError = list.error,
             search = q,
@@ -140,7 +128,6 @@ class ShellViewModel(
             is ShellAction.Select -> open.select(a.key)
             is ShellAction.SelectRelative -> open.selectRelative(a.delta)
             is ShellAction.OpenHistory -> sessions.openFromHistory(a.session)
-            is ShellAction.OpenLive -> open.openLive(a.session)
             ShellAction.NewArchie -> sessions.requestNewArchie()
             ShellAction.NewAgent -> sessions.onIntent(SessionsIntent.NewAgent)
             is ShellAction.Close -> viewModelScope.launch { open.close(a.key) }

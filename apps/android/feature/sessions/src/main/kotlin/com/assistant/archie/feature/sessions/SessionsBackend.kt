@@ -39,6 +39,9 @@ interface SessionsBackend {
     /** `error{orchestrator_active}` after a start/attach the user asked for (§6.11). */
     val conflicts: Flow<Unit>
 
+    /** "<title> was closed elsewhere" / "<title> ended: <why>" for the active agent view (OPEN-3). */
+    val notices: Flow<String>
+
     /** The Archie view of this device while it is a live conversation (not ended, not failed). */
     fun liveArchieHere(): RunningArchie?
 
@@ -69,7 +72,6 @@ interface SessionsBackend {
     fun newAgent()
     fun openAgent(summary: SessionSummary)
     fun openAgent(sdkId: String, provider: HarnessProvider?)
-    fun openLive(pool: PoolSession)
     suspend fun close(key: ItemKey): Boolean
     fun compact(key: ItemKey)
     fun storedTitle(sdkId: String): String?
@@ -96,6 +98,7 @@ class RepositorySessionsBackend(
     override val items: StateFlow<List<WorkspaceItem>> get() = open.items
     override val sessions get() = history.sessions
     override val pool: StateFlow<List<PoolSession>> get() = history.pool
+    override val notices: Flow<String> get() = open.notices
     override val conflicts: Flow<Unit> =
         conversations.events.filterIsInstance<ConversationEvent.OrchestratorConflict>().map { }
 
@@ -139,8 +142,6 @@ class RepositorySessionsBackend(
 
     override fun openAgent(sdkId: String, provider: HarnessProvider?) =
         open.openRef(SessionRef(newId(), sdkId, SessionKind.AGENT, provider))
-
-    override fun openLive(pool: PoolSession) = open.openLive(pool)
 
     override suspend fun close(key: ItemKey): Boolean = open.close(key)
 

@@ -19,9 +19,21 @@ interface Sent {
   msg: string;
 }
 
-function sandbox(target: 'main' | 'compat', stored: string | null = null) {
+function sandbox(target: 'main' | 'compat', stored: string | null = null, opts: { xhr?: boolean } = {}) {
   let now = 1_000_000;
   const sent: Sent[] = [];
+  const viaXhr: Sent[] = [];
+  class FakeXhr {
+    url = '';
+    open(_method: string, url: string) {
+      this.url = url;
+    }
+    setRequestHeader() {}
+    send(body: string) {
+      expect(this.url).toBe('/api/debug/log');
+      viaXhr.push(JSON.parse(body) as Sent);
+    }
+  }
   const printed: unknown[][] = [];
   const listeners: Record<string, ((e: unknown) => void)[]> = {};
   const storage = new Map<string, string>(stored === null ? [] : [[REMOTE_CONSOLE_KEY, stored]]);
@@ -47,6 +59,7 @@ function sandbox(target: 'main' | 'compat', stored: string | null = null) {
       (listeners[type] ??= []).push(fn);
     },
   };
+  if (opts.xhr) win.XMLHttpRequest = FakeXhr;
   vm.runInNewContext(remoteConsoleScript(target), { window: win, Date: FakeDate, JSON, String, Error });
   const api = win.__archieRemoteConsole as {
     isEnabled(): boolean;
@@ -58,6 +71,7 @@ function sandbox(target: 'main' | 'compat', stored: string | null = null) {
     win,
     api,
     sent,
+    viaXhr,
     printed,
     storage,
     console: win.console as { log: (...a: unknown[]) => void; info: (...a: unknown[]) => void },
@@ -137,5 +151,18 @@ describe('remote console inline script', () => {
     cyclic.self = cyclic;
     s.console.log(cyclic);
     expect(s.sent[0]?.msg).toBe('[unserializable]');
+  });
+
+  it('prefers XMLHttpRequest and falls back to sendBeacon', () => {
+    const s = sandbox('main', '1', { xhr: true });
+    s.console.log('over xhr');
+    expect(s.viaXhr.map((m) => m.msg)).toEqual(['over xhr']);
+    expect(s.sent).toEqual([]);
+  });
+
+  it('sends the stack of an uncaught error', () => {
+    const s = sandbox('main');
+    s.fire('error', { message: 'boom', filename: 'app.js', lineno: 3, colno: 7, error: { stack: 'at f (app.js:3:7)' } });
+    expect(s.sent[0]?.msg).toBe('boom @ app.js:3:7\nat f (app.js:3:7)');
   });
 });

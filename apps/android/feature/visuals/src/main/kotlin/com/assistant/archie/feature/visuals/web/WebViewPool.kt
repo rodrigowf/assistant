@@ -56,6 +56,9 @@ class WebViewPool(
         /** Reload requests already applied (a saved reload counter must not replay after rotation). */
         var handledReload: Int = 0
 
+        /** The live-change counter (spec 12 §9.3) the page reflects; a newer one reloads it, even after the tab was away. */
+        var liveVersion: Int = 0
+
         /** The host currently showing this page; the WebView's clients report to it. */
         @Volatile var listener: PageListener? = null
 

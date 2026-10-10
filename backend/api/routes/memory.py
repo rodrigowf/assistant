@@ -5,8 +5,9 @@ Only a *tree* endpoint lives here. File content is already reachable: the
 context/memory/ and is matched before the SPA catch-all, so the frontend
 fetches markdown straight from there rather than through a second endpoint.
 
-Like the visualizations route, there is no watcher or cache — the frontend
-refetches when the sidebar loads.
+Like the visualizations route there is no cache: clients refetch when the
+section opens and when ``api/content_watcher.py`` pushes ``memory_changed``
+(spec 12 §9.3).
 """
 
 from __future__ import annotations

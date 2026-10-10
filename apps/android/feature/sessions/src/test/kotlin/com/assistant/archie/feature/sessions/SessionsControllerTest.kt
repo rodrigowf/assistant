@@ -31,6 +31,7 @@ class SessionsControllerTest {
         override val sessions = MutableStateFlow(LoadState<List<SessionSummary>>(emptyList()))
         override val pool = MutableStateFlow<List<PoolSession>>(emptyList())
         override val conflicts = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+        override val notices = MutableSharedFlow<String>(extraBufferCapacity = 4)
         var here: RunningArchie? = null
         var view: Pair<String, String?>? = null
         var poolRows: List<PoolSession>? = emptyList()
@@ -49,7 +50,6 @@ class SessionsControllerTest {
         override fun newAgent() { calls += "newAgent" }
         override fun openAgent(summary: SessionSummary) { calls += "openAgent:${summary.sdkId}" }
         override fun openAgent(sdkId: String, provider: HarnessProvider?) { calls += "openAgent:$sdkId" }
-        override fun openLive(pool: PoolSession) { calls += "openLive:${pool.localId}" }
         override suspend fun close(key: ItemKey): Boolean { calls += "close:$key"; return true }
         override fun compact(key: ItemKey) { calls += "compact:$key" }
         override fun storedTitle(sdkId: String): String? = "Old title"
@@ -65,6 +65,19 @@ class SessionsControllerTest {
     private fun TestScope.controller(f: Fake) = SessionsController(f, backgroundScope, now = { testScheduler.currentTime })
 
     private val agent = WorkspaceItem(ItemKey.Agent(ConversationKey.agent("A")), ItemKind.AGENT, "Agent", HarnessProvider.CLAUDE, TabStatus.IDLE, localId = "A", sdkId = "S")
+
+    @Test fun aServerCloseOfTheActiveViewIsTheSnackbar_OPEN3() = runTest(UnconfinedTestDispatcher()) {
+        val f = Fake()
+        val c = controller(f)
+        f.notices.emit(com.assistant.core.data.OpenSessionsRepository.closedNotice("Energy dashboard", null))
+        assertEquals("Energy dashboard was closed elsewhere", c.state.value.snack?.message)
+        f.notices.emit(
+            com.assistant.core.data.OpenSessionsRepository.closedNotice(
+                "Energy dashboard", com.assistant.core.conversation.Termination("subprocess_crashed", "claude exited with code 1", null),
+            ),
+        )
+        assertEquals("Energy dashboard crashed: claude exited with code 1", c.state.value.snack?.message)
+    }
 
     @Test fun beforeTheFirstReply_actionsSayWhy_insteadOfDoingNothing() = runTest(UnconfinedTestDispatcher()) {
         val f = Fake()

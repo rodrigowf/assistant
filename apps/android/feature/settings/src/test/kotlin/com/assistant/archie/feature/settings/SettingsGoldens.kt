@@ -133,6 +133,7 @@ class CompactSettingsGoldens : SettingsGoldenBase("compact") {
 
     @Test fun wakeWord() = page(SettingsPageKey.WAKE_WORD, "settings-wake-word")
     @Test fun appearance() = page(SettingsPageKey.APPEARANCE, "settings-appearance")
+    @Test fun notifications() = page(SettingsPageKey.NOTIFICATIONS, "settings-notifications")
 
     @Test fun permissions() {
         val p = FakePlatform().apply { granted.remove(AppPermission.NOTIFICATIONS); blocked += AppPermission.NOTIFICATIONS }
@@ -153,7 +154,7 @@ class CompactSettingsGoldens : SettingsGoldenBase("compact") {
     })
 
     /** Headless server, signed out: the paste-credentials flow. */
-    @Test fun account() = page(SettingsPageKey.ACCOUNT, "settings-account", harness { it.auth = """{"authenticated":false,"auth_url":null,"headless":true}""" })
+    @Test fun account() = page(SettingsPageKey.ACCOUNT, "settings-account", harness())
 
     @Test fun about() = page(SettingsPageKey.ABOUT, "settings-about")
 

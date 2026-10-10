@@ -1,7 +1,7 @@
 /**
  * AuthGate flows (inv02 §1.11, spec 12 §8.1): status check at startup, headless paste flow,
  * sign-in on a server with a browser, failures shown verbatim, "Not now", and a failed check
- * never blocking the app. Settings → Account reuses the same panel.
+ * never blocking the app. The link sign-in uses `/api/accounts/claude/login` (spec 12 §8.1).
  */
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -9,7 +9,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { sessionStore } from '@/platform';
 import { expectNoAxeViolations } from '@/test/axe';
 import { jsonResponse, setupServices, teardownServices, type Harness, type RecordedRequest } from '../../../services/__tests__/fakes';
-import { AuthGate, authStore, checkCredentialsText, GATE_DISMISSED_KEY, resetAuth } from '..';
+import { AuthGate, authStore, GATE_DISMISSED_KEY, resetAuth } from '..';
+import { checkCredentialsText } from '../authActions';
 
 let h: Harness;
 
@@ -66,7 +67,8 @@ describe('AuthGate', () => {
       );
     app();
     const gate = await screen.findByRole('dialog', { name: 'Sign in to Claude' });
-    expect(within(gate).queryByRole('button', { name: 'Sign in with Claude' })).toBeNull();
+    expect(within(gate).getByRole('button', { name: 'Sign in with Claude' })).toBeTruthy(); // the link works headless too
+    await user.click(within(gate).getByRole('button', { name: 'Paste credentials instead' }));
     expect(within(gate).getByRole('button', { name: 'Claude Console' })).toBeTruthy();
     // the app underneath is hidden from AT while the gate is up
     expect(screen.getByRole('button', { name: 'App content', hidden: true }).closest('[aria-hidden="true"]')).not.toBeNull();
@@ -91,34 +93,49 @@ describe('AuthGate', () => {
       .on('POST', '/api/auth/credentials', { authenticated: false, auth_url: null, headless: true });
     app();
     const gate = await screen.findByRole('dialog', { name: 'Sign in to Claude' });
+    await user.click(within(gate).getByRole('button', { name: 'Paste credentials instead' }));
     await user.click(within(gate).getByRole('textbox', { name: 'Credentials JSON' }));
     await user.paste(VALID);
     await user.click(within(gate).getByRole('button', { name: 'Set credentials' }));
     expect(await within(gate).findByText(/server didn't accept them/)).toBeTruthy();
   });
 
-  it('server with a browser: "Sign in with Claude" runs the login; paste is the alternative', async () => {
+  it('"Sign in with Claude" runs the link sign-in: URL, pasted code, then the gate goes', async () => {
     const user = userEvent.setup();
-    let release = (): void => undefined;
+    let signedIn = false;
+    const flow = {
+      id: 'f1', service: 'claude', method: 'token', status: 'waiting', url: 'https://claude.com/cai/oauth/authorize?code=true&state=S',
+      user_code: null, needs_code: true, code_label: 'Code', code_help: '', message: 'Open the link…', started_at: '', expires_at: '', finished_at: null,
+    };
     h.fetch
-      .on('GET', '/api/auth/status', { authenticated: false, auth_url: null, headless: false })
-      .on(
-        'POST',
-        '/api/auth/login',
-        () =>
-          new Promise<Response>((resolve) => {
-            release = () => resolve(jsonResponse({ authenticated: true, auth_url: null, headless: false }));
-          }),
-      );
+      .on('GET', '/api/auth/status', () => jsonResponse({ authenticated: signedIn, auth_url: null, headless: true }))
+      .on('POST', '/api/accounts/claude/login', () => jsonResponse(flow))
+      .on('POST', '/api/accounts/claude/login/code', () => {
+        signedIn = true;
+        return jsonResponse({ ...flow, status: 'succeeded', needs_code: false, message: 'Signed in.' });
+      });
     app();
     const gate = await screen.findByRole('dialog', { name: 'Sign in to Claude' });
-    await user.click(within(gate).getByRole('button', { name: 'Paste credentials instead' }));
-    expect(within(gate).getByRole('textbox', { name: 'Credentials JSON' })).toBeTruthy();
-    await user.click(within(gate).getByRole('button', { name: 'Back' }));
     await user.click(within(gate).getByRole('button', { name: 'Sign in with Claude' }));
-    expect(await within(gate).findByText(/Waiting for sign-in to finish/)).toBeTruthy();
-    release();
+    expect(await within(gate).findByText('https://claude.com/cai/oauth/authorize?code=true&state=S')).toBeTruthy();
+    expect(h.fetch.calls('POST', '/api/accounts/claude/login')[0]?.body).toEqual({ method: 'token' });
+    await user.type(within(gate).getByRole('textbox', { name: 'Code' }), 'abc#def');
+    await user.click(within(gate).getByRole('button', { name: /Finish sign-in/ }));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Sign in to Claude' })).toBeNull());
+    expect(h.fetch.calls('POST', '/api/accounts/claude/login/code')[0]?.body).toEqual({ code: 'abc#def' });
+    expect(h.fetch.calls('POST', '/api/auth/login')).toHaveLength(0);
+  });
+
+  it('an older backend without /api/accounts falls back to the blocking login when it has a screen', async () => {
+    const user = userEvent.setup();
+    h.fetch
+      .on('GET', '/api/auth/status', { authenticated: false, auth_url: null, headless: false })
+      .on('POST', '/api/auth/login', { authenticated: true, auth_url: null, headless: false });
+    app();
+    const gate = await screen.findByRole('dialog', { name: 'Sign in to Claude' });
+    await user.click(within(gate).getByRole('button', { name: 'Sign in with Claude' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Sign in to Claude' })).toBeNull());
+    expect(h.fetch.calls('POST', '/api/auth/login')).toHaveLength(1);
   });
 
   it('"Not now" dismisses it for this browser tab', async () => {

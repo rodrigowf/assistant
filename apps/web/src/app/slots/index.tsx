@@ -23,6 +23,7 @@
  * | AuthGate             | W-13  | App root                                       | wired
  * | VoiceAction          | W-12  | compact app bar trailing voice/speaker state   | wired
  * | VoiceSlot            | W-12  | composer slot: VoiceDock / Active elsewhere    | wired
+ * | VoiceOverlay         | W-12  | VoiceOverlayHost: floating controls in a call  | wired
  */
 import { useCallback, useMemo, type ReactNode } from 'react';
 import { Composer, startVoice } from '@/features/composer';
@@ -45,7 +46,7 @@ import { StatusGlyph, TabLeading } from '../workspace/TabParts';
 import { useTabSummaries } from '../workspace/tabSummary';
 
 export { Composer } from '@/features/composer';
-export { VoiceAction } from '@/features/voice';
+export { VoiceAction, VoiceOverlay, preloadVoiceOverlay, useLiveVoiceId, VOICE_OVERLAY_SELECTOR } from '@/features/voice';
 
 // W-12: voice controllers follow the Archie runtimes; the composer's Voice button starts voice.
 installVoice();

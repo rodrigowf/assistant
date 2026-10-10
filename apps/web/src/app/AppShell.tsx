@@ -10,13 +10,14 @@
  *     {wc === 'medium' && <ListPaneOverlay/>}
  *     {wc === 'compact' && <AppDrawer/>}
  *     <ScreenLayer/>                                  screens above the workspace
+ *     <VoiceOverlayHost/>                             floating voice controls during a call (not on its Archie view)
  *     <SessionSwitcherSheet/> <ShellDialogs/> <AppSnackbars/> <div id="overlay-root"/>
  *
  * **Stable tree position (§4.4, must-preserve inv02 §7 #1):** the conditional siblings before
  * `<main>` render `false` placeholders, so `<main>` and `PanelHost` keep their parent and index in
  * every window class. Rotating the iPad or resizing the window never remounts a panel.
  */
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { ensureMemoryTree } from '@/services';
 import { dismissSnackbar, usePrefs, useSnackbar } from '@/stores';
 import { OVERLAY_ROOT_ID, SnackbarHost } from '@/ui/overlays';
@@ -28,6 +29,7 @@ import { AppRail, useRailValue } from './shell/AppRail';
 import { ListPane, ListPaneOverlay } from './shell/ListPane';
 import { ScreenLayer, useScreens } from './shell/ScreenLayer';
 import { closeShellOverlays } from './shell/shellState';
+import { VoiceOverlayHost } from './shell/VoiceOverlayHost';
 import { useWindowClass, type WindowClass } from './useWindowClass';
 import { PanelHost } from './workspace/PanelHost';
 import { SessionSwitcherSheet } from './workspace/SessionSwitcherSheet';
@@ -94,6 +96,7 @@ export function AppShell() {
   const collapsed = usePrefs((p) => p.listPaneCollapsed);
   const screens = useScreens(wc);
   const covered = screens.length > 0;
+  const workspaceRef = useRef<HTMLElement>(null);
   useAppKeyboard();
   useWindowClassTransitions(wc);
   useDocumentRoutesAsTabs(wc);
@@ -115,13 +118,14 @@ export function AppShell() {
       ) : (
         false
       )}
-      <main className={styles.workspace} aria-label="Workspace" {...coveredProps}>
+      <main ref={workspaceRef} className={styles.workspace} aria-label="Workspace" {...coveredProps}>
         <WorkspaceTopBar wc={wc} />
         <PanelHost />
       </main>
       {wc === 'medium' ? <ListPaneOverlay /> : false}
       {wc === 'compact' ? <AppDrawer /> : false}
       <ScreenLayer wc={wc} screens={screens} />
+      <VoiceOverlayHost wc={wc} covered={covered} screenKey={screens.map((s) => s.key).join(',')} workspaceRef={workspaceRef} />
       {wc === 'compact' ? <SessionSwitcherSheet /> : false}
       <ShellDialogs />
       <AppSnackbars />

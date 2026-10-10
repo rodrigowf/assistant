@@ -27,7 +27,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.assistant.core.data.ItemKey
 import com.assistant.core.data.ItemKind
-import com.assistant.core.data.OpenSessionsRepository
 import com.assistant.core.data.WorkspaceItem
 import com.assistant.core.design.components.ArchieButton
 import com.assistant.core.design.components.ArchieIconButton
@@ -42,22 +41,19 @@ import com.assistant.core.design.components.StatusIndicator
 import com.assistant.core.design.icons.ArchieIcon
 import com.assistant.core.design.icons.ArchieIcons
 import com.assistant.core.design.theme.ArchieTheme
-import com.assistant.core.model.PoolSession
 import kotlinx.coroutines.launch
 
 /**
  * The session switcher sheet body (IA §5, mockup phone (c)): the phone version of tabs. "Open now"
  * with live status, each closable by × **or a horizontal swipe** (both go through the same close
- * flow: Archie and a working agent ask first, P-1), live sessions of other devices, then
+ * flow: Archie and a working agent ask first, P-1) — the server's open set, the same on every device — then
  * "New Archie chat" / "New agent session"; "History" opens the History screen.
  */
 @Composable
 fun SessionSwitcherContent(
     items: List<WorkspaceItem>,
     active: ItemKey?,
-    liveElsewhere: List<PoolSession>,
     onSelect: (ItemKey) -> Unit,
-    onOpenLive: (PoolSession) -> Unit,
     onRequestClose: (WorkspaceItem) -> Unit,
     onNewArchie: () -> Unit,
     onNewAgent: () -> Unit,
@@ -72,7 +68,7 @@ fun SessionSwitcherContent(
         }
         Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
             ListSectionHeader("Open now")
-            if (items.isEmpty() && liveElsewhere.isEmpty()) {
+            if (items.isEmpty()) {
                 Text(
                     "No open sessions. Start one below.",
                     Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -82,9 +78,6 @@ fun SessionSwitcherContent(
             }
             for (item in items) {
                 key(item.key) { SwipeToCloseRow(item, item.key == active, { onSelect(item.key); onDismiss() }, onRequestClose) }
-            }
-            for (p in liveElsewhere) {
-                key(p.localId) { LiveElsewhereRow(p) { onOpenLive(p); onDismiss() } }
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 14.dp, start = 4.dp, end = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -131,7 +124,6 @@ private fun SwipeToCloseRow(
                 Text(item.detail, maxLines = 1)
             },
             trailing = {
-                if (item.unread && !selected) UnreadDot()
                 ArchieIconButton(ArchieIcons.Close, "Close ${item.title}", { onRequestClose(item) })
             },
         )
@@ -148,19 +140,4 @@ private fun SwipeBackground(direction: SwipeToDismissBoxValue) {
     ) {
         ArchieIcon(ArchieIcons.Close, null, tint = c.onErrorContainer)
     }
-}
-
-@Composable
-private fun LiveElsewhereRow(p: PoolSession, onClick: () -> Unit) {
-    ArchieListItem(
-        p.title?.takeIf { it.isNotBlank() } ?: OpenSessionsRepository.AGENT_PLACEHOLDER,
-        onClick = onClick,
-        modifier = Modifier.testTag("switcher-live-row"),
-        size = ListItemSize.Large,
-        leading = { ListLeadingTile(ArchieIcons.Terminal) },
-        supporting = {
-            OpenSessionsRepository.statusOf(p.status).toLive()?.let { StatusIndicator(it) }
-            Text("Open on another device", maxLines = 1)
-        },
-    )
 }

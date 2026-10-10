@@ -10,7 +10,8 @@
  * - D2 history `prepend` keeps `promptSinceTurnEnd`, `pendingSplit` and the open voice entry
  *   untouched (an older page is not a new prompt), and shifts `speechAnchor` by the prepended count.
  * - D3 `agent_session_closed` for this conversation's own `localId` stops it like `session_stopped`
- *   (§3.7 onWatcherEvent; FOCUS-2 kind check).
+ *   (§3.7 onWatcherEvent; FOCUS-2 kind check); `error{session_closed}` does the same and emits that
+ *   close as a `watcher` effect. Either way the session directory then closes the view (OPEN-3).
  * - D5 a start error that fails the pending `start` releases the held `preStart` frames (lossless,
  *   L-2) instead of leaving them for a `session_started` that will not come.
  */
@@ -37,13 +38,13 @@ import {
   type ToolResultData,
   type UserEntry,
 } from '../types';
-import type { ClientMessage, StartMessage, VoiceStartMessage } from '../wire/client';
+import type { StartMessage, VoiceStartMessage } from '../wire/client';
 import { coerceFrame, isPlainObject } from '../wire/decode';
 import type { MessagePreview, MessagesPage, ServerFrame, SessionStartedFrame } from '../wire/server';
 import { Draft, type Loc, type Mutable } from './draft';
 import type { ConversationInput, Effect, HistoryMode, StepResult } from './io';
 
-const TURN_FAILURE_AGENT = ['send_failed', 'upstream_wedged', 'command_failed', 'compact_failed'];
+const TURN_FAILURE_AGENT = ['send_failed', 'upstream_wedged', 'turn_timeout', 'command_failed', 'compact_failed'];
 const TURN_FAILURE_ORCH = [
   'api_error',
   'provider_error',
@@ -112,6 +113,8 @@ export interface InitialConversationOptions {
   voiceActive?: boolean;
   /** The socket is already subscribed (tests and the fixture runner): status `idle`, conn `subscribed`. */
   subscribed?: boolean;
+  /** Opened from the server's pool, not by a user action: every `start` reattaches (OPEN-2). Default: `subscribed`. */
+  reattach?: boolean;
 }
 
 /** spec 12 §2.3 initial values. */
@@ -165,6 +168,7 @@ export function initialConversation(o: InitialConversationOptions): Conversation
     reloading: false,
     reloadBuffer: [],
     stoppingRetried: false,
+    reattach: o.reattach ?? o.subscribed === true,
   };
 }
 
@@ -218,6 +222,7 @@ class Machine extends Draft {
         return;
       case 'local_stop':
         this.s.expectStopAck = true;
+        this.s.reattach = false; // we close or replace it ourselves: the next start is ours (OPEN-2)
         return;
       case 'voice_local_end':
         return this.endVoice();
@@ -256,7 +261,7 @@ class Machine extends Draft {
 
   private sendStart(override?: VoiceStartMessage): void {
     const ref = this.s.ref;
-    let msg: ClientMessage;
+    let msg: StartMessage | VoiceStartMessage;
     if (override) {
       msg = override;
     } else {
@@ -266,6 +271,7 @@ class Machine extends Draft {
       if (cp && canResume(this.s as Conversation)) m.resume_from = { stream_id: cp.stream_id, seq: cp.seq }; // T-10
       msg = m;
     }
+    if (this.s.reattach) msg = { ...msg, reattach: true }; // OPEN-2: never re-create a closed conversation
     this.s.startRequest = msg;
     this.s.awaitingSessionStarted = true;
     this.s.preStart = [];
@@ -305,6 +311,7 @@ class Machine extends Draft {
   private onSessionStarted(f: SessionStartedFrame): void {
     this.s.awaitingSessionStarted = false;
     this.s.stoppingRetried = false;
+    this.s.reattach = true; // in the server's open set now: later starts only reattach (OPEN-2)
     this.applySessionStartedFields(f);
     this.reduce(f);
     const sr = this.s.startRequest;
@@ -375,7 +382,8 @@ class Machine extends Draft {
         this.s.promptSinceTurnEnd = false;
       }
       this.s.status = status as SessionStatus;
-    } else if (status === 'idle' && this.s.inTurn) {
+    } else if (this.s.inTurn) {
+      // idle, interrupted (Codex/Gemini/Qwen keep it after a stop), disconnected: no turn runs
       this.endTurn();
     }
   }
@@ -962,7 +970,7 @@ class Machine extends Draft {
           this.s.expectStopAck = false; // reply to our own stop / close
           return;
         }
-        return this.stoppedByServer(); // the view is NOT closed (W-9)
+        return this.stoppedByServer(); // the view closes on the watcher's agent_session_closed (OPEN-3)
 
       case 'voice_event':
         return this.onVoiceEvent(f.event);
@@ -990,12 +998,13 @@ class Machine extends Draft {
       case 'agent_session_closed':
         this.effects.push({ type: 'watcher', frame: f });
         // D3 (§3.7, FOCUS-2): this conversation itself left the pool.
-        if (f.session_id === ref.localId && (f.is_orchestrator === true) === (ref.kind === 'orchestrator'))
-          this.stoppedByServer();
+        if (f.session_id === ref.localId && (f.is_orchestrator === true) === (ref.kind === 'orchestrator')) this.stoppedByServer();
         return;
       default:
         // voice_ending, voice_command, voice_audio_out, voice_connection_error, models_list,
-        // orchestrator_switch (channel level, SW-1), audio_upload, ping, unknown: handled
+        // orchestrator_switch (channel level, SW-1), agent_turn_started/finished (channel level,
+        // device notifications), visualization_changed / memory_changed (channel level, §9.3),
+        // audio_upload, ping, unknown: handled
         // outside the reducer or ignored
         return;
     }
@@ -1114,6 +1123,14 @@ class Machine extends Draft {
       this.effects.push({ type: 'protocol_error', code, detail });
       return this.sendStart();
     }
+    if (code === 'session_closed') {
+      // OPEN-3: the answer to a `reattach` start, the conversation is not open on the server
+      this.endStartWait();
+      this.stoppedByServer();
+      const ref = this.s.ref;
+      this.effects.push({ type: 'watcher', frame: { type: 'agent_session_closed', session_id: ref.localId, is_orchestrator: ref.kind === 'orchestrator' } });
+      return;
+    }
     if (START_ERRORS.indexOf(code) < 0) {
       this.effects.push({ type: 'protocol_error', code, detail });
       return;
@@ -1125,13 +1142,16 @@ class Machine extends Draft {
     }
     this.s.connectionBanner = { code, detail };
     this.s.conn = 'failed';
-    if (this.s.awaitingSessionStarted) {
-      // no session_started will come for this start: keep what was held (lossless, L-2)
-      this.s.awaitingSessionStarted = false;
-      const held = this.s.preStart;
-      this.s.preStart = [];
-      for (const g of held) this.dispatch(g);
-    }
+    this.endStartWait();
+  }
+
+  /** No `session_started` will come for this start: keep what was held (lossless, L-2, SEQ-8). */
+  private endStartWait(): void {
+    if (!this.s.awaitingSessionStarted) return;
+    this.s.awaitingSessionStarted = false;
+    const held = this.s.preStart;
+    this.s.preStart = [];
+    for (const g of held) this.dispatch(g);
   }
 
   // ───────────────────────── local actions ─────────────────────────

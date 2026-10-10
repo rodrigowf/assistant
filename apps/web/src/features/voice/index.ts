@@ -4,6 +4,8 @@
  *   <VoiceSlot localId composer />   composer slot: VoiceDock while voice is on, Active elsewhere above the composer
  *   <VoiceDock localId />            the own-device dock
  *   <VoiceAction localId />          compact app bar speaker toggle
+ *   <VoiceOverlay localId … />       the same controls floating above every other view during a call (lazy chunk)
+ *   useLiveVoiceId(archieIds)        which Archie conversation has voice on this device
  *   useVoiceUi(localId)              voice snapshot + controller
  *   installVoice()                   engine + the composer's Voice handler (W-11 setStartVoiceHandler)
  *                                    + the voice auto-start after an orchestrator switch (§6.11a SW-2)
@@ -13,10 +15,22 @@ import { setSwitchVoiceHandler } from '@/services';
 import { showSnackbar } from '@/stores';
 import { installVoiceEngine, startVoiceFromGesture, startVoiceWithoutGesture, VOICE_NEEDS_TAP } from '@/voice';
 
-export { VoiceDock, VoiceDockView, ActiveElsewhereView, type VoiceDockViewProps, type VoiceDockActions, type ActiveElsewhereViewProps } from './VoiceDock';
+export {
+  VoiceDock,
+  VoiceDockView,
+  ActiveElsewhereView,
+  useVoiceDock,
+  type VoiceDockViewProps,
+  type VoiceDockActions,
+  type ActiveElsewhereViewProps,
+} from './VoiceDock';
 export { VoiceSlot, VoiceAction } from './VoiceSlot';
+export { VoiceOverlay, preloadVoiceOverlay } from './lazyOverlay';
+export type { VoiceOverlayProps } from './VoiceOverlay';
+export { needsAttention, overlayBox, snapAnchor, IDLE_AFTER_MS, WAKE_GUARD_MS, type OverlayAnchor, type OverlayBox } from './overlay';
+export { VOICE_OVERLAY_SELECTOR } from './overlaySelector';
 export { LevelOrb, type OrbTone, type LevelOrbProps } from './LevelOrb';
-export { useVoiceUi, useTicker, type VoiceUi } from './useVoiceUi';
+export { useVoiceUi, useTicker, useLiveVoiceId, type VoiceUi } from './useVoiceUi';
 export { dockText, statusWord, formatElapsed, vadSeconds, bannerText, VAD_COUNTER_AFTER_MS } from './copy';
 
 let installed = false;

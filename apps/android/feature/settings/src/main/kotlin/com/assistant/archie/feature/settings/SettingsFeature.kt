@@ -36,6 +36,7 @@ class SettingsFeature(val deps: SettingsDeps) {
     val messages = SettingsMessages()
     val server = ServerSettingsModel(deps.serverConfig, deps.api, messages, deps.scope)
     val auth = AuthModel(deps.api, messages, deps.scope)
+    val accounts = AccountsModel(deps.api, messages, deps.scope, onClaudeChanged = { auth.check() })
     val device = DeviceSettingsModel(deps.settings, deps.appearance, deps.platform, messages, deps.scope)
     val connection = ConnectionModel(deps.connection, deps.settings, messages, deps.scope)
     val permissions = PermissionCenter(deps.platform)
@@ -45,7 +46,7 @@ class SettingsFeature(val deps: SettingsDeps) {
     init {
         // A new server (T-15): its config, catalogs and sign-in state are different.
         deps.connection.status.map { it.serverUrl }.filter { it != null }.distinctUntilChanged().drop(1)
-            .onEach { server.reset(); auth.reset() }
+            .onEach { server.reset(); auth.reset(); accounts.reset() }
             .launchIn(deps.scope)
         // AuthGate: check the sign-in each time this device (re)connects to a server.
         deps.connection.status.distinctUntilChangedBy { it.phase to it.serverUrl }

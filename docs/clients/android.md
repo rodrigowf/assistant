@@ -3,10 +3,12 @@ name: android
 category: archie/clients
 tags: [android, kotlin, compose, navigation3, views, app-main, app-lite, a300m, poco, gradle, adb, signing, vosk]
 created: 2026-04-14
-modified: 2026-10-08
+modified: 2026-10-10
 summary: apps/android — Gradle multi-module project with the main app (com.assistant.archie) and the A300M lite app (com.assistant.peripheral).
 source: curated (consolidated from memory notes assistant/android/android_peripheral_project.md, assistant/infrastructure/repo_layout_cutover_2026_10.md, assistant/devices/peripheral_devices.md, auto-memory feedback_android_ws_keepalive_silent_drop.md, feedback_use_adb_input_for_device_tests.md, feedback_hands_on_checks_over_suites.md, feedback_run_test_before_speculating.md, project_frontend_refactor_2026_10_03.md; verified against code 2026-10-06)
 references:
+  - ../harnesses/authentication.md
+  - ../integrations/visualizations-and-sharing.md
   - ../specs/14-android-architecture.md
   - ../specs/12-client-protocol.md
   - ../projects/frontend-refactor/README.md
@@ -72,6 +74,10 @@ are minSdk 26 and main-app only.
 | `build-logic/` | — | Convention plugins: SDK levels (`ArchieBuild.kt`), signing, tiers, `LiteGuards`, `verifyNoCompose`, `verifyPatchedVosk` |
 | `tools/native/` | — | `patch_vosk_weaken.py`, `verify_vosk_patch.py`, `check_elf_alignment.sh` |
 | `tools/parity/` | — | `extract_old_constants.py` + `old_constants.json` (constants pinned from the old app) |
+
+The main app's floating voice controls (over every non-Archie view during a call) are
+`:feature:chat`'s `VoiceOverlay`, hosted by `app-main`'s `ShellVoiceOverlay`
+([voice architecture](../voice/architecture.md#floating-voice-controls-web-and-android)).
 
 `VERSIONS.md` lists every pinned library version (the voice-parity pins — stream-webrtc-android
 1.1.1, vosk-android 0.3.47 — are deliberate).
@@ -187,6 +193,68 @@ request.
 | Model packaging | `androidResources.noCompress += "vosk-model-small-en-us-0.15"` must be set in `app-lite/build.gradle.kts` itself — the library module's setting does not reach the APK |
 | 16 KB pages | Not relevant on the 32-bit A300M. For the main app, WebRTC 1.1.1 and Vosk 0.3.47 are still 4 KB-aligned (the POCO uses 4 KB pages); newer versions are aligned but need a voice retest |
 
+## Open sessions follow the server
+
+The server's pool is the one truth for what is open (spec 12 OPEN-1..4); every device shows the
+same set and never revives a closed conversation.
+
+- **"Open now"** (drawer, switcher, list pane, History) is `OpenSessionsRepository.items`: Archie,
+  then every agent session in `pool/live` in pool order, with or without a view here (tapping one
+  opens its view), then views not listed yet (a session the user just started), then memory and
+  visuals. There is no "open on another device" row, no background view and no unread badge.
+- **Reattach, never re-create** (OPEN-2). `ConversationState.userStart` marks the user's own first
+  `start` (new session, History, fork, continue, rewind; Archie: new, resume, switch); every other
+  `start` — reconnect, foreground, `not_started` recovery, adoption, the voice owner's
+  `voice_start` re-arm (`VoiceStartRequest.reattach`) — carries `reattach: true`, so the server
+  answers `error{session_closed}` instead of creating anything.
+- **Closed = gone** (OPEN-3). `session_stopped` (not our own), `agent_session_closed` for the view,
+  or `error{session_closed}` make the reducer emit `ConversationEffect.Closed`; the repository
+  removes the view (no close request) and emits `ConversationEvent.Closed`, and
+  `OpenSessionsRepository` moves focus to the neighbour as after an explicit close. If it was the
+  active agent view, the snackbar says "<title> was closed elsewhere" or "<title> crashed: <detail>" (how it ended, by reason; spec 12 §6.13)
+  for a terminated session (the web's wording; none for Archie). A terminated session is reopened
+  from History; there is no "Continue in new session" card any more. Agent views
+  also close on the watcher frame (`ConversationRepository`), and the row leaves `history.pool` at
+  once (`dropFromPool`).
+- **Reconcile on every read** (OPEN-4). `HistoryRepository.poolReads` carries each `pool/live`
+  answer with its request time; agent views subscribed before that read and missing from it close.
+  Reads happen on every orchestrator socket open (`MainAppGraph`), every foreground
+  (`refreshAll`), after each agent `session_started` (ST-2, the same read) and on
+  `agent_session_opened`. `OrchestratorChannel` probes the pool itself on every socket open and
+  every foreground: its row is adopted, a missing one closes the Archie view (it publishes a
+  synthesized `agent_session_closed`, so the lite face and every frame consumer see one signal).
+- Tests: `OrchestratorChannelTest` (`open*`), `OpenRulesTest` (reducer), `DataLayerTest`
+  (`open*`, against `FakeBackend`, which keeps its pool like the server and answers reattach starts).
+
+## Agent notifications (main app)
+
+Settings → This device → Notifications → "Agent session finished" (DataStore
+`notify_agent_turns`, off by default; turning it on asks for POST_NOTIFICATIONS through the
+usual rationale) posts a heads-up notification on the "Agent sessions" channel when any agent session
+finishes a turn (spec 12 TURN-1/TURN-2). `app-main/.../system/TurnNotifier.kt` holds the decision
+(`TurnAttention`: switch, Stop, "looking at it" = the approvals' `lookingAtFrom`), the notifier and
+`SystemTurnSink`; the graph feeds it `orchestrator.frames`. "Looking at it" needs `MainActivity` to be
+**resumed** (`approvals.foreground`, set in `onResume`/`onPause`), so it ends the moment Home is
+pressed, the shade is pulled or the screen locks; it used the process lifecycle before, whose
+`ON_STOP` arrives ~1 s late, and a turn finishing in that gap was wrongly treated as seen
+(2026-10-10). The Settings home lists the page between Appearance and Permissions
+(`SettingsUiTest.home_listsEveryDevicePage_includingNotifications` keeps every device page reachable;
+it was missing from the home until 2026-10-10). A tap reuses the approval tap path
+(`EXTRA_OPEN_AGENT`, plus `EXTRA_OPEN_AGENT_SDK` to reopen a session that left the pool).
+
+**Background delivery.** Frames only arrive while the process runs and is not frozen.
+`AgentWork` tracks in-flight agent turns (`agent_turn_started/finished`, reconciled with
+`pool/live`); while the switch is on and one is in flight, the graph holds the voice host's
+foreground service (`VoiceHostRuntime.setAgentWorkHold`; special-use type only, notification
+"Waiting for N agent sessions"), released with the last turn. To keep a missed finish (backend
+restart, dropped socket) from holding it forever, the graph re-reads `pool/live` on every
+orchestrator reconnect and every 3 min while turns run; a finish newer than the read wins, and a
+turn older than 2 h ages out. Android 12+ only starts that service from the foreground, so the hold
+covers a turn that was running while Archie was open (send, pocket the phone). A turn started on
+another device while Archie sat in the background reaches the phone only with "Stay connected in
+background", the wake word or a live voice call (all of which run the same service). No push
+server is involved.
+
 ## Debugging
 
 Order of operations: **build → install → drive the real app on the device → only then the
@@ -210,7 +278,8 @@ adb -s 06e4f224 logcat -v time LiteMain:* LiteGraph:* ArchieLite:* AssistantServ
 ```
 
 Tags by module: `app-main` `ArchieVoice`, `ArchieVIS`, `ArchieTile`, `ArchieShare`,
-`ArchieApprovals`, network `Archie/ws`, `Archie/orch`; `app-lite` `LiteMain`, `LiteGraph`,
+`ArchieApprovals`, `ArchieNotify` ("agent session finished" notifications: `posted` /
+`suppressed … reason=` / `cleared` / `background hold on|off`), network `Archie/ws`, `Archie/orch`; `app-lite` `LiteMain`, `LiteGraph`,
 `ArchieLite`, `AssistantVIS`; `core/voice-host` `AssistantService`, `VoiceHost`,
 `TriggerRouter`, `PushToTalk`, `VoiceCues`, `ButtonAccessibility`; `core/wakeword`
 `WakeWordDetector`, `VoskRecogEngine`, `VoskModelLoader`, `WhisperConfirmer`,
@@ -303,6 +372,29 @@ its catalog hints, or one inferred from its kind (`HarnessControls.optionControl
 - **Test data**: the JVM tests of `:core:protocol` and `:feature:settings` read the web mock
   catalogs (`apps/web/mock-server/data/harnesses.json`) through the `archie.harnessCatalogs`
   system property, so both clients test against the same data.
+
+## Settings → Accounts
+
+`feature/settings`: `AccountsModel.kt` (state + actions over `ArchieApi.accounts()` … `deleteEnv()`,
+flow polling while the page is shown, pure helpers in its companion) and `ui/AccountsPage.kt` (one
+card per service, the link flow — Open opens the URL in the browser via an `ACTION_VIEW` intent,
+Copy puts it on the clipboard — pasted-back code, credentials paste, API-key fields, sign out,
+Test, and the Environment keys list with reveal-on-demand / edit / delete / add). DTOs in
+`core/protocol` `RestDto.kt` (`AccountServiceDto`, `LoginFlowDto`, `EnvKeyDto`, …). The AuthGate
+(Claude only) is unchanged. See [authentication.md](../harnesses/authentication.md).
+
+## Live visuals and internal links
+
+- `:core:protocol` decodes `visualization_changed` / `memory_changed` (spec 12 §9.3);
+  `:core:data` `ContentChangesRepository` (in `MainAppGraph`) bumps per-path counters, refreshes
+  the lists and catches up after a reconnect (VZ-6). `VisualWebView` reloads the pooled WebView
+  (`reload()`, keeps the scroll) when the counter passes the version the pool entry loaded, also
+  after the tab was away; memory documents refetch in place. Both show a short "Updated" cue.
+- Links (spec 12 §9.4): `:core:markdown` `InternalLinks` (same corpus as the web,
+  `InternalLinksTest`), `autoLinkPaths` behind `MarkdownStyle.autoLinkPaths` (chat and memory
+  documents). Chat links go through `rememberChatLinkHandler` (`shell/ContentWiring.kt`): visuals
+  and memory files open as workspace items; memory documents open visuals in the app too (a
+  `VisualDoc` screen on Compact).
 
 ## Rules for changing the apps
 

@@ -9,3 +9,6 @@ project_doc_max_bytes = 131072
 # ChatGPT plugins/apps add ~10 KB of instructions to every turn.
 plugins = false
 apps = false
+# Archie's memory is the context/memory wiki (MEMORY.md is passed per
+# session); keep Codex's own memory store (CODEX_HOME/memories) off.
+memories = false

@@ -101,16 +101,6 @@ sealed interface InlineCardUi {
         val retry: RetryKind?,
     ) : InlineCardUi
 
-    /** §6.13 termination; Continue is enabled when an `sdk_session_id` is present. */
-    data class Ended(val title: String, val detail: String?, val canContinue: Boolean) : InlineCardUi {
-        override val id get() = "ended"
-    }
-
-    /** The view stopped (another device closed it, or the pool dropped it). */
-    data class Stopped(val title: String) : InlineCardUi {
-        override val id get() = "stopped"
-    }
-
     /** A `replay_overflow` / failed reload left a possible gap: offer Reload (§5.6). */
     data object GapPossible : InlineCardUi {
         override val id get() = "gap"
@@ -213,23 +203,7 @@ object ConversationUiMapper {
         }
         transient.filter { it.id !in dismissed }.forEach { out += it }
         if (s.gapPossible && "gap" !in dismissed) out += InlineCardUi.GapPossible
-        s.termination?.let { t ->
-            out += InlineCardUi.Ended(terminationTitle(t.reason), t.detail, t.sdkSessionId != null)
-        }
-        if (s.termination == null && s.status == SessionStatus.STOPPED && "stopped" !in dismissed) {
-            out += InlineCardUi.Stopped("This session was stopped")
-        }
         return out.toImmutableList()
-    }
-
-    /** §6.13 headlines by `reason`. */
-    fun terminationTitle(reason: String?): String = when (reason) {
-        "subprocess_crashed" -> "This session crashed"
-        "subprocess_lost" -> "The session ended unexpectedly"
-        "unreachable" -> "The host is unreachable"
-        "replaced" -> "This session was replaced"
-        "closed_by_user" -> "This session was closed"
-        else -> "This session ended"
     }
 
     fun bannerTitle(code: String): String = when (code) {

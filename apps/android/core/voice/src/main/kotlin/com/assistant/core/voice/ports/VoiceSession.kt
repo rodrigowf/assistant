@@ -52,6 +52,8 @@ data class VoiceStartRequest(
     val voiceName: String,
     val transcriptionLanguage: String,
     val endpoint: String?,
+    /** Spec 12 OPEN-2: the re-arm after a reconnect only re-subscribes; never re-creates a closed conversation. */
+    val reattach: Boolean = false,
 )
 
 /** Orchestrator-socket writes the voice core needs (encoded by :core:protocol). */

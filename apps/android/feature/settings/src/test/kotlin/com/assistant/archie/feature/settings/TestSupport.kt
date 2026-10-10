@@ -63,6 +63,13 @@ class SettingsBackend {
     /** `GET /api/config/harnesses`; null = an older server (404 → providers + Qwen models fallback). */
     @Volatile var harnesses: String? = harnessCatalogsFixture()
     @Volatile var failNextPut: Pair<Int, String>? = null
+    /** `GET /api/accounts` and `GET /api/env` (synthetic, `src/test/resources/jetson/`). */
+    @Volatile var accounts: String = fixture("accounts.json")
+    @Volatile var envKeys: String = fixture("env.json")
+    /** `GET /api/accounts/{id}/login` while a flow runs; set by the test. */
+    @Volatile var loginFlow: String? = null
+    /** Bodies of the accounts / env writes, as "METHOD path body". */
+    val accountWrites = CopyOnWriteArrayList<String>()
     val puts = CopyOnWriteArrayList<String>()
     val requests = CopyOnWriteArrayList<String>()
 
@@ -87,6 +94,7 @@ class SettingsBackend {
                     path == "/api/skills" -> ok(fixture("skills.json"))
                     path == "/api/agents" -> ok(fixture("agents.json"))
                     path == "/api/auth/status" -> ok(auth)
+                    path.startsWith("/api/accounts") || path.startsWith("/api/env") -> accountsRoute(request.method.orEmpty(), path, body)
                     path == "/api/auth/credentials" -> ok("""{"authenticated":true,"auth_url":null,"headless":true}""")
                     path.matches(Regex("/api/sessions/[^/]+/config")) -> {
                         if (request.method == "PUT") { puts += body; sessionConfig = mergeSession(body) }
@@ -122,6 +130,34 @@ class SettingsBackend {
         config = JsonObject(merged)
         return ok(config.toString())
     }
+
+    /** A tiny stand-in for `api/routes/accounts.py`. */
+    private fun accountsRoute(method: String, path: String, body: String): MockResponse {
+        if (method != "GET") accountWrites += "$method $path $body"
+        val flow = """{"id":"f1","service":"claude","method":"token","status":"waiting","url":"https://claude.com/cai/oauth/authorize?code=true&state=S","needs_code":true,"code_label":"Code","message":"Open the link, sign in, then paste the code here."}"""
+        return when {
+            path == "/api/accounts" -> ok(accounts)
+            path == "/api/env" && method == "GET" -> ok(envKeys)
+            path == "/api/env" -> ok("""{"applies":"now","note":""}""")
+            path.endsWith("/reveal") -> ok("""{"name":"OPENAI_API_KEY","value":"sk-full-secret-value"}""")
+            path.startsWith("/api/env/") -> ok("""{"applies":"now","note":""}""")
+            path.endsWith("/login/code") -> ok(flow.replace("\"waiting\"", "\"succeeded\"").replace("Open the link, sign in, then paste the code here.", "Signed in."))
+            path.endsWith("/login") && method == "POST" -> ok(flow)
+            path.endsWith("/login") && method == "GET" -> loginFlow?.let { ok(it) } ?: MockResponse().setResponseCode(404)
+            path.endsWith("/login") && method == "DELETE" -> ok(flow.replace("\"waiting\"", "\"cancelled\""))
+            path.endsWith("/credentials") -> if (body.contains("accessToken")) ok("""{"message":"Credentials saved.","service":${serviceJson("claude")}}""")
+                else MockResponse().setResponseCode(400).setHeader("Content-Type", "application/json").setBody("""{"detail":"Invalid credentials: the file has no claudeAiOauth.accessToken."}""")
+            path.endsWith("/logout") -> ok("""{"message":"Signed out.","service":${serviceJson("claude").replace("\"signed_in\"", "\"signed_out\"")}}""")
+            path.endsWith("/verify") -> ok(JsonObject((json.parseToJsonElement(serviceJson("openai")) as JsonObject) +
+                ("verified" to json.parseToJsonElement("""{"ok":false,"message":"The provider rejected the key (401)."}"""))).toString())
+            path.matches(Regex("/api/accounts/[^/]+")) -> ok(serviceJson(path.substringAfterLast('/')))
+            else -> MockResponse().setResponseCode(404)
+        }
+    }
+
+    private fun serviceJson(id: String): String =
+        ((json.parseToJsonElement(accounts) as JsonObject)["services"] as kotlinx.serialization.json.JsonArray)
+            .first { ((it as JsonObject)["id"] as kotlinx.serialization.json.JsonPrimitive).content == id }.toString()
 
     private fun mergeSession(body: String): String {
         val cur = json.parseToJsonElement(sessionConfig) as JsonObject

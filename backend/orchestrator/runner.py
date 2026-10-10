@@ -45,6 +45,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Finished turns a runner keeps for read_agent_session / peek.
+_MAX_FINISHED_TURNS = 100
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -76,6 +79,9 @@ class _TurnRecord:
     origin_tool_use_id: str | None
     started_at: float  # time.monotonic
     started_at_wall: float  # time.time, for surfacing to the LLM
+    # time.monotonic of the last event the agent produced (text, tool, permission).
+    # The no-progress timeout counts from here, not from started_at.
+    last_progress_at: float = 0.0
     status: str = "running"
     task: asyncio.Task | None = None
     finished: bool = False
@@ -144,6 +150,7 @@ class NotificationQueue:
     def __init__(self) -> None:
         self._items: list[Notification] = []
         self._wake_cb: Callable[[], Awaitable[None]] | None = None
+        self._wake_owner: object | None = None
 
     def push(self, n: Notification) -> None:
         self._items.append(n)
@@ -170,8 +177,21 @@ class NotificationQueue:
     def pending_count(self) -> int:
         return len(self._items)
 
-    def set_wake_callback(self, cb: Callable[[], Awaitable[None]] | None) -> None:
+    def set_wake_callback(
+        self, cb: Callable[[], Awaitable[None]] | None, *, owner: object | None = None,
+    ) -> None:
         self._wake_cb = cb
+        self._wake_owner = owner if cb is not None else None
+
+    def release_wake_callback(self, owner: object) -> None:
+        """Clear the wake callback only if ``owner`` installed it.
+
+        The queue outlives orchestrator sessions (:class:`AgentRuntimes`): an
+        old session stopping must not unhook the callback a newer session of
+        the same conversation already installed."""
+        if self._wake_owner is owner:
+            self._wake_cb = None
+            self._wake_owner = None
 
 
 async def _safe_invoke(cb: Callable[[], Awaitable[None]]) -> None:
@@ -179,6 +199,14 @@ async def _safe_invoke(cb: Callable[[], Awaitable[None]]) -> None:
         await cb()
     except Exception:  # noqa: BLE001
         logger.exception("NotificationQueue wake callback raised")
+
+
+class _TurnTimedOut(Exception):
+    """Raised by :meth:`BackgroundAgentRunner._run_watched`; ``reason`` is human-readable."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +217,8 @@ async def _safe_invoke(cb: Callable[[], Awaitable[None]]) -> None:
 class BackgroundAgentRunner:
     """Lifecycle manager for fire-and-forget agent turns.
 
-    One instance per :class:`OrchestratorSession`.  Tools call
+    One instance per orchestrator conversation (:class:`AgentRuntimes`), shared
+    by every :class:`OrchestratorSession` of that conversation.  Tools call
     :meth:`spawn` to dispatch a turn; the runner drives ``pool.send()`` to
     completion in a background task and pushes a :class:`Notification`
     onto the shared queue when done.  The orchestrator drains the queue
@@ -208,13 +237,21 @@ class BackgroundAgentRunner:
         notifications: NotificationQueue,
         *,
         peek_buffer_size: int = 200,
-        default_timeout: float = 600.0,
+        idle_timeout: float = 1800.0,
+        max_turn_seconds: float | None = None,
     ) -> None:
+        """``idle_timeout``: stop a turn only after this long WITHOUT any event
+        from the agent (text, tool call, tool result, permission) — a working
+        agent is never stopped, however long the task.  ``SessionStalled``
+        notices don't count as progress, and a turn waiting on a permission
+        answer is never idle.  ``max_turn_seconds``: optional hard cap on the
+        whole turn (``None`` = none)."""
         self._pool = pool
         self._store = store
         self._notifications = notifications
         self._peek_buffer_size = peek_buffer_size
-        self._default_timeout = default_timeout
+        self._idle_timeout = idle_timeout
+        self._max_turn_seconds = max_turn_seconds
         # turn_id → record
         self._turns: dict[str, _TurnRecord] = {}
         # session_id → last turn_id (for peek without explicit turn_id)
@@ -238,10 +275,11 @@ class BackgroundAgentRunner:
     ) -> AgentTurnHandle:
         """Validate, generate a ``turn_id``, spawn the driver task, return a handle.
 
-        Raises ``ValueError`` if the pool has no live session with that ID.
-        Returns within microseconds — does not await the agent's response.
+        Raises ``ValueError`` if the pool has no open session with that ID.
+        A session restored after a restart is spawned first; otherwise this
+        returns at once — it does not await the agent's response.
         """
-        if not self._pool.has(session_id):
+        if not await self._pool.ensure_live(session_id):
             raise ValueError(f"No active session with ID {session_id}")
 
         title = self._resolve_title(session_id)
@@ -255,12 +293,13 @@ class BackgroundAgentRunner:
             origin_tool_use_id=origin_tool_use_id,
             started_at=now_mono,
             started_at_wall=now_wall,
+            last_progress_at=now_mono,
         )
         self._turns[turn_id] = record
         self._latest_by_session[session_id] = turn_id
 
         record.task = asyncio.create_task(
-            self._drive(record, message, timeout or self._default_timeout),
+            self._drive(record, message, timeout or self._idle_timeout),
             name=f"runner-{session_id[:8]}-{turn_id[:8]}",
         )
         return self._handle(record)
@@ -339,7 +378,8 @@ class BackgroundAgentRunner:
         return True
 
     async def cancel_all(self) -> None:
-        """Cancel every in-flight task. Called from OrchestratorSession.stop().
+        """Cancel every in-flight task (tests and explicit teardown only —
+        stopping an orchestrator session deliberately does NOT call this).
 
         After all tasks complete, finalise any record whose task was cancelled
         before its body ran (asyncio can cancel-before-start, in which case
@@ -410,7 +450,10 @@ class BackgroundAgentRunner:
         return info.title if info is not None else None
 
     def _buffer(self, record: _TurnRecord, kind: str, payload: dict[str, Any]) -> None:
-        """Append an event to the per-turn ring buffer (bounded)."""
+        """Append an event to the per-turn ring buffer (bounded).
+
+        Every buffered event is agent progress: it resets the no-progress timeout."""
+        record.last_progress_at = time.monotonic()
         seq = record.next_seq
         record.next_seq += 1
         evt = AgentTurnEvent(seq=seq, kind=kind, payload=payload, timestamp=time.monotonic())
@@ -422,7 +465,7 @@ class BackgroundAgentRunner:
         self,
         record: _TurnRecord,
         message: str,
-        timeout: float,
+        idle_timeout: float,
     ) -> None:
         """Task body. Iterate ``pool.send``, buffer events, push Notification.
 
@@ -492,14 +535,25 @@ class BackgroundAgentRunner:
                     "reason": "abandoned",
                     "elapsed_seconds": exc.elapsed_seconds,
                 })
+                await self._tell_tabs(record.session_id, {
+                    "type": "status", "status": "retrying",
+                    "detail": f"upstream silent for {exc.elapsed_seconds:.0f}s, retrying",
+                })
                 # Interrupt the wedged SDK turn so the bundled `claude`
                 # subprocess isn't left stuck on the original query.
                 try:
-                    await self._pool.interrupt(record.session_id)
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed to interrupt abandoned turn %s", record.turn_id)
-                # Brief pause so the SDK can settle before the retry.
-                await asyncio.sleep(1.0)
+                    try:
+                        await self._pool.interrupt(record.session_id)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Failed to interrupt abandoned turn %s", record.turn_id)
+                    # Brief pause so the SDK can settle before the retry.
+                    await asyncio.sleep(1.0)
+                except BaseException as gap:
+                    # No pool.send() runs between the attempts: announce the end here.
+                    announce_gap = getattr(self._pool, "announce_turn_aborted", None)
+                    if announce_gap is not None:
+                        announce_gap(record.session_id, gap)
+                    raise
                 await _consume()
 
         # The try/except below sets a specific status; the outer finally is a
@@ -508,24 +562,48 @@ class BackgroundAgentRunner:
         # would otherwise never run and a Notification would leak.
         try:
             try:
-                await asyncio.wait_for(_consume_with_retry(), timeout=timeout)
-            except asyncio.TimeoutError:
+                await self._run_watched(record, _consume_with_retry(), idle_timeout)
+            except _TurnTimedOut as exc:
                 try:
                     await self._pool.interrupt(record.session_id)
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to interrupt session %s after timeout", record.session_id)
-                self._finalise(record, status="timeout", error=f"turn exceeded {timeout:.0f}s")
+                self._finalise(record, status="timeout", error=exc.reason)
+                # pool.send() saw a cancellation ("interrupted"); devices hear it failed.
+                self._announce_failed(record.session_id, f"Stopped: {exc.reason}")
+                # The cancelled send() emits no turn_complete: end the turn in every open
+                # tab (as the chat route's own interrupt does) and say why.
+                # Reason first (an error notice that ends the turn), then the
+                # status every client already knows (ends it on older clients).
+                await self._tell_tabs(record.session_id, {
+                    "type": "error", "error": "turn_timeout",
+                    "detail": f"The orchestrator stopped this turn: {exc.reason}.",
+                })
+                await self._tell_tabs(record.session_id, {"type": "status", "status": "interrupted"})
             except asyncio.CancelledError:
                 self._finalise(record, status="cancelled", error="cancelled by orchestrator")
+                await self._tell_tabs(record.session_id, {"type": "status", "status": "interrupted"})
                 raise
             except TurnAbandoned as exc:
                 # Retry already happened inside _consume_with_retry and
                 # also failed — give up and surface the failure.
                 logger.error("Turn %s abandoned twice (%.0fs); giving up", record.turn_id, exc.elapsed_seconds)
                 self._finalise(record, status="failed", error=f"upstream wedged after retry: {exc}")
+                # pool.send() leaves an abandoned turn unannounced (it may be retried).
+                self._announce_failed(record.session_id, "Upstream did not respond after retry")
+                await self._tell_tabs(record.session_id, {
+                    "type": "error", "error": "upstream_wedged",
+                    "detail": (
+                        f"Upstream did not respond after retry "
+                        f"({exc.elapsed_seconds:.0f}s). Try again in a moment."
+                    ),
+                })
             except Exception as exc:  # noqa: BLE001
                 logger.exception("BackgroundAgentRunner._drive failed for turn %s", record.turn_id)
                 self._finalise(record, status="failed", error=str(exc))
+                await self._tell_tabs(record.session_id, {
+                    "type": "error", "error": "send_failed", "detail": str(exc),
+                })
             else:
                 self._finalise(record, status="succeeded", error=None)
         finally:
@@ -533,6 +611,78 @@ class BackgroundAgentRunner:
             # any other path missed _finalise), still emit a notification.
             if not record.finished:
                 self._finalise(record, status="cancelled", error="cancelled before start")
+
+    async def _run_watched(
+        self,
+        record: _TurnRecord,
+        coro: Awaitable[None],
+        idle_timeout: float,
+    ) -> None:
+        """Await ``coro``; raise :class:`_TurnTimedOut` (after cancelling it) when
+        the agent has produced nothing for ``idle_timeout`` seconds, or the turn
+        passed ``max_turn_seconds``.  A turn waiting on a permission answer is
+        waiting on a person, so it is never idle."""
+        task = asyncio.ensure_future(coro)
+        tick = max(0.05, min(15.0, idle_timeout / 4))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=tick)
+                if done:
+                    task.result()
+                    return
+                now = time.monotonic()
+                reason: str | None = None
+                if self._max_turn_seconds is not None and now - record.started_at > self._max_turn_seconds:
+                    reason = f"turn exceeded {self._max_turn_seconds:g}s"
+                elif record.pending_permission_ids:
+                    record.last_progress_at = now
+                elif now - record.last_progress_at > idle_timeout:
+                    reason = f"no progress for {idle_timeout:g}s"
+                if reason is not None:
+                    await _cancel_and_wait(task)
+                    raise _TurnTimedOut(reason)
+        finally:
+            # Our own cancellation (orchestrator cancel): stop the send too, and
+            # let it finish unwinding so pool.send() announces the end first.
+            if not task.done():
+                await _cancel_and_wait(task)
+
+    async def _tell_tabs(self, session_id: str, frame: dict[str, Any]) -> None:
+        """Send ``frame`` to every chat tab watching ``session_id``.
+
+        ``pool.send()`` only broadcasts events it streams, so a turn the runner
+        ends (timeout, cancel, failure) would otherwise leave every open tab
+        showing it as running.  Best effort: never raises."""
+        broadcast = getattr(self._pool, "broadcast_session", None)
+        if broadcast is None:
+            return
+        try:
+            await broadcast(session_id, frame)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to tell the tabs of %s about %s", session_id, frame.get("type"))
+
+    def _announce_failed(self, session_id: str, error: str) -> None:
+        """``agent_turn_finished{status: error}`` for the failures ``pool.send`` can't see."""
+        try:
+            self._pool.announce_turn_finished(session_id, status="error", error=error)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to announce the failed turn of %s", session_id)
+
+    def _prune_finished(self) -> None:
+        """Forget old finished turns (the runner lives as long as its conversation):
+        keep at most ``_MAX_FINISHED_TURNS``, never a session's latest turn."""
+        finished = [r for r in self._turns.values() if r.finished]
+        excess = len(finished) - _MAX_FINISHED_TURNS
+        if excess <= 0:
+            return
+        latest = set(self._latest_by_session.values())
+        for r in finished:  # dict order = spawn order, oldest first
+            if excess <= 0:
+                break
+            if r.turn_id in latest:
+                continue
+            del self._turns[r.turn_id]
+            excess -= 1
 
     def _finalise(
         self,
@@ -547,6 +697,7 @@ class BackgroundAgentRunner:
         record.finished = True
         record.status = status
         record.error = error
+        self._prune_finished()
         duration = time.monotonic() - record.started_at
         notification = Notification(
             notification_id=str(uuid.uuid4()),
@@ -567,8 +718,50 @@ class BackgroundAgentRunner:
 
 
 # ---------------------------------------------------------------------------
+# AgentRuntimes
+# ---------------------------------------------------------------------------
+
+
+class AgentRuntimes:
+    """The runner + notification queue of each orchestrator conversation.
+
+    Keyed by the conversation's ``jsonl_id`` and held by the pool, so they
+    outlive :class:`OrchestratorSession` objects.  Closing the orchestrator
+    tab, ``switch_conversation``, a voice rebuild, or a crash/restart of the
+    orchestrator conversation never stops the agent turns it delegated: they
+    run to completion, and their notifications wait in the queue until that
+    conversation is open again (the next session for the same ``jsonl_id``
+    gets the same runner and queue, in-flight turns included).
+    """
+
+    def __init__(self) -> None:
+        self._by_conversation: dict[str, tuple[BackgroundAgentRunner, NotificationQueue]] = {}
+
+    def acquire(
+        self, conversation_id: str, pool: SessionPool, store: SessionStore,
+    ) -> tuple[BackgroundAgentRunner, NotificationQueue]:
+        rt = self._by_conversation.get(conversation_id)
+        if rt is None:
+            queue = NotificationQueue()
+            rt = (BackgroundAgentRunner(pool, store, queue), queue)
+            self._by_conversation[conversation_id] = rt
+        return rt
+
+    def get(self, conversation_id: str) -> tuple[BackgroundAgentRunner, NotificationQueue] | None:
+        return self._by_conversation.get(conversation_id)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+async def _cancel_and_wait(task: asyncio.Future[Any]) -> None:
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001 — the cancellation (or its fallout) is expected
+        pass
 
 
 def _excerpt(text: str, limit: int) -> str:
@@ -581,6 +774,7 @@ def _excerpt(text: str, limit: int) -> str:
 
 
 __all__ = [
+    "AgentRuntimes",
     "AgentTurnEvent",
     "AgentTurnHandle",
     "BackgroundAgentRunner",

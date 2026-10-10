@@ -1,0 +1,100 @@
+/*
+ * Floating voice controls (VoiceOverlay.tsx). A fixed row the controls align in; z-index 19 sits
+ * above the shell (rail, list pane, workspace, screens at 5, busy scrim at 15) and below every
+ * #overlay-root layer (drawer / sheets / dialogs 20, menus 25, snackbars 30, tooltips 40).
+ * Offsets come from JS (no `inset`, Safari 12). No flex `gap`. Motion is switched off by
+ * motion.css on low-end devices and under reduced motion.
+ */
+
+.layer {
+  position: fixed;
+  z-index: 19;
+  display: flex;
+  box-sizing: border-box;
+  align-items: flex-end;
+  pointer-events: none;
+}
+
+.alignLeft {
+  justify-content: flex-start;
+}
+
+.alignCenter {
+  justify-content: center;
+}
+
+.alignRight {
+  justify-content: flex-end;
+}
+
+/* bottom anchors with no composer underneath: clear the home indicator */
+.safeBottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.frame {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 560px;
+  border-radius: 32px;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  transition: opacity var(--md-sys-motion-duration-medium1) var(--md-sys-motion-easing-standard);
+}
+
+/* the dock / pill casts the shadow, so it follows their own corner radius */
+.frame > :first-child {
+  box-shadow: var(--md-sys-elevation-level3);
+}
+
+.frame[data-dragging] {
+  cursor: grabbing;
+  opacity: 0.92;
+}
+
+.frame[data-settling] {
+  transition:
+    opacity var(--md-sys-motion-duration-medium1) var(--md-sys-motion-easing-standard),
+    transform 250ms var(--md-sys-motion-easing-emphasized-decelerate);
+}
+
+/* idle: the compact pill, faded but never invisible (a live microphone always shows) */
+.idle {
+  width: auto;
+  border-radius: 24px;
+  opacity: 0.55;
+}
+
+.idle:hover,
+.idle:focus-within {
+  opacity: 1;
+}
+
+.pill {
+  display: flex;
+  box-sizing: border-box;
+  align-items: center;
+  min-height: 48px;
+  margin: 0;
+  padding: 4px 14px 4px 6px;
+  border: 0;
+  border-radius: 24px;
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pill > * + * {
+  margin-left: 4px;
+}
+
+.pill:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
+.micOff {
+  color: var(--md-sys-color-error);
+}

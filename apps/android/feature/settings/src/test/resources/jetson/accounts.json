@@ -1,0 +1,144 @@
+{
+ "env_path": "/home/me/assistant/context/.env",
+ "services": [
+  {
+   "id": "claude",
+   "label": "Claude Code",
+   "group": "harness",
+   "description": "Agent sessions (Claude Code harness) and the CLI's model list.",
+   "state": "signed_in",
+   "method": "Long-lived token (CLAUDE_CODE_OAUTH_TOKEN in context/.env)",
+   "account": null,
+   "plan": null,
+   "expires_at": null,
+   "detail": "Valid for a year from when it was made; shared by every machine that syncs context/.",
+   "warnings": [],
+   "used_by": [],
+   "docs": null,
+   "flow": null,
+   "verified": null,
+   "can_verify": false,
+   "methods": [
+    {
+     "id": "token",
+     "kind": "link",
+     "label": "Sign in with a link · 1-year token",
+     "recommended": true,
+     "needs_code": true,
+     "code_label": "Code",
+     "active": true,
+     "warning": "A token is already set: the new one replaces CLAUDE_CODE_OAUTH_TOKEN only once the sign-in succeeds."
+    },
+    {
+     "id": "credentials",
+     "kind": "credentials",
+     "label": "Paste credentials JSON",
+     "path": "/home/me/assistant/.claude_config/.credentials.json",
+     "source_hint": "~/.claude/.credentials.json",
+     "warning": "Refresh tokens rotate."
+    },
+    {
+     "id": "keys",
+     "kind": "env",
+     "label": "Token or API key",
+     "fields": [
+      {
+       "name": "CLAUDE_CODE_OAUTH_TOKEN",
+       "label": "Long-lived token",
+       "secret": true,
+       "set": true,
+       "preview": "••••wxyz"
+      },
+      {
+       "name": "ANTHROPIC_API_KEY",
+       "label": "Anthropic API key",
+       "secret": true,
+       "set": false,
+       "preview": ""
+      }
+     ]
+    },
+    {
+     "id": "signout",
+     "kind": "signout",
+     "label": "Sign out of this server's login",
+     "description": "Runs `claude auth logout`.",
+     "available": true
+    }
+   ]
+  },
+  {
+   "id": "codex",
+   "label": "Codex",
+   "group": "harness",
+   "description": "Agent sessions (OpenAI Codex harness), with your ChatGPT plan.",
+   "state": "signed_out",
+   "warnings": [],
+   "can_verify": false,
+   "methods": [
+    {
+     "id": "device",
+     "kind": "link",
+     "label": "Sign in with a device code",
+     "recommended": true
+    }
+   ]
+  },
+  {
+   "id": "qwen",
+   "label": "Qwen Code",
+   "group": "harness",
+   "description": "Agent sessions (Qwen Code harness).",
+   "state": "signed_in",
+   "method": "API key (DASHSCOPE_API_KEY)",
+   "warnings": [],
+   "methods": [
+    {
+     "id": "keys",
+     "kind": "env",
+     "label": "API key",
+     "fields": [
+      {
+       "name": "DASHSCOPE_API_KEY",
+       "label": "DASHSCOPE_API_KEY",
+       "set": true,
+       "preview": "••••"
+      }
+     ]
+    },
+    {
+     "id": "qwen_oauth",
+     "kind": "link",
+     "label": "Qwen OAuth",
+     "available": false,
+     "unavailable_reason": "Discontinued by Alibaba on 2026-04-15."
+    }
+   ]
+  },
+  {
+   "id": "openai",
+   "label": "OpenAI",
+   "group": "api",
+   "description": "Realtime voice, talk mode, history re-ranking, session summaries.",
+   "state": "signed_in",
+   "method": "OpenAI API key (OPENAI_API_KEY)",
+   "can_verify": true,
+   "warnings": [],
+   "methods": [
+    {
+     "id": "keys",
+     "kind": "env",
+     "label": "API key",
+     "fields": [
+      {
+       "name": "OPENAI_API_KEY",
+       "label": "OpenAI API key",
+       "set": true,
+       "preview": "••••abcd"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

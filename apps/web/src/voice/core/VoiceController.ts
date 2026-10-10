@@ -319,20 +319,6 @@ export class VoiceController {
         return this.onVoiceEnded();
       case 'error':
         return this.onErrorFrame(f.error, f.detail ?? null);
-      case 'agent_session_closed':
-        if (f.is_orchestrator === true && f.session_id === this.port.localId) {
-          // the orchestrator left the pool (explicit close elsewhere): nothing to stop
-          const wasOwner = this.isOwner();
-          this.closeTransport();
-          this.clearAllTimers();
-          this.deps.cues.stopLoop();
-          this.armed = false;
-          this.pendingStart = false;
-          this.awaitingStarted = false;
-          if (wasOwner) this.port.voiceLocalEnd();
-          this.patch({ ...OFF_SNAPSHOT, speakerMuted: this.snapshot.speakerMuted });
-        }
-        return;
       default:
         return;
     }

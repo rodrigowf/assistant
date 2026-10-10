@@ -56,6 +56,7 @@ internal class Draft(s: ConversationState) {
     var turnNeedsReconcile = s.turnNeedsReconcile
 
     var connection = s.connection
+    var userStart = s.userStart
     var awaitingSessionStarted = s.awaitingSessionStarted
     var stoppingRetried = s.stoppingRetried
     var startRequest = s.startRequest
@@ -102,6 +103,7 @@ internal class Draft(s: ConversationState) {
         expectStopAck = expectStopAck,
         turnNeedsReconcile = turnNeedsReconcile,
         connection = connection,
+        userStart = userStart,
         awaitingSessionStarted = awaitingSessionStarted,
         stoppingRetried = stoppingRetried,
         startRequest = startRequest,

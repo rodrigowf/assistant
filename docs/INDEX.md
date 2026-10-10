@@ -17,7 +17,7 @@ browser, and they are served at `/memory/archie/<path>`.
 |---|---|---|
 | [overview/](overview/INDEX.md) | What Archie is, repo layout, glossary, cross-cutting decisions | [archie.md](overview/archie.md) |
 | [architecture/](architecture/INDEX.md) | Backend: components and data flows, FastAPI app, agent sessions, orchestrator, memory and search | [system-overview.md](architecture/system-overview.md) |
-| [harnesses/](harnesses/INDEX.md) | The pluggable agent CLIs: registry, Claude Code, Qwen Code, Gemini CLI | [registry.md](harnesses/registry.md) |
+| [harnesses/](harnesses/INDEX.md) | The pluggable agent CLIs: registry, Claude Code, Qwen Code, Gemini CLI, Codex; sign-in of every service (Settings → Accounts) | [registry.md](harnesses/registry.md), [authentication.md](harnesses/authentication.md) |
 | [voice/](voice/INDEX.md) | Realtime voice: providers, transports, lifecycle, prompt budget, OpenAI / Qwen / Gemini specifics, Android wake word | [architecture.md](voice/architecture.md) |
 | [clients/](clients/INDEX.md) | Web app (+ Safari 12 build), Android apps, companion app, Chrome extension, legacy apps | [web.md](clients/web.md), [android.md](clients/android.md) |
 | [devices/](devices/INDEX.md) | The reference deployment's devices; Fire TV; photo servers | [devices.md](devices/devices.md) |

@@ -3,7 +3,7 @@
  *
  * HAND-WRITTEN ES5: this file is inlined into index.html by scripts/vite-plugin-html-target.ts and
  * is NOT transpiled. No let/const, arrow functions, template literals, or other ES2015+ syntax.
- * scripts/__tests__/remote-console.test.mjs parses it with acorn at ecmaVersion 5.
+ * scripts/__tests__/remote-console.test.ts parses it with acorn at ecmaVersion 5.
  *
  * Changes from the old script:
  *  - console mirroring can be switched off (default: off on main, on for compat), via the
@@ -11,7 +11,10 @@
  *  - window `error` and `unhandledrejection` are always sent, even when mirroring is off;
  *  - rate limit: at most 60 messages per 10 s window; extra messages are counted and reported
  *    as one "dropped N" line when the next window opens;
- *  - each message is capped at 4 KB.
+ *  - each message is capped at 4 KB;
+ *  - uncaught errors carry the error's stack;
+ *  - transport is XMLHttpRequest first, sendBeacon as the fallback (an async XHR is the path
+ *    every old WebKit delivers while the page is alive).
  *
  * __REMOTE_CONSOLE_CONFIG__ is replaced by a JSON object literal at build time:
  *   { endpoint: string, prefix: string, defaultOn: boolean }
@@ -54,17 +57,20 @@
   function post(level, msg) {
     var body = JSON.stringify({ level: level, msg: msg, ts: new Date().toISOString() });
     try {
-      if (w.navigator && typeof w.navigator.sendBeacon === 'function' && w.navigator.sendBeacon(endpoint, body)) {
+      if (typeof w.XMLHttpRequest === 'function' || typeof w.XMLHttpRequest === 'object') {
+        var xhr = new w.XMLHttpRequest();
+        xhr.open('POST', endpoint, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.send(body);
         return;
       }
     } catch (e) {
-      /* fall through to XHR */
+      /* fall through to sendBeacon */
     }
     try {
-      var xhr = new w.XMLHttpRequest();
-      xhr.open('POST', endpoint, true);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(body);
+      if (w.navigator && typeof w.navigator.sendBeacon === 'function') {
+        w.navigator.sendBeacon(endpoint, body);
+      }
     } catch (e) {
       /* give up silently */
     }
@@ -152,7 +158,8 @@
 
   w.addEventListener('error', function (e) {
     var where = e && e.filename ? ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno : '';
-    send('uncaught', (e && e.message ? e.message : 'error') + where);
+    var stack = e && e.error && e.error.stack ? '\n' + String(e.error.stack) : '';
+    send('uncaught', (e && e.message ? e.message : 'error') + where + stack);
   });
 
   w.addEventListener('unhandledrejection', function (e) {

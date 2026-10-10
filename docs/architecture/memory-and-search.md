@@ -3,7 +3,7 @@ name: memory-and-search
 category: archie/architecture
 tags: [memory, wiki, frontmatter, search, history-search, sqlite, fts5, embeddings, rerank, session-summaries, indexing, recall]
 created: 2026-02-23
-modified: 2026-10-06
+modified: 2026-10-09
 summary: The memory wiki as a system, and the search stack over memory and conversation history (indexes, warm server, tools).
 source: curated (consolidated from memory notes assistant/architecture/project-overview.md, assistant/architecture/permissions_branch_architecture.md, assistant/plans/memory_improvements.md, assistant/infrastructure/features_and_integrations_summary.md, context/memory/MEMORY.md, auto-memory project_indexer_full_reembed_fix_2026_06_17.md, project_history_search_rebuild_2026_10_06.md; verified against code 2026-10-06)
 references:
@@ -17,6 +17,7 @@ references:
   - ../infrastructure/context-sync.md
   - ../infrastructure/deployment.md
   - ../operations/troubleshooting.md
+  - ../harnesses/registry.md
 ---
 
 # Memory and search
@@ -98,8 +99,30 @@ into memory is delegated to an agent session given the conversation's absolute J
 Only the root `MEMORY.md` and `ORCHESTRATOR_MEMORY*.md` (plus `ORCHESTRATOR_SCRIPTS.md`) are
 injected into the orchestrator's system prompt, with size caps (40 000 chars for `MEMORY.md`,
 12 000 for the others — see [orchestrator.md](orchestrator.md)).
-Claude Code sessions get `AGENTS.md` (`CLAUDE.md`) through the CLI. Everything else is read on
-demand.
+Agent sessions of every harness get `AGENTS.md` (as `CLAUDE.md` / `QWEN.md` / `GEMINI.md` /
+`AGENTS.md`) through their CLI, and — when their working directory is the Archie repo — the live
+`MEMORY.md` once per session (below). Everything else is read on demand.
+
+### Every harness reads and writes the same memory
+
+Sessions in the repo get `context/memory/MEMORY.md`, read when the session (Qwen: each spawn)
+starts, with one "Memory" block saying that the wiki is the persistent memory and that writes
+follow `AGENTS.md`'s rules. The block comes from `backend/manager/memory_context.py` (capped at 200
+lines / 25 KB like Claude Code's auto-memory) unless the CLI loads the file itself:
+
+| Harness | How `MEMORY.md` gets in | Built-in memory writer | Where writes land |
+|---|---|---|---|
+| Claude Code, Model Studio | `system_prompt.append` (after the gating prompt); the CLI's auto-memory is switched off with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` | auto-memory off | file tools → `context/memory/` per the wiki rules |
+| Qwen Code 0.25 | `--append-system-prompt` on every spawn | managed auto-memory off per run; 0.25 has no `save_memory` tool (`manage_memory`/`search_memory` are only declared in structured-recall mode) | file tools |
+| Gemini CLI 0.63 | natively: its private project memory index is `~/.gemini/tmp/<label>/memory/MEMORY.md`, i.e. `context/memory/MEMORY.md` through the install symlink | none (0.63 has no `save_memory`; it edits memory files) | file tools; its prompt also offers `~/.gemini/GEMINI.md` for cross-project preferences |
+| Codex 0.161 | `developerInstructions` on `thread/start` (one developer message at the head of the rollout; resume/fork reuse it) | `memories` feature off (default) | file tools |
+
+Why Claude's auto-memory is off in the repo: its own instructions write flat notes in its own
+frontmatter at the root of `context/memory/` and append pointers to the wiki's `MEMORY.md` (seen
+live 2026-10-08; it overwrote `MEMORY.md` on 2026-10-03). `"autoMemoryEnabled": false` in
+`.claude_config/settings.json` never reached SDK sessions, which load only the `project` and
+`local` setting sources. Qwen's managed auto-memory has the same problem plus a model call per
+turn ([qwen-code](../harnesses/qwen-code.md)). Sessions outside the repo keep each CLI's defaults.
 
 ### Serving
 
@@ -123,7 +146,7 @@ Rebuilt and evaluated on 2026-10-06 (design and measurements: [PLAN.md](../proje
 | Search service | `backend/utils/search_service.py` `SearchService` | `history_search` / `memory_search` requests; the single code path for the warm server, the cold fallback and the eval harness |
 | Warm server | `shared/scripts/search-server.py` | Long-lived process that keeps the embedding model loaded; JSON lines over stdin/stdout and a Unix socket `index/.search-server.sock` |
 | Orchestrator client | `backend/orchestrator/tools/search.py` | Manages the warm server singleton (`_ensure_server`, auto-restart), cold fallback to `shared/scripts/search.py`, the seven search/navigation tools |
-| Indexers | `backend/api/indexer.py` `MemoryWatcher`, `HistoryIndexer` | Background tasks in the backend that run `index-memory.py` |
+| Indexers | `backend/api/indexer.py` `MemoryWatcher`, `HistoryIndexer`; `backend/api/content_watcher.py` `ContentWatcher` | Background tasks in the backend that run `index-memory.py` (the content watcher does the file watching) |
 | CLI | `shared/scripts/search.py`, `shared/scripts/index-memory.py` | One-shot search (`--collection memory|history`, `--also`, `--json`); (re)index (`--memory-only`, `--history-only`, `--reset`, `--no-summaries`, `--local-model`) |
 | `/recall` skill | `shared/skills/recall/SKILL.md` | Lets Claude Code sessions search both stores via `search.py` |
 | Eval harness | `shared/scripts/history_eval/` (data private in `context/evals/history_search/`) | Retrieval and agent-level evaluation |
@@ -170,8 +193,12 @@ Claude Code sessions use `/recall` or `context/scripts/run.sh context/scripts/se
 
 | Store | Trigger | What happens |
 |---|---|---|
-| Memory | `MemoryWatcher`: `watchfiles.awatch` on `context/memory/` **and** the linked `docs/` (inotify does not follow the symlink), 1 s debounce | `index-memory.py --memory-only` |
-| History | `HistoryIndexer`: every 300 s, only if the hash of all JSONL names/sizes/mtimes changed | `index-memory.py --history-only` (summaries for new/grown sessions first) |
+| Memory | `ContentWatcher`: `watchfiles.awatch` on `context/memory/` **and** the linked `docs/` (inotify does not follow the symlink) plus `context/public/`, batches closed after 300 ms of quiet (max 1.5 s), polling fallback when out of inotify watches; markdown changes wake `MemoryWatcher`, which runs the script single-flight (changes during a run → one more run) | `index-memory.py --memory-only` |
+| History | `HistoryIndexer`: every 300 s, only if the hash of all JSONL names/sizes/mtimes changed (`context/*.jsonl`, `context/chats/*.jsonl` and the Codex rollouts) | `index-memory.py --history-only` (summaries for new/grown sessions first) |
+
+A history session's id is the one `SessionStore` uses: the file name, except Codex (thread id from
+`rollout-…-<id>.jsonl`) and Gemini (the header's `sessionId`; the file name only has `id[:8]`), so
+`resume_conversation`, titles and `source:` links work for every harness.
 
 Indexing is incremental: unchanged files are skipped, changed ones re-derived with only new chunks
 embedded, deleted ones removed, and one failing file never blocks the rest (exit status 1, failures
@@ -234,5 +261,8 @@ From the memory-improvements plan, still open:
   history hit@1 0.57 → 0.70, hit@5 0.80 → 0.92, Portuguese hit@5 0.26 → 0.89; memory hit@5
   0.65 → 0.85.
 - 2026-10-06: `docs/` linked into the wiki as `context/memory/archie`.
+- 2026-10-08: memory parity across harnesses — `MEMORY.md` block for Claude/Model Studio (auto-memory
+  off), Qwen and Codex; Gemini history ids = header `sessionId`; Codex rollouts in the history
+  indexer's change hash.
 
 Related: [system overview](system-overview.md), [backend](backend.md) (`/memory/` routes), [skills](../integrations/skills.md) (`/recall`), [context sync](../infrastructure/context-sync.md) (how `context/memory/` reaches the Jetson).

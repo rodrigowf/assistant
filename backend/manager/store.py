@@ -308,6 +308,20 @@ class SessionStore:
             return None
         return self._with_pinned_provider(self._parse_session_info(jsonl_path, session_id))
 
+    def session_title(self, session_id: str) -> str | None:
+        """A session's display title, cheaply (device notifications, per turn).
+
+        The custom title, else the one the list cache already parsed (a
+        derived title is the first prompt, so a stale entry still has it),
+        else a full parse.  None when unknown.
+        """
+        custom = self._load_titles().get(session_id)
+        if custom:
+            return custom
+        cached = self._info_cache.get(session_id)
+        info = cached[2] if cached is not None else self.get_session_info(session_id)
+        return (info.title or None) if info is not None else None
+
     def rename_session(self, session_id: str, title: str) -> bool:
         """Store a custom title for a session. Returns True if the session exists."""
         if self._locate_jsonl(session_id) is None:

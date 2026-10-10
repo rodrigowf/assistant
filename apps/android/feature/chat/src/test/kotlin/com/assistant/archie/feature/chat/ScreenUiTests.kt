@@ -121,7 +121,6 @@ class ComposerStatesUiTest : ScreenTestBase() {
         backend.set(ended)
         compose.waitForIdle()
         compose.onNodeWithText("This session has ended").assertExists()
-        compose.onNodeWithText("This session crashed").assertExists()
     }
 
     @Test
@@ -198,29 +197,6 @@ class InlineCardsUiTest : ScreenTestBase() {
         compose.onNodeWithText("WebFetch silent for 2 min").assertExists()
         compose.onNodeWithText("Interrupt").performClick()
         assertEquals(1, backend.interrupts)
-    }
-
-    @Test
-    fun terminationContinuesOnTheAgentEndpointForAgents() {
-        show(
-            Frames.reduce(
-                Frames.agent(),
-                """{"type":"session_terminated","reason":"subprocess_crashed","detail":"claude exited with code 1","sdk_session_id":"sdk-9"}""",
-                """{"type":"session_stopped"}""",
-            ),
-        )
-        compose.onNodeWithText("Continue in new session").performClick()
-        assertEquals(listOf<ContinueTarget>(ContinueTarget.Agent("sdk-9")), backend.continued)
-    }
-
-    @Test
-    fun terminationOfAnArchieViewResumesArchieNotAnAgent() {
-        // inv03 §8 bug 5: Continue always reopened on the agent endpoint.
-        val s = Frames.archie().copy(termination = com.assistant.core.conversation.Termination("subprocess_lost", null, "orch-9"))
-        assertEquals(ContinueTarget.Archie("orch-9"), ContinueTarget.of(s))
-        show(s)
-        compose.onNodeWithText("Continue in new session").performClick()
-        assertEquals(listOf<ContinueTarget>(ContinueTarget.Archie("orch-9")), backend.continued)
     }
 
     @Test

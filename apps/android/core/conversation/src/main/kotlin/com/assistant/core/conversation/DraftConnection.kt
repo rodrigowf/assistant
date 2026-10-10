@@ -80,6 +80,7 @@ internal fun Draft.dispatch(f: ServerFrame) {
 private fun Draft.onSessionStarted(f: ServerFrame.SessionStarted) {
     awaitingSessionStarted = false
     stoppingRetried = false
+    userStart = false                                                        // OPEN-2: from now on, reattach
     // T-12
     connection = ConnectionState.SUBSCRIBED
     connectionBanner = null
@@ -140,11 +141,11 @@ private fun Draft.finishReload() {
     for (f in buffered) onFrame(f)                                           // §3.6 rules apply now
 }
 
-/** §3.3 `sendStart`: every socket open and every resync. */
+/** §3.3 `sendStart`: every socket open and every resync; `reattach` unless the user asked for this one (OPEN-2). */
 internal fun Draft.sendStart() {
     val cp = checkpoint
     val resumeFrom = if (ref.seqCapable && cp != null && history.loaded) ResumeCursor(cp.streamId, cp.seq) else null   // T-10
-    val msg = ClientFrame.Start(localId = ref.localId, resumeSdkId = ref.sdkId, resumeFrom = resumeFrom)
+    val msg = ClientFrame.Start(localId = ref.localId, resumeSdkId = ref.sdkId, resumeFrom = resumeFrom, reattach = true.takeUnless { userStart })
     startRequest = msg
     awaitingSessionStarted = true
     preStart.clear()
@@ -159,8 +160,8 @@ private fun Draft.poolStatus(s: LiveStatus) {
             if (!inTurn) { inTurn = true; promptSinceTurnEnd = false }
             status = SessionStatus.fromWire(s.wire)!!
         }
-        LiveStatus.IDLE -> if (inTurn) endTurn("unknown")
-        else -> Unit
+        // idle, interrupted (Codex/Gemini/Qwen keep it after a stop), disconnected: no turn runs
+        LiveStatus.IDLE, LiveStatus.INTERRUPTED, LiveStatus.DISCONNECTED -> if (inTurn) endTurn("unknown")
     }
 }
 

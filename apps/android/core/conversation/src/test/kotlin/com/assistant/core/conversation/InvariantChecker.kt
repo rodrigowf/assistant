@@ -70,7 +70,7 @@ object InvariantChecker {
             input is ConversationInput.Resync || input is ConversationInput.DismissBanner ||
             (frame is ServerFrame.Error && frame.error in ConversationReducer.START_ERRORS && !startErrorReleasingHeld)
         if (transport && before.entries != after.entries) v += "I-15: transport input $input changed the entries"
-        // I-14: watcher frames about OTHER sessions never touch this conversation (WATCH-1 handles its own close;
+        // I-14: watcher frames about OTHER sessions never touch this conversation (OPEN-3 handles its own close;
         // PM-5 approvals are side state, never entries)
         val ownClose = frame is ServerFrame.AgentSessionClosed && frame.sessionId == before.ref.localId
         if ((frame is ServerFrame.AgentSessionOpened || frame is ServerFrame.AgentSessionClosed) && !ownClose && before != after) {

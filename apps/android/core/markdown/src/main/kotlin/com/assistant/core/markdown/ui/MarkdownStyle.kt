@@ -67,6 +67,13 @@ data class MarkdownStyle(
     /** Code blocks taller than this collapse to "Show all (N lines)" (spec 14 §3.3). */
     val codeMaxHeight: Dp = 480.dp,
     val tableMaxColumnWidth: Dp = 280.dp,
+    /**
+     * LNK-5 (spec 12 §9.4): printed visualization / memory paths become links. Only for hosts whose
+     * link handler resolves them with [com.assistant.core.markdown.InternalLinks] (chat, memory).
+     */
+    val autoLinkPaths: Boolean = false,
+    /** The backend origin for [autoLinkPaths] (an `https://<server>/…` URL in backticks is internal, LNK-3). */
+    val linkOrigin: String? = null,
 ) {
     fun heading(level: Int): TextStyle = headings[(level - 1).coerceIn(0, headings.size - 1)]
 

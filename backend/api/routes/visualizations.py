@@ -13,8 +13,8 @@ Titles resolve in three steps, first hit wins:
 2. The ``<title>`` tag inside the HTML.
 3. A prettified version of the filename.
 
-There is deliberately no watcher or cache: the frontend refetches on load,
-matching how it treats the session list.
+There is no cache: clients refetch on load and when
+``api/content_watcher.py`` pushes ``visualization_changed`` (spec 12 §9.3).
 """
 
 from __future__ import annotations

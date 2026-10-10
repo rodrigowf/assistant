@@ -398,10 +398,10 @@ class BaseSessionManager(ABC):
 
     @property
     def is_active(self) -> bool:
-        return self._status not in (
-            SessionStatus.DISCONNECTED,
-            SessionStatus.INTERRUPTED,
-        )
+        """False only for a dead session.  ``INTERRUPTED`` is alive: it is the
+        settled state after a stopped turn (Codex, Gemini and Qwen keep it until
+        the next prompt), and the next ``send()`` works normally."""
+        return self._status != SessionStatus.DISCONNECTED
 
     @property
     def status(self) -> SessionStatus:

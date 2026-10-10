@@ -1,0 +1,446 @@
+{
+  "description": "Internal-link corpus (spec 12 §9.4 LNK-1…LNK-5). resolve(href, {origin, visuals}) must return `expect` (null = not internal). Default origin: https://192.168.0.200. Web: features/links/internalLinks.ts; Android: :core:markdown InternalLinks.kt.",
+  "origin": "https://192.168.0.200",
+  "cases": [
+    {
+      "href": "/visualizations/foo.html",
+      "expect": {
+        "kind": "visual",
+        "path": "visualizations/foo.html"
+      },
+      "note": "canonical visual link"
+    },
+    {
+      "href": "/avatar-pipeline/index.html",
+      "expect": {
+        "kind": "visual",
+        "path": "avatar-pipeline/index.html"
+      },
+      "note": "folder visualization"
+    },
+    {
+      "href": "/avatar-pipeline/",
+      "expect": {
+        "kind": "visual",
+        "path": "avatar-pipeline/index.html"
+      },
+      "note": "trailing slash = the folder's index.html"
+    },
+    {
+      "href": "/avatar-pipeline",
+      "expect": null,
+      "note": "no trailing slash: could be a file, not recognised"
+    },
+    {
+      "href": "/tarot-canvas/index.html#deck",
+      "expect": {
+        "kind": "visual",
+        "path": "tarot-canvas/index.html"
+      },
+      "note": "fragment ignored for visuals"
+    },
+    {
+      "href": "/visualizations/my%20chart.html",
+      "expect": {
+        "kind": "visual",
+        "path": "visualizations/my chart.html"
+      },
+      "note": "segments are decoded"
+    },
+    {
+      "href": "/memory/projects/x.md",
+      "expect": {
+        "kind": "memory",
+        "path": "projects/x.md",
+        "fragment": null
+      },
+      "note": "canonical memory link"
+    },
+    {
+      "href": "/memory/archie/specs/12-client-protocol.md#9-visualizations-and-memory",
+      "expect": {
+        "kind": "memory",
+        "path": "archie/specs/12-client-protocol.md",
+        "fragment": "9-visualizations-and-memory"
+      },
+      "note": "fragment kept for memory"
+    },
+    {
+      "href": "/memory/",
+      "expect": {
+        "kind": "memory",
+        "path": "MEMORY.md",
+        "fragment": null
+      },
+      "note": "memory root"
+    },
+    {
+      "href": "/memory/projects/gender-vid1/editor/index.html",
+      "expect": null,
+      "note": "html under /memory is not a memory document"
+    },
+    {
+      "href": "/memory/../secret.md",
+      "expect": null,
+      "note": "climbs out of the memory root"
+    },
+    {
+      "href": "/visualizations/..%2F..%2Fapi%2Fx.html",
+      "expect": null,
+      "note": "an encoded separator never hides a .. segment"
+    },
+    {
+      "href": "/memory/projects%2F..%2F..%2Fsecret.md",
+      "expect": null,
+      "note": "encoded separator in a memory path"
+    },
+    {
+      "href": "/markdown_reader.html?file=memory/projects/archie-avatar/next_priorities.md",
+      "expect": {
+        "kind": "memory",
+        "path": "projects/archie-avatar/next_priorities.md",
+        "fragment": null
+      },
+      "note": "the old markdown reader"
+    },
+    {
+      "href": "/markdown_reader.html?file=first_reel_script.md",
+      "expect": null,
+      "note": "reader on a public .md file stays external"
+    },
+    {
+      "href": "/api/visualizations",
+      "expect": null,
+      "note": "app route"
+    },
+    {
+      "href": "/compat/index.html",
+      "expect": null,
+      "note": "app build"
+    },
+    {
+      "href": "/uploads/a.html",
+      "expect": null,
+      "note": "uploads"
+    },
+    {
+      "href": "/projects/music1/out.html",
+      "expect": null,
+      "note": "projects mount"
+    },
+    {
+      "href": "/photo-server/iphone_photo_server.html?x=1",
+      "expect": null,
+      "note": "query string: not a list entry"
+    },
+    {
+      "href": "/images/cat.png",
+      "expect": null,
+      "note": "assets are not visuals"
+    },
+    {
+      "href": "/tmp/report.html",
+      "expect": null,
+      "note": "absolute filesystem path outside context/"
+    },
+    {
+      "href": "https://192.168.0.200/avatar-pipeline/index.html",
+      "expect": {
+        "kind": "visual",
+        "path": "avatar-pipeline/index.html"
+      },
+      "note": "same host as the backend"
+    },
+    {
+      "href": "https://192.168.0.200:8765/picnic_mock/",
+      "expect": {
+        "kind": "visual",
+        "path": "picnic_mock/index.html"
+      },
+      "note": "same host, other port"
+    },
+    {
+      "href": "https://192.168.0.200/memory/MEMORY.md",
+      "expect": {
+        "kind": "memory",
+        "path": "MEMORY.md",
+        "fragment": null
+      },
+      "note": "same host memory"
+    },
+    {
+      "href": "https://192.168.0.200/markdown_reader.html?file=memory/projects/x.md",
+      "expect": {
+        "kind": "memory",
+        "path": "projects/x.md",
+        "fragment": null
+      },
+      "note": "same host reader"
+    },
+    {
+      "href": "https://192.168.0.200/api/sessions",
+      "expect": null,
+      "note": "same host app route"
+    },
+    {
+      "href": "http://192.168.0.28:8765/visualizations/foo.html",
+      "expect": {
+        "kind": "visual",
+        "path": "visualizations/foo.html"
+      },
+      "note": "other Archie machine, /visualizations/"
+    },
+    {
+      "href": "https://100.101.102.103/memory/projects/x.md",
+      "expect": {
+        "kind": "memory",
+        "path": "projects/x.md",
+        "fragment": null
+      },
+      "note": "Tailscale address"
+    },
+    {
+      "href": "https://localhost:5173/visualizations/qvcm-interactive.html",
+      "expect": {
+        "kind": "visual",
+        "path": "visualizations/qvcm-interactive.html"
+      },
+      "note": "old dev server link"
+    },
+    {
+      "href": "http://192.168.0.28:8765/picnic_mock/index.html",
+      "expect": null,
+      "note": "other machine, path not in the list"
+    },
+    {
+      "href": "http://192.168.0.28:8765/picnic_mock/index.html",
+      "context": {
+        "visuals": [
+          "picnic_mock/index.html"
+        ]
+      },
+      "expect": {
+        "kind": "visual",
+        "path": "picnic_mock/index.html"
+      },
+      "note": "other machine, path in the list"
+    },
+    {
+      "href": "http://192.168.0.1/index.html",
+      "expect": null,
+      "note": "router page"
+    },
+    {
+      "href": "https://example.com/visualizations/foo.html",
+      "expect": null,
+      "note": "public host"
+    },
+    {
+      "href": "mailto:a@b.co",
+      "expect": null,
+      "note": "other scheme"
+    },
+    {
+      "href": "#anchor",
+      "expect": null,
+      "note": "anchor"
+    },
+    {
+      "href": "//cdn.example.com/x.html",
+      "expect": null,
+      "note": "protocol-relative"
+    },
+    {
+      "href": "",
+      "expect": null,
+      "note": "empty"
+    },
+    {
+      "href": "context/public/visualizations/x.html",
+      "expect": {
+        "kind": "visual",
+        "path": "visualizations/x.html"
+      },
+      "note": "repo-relative public path"
+    },
+    {
+      "href": "./context/public/tarot-canvas/index.html",
+      "expect": {
+        "kind": "visual",
+        "path": "tarot-canvas/index.html"
+      },
+      "note": "./ prefix"
+    },
+    {
+      "href": "/home/rodrigo/assistant/context/public/picnic_mock/index.html",
+      "expect": {
+        "kind": "visual",
+        "path": "picnic_mock/index.html"
+      },
+      "note": "absolute public path"
+    },
+    {
+      "href": "~/assistant/context/public/avatar-pipeline/observer.html",
+      "expect": {
+        "kind": "visual",
+        "path": "avatar-pipeline/observer.html"
+      },
+      "note": "home-relative"
+    },
+    {
+      "href": "context/public/avatar-pipeline/data/state.json",
+      "expect": null,
+      "note": "public asset"
+    },
+    {
+      "href": "context/memory/projects/x.md",
+      "expect": {
+        "kind": "memory",
+        "path": "projects/x.md",
+        "fragment": null
+      },
+      "note": "repo-relative memory path"
+    },
+    {
+      "href": "/home/rodrigo/assistant/context/memory/people/rodrigo/x.md:12",
+      "expect": {
+        "kind": "memory",
+        "path": "people/rodrigo/x.md",
+        "fragment": null
+      },
+      "note": "absolute memory path with a line number"
+    },
+    {
+      "href": "context/memory/projects/x.md#status",
+      "expect": {
+        "kind": "memory",
+        "path": "projects/x.md",
+        "fragment": "status"
+      },
+      "note": "memory path with fragment"
+    },
+    {
+      "href": "context/memory/projects/notes.txt",
+      "expect": null,
+      "note": "non-markdown memory file"
+    },
+    {
+      "href": "docs/specs/12-client-protocol.md",
+      "expect": {
+        "kind": "memory",
+        "path": "archie/specs/12-client-protocol.md",
+        "fragment": null
+      },
+      "note": "docs/ is memory archie/"
+    },
+    {
+      "href": "docs/specs/12-client-protocol.md:1622-1660",
+      "expect": {
+        "kind": "memory",
+        "path": "archie/specs/12-client-protocol.md",
+        "fragment": null
+      },
+      "note": "docs path with a line range"
+    },
+    {
+      "href": "/home/rodrigo/assistant/docs/INDEX.md",
+      "expect": {
+        "kind": "memory",
+        "path": "archie/INDEX.md",
+        "fragment": null
+      },
+      "note": "absolute docs path"
+    },
+    {
+      "href": "/home/rodrigo/other-project/docs/README.md",
+      "expect": null,
+      "note": "another repo's docs"
+    },
+    {
+      "href": "context/memory/archie/INDEX.md",
+      "expect": {
+        "kind": "memory",
+        "path": "archie/INDEX.md",
+        "fragment": null
+      },
+      "note": "memory alias path"
+    },
+    {
+      "href": "apps/web/src/features/markdown/links.ts",
+      "expect": null,
+      "note": "source file"
+    },
+    {
+      "href": "visualizations/foo.html",
+      "expect": null,
+      "note": "bare relative path is ambiguous"
+    }
+  ],
+  "inline_code": [
+    {
+      "code": "context/public/visualizations/foo.html",
+      "linked": true
+    },
+    {
+      "code": "/memory/projects/x.md",
+      "linked": true
+    },
+    {
+      "code": "docs/specs/12-client-protocol.md:40",
+      "linked": true
+    },
+    {
+      "code": "https://192.168.0.200/avatar-pipeline/index.html",
+      "linked": true
+    },
+    {
+      "code": "context/public/*.html",
+      "linked": false
+    },
+    {
+      "code": "ls context/public/x.html",
+      "linked": false
+    },
+    {
+      "code": "index.html",
+      "linked": false
+    },
+    {
+      "code": "backend/api/app.py",
+      "linked": false
+    }
+  ],
+  "bare_text": [
+    {
+      "text": "Saved to context/public/visualizations/foo.html.",
+      "paths": [
+        "context/public/visualizations/foo.html"
+      ]
+    },
+    {
+      "text": "Updated /home/rodrigo/assistant/context/public/picnic_mock/index.html and context/memory/projects/picnic.md, then reloaded.",
+      "paths": [
+        "/home/rodrigo/assistant/context/public/picnic_mock/index.html",
+        "context/memory/projects/picnic.md"
+      ]
+    },
+    {
+      "text": "(see ~/assistant/context/memory/MEMORY.md)",
+      "paths": [
+        "~/assistant/context/memory/MEMORY.md"
+      ]
+    },
+    {
+      "text": "The data lives in context/public/avatar-pipeline/data/state.json now.",
+      "paths": []
+    },
+    {
+      "text": "Read docs/specs/12-client-protocol.md first.",
+      "paths": []
+    },
+    {
+      "text": "No paths here, just context/ talk.",
+      "paths": []
+    }
+  ]
+}

@@ -13,6 +13,14 @@ android {
     }
 }
 
+// Spec 12 §9.4: the internal-link corpus shared with the web (`InternalLinksTest`).
+val internalLinkCorpus = rootProject.layout.projectDirectory.file("../protocol-fixtures/links/internal-links.json")
+
+tasks.withType<Test>().configureEach {
+    inputs.file(internalLinkCorpus).withPathSensitivity(PathSensitivity.RELATIVE)
+    systemProperty("archie.internalLinks", internalLinkCorpus.asFile.absolutePath)
+}
+
 roborazzi {
     // Spec 14 §6.4: goldens live in <module>/src/test/screenshots/.
     outputDir.set(layout.projectDirectory.dir("src/test/screenshots"))
@@ -31,6 +39,7 @@ dependencies {
     implementation(libs.highlights)
 
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.kotlinx.serialization.json)
     testImplementation(libs.robolectric)
     testImplementation(libs.roborazzi)
     testImplementation(libs.roborazzi.compose)

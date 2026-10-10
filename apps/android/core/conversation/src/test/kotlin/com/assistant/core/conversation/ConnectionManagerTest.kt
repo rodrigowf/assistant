@@ -27,7 +27,7 @@ class ConnectionManagerTest {
     fun t10_resumeFromOnlyForInMemoryClaudeStreams() {
         val live = agent().send("go").on(processing(), ServerFrame.TextDelta("x", 14, stream))
         val start = live.effectsOf(ConversationInput.SocketOpened).filterIsInstance<ConversationEffect.SendStart>().single().frame
-        assertEquals(ClientFrame.Start("L1", "sdk-1", ResumeCursor(stream, 14)), start)
+        assertEquals(ClientFrame.Start("L1", "sdk-1", ResumeCursor(stream, 14), reattach = true), start)   // OPEN-2
         // not when the timeline was not built from the same stream (history not loaded yet)
         val cold = live.copy(history = live.history.copy(loaded = false))
         assertNull(cold.input(ConversationInput.SocketOpened).startRequest!!.resumeFrom)
@@ -35,7 +35,7 @@ class ConnectionManagerTest {
         val qwen = agent(provider = HarnessProvider.QWEN).copy(checkpoint = Checkpoint(stream, 3))
         assertNull(qwen.input(ConversationInput.SocketOpened).startRequest!!.resumeFrom)
         // a brand-new session has no sdk id to resume
-        assertEquals(ClientFrame.Start("L1"), agent(sdkId = null).input(ConversationInput.SocketOpened).startRequest)
+        assertEquals(ClientFrame.Start("L1", reattach = true), agent(sdkId = null).input(ConversationInput.SocketOpened).startRequest)
     }
 
     @Test
@@ -201,7 +201,7 @@ class ConnectionManagerTest {
         assertEquals(busy, busy.on(ServerFrame.AgentSessionClosed("O1", false)))   // FOCUS-2: wrong flag
         val closed = busy.on(ServerFrame.AgentSessionClosed("O1", true))
         assertEquals(SessionStatus.STOPPED, closed.status)
-        assertShape("U(x) A[X(c1:no_result)]", closed)                         // the view stays open (FOCUS-3)
+        assertShape("U(x) A[X(c1:no_result)]", closed)                         // the entries stay; the repository then closes the view (OPEN-3)
         // an agent view that receives its own close (agent flag) stops too; terminated is kept
         val agentClosed = agent().send("y").on(processing(), ServerFrame.AgentSessionClosed("L1", false))
         assertEquals(SessionStatus.STOPPED, agentClosed.status)
@@ -247,6 +247,12 @@ class ConnectionManagerTest {
         val idle = busy.on(toolUse("t")).input(ConversationInput.PoolStatus(LiveStatus.IDLE))
         assertFalse(idle.inTurn)
         assertShape("A[X(t:no_result)]", idle)
+        // interrupted (Codex/Gemini/Qwen keep it after a stop) and disconnected: no turn runs either
+        for (settled in listOf(LiveStatus.INTERRUPTED, LiveStatus.DISCONNECTED)) {
+            val ended = busy.on(toolUse("t")).input(ConversationInput.PoolStatus(settled))
+            assertFalse(ended.inTurn)
+            assertShape("A[X(t:no_result)]", ended)
+        }
         // the orchestrator row always says idle (G-15): ignored
         val o = orchestrator().send("x").on(ServerFrame.Status("streaming"))
         assertEquals(o, o.input(ConversationInput.PoolStatus(LiveStatus.IDLE)))

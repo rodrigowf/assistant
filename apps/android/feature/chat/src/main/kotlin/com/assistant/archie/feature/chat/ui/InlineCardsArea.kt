@@ -33,8 +33,8 @@ import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * Cards above the composer (IA §6): permission (Approve / Reject / type to give feedback), agent
- * approvals (PM-5), stall (Interrupt), errors (Retry + dismiss + detail), gap (Reload), termination
- * (Continue in a new view). Never pinned to an edge, never a modal, never a list entry.
+ * approvals (PM-5), stall (Interrupt), errors (Retry + dismiss + detail), gap (Reload). A session
+ * closed on the server closes its view instead (spec 12 OPEN-3). Never pinned, never modal, never an entry.
  */
 @Composable
 fun InlineCardsArea(
@@ -69,26 +69,6 @@ fun InlineCardsArea(
                     onDismiss = { onAction(ChatAction.DismissCard("gap")) },
                     body = { Text("The live stream skipped ahead. Reload to fetch the full conversation.") },
                     actions = { InlineCardAction("Reload", { onAction(ChatAction.Reload) }, primary = true, icon = ArchieIcons.Refresh) },
-                )
-                is InlineCardUi.Ended -> InlineCard(
-                    InlineCardKind.Ended,
-                    card.title,
-                    m,
-                    body = card.detail?.let { d -> { Text(d) } },
-                    actions = {
-                        InlineCardAction(
-                            if (card.canContinue) "Continue in new session" else "Can't continue: no session id",
-                            { if (card.canContinue) onAction(ChatAction.ContinueInNewView) },
-                            primary = true,
-                        )
-                    },
-                )
-                is InlineCardUi.Stopped -> InlineCard(
-                    InlineCardKind.Ended,
-                    card.title,
-                    m,
-                    onDismiss = { onAction(ChatAction.DismissCard("stopped")) },
-                    body = { Text("Send a message to start it again.") },
                 )
             }
         }

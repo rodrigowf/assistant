@@ -92,4 +92,13 @@ class NotificationPolicyTest {
         assertEquals("Archie · Voice connection lost", failed.text)
         assertEquals(listOf(RECONNECT), failed.actions)
     }
+
+    /** Main app: the service held only for agent notifications says what it waits for. */
+    @Test
+    fun agentWorkHoldShowsWhatItWaitsFor() {
+        assertEquals("Waiting for 1 agent session", model(VoiceUiState(agentTurnsWaiting = 1)).text)
+        assertEquals("Waiting for 3 agent sessions", model(VoiceUiState(agentTurnsWaiting = 3)).text)
+        assertEquals("Connected", model(VoiceUiState()).text)
+        assertEquals("armed wake word wins", "Listening for \"wake up\"", model(VoiceUiState(wake = WakeHealth.ARMED, agentTurnsWaiting = 1)).text)
+    }
 }

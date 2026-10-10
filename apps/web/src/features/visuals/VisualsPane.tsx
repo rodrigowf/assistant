@@ -12,6 +12,7 @@ import { errorMessage, refreshVisuals, renameVisualization, type VisualizationIn
 import { showSnackbar, useCapabilities, useCatalog, useTabs } from '@/stores';
 import { Button, EmptyState, IconButton, SearchField } from '@/ui/controls';
 import { Icon } from '@/ui/primitives';
+import { preloadVisualViewer } from './lazy';
 import { showOnTv, vizFolder, vizHref } from './viz';
 import styles from './visuals.module.css';
 
@@ -36,6 +37,7 @@ export function VisualsPane({ onOpen, selectedPath, now }: VisualsPaneProps) {
 
   useEffect(() => {
     void refreshVisuals();
+    preloadVisualViewer();
   }, []);
 
   const clock = useMinuteClock(now);

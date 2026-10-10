@@ -9,6 +9,7 @@
  * | `trapFocus`   | trap without the rest of `modal` (non-modal side sheets: false)           |
  * | `outsidePress`| a press outside `containerRef` (and `outsideIgnore`) closes it            |
  * | `returnFocus` | focus goes back to the trigger on close (default true)                    |
+ * | `keepExposed` | `modal`: a selector left exposed and focusable (compact screens: voice)   |
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, type RefObject } from 'react';
 import { hideOthers } from './hideOthers';
@@ -32,6 +33,8 @@ export interface OverlayLayerOptions {
   initialFocus?: RefObject<HTMLElement | null>;
   returnFocus?: boolean;
   returnFocusTo?: RefObject<HTMLElement | null>;
+  /** With `modal`: elements matching this selector stay exposed and may keep focus. */
+  keepExposed?: string;
 }
 
 const NO_REFS: readonly RefObject<Element | null>[] = [];
@@ -59,11 +62,12 @@ export function useOverlayLayer(o: OverlayLayerOptions): { isTop: () => boolean 
 
   const isTop = useCallback(() => handle.current?.isTop() ?? false, []);
 
+  const keepExposed = o.keepExposed;
   useLayoutEffect(() => {
     if (!open || !modal) return undefined;
     const el = containerRef.current;
-    return el ? hideOthers(el) : undefined;
-  }, [open, modal, containerRef]);
+    return el ? hideOthers(el, keepExposed) : undefined;
+  }, [open, modal, containerRef, keepExposed]);
 
   useScrollLock(open && modal);
   useReturnFocus(open, {
@@ -75,6 +79,7 @@ export function useOverlayLayer(o: OverlayLayerOptions): { isTop: () => boolean 
     active: open && (o.trapFocus ?? modal),
     isTop,
     ...(o.initialFocus ? { initialFocus: o.initialFocus } : null),
+    ...(keepExposed ? { allowFocusIn: keepExposed } : null),
   });
 
   const ignore = o.outsideIgnore ?? NO_REFS;

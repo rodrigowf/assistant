@@ -102,3 +102,23 @@ describe('§6.11a SW-2: voice continues on the resumed conversation', () => {
     expect(startVoiceWithoutGesture('nope')).toBe('Open Archie to start voice');
   });
 });
+
+describe('OPEN-3: Archie closed elsewhere during a call', () => {
+  it('its view closes and the voice controller is disposed with it (local media released); nothing is sent', () => {
+    setSharedAudioContext(audioContext('running'));
+    startServices({ skipInitialSync: true });
+    openSession({ kind: 'archie', localId: 'O1', focus: true });
+    const ws = FakeWebSocket.last(ORCH);
+    ws.open();
+    ws.emit({ type: 'session_started', session_id: 'O1', jsonl_id: 'O1' });
+    const c = getVoiceController('O1');
+    c?.start();
+    ws.emit({ type: 'session_started', session_id: 'O1', jsonl_id: 'O1', voice: true, voice_initiator: true });
+    expect(c?.snapshot.status).toBe('connecting');
+    const dispose = vi.spyOn(c as NonNullable<typeof c>, 'dispose');
+    ws.emit({ type: 'agent_session_closed', session_id: 'O1', is_orchestrator: true });
+    expect(getArchieRuntime()).toBeUndefined();
+    expect(dispose).toHaveBeenCalled();
+    expect(ws.types()).toEqual(['start', 'voice_start']);
+  });
+});

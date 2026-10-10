@@ -25,7 +25,7 @@ import org.junit.Test
 
 /**
  * The data layer end to end against [FakeBackend] (real sockets, real REST): adoption opens the
- * Archie item, watcher events open background items without stealing focus (P-6), lifecycle paths
+ * Archie item, "Open now" follows the server's pool (OPEN-1..4) without stealing focus, lifecycle paths
  * never close or stop anything (P-1), an explicit close is the one `POST …/close`, and adopting a
  * scanned server connects (inv03 §8 bug 3).
  */
@@ -112,31 +112,134 @@ class DataLayerTest {
         })
     }
 
-    @Test fun watcherEventOpensBackgroundTab_withoutStealingFocus_P6() {
+    private val agentRow = """{"local_id":"AG1","sdk_session_id":"SDK1","status":"tool_use","cost":0.0,"turns":2,"title":"Energy dashboard","is_orchestrator":false}"""
+    private val orchAndAgentPool = orchPool.dropLast(1) + ",$agentRow]"
+
+    private fun FakeBackend.agentStarts(localId: String) =
+        frames.filter { it.first == "agent" && it.second.contains("\"type\":\"start\"") && it.second.contains("\"local_id\":\"$localId\"") }.map { it.second }
+
+    @Test fun open1_aPoolSessionIsListedWithoutAView_watcherEventsKeepItCurrent_noFocusChange() {
         val b = backend()
         b.poolJson = orchPool
         val g = graph(b.url)
         g.connection.start()
         eventually { g.open.active.value == ItemKey.Archie && b.orchestratorSockets.isNotEmpty() }
 
-        b.poolJson = orchPool.dropLast(1) +
-            """,{"local_id":"AG1","sdk_session_id":"SDK1","status":"tool_use","cost":0.0,"turns":2,"title":"Energy dashboard","is_orchestrator":false}]"""
+        b.poolJson = orchAndAgentPool
         b.pushOrchestrator("""{"type":"agent_session_opened","session_id":"AG1","sdk_session_id":"SDK1","is_orchestrator":false}""")
-
         eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.any { it.kind == ItemKind.AGENT && it.localId == "AG1" } }
-        val bg = g.open.items.value.first { it.localId == "AG1" }
-        assertTrue("background item is unread", bg.unread)
+        val row = g.open.items.value.first { it.localId == "AG1" }
+        assertEquals(TabStatus.WORKING, row.status)                              // the pool row's status
         assertEquals("focus never moves on a server event (FOCUS-1)", ItemKey.Archie, g.open.active.value)
         Thread.sleep(300)
-        assertEquals(ItemKey.Archie, g.open.active.value)
-        // The background view subscribed to its own chat socket (T-5) and shows the pool status (ST-2).
-        eventually { b.frames.any { it.first == "agent" && it.second.contains("\"local_id\":\"AG1\"") } }
-        assertEquals(TabStatus.WORKING, g.open.items.value.first { it.localId == "AG1" }.status)
+        assertTrue("listed, not opened: no socket for it", b.agentStarts("AG1").isEmpty())
 
-        // The user looks at it: now it is active and read.
-        g.open.select(bg.key)
-        assertEquals(bg.key, g.open.active.value)
-        eventually { g.open.items.value.first { it.localId == "AG1" }.unread.not() }
+        b.poolJson = orchPool
+        b.pushOrchestrator("""{"type":"agent_session_closed","session_id":"AG1","is_orchestrator":false}""")
+        eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.none { it.localId == "AG1" } }
+    }
+
+    @Test fun open2_selectingAPoolSessionOpensItsViewWithAReattachStart() {
+        val b = backend()
+        b.poolJson = orchAndAgentPool                                            // e.g. restored after a backend restart
+        val g = graph(b.url)
+        g.connection.start()
+        eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.any { it.localId == "AG1" } }
+        g.open.select(g.open.items.value.first { it.localId == "AG1" }.key)
+        eventually(message = { "frames=${b.frames}" }) { b.agentStarts("AG1").isNotEmpty() }
+        assertTrue(b.agentStarts("AG1").single(), b.agentStarts("AG1").single().contains("\"reattach\":true"))
+        val key = g.open.active.value as ItemKey.Agent
+        eventually { g.conversations.current(key.conversation)?.connection == com.assistant.core.model.ConnectionState.SUBSCRIBED }
+    }
+
+    @Test fun open2_historyOpenAndNewSessionSendNoReattach_theirReconnectsDo() {
+        val b = backend()
+        b.poolJson = orchPool
+        val g = graph(b.url)
+        g.connection.start()
+        eventually { g.open.active.value == ItemKey.Archie }
+        g.open.openSession(com.assistant.core.model.SessionSummary("PAST", null, null, "Old work", 3, false, null, "H1"))
+        eventually(message = { "frames=${b.frames}" }) { b.agentStarts("H1").isNotEmpty() }
+        assertTrue("the user's open may resume it", !b.agentStarts("H1").single().contains("reattach"))
+        eventually { g.conversations.current(ConversationKey.agent("H1"))?.connection == com.assistant.core.model.ConnectionState.SUBSCRIBED }
+
+        b.agentSockets.toList().forEach { it.close(1001, "going away") }      // a drop: the reconnect reattaches
+        eventually(message = { "frames=${b.frames}" }) { b.agentStarts("H1").size == 2 }
+        assertTrue(b.agentStarts("H1")[1], b.agentStarts("H1")[1].contains("\"reattach\":true"))
+    }
+
+    @Test fun open3_closedElsewhereWhileActive_viewClosesAndFocusMoves_noCloseRequest() {
+        val b = backend()
+        b.poolJson = orchPool
+        val g = graph(b.url)
+        g.connection.start()
+        eventually { g.open.active.value == ItemKey.Archie }
+        g.open.newAgentSession()
+        val key = g.open.active.value as ItemKey.Agent
+        val localId = g.conversations.current(key.conversation)!!.ref.localId
+        eventually { g.conversations.current(key.conversation)?.connection == com.assistant.core.model.ConnectionState.SUBSCRIBED }
+        assertEquals(key, g.open.active.value)
+
+        val notices = java.util.concurrent.CopyOnWriteArrayList<String>()
+        g.scope.launch { g.open.notices.collect { notices += it } }
+        Thread.sleep(100)
+        b.closedElsewhere(localId)
+        b.pushOrchestrator("""{"type":"agent_session_closed","session_id":"$localId","is_orchestrator":false}""")
+        eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.none { it.key == key } }
+        assertEquals("focus moves as after an explicit close", ItemKey.Archie, g.open.active.value)
+        eventually(message = { "notices=$notices" }) { notices == listOf("New agent session was closed elsewhere") }
+        assertEquals(null, g.conversations.current(key.conversation))
+        assertTrue(b.closeRequests().isEmpty())
+
+        // The Archie conversation too: its view closes, nothing is left open.
+        b.pushOrchestrator("""{"type":"agent_session_closed","session_id":"ORCH","is_orchestrator":true}""")
+        eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.none { it.key == ItemKey.Archie } }
+        assertEquals(null, g.conversations.current(ConversationKey.ARCHIE))
+        assertTrue(b.closeRequests().isEmpty())
+        Thread.sleep(200)
+        assertEquals("no notice for Archie", 1, notices.size)
+    }
+
+    @Test fun open4_closedWhileAway_aPoolReadClosesTheView() {
+        val b = backend()
+        b.poolJson = orchPool
+        val g = graph(b.url)
+        g.connection.start()
+        eventually { g.open.active.value == ItemKey.Archie }
+        g.open.newAgentSession(); val first = g.open.active.value as ItemKey.Agent
+        g.open.newAgentSession(); val second = g.open.active.value as ItemKey.Agent
+        val firstId = g.conversations.current(first.conversation)!!.ref.localId
+        val secondId = g.conversations.current(second.conversation)!!.ref.localId
+        eventually { listOf(first, second).all { g.conversations.current(it.conversation)?.connection == com.assistant.core.model.ConnectionState.SUBSCRIBED } }
+
+        // Both closed on another device while this one was not listening (no watcher frame).
+        b.closedElsewhere(firstId); b.closedElsewhere(secondId)               // then e.g. the foreground read:
+        val notices = java.util.concurrent.CopyOnWriteArrayList<String>()
+        g.scope.launch { g.open.notices.collect { notices += it } }
+        Thread.sleep(100)
+        runBlocking { g.history.syncPool() }
+        eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.none { it.key == first || it.key == second } }
+        assertEquals("only the active view gets a notice", 1, notices.size)
+        assertTrue(b.closeRequests().isEmpty())
+        assertEquals("no re-start: it would re-open them", 1, b.agentStarts(firstId).size)
+    }
+
+    @Test fun open3_aReconnectFindingItClosed_sessionClosed_closesTheView() {
+        val b = backend()
+        b.poolJson = orchPool
+        val g = graph(b.url)
+        g.connection.start()
+        eventually { g.open.active.value == ItemKey.Archie }
+        g.open.newAgentSession()
+        val key = g.open.active.value as ItemKey.Agent
+        val localId = g.conversations.current(key.conversation)!!.ref.localId
+        eventually { g.conversations.current(key.conversation)?.connection == com.assistant.core.model.ConnectionState.SUBSCRIBED }
+
+        b.closedElsewhere(localId)
+        b.agentSockets.toList().forEach { it.close(1001, "going away") }
+        eventually(message = { "items=${g.open.items.value}" }) { g.open.items.value.none { it.key == key } }
+        assertEquals(2, b.agentStarts(localId).size)                            // the user's, then the reattach
+        assertTrue(b.agentStarts(localId)[1].contains("\"reattach\":true"))
     }
 
     @Test fun lifecycleNeverClosesOrStops_explicitCloseDoes_P1() = runBlocking {
@@ -232,7 +335,7 @@ class DataLayerTest {
     }
 
     /**
-     * §6.11a: Archie's `switch_conversation`. The server closed the old orchestrator (WATCH-1) and
+     * §6.11a: Archie's `switch_conversation`. The server closed the old orchestrator (OPEN-3) and
      * sends `orchestrator_switch` to this socket: the Archie view is replaced in place by the past
      * conversation (new local id, `resume_sdk_id`, history cold-opened) and focused (SW-2), with no
      * conflict dialog, no close and no stop; a duplicate frame does nothing (SW-1).

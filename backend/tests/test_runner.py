@@ -59,6 +59,9 @@ class FakePool:
     def has(self, sid: str) -> bool:
         return sid in self.sessions
 
+    async def ensure_live(self, sid: str) -> bool:
+        return sid in self.sessions
+
     def get(self, sid: str) -> Any:
         return self.sessions.get(sid)
 
@@ -118,7 +121,7 @@ def store() -> FakeStore:
 
 @pytest.fixture
 def runner(pool: FakePool, store: FakeStore, queue: NotificationQueue) -> BackgroundAgentRunner:
-    return BackgroundAgentRunner(pool, store, queue, default_timeout=2.0)
+    return BackgroundAgentRunner(pool, store, queue, idle_timeout=2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +221,7 @@ async def test_timeout_pushes_timeout_notification(
 ) -> None:
     pool.add_session("s1")
     pool.block_send("s1")  # never unblock except via interrupt
-    runner = BackgroundAgentRunner(pool, store, queue, default_timeout=0.2)
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=0.2)
 
     handle = await runner.spawn("s1", "go")
     # Driver should hit its 0.2s timeout
@@ -227,7 +230,7 @@ async def test_timeout_pushes_timeout_notification(
     pending = queue.drain()
     assert len(pending) == 1
     assert pending[0].status == "timeout"
-    assert pending[0].error and "exceeded" in pending[0].error
+    assert pending[0].error and "no progress for 0.2s" in pending[0].error
     assert "s1" in pool.interrupts
 
 
@@ -274,6 +277,7 @@ async def test_cancel_propagates_when_task_blocks_through_interrupt(
             self.sessions = {"a": MagicMock(sdk_session_id="sdk-a", pending_permission_ids=lambda: [])}
             self.interrupts: list[str] = []
         def has(self, sid): return sid in self.sessions
+        async def ensure_live(self, sid): return sid in self.sessions
         def get(self, sid): return self.sessions.get(sid)
         async def interrupt(self, sid): self.interrupts.append(sid)
         async def send(self, sid, message, *, source_ws=None):
@@ -282,7 +286,7 @@ async def test_cancel_propagates_when_task_blocks_through_interrupt(
             yield  # pragma: no cover
 
     pool = StubbornPool()
-    runner = BackgroundAgentRunner(pool, store, queue, default_timeout=10.0)  # type: ignore[arg-type]
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=10.0)  # type: ignore[arg-type]
 
     handle = await runner.spawn("a", "go")
     # Yield so the driver actually enters pool.send()
@@ -461,3 +465,170 @@ def _make_notification(turn_id: str) -> Notification:
         duration_seconds=0.1,
         error=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# No-progress timeout, tab signalling, per-conversation runtimes
+# ---------------------------------------------------------------------------
+
+
+class TabPool(FakePool):
+    """FakePool that records what the runner tells a session's open tabs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tab_frames: list[tuple[str, dict[str, Any]]] = []
+
+    async def broadcast_session(self, sid: str, payload: dict[str, Any], *, exclude=None) -> None:
+        self.tab_frames.append((sid, payload))
+
+
+async def test_working_agent_is_not_stopped_past_the_idle_timeout(
+    store: FakeStore, queue: NotificationQueue
+) -> None:
+    """The limit counts time WITHOUT progress: a turn that keeps producing
+    events runs well past it (the 2026-10-10 digest turn was killed at 600 s
+    while still editing files)."""
+    pool = TabPool()
+    pool.add_session("s1")
+
+    async def slow_send(sid: str, message: str, *, source_ws=None):
+        for i in range(6):
+            await asyncio.sleep(0.1)
+            yield ToolUse(tool_use_id=f"t{i}", tool_name="Edit", tool_input={})
+        yield TurnComplete(session_id="sdk", cost=0.0, num_turns=1)
+
+    pool.send = slow_send  # type: ignore[method-assign]
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=0.3)
+    handle = await runner.spawn("s1", "go")
+    await runner._turns[handle.turn_id].task  # type: ignore[arg-type]
+
+    [n] = queue.drain()
+    assert n.status == "succeeded"
+    assert n.duration_seconds > 0.5  # longer than the idle timeout
+    assert pool.interrupts == []
+    assert pool.tab_frames == []
+
+
+async def test_timeout_ends_the_turn_in_every_open_tab(
+    store: FakeStore, queue: NotificationQueue
+) -> None:
+    pool = TabPool()
+    pool.add_session("s1")
+    pool.block_send("s1")
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=0.2)
+    handle = await runner.spawn("s1", "go")
+    await runner._turns[handle.turn_id].task  # type: ignore[arg-type]
+
+    [n] = queue.drain()
+    assert n.status == "timeout"
+    assert "no progress" in (n.error or "")
+    frames = [f for sid, f in pool.tab_frames if sid == "s1"]
+    assert frames[0]["type"] == "error" and frames[0]["error"] == "turn_timeout"
+    assert "no progress" in frames[0]["detail"]
+    assert frames[-1] == {"type": "status", "status": "interrupted"}
+
+
+async def test_max_turn_seconds_caps_a_busy_turn(
+    store: FakeStore, queue: NotificationQueue
+) -> None:
+    pool = TabPool()
+    pool.add_session("s1")
+
+    async def chatty_send(sid: str, message: str, *, source_ws=None):
+        while True:
+            await asyncio.sleep(0.02)
+            yield TextDelta(text=".")
+
+    pool.send = chatty_send  # type: ignore[method-assign]
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=5.0, max_turn_seconds=0.2)
+    handle = await runner.spawn("s1", "go")
+    await runner._turns[handle.turn_id].task  # type: ignore[arg-type]
+    [n] = queue.drain()
+    assert n.status == "timeout"
+    assert "exceeded" in (n.error or "")
+
+
+async def test_pending_permission_is_never_idle(
+    store: FakeStore, queue: NotificationQueue
+) -> None:
+    pool = TabPool()
+    pool.add_session("s1")
+    pool.sessions["s1"].pending_permission_ids = MagicMock(return_value=["perm-1"])
+    gate = asyncio.Event()
+
+    async def waiting_send(sid: str, message: str, *, source_ws=None):
+        yield PermissionRequest(request_id="perm-1", tool_name="ExitPlanMode", tool_input={})
+        await gate.wait()  # the user takes their time answering
+        yield TurnComplete(session_id="sdk", cost=0.0, num_turns=1)
+
+    pool.send = waiting_send  # type: ignore[method-assign]
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=0.2)
+    handle = await runner.spawn("s1", "go")
+    await asyncio.sleep(0.6)
+    assert not runner._turns[handle.turn_id].finished
+    gate.set()
+    await runner._turns[handle.turn_id].task  # type: ignore[arg-type]
+    [n] = queue.drain()
+    assert n.status == "succeeded"
+
+
+async def test_orchestrator_cancel_ends_the_turn_in_every_open_tab(
+    store: FakeStore, queue: NotificationQueue
+) -> None:
+    pool = TabPool()
+    pool.add_session("s1")
+    pool.block_send("s1")
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=10.0)
+    handle = await runner.spawn("s1", "go")
+    await asyncio.sleep(0.05)
+    assert await runner.cancel(handle.turn_id)
+    await asyncio.gather(runner._turns[handle.turn_id].task, return_exceptions=True)  # type: ignore[arg-type]
+    assert ("s1", {"type": "status", "status": "interrupted"}) in pool.tab_frames
+    [n] = queue.drain()
+    assert n.status == "cancelled"
+
+
+async def test_agent_runtimes_are_per_conversation(store: FakeStore) -> None:
+    from orchestrator.runner import AgentRuntimes
+
+    pool = FakePool()
+    rts = AgentRuntimes()
+    a1 = rts.acquire("conv-a", pool, store)  # type: ignore[arg-type]
+    a2 = rts.acquire("conv-a", pool, store)  # type: ignore[arg-type]
+    b = rts.acquire("conv-b", pool, store)  # type: ignore[arg-type]
+    assert a1 is a2
+    assert a1[0] is not b[0] and a1[1] is not b[1]
+
+
+def test_release_wake_callback_only_clears_its_owner(queue: NotificationQueue) -> None:
+    old, new = object(), object()
+
+    async def cb() -> None:
+        return None
+
+    queue.set_wake_callback(cb, owner=old)
+    queue.set_wake_callback(cb, owner=new)  # the conversation's next session
+    queue.release_wake_callback(old)        # the old session stops afterwards
+    assert queue._wake_cb is cb
+    queue.release_wake_callback(new)
+    assert queue._wake_cb is None
+
+
+async def test_finished_turns_are_pruned_but_latest_per_session_kept(
+    pool: FakePool, store: FakeStore, queue: NotificationQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import orchestrator.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_MAX_FINISHED_TURNS", 3)
+    pool.add_session("s1")
+    pool.add_session("s2")
+    runner = BackgroundAgentRunner(pool, store, queue, idle_timeout=2.0)
+    h2 = await runner.spawn("s2", "once")
+    await runner._turns[h2.turn_id].task  # type: ignore[arg-type]
+    last = None
+    for _ in range(6):
+        last = await runner.spawn("s1", "go")
+        await runner._turns[last.turn_id].task  # type: ignore[arg-type]
+    assert len(runner._turns) <= 4
+    assert h2.turn_id in runner._turns and last.turn_id in runner._turns

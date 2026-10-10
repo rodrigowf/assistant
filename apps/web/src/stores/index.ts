@@ -10,6 +10,7 @@ import { deriveTitle, initialConversation } from '@/protocol';
 import { capabilitiesStore, type CapabilitiesState } from './capabilities';
 import { catalogStore, type CatalogState } from './catalog';
 import { connectionStore, type ConnectionState } from './connection';
+import { contentChangesStore, type ContentArea, type ContentStamp } from './contentChanges';
 import { prefsStore, type Prefs } from './prefs';
 import { providerLabel } from './providerLabels';
 import { serverConfigStore, type ServerConfigState } from './serverConfig';
@@ -23,6 +24,7 @@ export { useShallow } from 'zustand/react/shallow';
 export * from './capabilities';
 export * from './catalog';
 export * from './connection';
+export * from './contentChanges';
 export * from './liveStatus';
 export * from './prefs';
 export * from './providerLabels';
@@ -65,6 +67,16 @@ export function useTabs<T>(selector: (s: TabsState) => T): T {
 
 export function useCatalog<T>(selector: (s: CatalogState) => T): T {
   return useStore(catalogStore, selector);
+}
+
+/** The change stamp of one visualization / memory file (`null` until it changes). */
+export function useContentStamp(area: ContentArea, path: string): ContentStamp | null {
+  return useStore(contentChangesStore, (s) => s[area][path] ?? null);
+}
+
+/** Bumped when the watcher socket reopens after a drop (spec 12 VZ-6). */
+export function useContentResyncEpoch(): number {
+  return useStore(contentChangesStore, (s) => s.resyncEpoch);
 }
 
 export function useServerConfig<T>(selector: (s: ServerConfigState) => T): T {

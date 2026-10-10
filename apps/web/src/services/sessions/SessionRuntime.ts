@@ -36,6 +36,8 @@ export interface SessionRuntimeOptions {
   provider?: Provider | null;
   /** `pool/live` status at open (ST-2). */
   liveStatus?: LiveStatus | null;
+  /** Opened from the server's pool, not by a user action: every `start` reattaches (OPEN-2). */
+  reattach?: boolean;
   /** H-3: REST only, no WebSocket. */
   readOnly?: boolean;
   hidden?: boolean;
@@ -59,6 +61,7 @@ export class SessionRuntime extends ConversationRuntime {
       sdkId: opts.sdkId ?? null,
       provider: opts.provider ?? 'claude',
       liveStatus: opts.liveStatus ?? null,
+      reattach: opts.reattach,
     });
     const handle = createSessionStore({ localId: opts.localId, conv, readOnly: opts.readOnly, hidden: opts.hidden });
     super(conv, handle, hooks);
@@ -103,7 +106,7 @@ export class SessionRuntime extends ConversationRuntime {
 
   private onFrame(f: ServerFrame): void {
     this.step({ type: 'frame', frame: f });
-    if (this.coldOpenPending && (f.type === 'session_started' || f.type === 'error')) this.startColdFetch();
+    if (this.coldOpenPending && !this.disposed && (f.type === 'session_started' || f.type === 'error')) this.startColdFetch();
   }
 
   private startColdFetch(): void {

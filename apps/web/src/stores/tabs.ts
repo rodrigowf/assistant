@@ -31,10 +31,6 @@ export interface Tab {
   readonly titleHint?: string;
   /** Opened in the background and not looked at yet (P-6 badge). */
   readonly unseen: boolean;
-  /** Opened by pool sync / a watcher event, not by the user (§3.7). */
-  readonly openedBySync: boolean;
-  /** The user activated it at least once (FOCUS-3: never auto-closed afterwards). */
-  readonly everFocused: boolean;
   /** H-3 read-only view. */
   readonly readOnly?: boolean;
 }
@@ -44,8 +40,7 @@ export interface TabsState {
   readonly activeId: string | null;
 }
 
-export type NewTab = Omit<Tab, 'unseen' | 'openedBySync' | 'everFocused'> &
-  Partial<Pick<Tab, 'unseen' | 'openedBySync' | 'everFocused'>>;
+export type NewTab = Omit<Tab, 'unseen'> & Partial<Pick<Tab, 'unseen'>>;
 
 export const TABS_STORAGE_KEY = 'tabs:v1';
 /** The active tab, per browser tab (spec 12 §8.2: sessionStorage). */
@@ -154,8 +149,6 @@ export function openTab(tab: NewTab, opts: OpenTabOptions): void {
       ...tab,
       // unseen = new activity in the background; a tab restored after a reload has none yet
       unseen: restored ? false : (tab.unseen ?? !opts.focus),
-      openedBySync: restored ? false : (tab.openedBySync ?? false),
-      everFocused: restored ? true : (tab.everFocused ?? opts.focus),
     };
     tabs = s.tabs.slice();
     tabs.splice(insertIndex(tabs, tab.id), 0, full);
@@ -165,10 +158,7 @@ export function openTab(tab: NewTab, opts: OpenTabOptions): void {
     pendingActive = null;
     if (activeId === null) activeId = tab.id; // restoring the pre-reload view, not a focus change
   }
-  set(
-    opts.focus ? tabs.map((t) => (t.id === tab.id ? { ...t, everFocused: true, unseen: false } : t)) : tabs,
-    activeId,
-  );
+  set(opts.focus ? tabs.map((t) => (t.id === tab.id ? { ...t, unseen: false } : t)) : tabs, activeId);
 }
 
 /** A direct user action: make the tab active, clear its badge. */
@@ -176,7 +166,7 @@ export function activateTab(id: string): void {
   const s = tabsStore.getState();
   if (!s.tabs.some((t) => t.id === id)) return;
   set(
-    s.tabs.map((t) => (t.id === id ? { ...t, unseen: false, everFocused: true } : t)),
+    s.tabs.map((t) => (t.id === id ? { ...t, unseen: false } : t)),
     id,
   );
 }

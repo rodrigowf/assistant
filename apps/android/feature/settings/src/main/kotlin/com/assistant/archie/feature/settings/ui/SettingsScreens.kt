@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.assistant.archie.feature.settings.AppPermission
 import com.assistant.archie.feature.settings.Format
+import com.assistant.archie.feature.settings.NotifyLogic
 import com.assistant.archie.feature.settings.McpLogic
 import com.assistant.archie.feature.settings.ModelLogic
 import com.assistant.archie.feature.settings.SettingsFeature
@@ -67,6 +68,7 @@ enum class SettingsPageKey(val title: String, val group: Group) {
     AUDIO("Audio", Group.DEVICE),
     WAKE_WORD("Wake word & triggers", Group.DEVICE),
     APPEARANCE("Appearance", Group.DEVICE),
+    NOTIFICATIONS("Notifications", Group.DEVICE),
     PERMISSIONS("Permissions", Group.DEVICE),
     CONVERSATION_MODEL("Conversation model", Group.SERVER),
     VOICE("Voice", Group.SERVER),
@@ -74,7 +76,7 @@ enum class SettingsPageKey(val title: String, val group: Group) {
     AGENT_SESSIONS("Agent sessions", Group.SERVER),
     WORKING_DIRECTORIES("Working directories", Group.SERVER),
     MCP_SERVERS("MCP servers", Group.SERVER),
-    ACCOUNT("Account", Group.SERVER),
+    ACCOUNT("Accounts", Group.SERVER),
     ABOUT("About Archie", Group.ABOUT),
 
     /** Wake word & triggers → Background (spec 14 §2.6). Not on the home list. */
@@ -89,6 +91,7 @@ enum class SettingsPageKey(val title: String, val group: Group) {
             AUDIO -> ArchieIcons.VolumeUp
             WAKE_WORD -> ArchieIcons.Hearing
             APPEARANCE -> ArchieIcons.Palette
+            NOTIFICATIONS -> SettingsIcons.Notifications
             PERMISSIONS -> ArchieIcons.Shield
             CONVERSATION_MODEL -> ArchieIcons.Forum
             VOICE -> ArchieIcons.RecordVoiceOver
@@ -178,6 +181,7 @@ internal fun SettingsPage(feature: SettingsFeature, page: SettingsPageKey, onBac
         SettingsPageKey.AUDIO -> AudioPage(feature, onBack)
         SettingsPageKey.WAKE_WORD -> WakeWordPage(feature, onBack, open)
         SettingsPageKey.APPEARANCE -> AppearancePage(feature, onBack)
+        SettingsPageKey.NOTIFICATIONS -> NotificationsPage(feature, onBack, open)
         SettingsPageKey.PERMISSIONS -> PermissionsPage(feature, onBack, open)
         SettingsPageKey.BACKGROUND -> BackgroundReliabilityPage(feature, onBack)
         SettingsPageKey.CONVERSATION_MODEL -> ConversationModelPage(feature, onBack)
@@ -186,7 +190,7 @@ internal fun SettingsPage(feature: SettingsFeature, page: SettingsPageKey, onBac
         SettingsPageKey.AGENT_SESSIONS -> AgentSessionsPage(feature, onBack)
         SettingsPageKey.WORKING_DIRECTORIES -> WorkingDirectoriesPage(feature, onBack)
         SettingsPageKey.MCP_SERVERS -> McpServersPage(feature, onBack)
-        SettingsPageKey.ACCOUNT -> AccountPage(feature, onBack)
+        SettingsPageKey.ACCOUNT -> AccountsPage(feature, onBack)
         SettingsPageKey.ABOUT -> AboutPage(feature, onBack)
     }
 }
@@ -219,6 +223,7 @@ internal fun SettingsHomeList(feature: SettingsFeature, onBack: (() -> Unit)?, s
     val conn by feature.connection.state.collectAsStateWithLifecycle()
     val server by feature.server.state.collectAsStateWithLifecycle()
     val auth by feature.auth.state.collectAsStateWithLifecycle()
+    val accounts by feature.accounts.state.collectAsStateWithLifecycle()
     val appearance by feature.device.appearance.collectAsStateWithLifecycle()
     val speaker by feature.device.speakerLevel.collectAsStateWithLifecycle()
     val perms by feature.permissions.state.collectAsStateWithLifecycle()
@@ -244,6 +249,8 @@ internal fun SettingsHomeList(feature: SettingsFeature, onBack: (() -> Unit)?, s
             if (perms.defaultAssistant == true) "assist gesture" else null,
         ).joinToString(" · ")
         summaries[SettingsPageKey.APPEARANCE] = "${themeLabel(s.themeMode)} · ${appearance.textSize.summary}"
+        summaries[SettingsPageKey.NOTIFICATIONS] =
+            NotifyLogic.summary(s.notifyAgentTurns, perms.granted(AppPermission.NOTIFICATIONS), perms.notificationsEnabled)
     }
     summaries[SettingsPageKey.PERMISSIONS] = perms.summary
     val cfg = server.config.value
@@ -274,7 +281,8 @@ internal fun SettingsHomeList(feature: SettingsFeature, onBack: (() -> Unit)?, s
         summaries[SettingsPageKey.MCP_SERVERS] = if (c.mcpServers != null) McpLogic.summary(cfg.enabledMcps, c.mcpNames)
         else if (cfg.enabledMcps.isNotEmpty()) "${cfg.enabledMcps.size} enabled" else "All enabled"
     }
-    summaries[SettingsPageKey.ACCOUNT] = auth.summary
+    // Every service once Accounts has been opened; until then the Claude check the gate does anyway.
+    summaries[SettingsPageKey.ACCOUNT] = accounts.summary ?: auth.summary
     val v = feature.platform.appVersion
     summaries[SettingsPageKey.ABOUT] = "App ${v.name} (${v.code}) · backend on ${host.ifEmpty { "—" }}"
 
@@ -311,7 +319,7 @@ internal fun SettingsHomeList(feature: SettingsFeature, onBack: (() -> Unit)?, s
                     actions = { com.assistant.core.design.components.InlineCardAction("Review", { onOpen(SettingsPageKey.PERMISSIONS) }, primary = true) },
                 )
             }
-            HomeGroup("This device", null, listOf(SettingsPageKey.CONNECTION, SettingsPageKey.AUDIO, SettingsPageKey.WAKE_WORD, SettingsPageKey.APPEARANCE, SettingsPageKey.PERMISSIONS).filter(::visible), summaries, selected, false, onOpen, topPad = 4)
+            HomeGroup("This device", null, listOf(SettingsPageKey.CONNECTION, SettingsPageKey.AUDIO, SettingsPageKey.WAKE_WORD, SettingsPageKey.APPEARANCE, SettingsPageKey.NOTIFICATIONS, SettingsPageKey.PERMISSIONS).filter(::visible), summaries, selected, false, onOpen, topPad = 4)
             HomeGroup(
                 "Archie (server)",
                 {
