@@ -768,8 +768,11 @@ is part of R7's acceptance test.
 ### 3.6 Scrolling and performance budget
 
 - `LazyColumn(reverseLayout = true)` over the reversed item list. Bottom anchoring is native, so streaming growth stays
-  pinned without the per-delta `scrollToItem` calls that today's code needs (`ChatScreen.kt:104-149`). When the user
-  has scrolled up, keys preserve their position. The "Jump to latest" FAB uses `animateScrollToItem(0)` (user
+  pinned without the per-delta `scrollToItem` calls that today's code needs (`ChatScreen.kt:104-149`). A **new** item at
+  the bottom (the next markdown block, a tool card) is not covered by that: LazyList keeps its position on the first
+  visible item's key, so the list would stay on the old item with the new one below the fold. `ChatList`'s
+  `FollowNewest` calls `requestScrollToItem(0)` when the newest key changes while the list is at the bottom (within
+  24 dp, no scroll in progress); test `FollowNewestTest`. When the user has scrolled up, keys preserve their position. The "Jump to latest" FAB uses `animateScrollToItem(0)` (user
   initiated only; nothing animates during streaming, per `06fe06f`).
 - Load older: when the last visible index is within 3 of the end, call `loadOlder()`. A guard keyed on the oldest
   message id prevents the infinite load loop (port of `5c029d6`).

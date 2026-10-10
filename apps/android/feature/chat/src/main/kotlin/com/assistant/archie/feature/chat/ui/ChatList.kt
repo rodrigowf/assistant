@@ -23,6 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,6 +37,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
@@ -83,6 +85,11 @@ val MessageColumnMaxWidth: Dp = 840.dp
  * items, so the newest item is index 0 and streaming growth stays pinned without per-delta scroll calls.
  * Keys are the items' spec-12 keys; nothing animates while streaming. Load-older fires when the oldest
  * visible item is within 3 of the end (the ViewModel guards repeats on the oldest entry id).
+ *
+ * New items below the newest one (a new markdown block, a tool card) need one more step: LazyList keeps
+ * its position on the first visible item's **key**, so without it the list stays on the old item and the
+ * new one lands below the fold. [FollowNewest] re-anchors on index 0 when the list was at the bottom; a
+ * user who scrolled up keeps the key anchoring, so the text they are reading stays where it is.
  */
 @Composable
 fun ChatList(
@@ -99,6 +106,7 @@ fun ChatList(
     // LNK-5 (spec 12 §9.4): printed visualization / memory paths are links; the host resolves them.
     val style = MarkdownStyle.fromTheme().copy(autoLinkPaths = true, linkOrigin = linkOrigin)
     val reversed = remember(items) { items.asReversed() }
+    FollowNewest(listState, reversed.firstOrNull()?.key)
     LaunchedEffect(listState) {
         snapshotFlow {
             val info = listState.layoutInfo
@@ -138,6 +146,27 @@ fun ChatList(
         JumpToLatest(listState, Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 12.dp))
     }
 }
+
+/**
+ * Keeps a list that is at the bottom there when the newest item changes. Runs in a [SideEffect], after
+ * the composition that brings the new items and before the remeasure that applies them, so the state it
+ * reads is still the previous layout's. `requestScrollToItem` overrides the key anchoring for exactly
+ * that remeasure (no animation, no extra frame). A scroll in progress is the user's and is left alone.
+ */
+@Composable
+private fun FollowNewest(listState: LazyListState, newestKey: Any?) {
+    val slop = with(LocalDensity.current) { FollowSlop.roundToPx() }
+    val last = remember { arrayOfNulls<Any>(1) }
+    SideEffect {
+        if (newestKey == last[0]) return@SideEffect
+        last[0] = newestKey
+        val atBottom = listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset <= slop
+        if (atBottom && !listState.isScrollInProgress) listState.requestScrollToItem(0)
+    }
+}
+
+/** How far above the bottom still counts as "at the bottom" for [FollowNewest]. */
+private val FollowSlop: Dp = 24.dp
 
 @Composable
 private fun JumpToLatest(listState: LazyListState, modifier: Modifier) {
