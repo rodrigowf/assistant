@@ -22,7 +22,6 @@ export function VoiceSlot({ localId, composer }: { localId: string; composer: Re
     return (
       <>
         <ActiveElsewhereView
-          provider={s.remoteProvider}
           onTakeOver={
             canTakeOver
               ? () => {

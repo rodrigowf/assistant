@@ -272,7 +272,7 @@ async def orchestrator_ws(ws: WebSocket):
                         "detail": "No active voice session",
                     }))
                     continue
-                await _handle_voice_event(pool, session, msg.get("event", {}))
+                await _handle_voice_event(pool, session, msg.get("event", {}), sender=ws)
 
             elif msg_type == "voice_audio_in":
                 # WS-provider mic chunk → forward upstream.
@@ -1270,8 +1270,60 @@ async def _handle_compact(
         })
 
 
+# Inbound OpenAI (WebRTC) data-channel events the conversation reducer turns
+# into transcript entries (spec 12 §4.7). The owner device mirrors every
+# data-channel event here; these are the ones the other devices need.
+_PASSIVE_TRANSCRIPT_TYPES = frozenset({
+    "input_audio_buffer.speech_started",
+    "conversation.item.input_audio_transcription.completed",
+    "response.output_audio_transcript.delta",
+    "response.output_audio_transcript.done",
+    "response.audio_transcript.delta",
+    "response.audio_transcript.done",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.text.delta",
+    "response.text.done",
+    "response.done",
+})
+
+# User-side events fired by audio that listen_recording replays; never shown.
+_INJECTED_USER_TYPES = frozenset({
+    "input_audio_buffer.speech_started",
+    "conversation.item.input_audio_transcription.completed",
+})
+
+
+async def _mirror_to_passive_viewers(
+    pool: SessionPool,
+    session: OrchestratorSession,
+    event: dict,
+    sender: WebSocket | None,
+) -> None:
+    """Re-broadcast an owner-mirrored WebRTC transcript event (VT-2).
+
+    With WebRTC the audio and the provider events flow between the owner
+    device and OpenAI directly; the backend only sees them because the owner
+    mirrors them up as ``voice_event``. WS providers already broadcast every
+    provider event from the relay, but nothing forwarded these, so the other
+    devices showed only the tool cards of a live OpenAI voice turn. The owner
+    is excluded: it feeds its own timeline from the data channel.
+    """
+    event_type = event.get("type")
+    if event_type not in _PASSIVE_TRANSCRIPT_TYPES:
+        return
+    if session.is_injecting and event_type in _INJECTED_USER_TYPES:
+        return
+    await pool.broadcast_orchestrator(
+        {"type": "voice_event", "event": event}, exclude=sender,
+    )
+
+
 async def _handle_voice_event(
-    pool: SessionPool, session: OrchestratorSession, event: dict,
+    pool: SessionPool,
+    session: OrchestratorSession,
+    event: dict,
+    sender: WebSocket | None = None,
 ) -> None:
     """Process a mirrored realtime event and send back any voice commands.
 
@@ -1319,8 +1371,8 @@ async def _handle_voice_event(
         # For WS providers (Qwen / Gemini / locals), client-originated
         # control events need to be forwarded upstream.  WebRTC providers
         # (OpenAI) skip this path — the frontend talks to the provider
-        # directly via the data channel and only mirrors events here for
-        # backend persistence.
+        # directly via the data channel and mirrors events here for backend
+        # persistence; the transcript ones go on to the other devices.
         #
         # Filter through the provider's ``accepts_upstream_event`` first:
         # if the client is still mirroring events shaped for a previously
@@ -1344,6 +1396,8 @@ async def _handle_voice_event(
                     await session.send_voice_event_upstream(event)
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to forward client voice event upstream")
+        else:
+            await _mirror_to_passive_viewers(pool, session, event, sender)
 
         commands = await session.process_voice_event(event)
         await _dispatch_voice_commands(pool, session, commands)

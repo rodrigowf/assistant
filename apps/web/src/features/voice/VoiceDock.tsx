@@ -18,7 +18,7 @@ import { Button, IconButton } from '@/ui/controls';
 import { Icon, cx } from '@/ui/primitives';
 import { showSnackbar } from '@/stores';
 import { isOwnerLive, startVoiceFromGesture, type VoiceSnapshot } from '@/voice';
-import { dockText, elsewhereDetail, ELSEWHERE_TITLE, formatElapsed, RECONNECTING_DETAIL } from './copy';
+import { dockText, ELSEWHERE_DETAIL, ELSEWHERE_TITLE, formatElapsed, RECONNECTING_DETAIL } from './copy';
 import { LevelOrb, type OrbTone } from './LevelOrb';
 import { useTicker, useVoiceUi } from './useVoiceUi';
 import styles from './VoiceDock.module.css';
@@ -191,18 +191,17 @@ export function VoiceDockView(p: VoiceDockViewProps) {
 }
 
 export interface ActiveElsewhereViewProps {
-  readonly provider: string | null;
   /** Hidden when this device cannot run voice. */
   readonly onTakeOver?: () => void;
 }
 
-export function ActiveElsewhereView({ provider, onTakeOver }: ActiveElsewhereViewProps) {
+export function ActiveElsewhereView({ onTakeOver }: ActiveElsewhereViewProps) {
   return (
     <div className={cx(styles.dock, styles.readOnly)} role="status" data-voice="elsewhere">
       <LevelOrb tone="idle" size={44} still />
       <div className={styles.text}>
         <b className={cx(styles.title, styles.titleSmall)}>{ELSEWHERE_TITLE}</b>
-        <span className={styles.detail}>{elsewhereDetail(provider)}</span>
+        <span className={styles.detail}>{ELSEWHERE_DETAIL}</span>
       </div>
       {onTakeOver ? (
         <Button variant="text" onClick={onTakeOver}>

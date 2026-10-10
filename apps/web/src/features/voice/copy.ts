@@ -84,7 +84,5 @@ export function statusWord(s: VoiceSnapshot): string {
 
 export const RECONNECTING_DETAIL = 'Reconnecting to Archie · you’ll hear a tone when it’s back';
 export const ELSEWHERE_TITLE = 'Voice active on another device';
-export function elsewhereDetail(provider: string | null): string {
-  // VT-2: OpenAI (WebRTC) has no server mirror; passive viewers get tool cards only
-  return provider === 'openai' ? 'The live transcript shows on that device' : 'Transcripts mirror here';
-}
+/** VT-2: every provider's live transcript reaches passive viewers (OpenAI's through the backend). */
+export const ELSEWHERE_DETAIL = 'Transcripts mirror here';

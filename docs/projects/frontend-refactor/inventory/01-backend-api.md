@@ -814,7 +814,7 @@ Reconnect policies (`voice_relay.py:1295-1398,1480-1711`; `voice_reconnect.py:10
 - **G-29 — broadcast audio.** `voice_audio_out` and every mirrored `voice_event` go to all subscribers; only `voice_command` is owner-scoped. `owner_local_id` is the shared orchestrator id, useless for telling devices apart.
 - **G-30 — voice config drift on reconnect** destroys the orchestrator and clears every subscriber without notifying them.
 - **G-31 — any owner socket drop ends voice immediately** (no grace period).
-- **G-32 — OpenAI-specific duties fall on the client:** forward `voice_session_update` on data-channel open (initiator only), mirror every data-channel event, execute every `voice_command`. Non-owners get no live transcripts for OpenAI sessions. Ephemeral tokens are minted even for non-initiators.
+- **G-32 — OpenAI-specific duties fall on the client:** forward `voice_session_update` on data-channel open (initiator only), mirror every data-channel event, execute every `voice_command`. Non-owners get no live transcripts for OpenAI sessions (fixed 2026-10-10: the backend re-broadcasts the owner's mirrored transcript events, spec 12 VT-2). Ephemeral tokens are minted even for non-initiators.
 - **G-33 — provider/model defaults differ by entry point:** WS `voice_start` uses `assistant_config.json` defaults; REST `POST /voice/session` uses registry defaults; unknown provider ids silently become `openai`; `GET /api/orchestrator/voice/models` omits `google` on its live path.
 - **G-34 — `interrupt` does not stop a realtime voice response;** barge-in is client-driven (`response.cancel` for qwen, only while a response is active).
 - **G-35 — no `voice_status: ready` after a Qwen reconnect** (only Gemini re-emits it).

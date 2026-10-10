@@ -993,7 +993,7 @@ Rules:
 
 ### 4.7 Voice transcripts in the timeline
 
-Mapping from provider events to reducer actions. The same mapping applies to `voice_event{event}` frames (WS providers, received by every subscribed device) and `datachannel_event{event}` inputs (OpenAI owner only, inbound events only).
+Mapping from provider events to reducer actions. The same mapping applies to `voice_event{event}` frames (received by every subscribed device except the OpenAI owner) and `datachannel_event{event}` inputs (OpenAI owner only, inbound events only).
 
 | Provider event | Action |
 |---|---|
@@ -1045,7 +1045,7 @@ function voiceTurnEnd() {
 ```
 
 - **VT-1.** Voice assistant text streams into the current run as a `TextBlock{scope:"voice"}`; a voice user transcript is a user entry and therefore ends the run (I-2), unless it is placed by the anchor (I-9). This is the fix for the Android ordering bug (A-4.3): later tool calls go into the new tail run, never into an older message.
-- **VT-2.** Passive viewers render transcripts exactly like the owner for WS providers. For OpenAI (WebRTC) there is no server mirror, so passive viewers see only tool cards until the conversation is reloaded; the UI SHOULD say "Live transcript is only on the device that started voice" (G-32).
+- **VT-2.** Passive viewers render transcripts exactly like the owner, for every provider. WS providers: the backend relay broadcasts every provider event. OpenAI (WebRTC): the owner mirrors its data-channel events as `voice_event`, and the backend re-broadcasts the transcript ones (the event types of the table above) to every other subscriber, never back to the owner, which renders from its data channel (`api/routes/orchestrator.py` `_mirror_to_passive_viewers`). Before 2026-10-10 the backend did not, and passive viewers saw only tool cards (G-32).
 - **VT-3.** `voice_ended`/`voice_stopped`, `voice_owner_active{active:false}` and `voice_local_end` run `endVoice()` on **every** device, owner or passive, so voice tool cards always finish (A-4.3 compounding paths). This is conversation state; it is separate from the passive device's own voice-button state (§7.5).
 
 ---
@@ -1823,7 +1823,7 @@ IDs: **W-n** = item n of 02 §6.3; **W-6.1 / W-6.2** = the lists in 02 §6.1 / �
 | A-1.1 Auto-navigation on connect / orchestrator events | FOCUS-1. |
 | A-1.3 IME Send ignored while streaming; no queueing | §6.1: sending while busy is allowed and goes to the tray. |
 | A-3.6 `permission_*`, `session_stalled`, `voice_connection_error`, orchestrator `compact_complete` ignored | §4.3 handles every frame type; §6.9, §6.12, §7.7. |
-| A-5 Non-owner devices show no transcripts | VT-2 (WS providers mirror; OpenAI cannot). |
+| A-5 Non-owner devices show no transcripts | VT-2 (WS providers mirror from the relay; OpenAI from the owner's mirror, re-broadcast by the backend). |
 
 ---
 

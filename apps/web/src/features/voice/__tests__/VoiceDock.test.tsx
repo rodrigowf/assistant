@@ -138,16 +138,16 @@ describe('VoiceDockView states', () => {
     expect(a.calls).toEqual(['retry', 'dismiss']);
   });
 
-  it('Active elsewhere: read-only status; VT-2 copy for OpenAI; Take over only when offered', async () => {
+  it('Active elsewhere: read-only status; VT-2 copy; Take over only when offered', async () => {
     const onTakeOver = vi.fn();
-    const { rerender, container } = render(<ActiveElsewhereView provider="qwen" onTakeOver={onTakeOver} />);
+    const { rerender, container } = render(<ActiveElsewhereView onTakeOver={onTakeOver} />);
     expect(screen.getByText('Voice active on another device')).toBeTruthy();
     expect(screen.getByText('Transcripts mirror here')).toBeTruthy();
     await userEvent.setup().click(screen.getByRole('button', { name: 'Take over' }));
     expect(onTakeOver).toHaveBeenCalled();
     await expectNoAxeViolations(container);
-    rerender(<ActiveElsewhereView provider="openai" />);
-    expect(screen.getByText('The live transcript shows on that device')).toBeTruthy();
+    rerender(<ActiveElsewhereView />);
+    expect(screen.getByText('Transcripts mirror here')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Take over' })).toBeNull();
   });
 });

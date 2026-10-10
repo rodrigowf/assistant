@@ -67,8 +67,10 @@ Client ─────┤   every DC event mirrored ──► orchestrator WS `v
 - **WebRTC path (OpenAI)**: the backend never sees audio. It mints an
   ephemeral token (`client_secrets`), builds the `session.update`, receives
   every data-channel event mirrored as `voice_event`, runs tools, and sends
-  provider commands back as `voice_command`. The `OPENAI_API_KEY` stays on
-  the server.
+  provider commands back as `voice_command`. It re-broadcasts the mirrored
+  transcript events to the other devices (not the owner), so passive viewers
+  see the live transcript as with WS providers (spec 12 VT-2). The
+  `OPENAI_API_KEY` stays on the server.
 - **WS relay path (Qwen, Gemini, any future provider)**: the backend owns the
   upstream socket. The client sends PCM16 mono mic chunks as
   `voice_audio_in` and plays `voice_audio_out`. `DASHSCOPE_API_KEY`,

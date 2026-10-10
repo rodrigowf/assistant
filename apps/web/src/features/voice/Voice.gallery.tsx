@@ -137,7 +137,7 @@ function Dock({ state }: { state: State }) {
   if (!state.snap) {
     return (
       <>
-        <ActiveElsewhereView provider="qwen" onTakeOver={noop} />
+        <ActiveElsewhereView onTakeOver={noop} />
         <ComposerStub />
       </>
     );
